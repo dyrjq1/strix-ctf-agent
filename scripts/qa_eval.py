@@ -204,6 +204,53 @@ def vote(stem: str, opts: list[tuple[str, str]], k: int, temperature: float, see
     return best, votes
 
 
+def adaptive_vote(
+    stem: str,
+    opts: list[tuple[str, str]],
+    k: int,
+    extra: int,
+    temperature: float,
+    seed: int,
+    unanimous_need: int = 3,
+    majority_need: int = 4,
+) -> tuple[str | None, list[str], str]:
+    """自适应采样：一致就直接定，分歧再补票。
+
+    为什么这样省钱又安全：3 票一致（3/3）时答案基本可靠，直接提交；
+    3 票分裂时再补 2 票，只有 5 票里 ≥4 票同向才提交。这样把
+    "2/3 的题"从弃权变成可判，同时不给"2/3 里猜错的那一半"机会。
+
+    Args:
+        stem: 题干。
+        opts: 选项。
+        k: 首轮票数。
+        extra: 分歧时追加的票数。
+        temperature: 采样温度。
+        seed: 随机种子。
+        unanimous_need: 首轮全票要求。
+        majority_need: 追加后需要的票数。
+
+    Returns:
+        ``(胜出字母或 None, 全部票, 裁决理由)``。
+    """
+    choice, votes = vote(stem, opts, k, temperature, seed)
+    if not votes:
+        return None, [], "no_votes"
+    top = max(votes.count(v) for v in set(votes))
+    if top >= unanimous_need and len(votes) >= k:
+        return choice, votes, "unanimous"
+    more_choice, more_votes = vote(stem, opts, extra, temperature, seed + 7919)
+    merged = votes + more_votes
+    if not merged:
+        return None, [], "no_votes"
+    top = max(merged.count(v) for v in set(merged))
+    best = max(set(merged), key=lambda v: merged.count(v))
+    if top >= majority_need:
+        return best, merged, "majority"
+    return None, merged, "split"
+
+
+
 def api(token: str) -> requests.Session:
     """建一个带 token 的会话。"""
     s = requests.Session()
@@ -215,6 +262,19 @@ def register_solo(s: requests.Session, competition_id: str) -> int:
     """加入一个 suite（``POST /competitions/{id}/teams {"mode":"solo"}``）。"""
     r = s.post(f"{PLATFORM}/api/v1/competitions/{competition_id}/teams", json={"mode": "solo"}, timeout=60)
     return r.status_code
+
+
+def _load_rows(path: Path) -> list[dict]:
+    """读结果文件里的全部记录（坏行跳过）。"""
+    if not path.exists():
+        return []
+    out = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        try:
+            out.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue
+    return out
 
 
 def load_done(path: Path) -> set[str]:
@@ -240,6 +300,10 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--k", type=int, default=3, help="每题采样次数")
     ap.add_argument("--temperature", type=float, default=0.7)
     ap.add_argument("--min-agree", type=int, default=3, help="至少几张同票才提交")
+    ap.add_argument("--k-extra", type=int, default=2, help="首轮分歧时追加的票数（0=关闭自适应）")
+    ap.add_argument("--extra-min", type=int, default=4, help="追加后至少几张同票才提交")
+    ap.add_argument("--stop-after", type=int, default=25, help="至少交够这么多题后开始检查准确率")
+    ap.add_argument("--stop-below", type=float, default=0.6, help="准确率低于此值就停（防域偏移）")
     ap.add_argument("--submit", action="store_true", help="真的提交（默认只算）")
     ap.add_argument("--register", action="store_true", help="先加入该 suite")
     ap.add_argument("--out", default="~/qa-results.jsonl")
@@ -274,7 +338,14 @@ def main(argv: list[str] | None = None) -> int:
         if len(opts) < 2:
             print(f"  ! {c['id']} 选项解析失败，跳过")
             continue
-        choice, votes = vote(stem, opts, args.k, args.temperature, seed=hash(c["id"]) & 0xFFFF)
+        if args.k_extra > 0:
+            choice, votes, verdict = adaptive_vote(
+                stem, opts, args.k, args.k_extra, args.temperature,
+                seed=hash(c["id"]) & 0xFFFF, majority_need=args.extra_min,
+            )
+        else:
+            choice, votes = vote(stem, opts, args.k, args.temperature, seed=hash(c["id"]) & 0xFFFF)
+            verdict = "manual"
         agree = max((votes.count(v) for v in set(votes)), default=0)
         rec = {
             "challenge": c["id"],
@@ -282,7 +353,8 @@ def main(argv: list[str] | None = None) -> int:
             "choice": choice,
             "votes": votes,
             "agree": agree,
-            "k": args.k,
+            "verdict": verdict,
+            "k": len(votes),
             "ts": time.time(),
         }
         if not args.submit:
@@ -303,6 +375,13 @@ def main(argv: list[str] | None = None) -> int:
             )
             print(f"  {c['id']} -> {choice}  votes={votes}  "
                   f"{'✓' if rec['correct'] else '✗'} left={rec.get('attempts_remaining')}")
+            # 域偏移保护：换一个 bucket 后准确率可能整体下滑，继续交只是在烧机会。
+            graded = [r for r in _load_rows(out) if r.get("submitted")]
+            if len(graded) >= args.stop_after:
+                acc = sum(1 for r in graded if r.get("correct")) / len(graded)
+                if acc < args.stop_below:
+                    print(f"[stop] 已交 {len(graded)} 题，准确率 {acc:.0%} < {args.stop_below:.0%}，停止")
+                    break
         else:
             rec["skipped"] = "low_agreement"
             print(f"  {c['id']} -> 弃权  votes={votes}")
