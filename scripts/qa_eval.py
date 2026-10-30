@@ -213,6 +213,7 @@ def adaptive_vote(
     seed: int,
     unanimous_need: int = 3,
     majority_need: int = 4,
+    commit_split: bool = False,
 ) -> tuple[str | None, list[str], str]:
     """自适应采样：一致就直接定，分歧再补票。
 
@@ -229,6 +230,7 @@ def adaptive_vote(
         seed: 随机种子。
         unanimous_need: 首轮全票要求。
         majority_need: 追加后需要的票数。
+        commit_split: 仍然分裂时是否按多数票硬交。默认 False（弃权）。
 
     Returns:
         ``(胜出字母或 None, 全部票, 裁决理由)``。
@@ -244,9 +246,13 @@ def adaptive_vote(
     if not merged:
         return None, [], "no_votes"
     top = max(merged.count(v) for v in set(merged))
-    best = max(set(merged), key=lambda v: merged.count(v))
+    # 平票时按"首次出现顺序"取，避免 set 迭代顺序导致同一份数据两次跑出不同答案。
+    order = list(dict.fromkeys(merged))
+    best = max(order, key=lambda v: (merged.count(v), -order.index(v)))
     if top >= majority_need:
         return best, merged, "majority"
+    if commit_split:
+        return best, merged, "plurality"
     return None, merged, "split"
 
 
@@ -302,6 +308,10 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--min-agree", type=int, default=3, help="至少几张同票才提交")
     ap.add_argument("--k-extra", type=int, default=2, help="首轮分歧时追加的票数（0=关闭自适应）")
     ap.add_argument("--extra-min", type=int, default=4, help="追加后至少几张同票才提交")
+    ap.add_argument("--commit-split", action="store_true",
+                    help="5 票仍分裂时按多数票提交（默认弃权，等于放弃这题的分）")
+    ap.add_argument("--retry-skipped", action="store_true",
+                    help="只重做以前弃权、且还有提交机会的题")
     ap.add_argument("--stop-after", type=int, default=25, help="至少交够这么多题后开始检查准确率")
     ap.add_argument("--stop-below", type=float, default=0.6, help="准确率低于此值就停（防域偏移）")
     ap.add_argument("--submit", action="store_true", help="真的提交（默认只算）")
@@ -331,6 +341,10 @@ def main(argv: list[str] | None = None) -> int:
     out = Path(args.out).expanduser()
     done = load_done(out)
     todo = [c for c in items if c["id"] not in done]
+    if args.retry_skipped:
+        retry = {r["challenge"] for r in _load_rows(out)
+                 if not r.get("submitted") and not r.get("locked")}
+        todo = [c for c in items if c["id"] in retry]
     print(f"[qa] {args.suite}: {len(items)} 题，待做 {len(todo)}，已有结果 {len(done)}")
 
     for c in todo[: args.limit]:
@@ -342,6 +356,7 @@ def main(argv: list[str] | None = None) -> int:
             choice, votes, verdict = adaptive_vote(
                 stem, opts, args.k, args.k_extra, args.temperature,
                 seed=hash(c["id"]) & 0xFFFF, majority_need=args.extra_min,
+                commit_split=args.commit_split,
             )
         else:
             choice, votes = vote(stem, opts, args.k, args.temperature, seed=hash(c["id"]) & 0xFFFF)

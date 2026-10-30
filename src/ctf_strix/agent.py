@@ -756,6 +756,16 @@ def _run_agent(
     # engagement 的交付物就是报告，记账/报告工具更不能裁。
     install_ctf_toolset(drop_bookkeeping=False)
 
+    # 附件题（rev/pwn/misc/crypto）才装文件入口原语；web 题不为它付 schema token。
+    if kind == "file":
+        try:
+            from ctf_strix import file_triage
+
+            added = file_triage.register()
+            print(f"[file] registered {len(added)} tools: {', '.join(added) or '(already present)'}", flush=True)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[file] registration failed: {type(exc).__name__}: {exc}", flush=True)
+
     # token 计量：result.json 的 input_tokens / output_tokens 必须是真实值。
     # 计量失败不影响解题，只退化成 0。
     try:

@@ -246,6 +246,19 @@ async def main() -> int:
     except Exception as e:  # noqa: BLE001
         print(f"[discovery] registration failed: {type(e).__name__}: {e}")
 
+    # 文件类题（rev/pwn/misc/crypto 的附件题）才装入口原语。
+    #
+    # 只在 target_kind == file 时注册，是因为它会往 system prompt 里多塞一段
+    # schema；web 题每一轮都要为这段付 token，收益却是零。
+    if args.target_kind == "file":
+        try:
+            from ctf_strix import file_triage
+
+            added = file_triage.register()
+            print(f"[file] registered {len(added)} tools: {', '.join(added) or '(already present)'}")
+        except Exception as e:  # noqa: BLE001
+            print(f"[file] registration failed: {type(e).__name__}: {e}")
+
     # CTF 技能包：12 个方向索引，走 strix 自带的 load_skill。
     #
     # 只注册索引、不注册整包，是因为 strix 会把注册目录里每个 <分类>/*.md
