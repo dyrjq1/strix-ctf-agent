@@ -32,6 +32,25 @@ account can reach. Access-control and IDOR bugs live behind a session you have
 not created yet. Sending payloads at a login wall you never passed is the
 single most common way to burn the whole budget.
 
+## Scope: one vhost, no port scans
+
+The only in-scope asset is the target URL you were given. There is no other
+host, no internal DNS you can reach, and no second port worth scanning:
+host-header tricks against the edge IP and subdomain guessing have both been
+tried and return nothing. Every call spent there is a call not spent on the app.
+
+## First five calls: walk the product
+
+1. `http_probe` the root (one call).
+2. `route_map` once (one call) — it lists the API paths *and* unverified
+   `?` candidates derived from the page's own vocabulary.
+3. If the app has signup / login / create, do it now. Register a throwaway
+   account and look at every response: field names, ids, tokens, and any
+   per-user value (bonus, coupon, invite code) are the fastest schema lesson
+   you will get. Two accounts beat any wordlist — the difference between them
+   is the recipe.
+4. Only then attack: `method_sweep` the candidates, then send the hypothesis.
+
 ## No outbound internet
 
 The sandbox has no route to the internet. Any `curl` / `pip install` / `git
