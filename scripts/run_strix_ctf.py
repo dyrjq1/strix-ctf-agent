@@ -221,6 +221,16 @@ async def main() -> int:
     except Exception as e:  # noqa: BLE001 — 增强能力失败不能让整题跑不动
         print(f"[http] registration failed: {type(e).__name__}: {e}")
 
+    # 发现层：从 bundle 提路由 + 对路径换方法。这两个动作是把 009 的
+    # "运气"变成"流程"的关键，装一次就一直在。
+    try:
+        from ctf_strix import discovery
+
+        added = discovery.register()
+        print(f"[discovery] registered {len(added)} tools: {', '.join(added) or '(already present)'}")
+    except Exception as e:  # noqa: BLE001
+        print(f"[discovery] registration failed: {type(e).__name__}: {e}")
+
     # CTF 技能包：12 个方向索引，走 strix 自带的 load_skill。
     #
     # 只注册索引、不注册整包，是因为 strix 会把注册目录里每个 <分类>/*.md

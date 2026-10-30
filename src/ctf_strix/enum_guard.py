@@ -40,8 +40,12 @@ if TYPE_CHECKING:
 #: ``exec_command`` / ``write_stdin`` / ``repeat_request`` / ``apply_patch`` /
 #: ``view_image`` 等）。不存在的名字不会报错，只会让守卫永远不匹配，
 #: 属于最难查的一类失效。
-_PROBE_TOOLS = ("exec_command", "write_stdin", "repeat_request", "http_probe")
-#: ``http_probe`` 是 P1 新增的结构化原语。不加进这份名单，它就绕过了
+_PROBE_TOOLS = (
+    "exec_command", "write_stdin", "repeat_request",
+    "http_probe", "route_map", "method_sweep",
+)
+#: ``http_probe`` / ``route_map`` / ``method_sweep`` 是 P1/P2 新增的原语。
+#: 不加进这份名单，它们就绕过了
 #: 所有枚举计数——新工具最典型的失效方式不是报错，是"守卫根本不认识它"。
 
 #: 超过这个次数就开始警告。取 4 而不是 5，留一次给"确实需要补一枪"的情况。
