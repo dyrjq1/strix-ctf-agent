@@ -273,6 +273,43 @@ def _parse_guard(log: str) -> dict[str, object]:
     return out
 
 
+def _proxy_blackhole(target: str) -> dict[str, str]:
+    """把"外网不可达"从"卡 60 秒"变成"立刻拒绝"。
+
+    只做一件事：把 HTTP(S)_PROXY 指到一个关闭的本地端口，并用 NO_PROXY
+    放行本题靶机与 LLM 网关。这样 agent 再想 `curl github.com/...` 会拿到
+    瞬时 connection refused，而不是挂满超时——两者对模型的信息量完全不同。
+
+    Args:
+        target: 本题靶机地址（URL 或 host:port）。
+
+    Returns:
+        可直接并入子进程环境变量的字典。
+    """
+    from urllib.parse import urlsplit
+
+    allowed: list[str] = ["localhost", "127.0.0.1", "::1"]
+    host = urlsplit(target if "://" in target else f"//{target}").hostname
+    if host:
+        allowed.append(host)
+    llm_host = urlsplit(os.environ.get("LLM_API_BASE", "")).hostname
+    if llm_host:
+        allowed.append(llm_host)
+    allowed.extend(
+        h.strip() for h in os.environ.get("CTF_NO_PROXY_EXTRA", "").split(",") if h.strip()
+    )
+    no_proxy = ",".join(dict.fromkeys(allowed))
+    dead = "http://127.0.0.1:9"
+    return {
+        "HTTP_PROXY": dead,
+        "HTTPS_PROXY": dead,
+        "http_proxy": dead,
+        "https_proxy": dead,
+        "NO_PROXY": no_proxy,
+        "no_proxy": no_proxy,
+    }
+
+
 def _new_run_id(cid: str) -> str:
     """生成一次运行的唯一名字。
 
@@ -388,6 +425,14 @@ def run_agent(
 
     env = {
         "PYTHONPATH": "src:vendor/src",
+        # 外网黑洞：比赛规定 agent_internet=deny，但沙箱里 curl 一个外网域名
+        # 会**挂 20-60 秒**才超时。009 复跑实测：agent 试了两次下载字典
+        # （raw.githubusercontent.com），外加 3 次 write_stdin 等待，约 8 次
+        # 调用 / 90 秒花在"已知不可能成功"的事上。
+        # 指到一个必然拒绝的本地端口，失败就从"慢"变成"瞬时"，模型立刻换路。
+        # ⚠️ NO_PROXY 必须放行两类：本题靶机（否则打不到目标）和 LLM 网关
+        # （否则 strix 自己连不上模型，整题直接挂）。
+        **_proxy_blackhole(target),
         "STRIX_RUNTIME_BACKEND": "local",
         "PYTHONUNBUFFERED": "1",
         # 凭据只来自环境。仓库里写死 key 的代价不是"泄漏"，而是几个月后

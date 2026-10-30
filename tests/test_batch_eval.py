@@ -15,7 +15,7 @@ import pytest
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "scripts"))
 
-from batch_eval import _archive_run, _fresh_box, _new_run_id  # noqa: E402
+from batch_eval import _archive_run, _fresh_box, _new_run_id, _proxy_blackhole  # noqa: E402
 
 
 @pytest.fixture()
@@ -106,3 +106,25 @@ def test_archive_run_tolerates_missing_pieces(workdir: Path, missing: str) -> No
 
     assert (dest / "run.log").exists()
     assert not (dest / "strix_runs" / "sess" / ".state" / missing).exists()
+
+def test_proxy_blackhole_allows_target_and_llm(monkeypatch):
+    """黑洞不能把靶机和 LLM 网关一起挡掉——那会让整题连起步都做不到。"""
+    monkeypatch.setenv("LLM_API_BASE", "https://dashscope.aliyuncs.com/compatible-mode/v1")
+    monkeypatch.delenv("CTF_NO_PROXY_EXTRA", raising=False)
+
+    env = _proxy_blackhole("https://abc123.node1.ctfy.run/")
+
+    assert env["HTTPS_PROXY"] == "http://127.0.0.1:9"
+    allowed = env["NO_PROXY"].split(",")
+    assert "abc123.node1.ctfy.run" in allowed
+    assert "dashscope.aliyuncs.com" in allowed
+    assert "127.0.0.1" in allowed
+
+
+def test_proxy_blackhole_accepts_host_port_target(monkeypatch):
+    monkeypatch.setenv("LLM_API_BASE", "")
+    monkeypatch.delenv("CTF_NO_PROXY_EXTRA", raising=False)
+
+    env = _proxy_blackhole("10.0.0.5:31337")
+
+    assert "10.0.0.5" in env["NO_PROXY"].split(",")
