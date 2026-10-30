@@ -210,6 +210,17 @@ async def main() -> int:
     except Exception as e:  # noqa: BLE001 — 增强能力失败不能让整题跑不动
         print(f"[aisec] registration failed: {type(e).__name__}: {e}")
 
+    # 结构化 HTTP 原语。装它的理由不是"多一个工具"，而是把
+    # "请求没到达"与"服务器拒绝"拆开：009 第一跑把两者都读成 000，
+    # 于是放弃了唯一可行的入口。
+    try:
+        from ctf_strix import http_probe as http_probe_mod
+
+        added = http_probe_mod.register()
+        print(f"[http] registered {len(added)} tools: {', '.join(added) or '(already present)'}")
+    except Exception as e:  # noqa: BLE001 — 增强能力失败不能让整题跑不动
+        print(f"[http] registration failed: {type(e).__name__}: {e}")
+
     # CTF 技能包：12 个方向索引，走 strix 自带的 load_skill。
     #
     # 只注册索引、不注册整包，是因为 strix 会把注册目录里每个 <分类>/*.md
