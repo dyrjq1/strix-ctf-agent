@@ -54,6 +54,29 @@ _CAIDO_DEPENDENT: Final[frozenset[str]] = frozenset(
     }
 )
 
+#: 子 agent 编排工具。
+#:
+#: 实测（2026-10-30 009 复跑，77 次调用）：root 既 spawn 了 2 个子 agent，
+#: 又自己下场做侦察，中间还插了 `wait_for_agents` ×2、`agent_finish` ×2、
+#: `send_message_to_agent`、`view_agent_graph`——约 17 次调用（22%）花在
+#: 协调上，真正的入口在第 3 次调用就已经由 `route_map` 给出了。
+#:
+#: 这同时是"角色冲突"的硬解法：只要 `create_agent` 还在工具面里，root 就会
+#: 在"该不该派"上做没用的元推理（009 第一跑的原文："root agent shouldn't do
+#: hands-on testing... However..."，连续两轮）。删掉工具比写 prompt 稳。
+#:
+#: 需要多 agent 的题（长时间、多独立方向）可以用 ``CTF_ALLOW_SUBAGENTS=1``
+#: 打开——默认关闭，因为默认预算是 25-40 轮，协调成本占比过高。
+_AGENT_GRAPH: Final[frozenset[str]] = frozenset(
+    {
+        "create_agent",
+        "send_message_to_agent",
+        "wait_for_agents",
+        "stop_agent",
+        "view_agent_graph",
+    }
+)
+
 #: 依赖外网的工具。
 #:
 #: ⚠️ 正赛的 `internet_policy=deny`、`agent_internet=deny`，**agent 没有外网**，
@@ -66,17 +89,23 @@ _CAIDO_DEPENDENT: Final[frozenset[str]] = frozenset(
 _NETWORK_DEPENDENT: Final[frozenset[str]] = frozenset({"web_search"})
 
 
-def install_ctf_toolset(*, drop_caido: bool = True, drop_bookkeeping: bool = True) -> list[str]:
+def install_ctf_toolset(
+    *,
+    drop_caido: bool = True,
+    drop_bookkeeping: bool = True,
+    drop_agent_graph: bool | None = None,
+) -> list[str]:
     """把 strix 的基础工具面裁成 CTF 版本。
 
     Args:
         drop_caido: 是否摘掉 6 个 Caido 代理工具。本机没有 `caido-cli`，
             这 6 个调用必然报错，**裁掉是纯收益**。
         drop_bookkeeping: 是否摘掉 17 个记账工具（笔记/覆盖度/威胁建模/
-            报告）。默认 True 保持历史行为，但**评测与正赛必须一致**：
-            评测脚本不裁剪时，正赛也不该裁，否则评测数据不代表正赛。
-            收益本身已被证伪——`--trim-tools` 的 006 用了 48 次调用，
-            未裁剪的 011 只用 42 次，且原因是 prompt 仍在教被摘掉的工具。
+            报告）。默认 True：CTF 只认 flag，这些工具的产出不计分；且其中
+            ``create_vulnerability_report`` 在 VM 上**必然报错**
+            （`No module named 'cvss'`），留着只是白烧两轮。
+        drop_agent_graph: 是否摘掉子 agent 编排工具。默认按
+            ``CTF_ALLOW_SUBAGENTS`` 环境变量决定（不设=摘掉）。
 
     Returns:
         被摘掉的工具名列表（按原顺序），便于打印核对。
@@ -87,6 +116,11 @@ def install_ctf_toolset(*, drop_caido: bool = True, drop_bookkeeping: bool = Tru
     """
     from strix.agents import factory
 
+    import os
+
+    if drop_agent_graph is None:
+        drop_agent_graph = os.environ.get("CTF_ALLOW_SUBAGENTS", "").strip() not in ("1", "true", "yes")
+
     keep: list = []
     dropped: list[str] = []
     for tool in factory._BASE_TOOLS:  # noqa: SLF001 — 这是唯一可用的注入点
@@ -94,6 +128,9 @@ def install_ctf_toolset(*, drop_caido: bool = True, drop_bookkeeping: bool = Tru
             dropped.append(tool.name)
             continue
         if drop_caido and tool.name in _CAIDO_DEPENDENT:
+            dropped.append(tool.name)
+            continue
+        if drop_agent_graph and tool.name in _AGENT_GRAPH:
             dropped.append(tool.name)
             continue
         if tool.name in _NETWORK_DEPENDENT:

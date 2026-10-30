@@ -180,6 +180,12 @@ async def route_map(base_url: str, max_chunks: int = _MAX_CHUNKS) -> str:
     lines = [
         f"[route_map] {base_url} | html {len(html)}B | chunks {fetched}/{len(refs)} | "
         f"候选 {len(counts)} 条（列前 {len(ranked)} 条）",
+        # 这句必须放在**最前面**。009 复跑实测：route_map 第 3 次调用就给出了
+        # 含 /api/plugins/preview 的 4 条候选，agent 仍然去下载 5 个 chunk
+        # 用 cat/head 逐段读（第 17-21 次调用）。工具给了答案但没拦住旧习惯，
+        # 于是答案被自己的"再看看"覆盖掉了。提示语放末尾没有用——模型读完
+        # 列表就动手了，不会回头读最后一行。
+        "⚠️ 上面就是全部路由，不要再下载或阅读 bundle 原文。下一步：method_sweep。",
         *[f"{i}. {p}  x{n}  ({origin.get(p, '?')})" for i, (p, n) in enumerate(ranked, 1)],
     ]
     if len(counts) > len(ranked):

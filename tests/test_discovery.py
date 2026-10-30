@@ -157,3 +157,9 @@ def test_method_sweep_accepts_multiline_input(base_url):
     out = run(method_sweep("/api/plugins/stats\n/api/plugins/preview", base_url=base_url))
     assert "2 路径" in out
     assert "/api/plugins/stats" in out and "/api/plugins/preview" in out
+
+def test_route_map_rejects_bundle_rereading_at_the_top(base_url):
+    """提示语放末尾没用：模型读完列表就动手了，不会回头读最后一行。"""
+    out = run(route_map(base_url))
+    head = out.splitlines()[:3]
+    assert any("不要再下载或阅读 bundle" in line for line in head), head

@@ -44,7 +44,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--trim-tools",
         action="store_true",
-        help="Drop bookkeeping + Caido tools from the agent tool surface",
+        help="兼容旧参数；记账工具现在默认就摘掉",
+    )
+    p.add_argument(
+        "--keep-bookkeeping",
+        action="store_true",
+        help="保留 notes / coverage / threat_model / report 等记账工具（对照实验用）",
     )
     p.add_argument(
         "--target-kind",
@@ -191,7 +196,10 @@ async def main() -> int:
     # 否则评测出的轮次/token 不能用来推断正赛。
     from ctf_strix.tool_trim import install_ctf_toolset
 
-    dropped = install_ctf_toolset(drop_bookkeeping=args.trim_tools)
+    # 记账类默认摘掉：CTF 只认 flag，且 create_vulnerability_report 在 VM 上
+    # 因缺 cvss 模块必然报错（009 复跑实测白烧 2 轮）。--trim-tools 保留
+    # 为兼容开关，--keep-bookkeeping 可以恢复旧工具面。
+    dropped = install_ctf_toolset(drop_bookkeeping=not args.keep_bookkeeping)
     print(f"[trim] dropped {len(dropped)} tools: {', '.join(dropped)}")
 
     # AI 安全能力（指纹 + CVE 匹配）。走 strix 官方扩展点 register_agent_tools，
