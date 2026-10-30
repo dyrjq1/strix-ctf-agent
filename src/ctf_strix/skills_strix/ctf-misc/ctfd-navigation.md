@@ -187,7 +187,7 @@ done
 curl -s -X POST -H "Authorization: Token $CTF_TOKEN" \
   -H "Content-Type: application/json" \
   "$CTF_URL/api/v1/challenges/attempt" \
-  -d "{\"challenge_id\": $CHALL_ID, \"submission\": \"flag{example}\"}" | jq .
+  -d "{\"challenge_id\": $CHALL_ID, \"submission\": \"flag{...}\"}" | jq .
 ```
 
 **Response statuses:**

@@ -38,6 +38,26 @@ from typing import Any
 #: 原始技能包（唯一真相）。目录布局 ``<分类>/<分类>.md`` + 子文件。
 PACK_DIR: Path = Path(__file__).resolve().parent / "skills_strix"
 
+#: 技能包里带真实 flag 的 writeup 有 30+ 处。它们对解题毫无用处，却是最直接的
+#: 污染源：agent 一旦 ``read_file`` 到一份旧 writeup，日志里就会多出一个"看起来
+#: 像答案"的 flag，``flag_extract`` 的兜底（唯一候选）会把它交上去。CTFARENA-035
+#: 就是这么被人工解掉的题污染成"agent 解出"的。装载时统一抹成 ``FLAG{...}``，
+#: 形态保留、内容消失；``FLAG{...}`` 又刚好命中 flag_extract 的占位符排除规则。
+_FLAGISH = re.compile(r"(?i)\b(FLAG|CTF|CTFY)\{[0-9A-Za-z_\-]{2,}\}")
+
+
+def mask_flags(text: str) -> str:
+    """把文本里形如 ``FLAG{...}`` 的真实答案抹成 ``FLAG{...}`` 占位符。
+
+    Args:
+        text: 任意技能文本。
+
+    Returns:
+        抹掉答案内容的文本；前缀大小写保持不变。
+    """
+    return _FLAGISH.sub(lambda m: m.group(1) + "{...}", text)
+
+
 #: frontmatter 必须留在文件最前，所以提示只能插在 frontmatter **之后**。
 _FRONTMATTER = re.compile(r"^---\s*\n.*?\n---\s*\n", re.DOTALL)
 
@@ -128,7 +148,7 @@ def render(path: Path, ref: str, category: str) -> str:
         return _hint(ref, category) + text
     head = text[: m.end()]
     body = text[m.end() :]
-    return head + _hint(ref, category) + body
+    return head + _hint(ref, category) + mask_flags(body)
 
 
 def stage(ref: str | None = None, pack: Path | None = None) -> Path:

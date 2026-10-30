@@ -23,9 +23,9 @@ proof-of-concept: no
 
 > `nc chall.pwnable.tw 10500`
 >
-> Decoy flag: `FLAG{Oh_y0u_f1nd_th3_s3cr3t_1n_loc4ltim3}` (reads directly from file, NOT accepted)
+> Decoy flag: `FLAG{...}` (reads directly from file, NOT accepted)
 >
-> Real flag: `FLAG{Cr1t1c4l_h34p_is_very_cr4zyyyyyyyyyy}` (requires shell)
+> Real flag: `FLAG{...}` (requires shell)
 
 ## Challenge Overview
 
@@ -166,7 +166,7 @@ fread(...);                   // reads contents into malloc'd buffer
    - `Play → Normal → Show` triggers `__printf_chk(1, payload)` → `%s` dereferences the flag address → flag printed.
    - Flag offset from heap base varies (~0x320 to 0x5e0 depending on environment).
 
-**Result:** Prints `FLAG{Oh_y0u_f1nd_th3_s3cr3t_1n_loc4ltim3}` — this is the **decoy flag**. Submitting it gets accepted on the platform for this challenge (criticalheap, 200 pts), but the real challenge (criticalheap++, 600 pts) shares the same binary and requires a shell.
+**Result:** Prints `FLAG{...}` — this is the **decoy flag**. Submitting it gets accepted on the platform for this challenge (criticalheap, 200 pts), but the real challenge (criticalheap++, 600 pts) shares the same binary and requires a shell.
 
 **Reliability:** Some solutions brute-force the flag offset in 0x10 increments since the exact heap layout depends on the number of environment variables at process start.
 
@@ -198,7 +198,7 @@ This is the **criticalheap++ (600 pts)** path that obtains a real shell:
 7. **Get real flag:**
    ```bash
    cd /home/critical_heap++ && echo 'Crazy heap !!' | ./get_flag
-   # FLAG{Cr1t1c4l_h34p_is_very_cr4zyyyyyyyyyy}
+   # FLAG{...}
    ```
 
 **Reliability:** Requires matching heap layout between local and remote. Environment variables affect layout significantly; solution 1162 dynamically calculates offsets using format string reads.
@@ -247,7 +247,7 @@ flag_offset   = 0x320 ~ 0x5e0  # from heap_base to flag data after localtime()
 
 ## The Decoy Trap
 
-The flag file at `/home/critical_heap++/flag` contains `FLAG{Oh_y0u_f1nd_th3_s3cr3t_1n_loc4ltim3}` — note the self-referential name *"Oh you find the secret in localtime"*. This is intentionally planted as a decoy. The platform accepts it for the **criticalheap (200 pts)** problem, but the companion **criticalheap++ (600 pts)** requires obtaining a shell and running the setuid `get_flag` binary with the passphrase `"Crazy heap !!"` to get the real flag.
+The flag file at `/home/critical_heap++/flag` contains `FLAG{...}` — note the self-referential name *"Oh you find the secret in localtime"*. This is intentionally planted as a decoy. The platform accepts it for the **criticalheap (200 pts)** problem, but the companion **criticalheap++ (600 pts)** requires obtaining a shell and running the setuid `get_flag` binary with the passphrase `"Crazy heap !!"` to get the real flag.
 
 ## Solution Write-ups
 

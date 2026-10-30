@@ -24,7 +24,7 @@ proof-of-concept: no
 
 > `nc chall.pwnable.tw 10310`
 >
-> Flag: `FLAG{r3alloc_the_heap_r3alloc_the_file_Str34m_r3alloc_my_lif3}`
+> Flag: `FLAG{...}`
 
 ## Challenge Overview
 

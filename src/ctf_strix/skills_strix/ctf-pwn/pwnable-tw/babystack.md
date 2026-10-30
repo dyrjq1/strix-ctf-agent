@@ -24,7 +24,7 @@ proof-of-concept: no
 
 > `nc chall.pwnable.tw 10205`
 >
-> Flag: `FLAG{Its_juS7_a_st4ck0v3rfl0w}`
+> Flag: `FLAG{...}`
 
 ## Challenge Overview
 

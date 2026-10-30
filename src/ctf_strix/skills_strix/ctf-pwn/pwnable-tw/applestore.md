@@ -24,7 +24,7 @@ proof-of-concept: no
 
 > `nc chall.pwnable.tw 10104`
 >
-> Flag: `FLAG{I_th1nk_th4t_you_c4n_jB_1n_1ph0n3_8}`
+> Flag: `FLAG{...}`
 
 ## Challenge Overview
 

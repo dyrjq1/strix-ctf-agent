@@ -225,6 +225,34 @@ class Client:
             pass  # 删不掉不算错，TTL 会兜底
 
 
+def _known_flags() -> set[str]:
+    """仓库里现存的 flag 语料（docs/reports/技能包）。
+
+    用途只有一个：区分"agent 真打出来的"与"从本地文档里抄来的"。scrub 之后
+    正常应为空集；非空说明又有历史产物落进了仓库，``flag_provenance`` 会指出来。
+
+    Returns:
+        仓库文本里出现过的 flag 字符串集合。
+    """
+    from ctf_strix.flag_extract import FLAG_RE
+
+    repo = Path(__file__).resolve().parent.parent
+    seen: set[str] = set()
+    for rel in ("docs", "reports", "src/ctf_strix/skills_strix"):
+        root = repo / rel
+        if not root.is_dir():
+            continue
+        for path in root.rglob("*"):
+            if path.suffix.lower() not in {".md", ".txt", ".json", ".jsonl"}:
+                continue
+            try:
+                text = path.read_text(encoding="utf-8", errors="ignore")
+            except OSError:
+                continue
+            seen.update(m.group(0) for m in FLAG_RE.finditer(text))
+    return seen
+
+
 def _parse_guard(log: str) -> dict[str, object]:
     """从运行日志里抠出三个守卫的实际介入情况。
 
@@ -596,7 +624,12 @@ def main() -> int:
             #   2. 模板占位符：prompt 里的 FLAG{...}
             #   3. 日志截断：flag 跨在 event_sink 截断边界上
             # 判据必须带本题靶机 host，否则分不清"这题的证据"和"别题的残留"。
-            from ctf_strix.flag_extract import best_flag, fallback_flag, host_of
+            from ctf_strix.flag_extract import (
+                best_flag,
+                fallback_flag,
+                host_of,
+                provenance,
+            )
 
             # 守卫是否真的介入了，必须进数据。上一轮枚举守卫装在代码里、
             # 单测通过、真实日志重放也通过，但真实运行里一次都没触发——
@@ -614,6 +647,23 @@ def main() -> int:
                 if flag:
                     rec["flag_confidence"] = "low"
             rec["flags_found"] = [flag] if flag else []
+            if flag:
+                # 证据链：flag 是**哪次调用**吐出来的、离靶机多远、是不是出自本地文档。
+                # 没有这条，"agent 解出"和"读到别人 writeup 里的 flag"在结果表里长得一模一样。
+                prov = provenance(log, flag, own)
+                rec["flag_provenance"] = prov
+                # 低置信度 + 落地在本地文档 + 该 flag 在仓库语料里出现过 → 判污染，不提交。
+                # 三者同时成立才拦，宁可放过不可错杀：scrub 之后仓库里本不该再有真 flag，
+                # 真出现说明是历史产物污染（CTFARENA-035 那类账）。
+                if (
+                    rec["flag_confidence"] == "low"
+                    and prov.get("doc_source")
+                    and flag in _known_flags()
+                ):
+                    rec["flag_suspicious"] = True
+                    rec["flag_confidence"] = "contaminated"
+                    print("  !! flag 疑似来自本地文档污染，不提交", flush=True)
+                    flag = None
             if flag:
                 rec["flag_submitted"] = flag
                 verdict = client.submit(iid, flag)

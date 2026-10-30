@@ -23,7 +23,7 @@ proof-of-concept: no
 
 > `nc chall.pwnable.tw 10103`
 >
-> Flag: `FLAG{Silver_Bullet_Is_Not_Enough_QQ}`
+> Flag: `FLAG{...}`
 
 ## Challenge Overview
 

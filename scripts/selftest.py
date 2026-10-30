@@ -115,13 +115,16 @@ def test_enum_guard() -> None:
     g1 = _fingerprint("exec_command", '{"cmd":"B=https://abc.ctfy.run; curl $B/api/x"}')
     check("shell 变量不撕裂 host", g1 is not None and "abc.ctfy.run" in str(g1), str(g1))
 
+    # v2 判据：只有**响应完全一样**才算重复（AFL 覆盖率思维）。
     g = EnumerationGuard()
-    seq = [
-        g.observe("exec_command", '{"cmd":"curl https://abc.ctfy.run/api/coins/x"}')
-        for _ in range(7)
-    ]
-    check("第 4 次起警告", "ENUMERATION GUARD" in (seq[3] or ""), str(seq[3])[:60])
-    check("第 7 次升级硬指令", "MUST NOT" in (seq[6] or ""), str(seq[6])[:60])
+    same = '{"cmd":"curl https://abc.ctfy.run/api/coins/x"}'
+    seq = [g.observe("exec_command", same, "[HTTP 404] not found") for _ in range(6)]
+    check("第 3 次同响应起警告", "ENUMERATION GUARD" in (seq[2] or ""), str(seq[2])[:60])
+    check("第 5 次升级硬指令", "Stop now" in (seq[4] or ""), str(seq[4])[:60])
+    fresh = g.observe("exec_command", same, '[HTTP 200] {"ok":true,"n":7}')
+    check("新响应不算重复", fresh is None, str(fresh)[:40])
+    path_echo = g.observe("exec_command", same, "[HTTP 404] not found for /api/coins/x")
+    check("换路径的回显共同指纹", path_echo is None, str(path_echo)[:40])
 
 
 # ---------------------------------------------------------------- 旅程守卫

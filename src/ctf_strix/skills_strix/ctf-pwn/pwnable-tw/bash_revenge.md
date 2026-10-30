@@ -26,7 +26,7 @@ proof-of-concept: no
 >
 > `nc chall.pwnable.tw 10407`
 >
-> Flag: `FLAG{us3_4ft3r_fr33_1n_bash_1s_p0w3rful}`
+> Flag: `FLAG{...}`
 
 ## Challenge Overview
 

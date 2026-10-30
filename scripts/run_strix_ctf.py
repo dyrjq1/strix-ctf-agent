@@ -132,7 +132,7 @@ async def main() -> int:
     from ctf_strix.enum_guard import install as install_enum_guard
 
     guard = install_enum_guard()
-    print("[guard] enumeration guard installed (warn>=4, hard>=7)")
+    print("[guard] enumeration guard installed (warn>=3 identical, hard>=5 identical, stall>=6)")
 
     # 同一类教训：只写在 prompt 里的行为约束会随轮次衰减。旅程守卫跟踪
     # "是否见过认证墙 / 是否已登录 / 是否创建过资源"，在未认证状态下灌载荷时介入。

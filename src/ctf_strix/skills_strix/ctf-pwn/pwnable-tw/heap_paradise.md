@@ -23,7 +23,7 @@ proof-of-concept: no
 
 > `nc chall.pwnable.tw 10308`
 >
-> Flag: `FLAG{W3lc0m3_2_h3ap_p4radis3}`
+> Flag: `FLAG{...}`
 
 ## Challenge Overview
 
@@ -229,7 +229,7 @@ one_gadgets     = [0x45216, 0x4526a, 0xef6c4, 0xf0567]
 | `1177.md` | A | Fastbin dup → stdout FSOP → `__malloc_hook` | Local process exploit |
 | `2311.md` | B | **Leakless**: dual partial overwrite → stderr vtable → `_IO_flush_all_lockp` | ~1/256 brute; no libc leak needed |
 | `2796.md` | A | Standard three-phase | Concise implementation |
-| `5378.md` | A | stdout FSOP → `__malloc_hook` | `FLAG{W3lc0m3_2_h3ap_p4radis3}` confirmed |
+| `5378.md` | A | stdout FSOP → `__malloc_hook` | `FLAG{...}` confirmed |
 | `7905.md` | A | Detailed Chinese writeup; full phase breakdown | Best pedagogical write-up |
 | `8153.md` | A | Chinese writeup; clean overlap analysis | Notes signed index bug |
 | `9448.md` | A | Standard approach with retry loop | Clear heap layout diagrams |

@@ -1200,7 +1200,7 @@ for base in (UART_BASE, TIM2_BASE, NVIC_BASE):
 
 # --- MMIO models with side-effects ---
 timer = {"CNT": 0, "SR": 1}
-uart_buf = b"flag{test}\n"
+uart_buf = b"flag{...}\n"
 uart_idx = [0]
 
 def hook_mmio_read(mu, access, address, size, value, user_data):

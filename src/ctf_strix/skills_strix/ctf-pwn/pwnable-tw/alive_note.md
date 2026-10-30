@@ -25,7 +25,7 @@ proof-of-concept: no
 >
 > `nc chall.pwnable.tw 10300`
 >
-> Flag: `FLAG{Sh3llcoding_in_th3_n0t3_ch4in}`
+> Flag: `FLAG{...}`
 
 ## Challenge Overview
 

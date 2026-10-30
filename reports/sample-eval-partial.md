@@ -10,4 +10,4 @@
 | SAMPLE-002 | easy | file | FAIL* | 6.2s | 378.7s | 385.0s | 10 | 590,013 | 2,724 | 592,737 | 9 |
 
 \* 判 FAIL 是**判定环节**的问题，不是 agent 没做出来。两题日志里都拿到了正确 flag：
-SAMPLE-014 `FLAG{e4b4726419142cc0e32188df1f22dbab}`、SAMPLE-002 `FLAG{1b89b7e8d76a29d75d9defa89c93b536}`。
+SAMPLE-014 `FLAG{...}`、SAMPLE-002 `FLAG{...}`。

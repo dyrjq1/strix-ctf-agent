@@ -23,7 +23,7 @@ proof-of-concept: no
 
 > `nc chall.pwnable.tw 10402`
 >
-> Flag: `FLAG{R0P_H4rd_TO_D3F3AT_ASLR}`
+> Flag: `FLAG{...}`
 
 ## Challenge Overview
 

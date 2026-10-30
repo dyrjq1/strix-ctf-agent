@@ -72,7 +72,7 @@ sidecar，父进程回读后不再重复补交。
 
 同一类错误：`pending_checkers` 用 `answered_correctly` 过滤。这些题的 checker
 question 一开局就是 true，于是 sidecar 一次都没跑，即使 agent 已经拿到
-`FLAG{banner_defacement_confirmed_HACKED_BY_CTF}` 这样的实证。
+`FLAG{...}` 这样的实证。
 
 修法：只按 `mode == "checker"` 筛，`requires` 改用「本轮 + 平台账本」的并集判定。
 修完后 006/007/008 全部由 FAIL 变 OK。

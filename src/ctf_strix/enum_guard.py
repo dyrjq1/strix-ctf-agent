@@ -23,6 +23,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import re
 from collections import Counter
 from typing import TYPE_CHECKING, Any
@@ -48,10 +49,14 @@ _PROBE_TOOLS = (
 #: 不加进这份名单，它们就绕过了
 #: 所有枚举计数——新工具最典型的失效方式不是报错，是"守卫根本不认识它"。
 
-#: 超过这个次数就开始警告。取 4 而不是 5，留一次给"确实需要补一枪"的情况。
-_WARN_AFTER = 4
-#: 到这个次数警告升级为强指令。
-_HARD_AFTER = 7
+#: 同一族连续 N 次拿到**完全相同**的响应就警告。计的是"第一次之后的重复次数"：
+#: 2 表示第 3 次同响应。两次可能只是抖动，三次已经能断定这条路没有新信息。
+_WARN_REPEATS = 2
+#: 到这里升级成硬指令（禁止继续打这一族）。
+_HARD_REPEATS = 4
+#: 跨族连续零新信息的警告阈值，以及之后每隔多少次重复提醒。
+_STALL_AFTER = 6
+_STALL_REPEAT = 4
 
 #: 从命令里提取"被探测的路径族"。抽不出来就不计——宁可漏抓，不可误伤。
 _PATH_RE = re.compile(r"[A-Za-z0-9_\-./]*(?:api|admin|flag|config|debug|static|assets)[A-Za-z0-9_\-./]*")
@@ -123,52 +128,165 @@ def _fingerprint(tool_name: str, args: str) -> str | None:
     return f"{tool_name}|{host}|{sorted(families)[0]}"
 
 
+_URL_RE = re.compile(r"https?://[^\s\"'<>|)}\]]+")
+
+
+def _obs_signature(result: Any, args: str) -> str:
+    """把一次工具结果压成"观测指纹"，用来判断这次调用有没有带来新信息。
+
+    归一化三件事，都是实测里会把同一个页面变成不同指纹的噪声：
+
+    1. 参数里出现过的 URL 及其路径——404 页常把请求路径原样回显；
+    2. 所有数字——时间戳、长度、端口、耗时每次都不同；
+    3. 空白——换行与缩进不稳定。
+
+    只保留状态行（第一行，含 ``[HTTP 404]`` / ``phase=CONNECT`` 这类归因）
+    加上归一化后的正文前 1500 字符。
+
+    Args:
+        result: 工具返回值（通常是 str，也可能是结构化对象）。
+        args: 本次调用的原始参数串。
+
+    Returns:
+        12 位十六进制指纹。相同指纹 == 相同观测 == 零信息增益。
+    """
+    text = result if isinstance(result, str) else str(result)
+    for url in set(_URL_RE.findall(args or "")):
+        text = text.replace(url, "<url>")
+        parts = url.split("://", 1)[-1].split("/", 1)
+        if len(parts) == 2 and len(parts[1]) > 2:
+            text = text.replace("/" + parts[1], "<path>")
+    head, _, body = text.partition("\n")
+    body = re.sub(r"\d+", "#", body.lower())
+    body = re.sub(r"\s+", " ", body).strip()
+    payload = head.strip() + "|" + body[:1500]
+    return hashlib.sha1(payload.encode("utf-8", "replace")).hexdigest()[:12]
+
+
 class EnumerationGuard:
-    """统计探测重复度，并在工具结果里注入纠正提示。"""
+    """统计"信息增益为零"的重复探测，并在工具结果里注入纠正提示。
+
+    ## 为什么 v1 的计数没生效
+
+    v1 按"同 host + 同路径族"计数，完全不看响应。2026-10-30 009 复跑里 agent
+    对同一个 ``/api/plugins/preview`` 连打 4 次，每次换一个 body 字段名——
+    族名一样，但那是**有**信息增益的探测；反过来 018 那种
+    ``robots/sitemap/favicon/api`` 每换一个词就换一个族，一次都没触发。
+    只数动作，数不出"有没有学到东西"。
+
+    ## 现在的判据（AFL 式覆盖率思维）
+
+    一次探测只有在**观测指纹与之前完全相同**时才算重复。新指纹 = 新信息 =
+    这次调用有进展，计数清零。这就是模糊测试的语料库规则：只有产生新覆盖率的
+    输入才值得留下（AFL），也是 novelty search 的核心——奖励行为上的新奇，
+    而不是奖励动作次数。
+
+    另外维护**全局停滞**计数：连续 N 次调用（跨所有族）都没产生新指纹，
+    说明模型在原地打转，不管它换没换路径。
+
+    Attributes:
+        counts: 族 → 连续同响应次数。
+        stall: 连续零新信息的调用数（跨族）。
+    """
 
     def __init__(self) -> None:
         self.counts: Counter[str] = Counter()
         self.warned: set[str] = set()
-        #: `observe` 被调用过多少次（含没有指纹、不计数的情况）。
-        #: 用途同 `JourneyState.observe_calls`：区分"规则没命中"和"根本没接线"。
+        #: `begin` 被调用过多少次（含没有路径指纹、不计数的调用）。
         self.observe_calls: int = 0
+        self._seen: dict[str, set[str]] = {}
+        self._global: set[tuple[str | None, str]] = set()
+        self.stall: int = 0
+        self.stall_hits: int = 0
 
-    def observe(self, tool_name: str, args: str) -> str | None:
-        """记一次调用，返回要追加到结果后面的提示（或 None）。
+    def begin(self, tool_name: str, args: str) -> tuple[str | None, str]:
+        """调用前登记。
 
         Args:
             tool_name: 工具名。
-            args: 调用参数。
+            args: 原始参数串。
 
         Returns:
-            提示文本；不需要提示时返回 None。
+            ``(族指纹, 参数串)``，交给 :meth:`finish` 结算。
         """
         self.observe_calls += 1
-        key = _fingerprint(tool_name, args)
+        return _fingerprint(tool_name, args), args
+
+    def finish(self, token: tuple[str | None, str], result: Any) -> str | None:
+        """调用后结算，返回要追加到结果末尾的提示（或 None）。
+
+        Args:
+            token: :meth:`begin` 的返回值。
+            result: 工具返回值。
+
+        Returns:
+            提示文本；无需提示时返回 None。
+        """
+        key, args = token
+        sig = _obs_signature(result, args)
+        fresh = (key, sig) not in self._global
+        self._global.add((key, sig))
+        self.stall = 0 if fresh else self.stall + 1
+
         if key is None:
-            return None
+            return self._stall_hint()
 
-        self.counts[key] += 1
+        seen = self._seen.setdefault(key, set())
+        if sig in seen:
+            self.counts[key] += 1
+        else:
+            seen.add(sig)
+            self.counts[key] = 0
+
         n = self.counts[key]
+        family = key.split("|")[-1]
+        if n >= _HARD_REPEATS and (n - _HARD_REPEATS) % 3 == 0:
+            return (
+                f"\n\n[ENUMERATION GUARD] {n + 1} probes of '{family}' returned the "
+                "IDENTICAL response. Re-sending cannot produce new information. Stop now.\n"
+                "Switch mechanism: parameter injection, auth bypass, file read, SSTI, "
+                "SSRF pivot, or use the access you already have (code execution / DB "
+                "read) to locate the flag file."
+            )
+        if n >= _WARN_REPEATS and f"{key}|{sig}" not in self.warned:
+            self.warned.add(f"{key}|{sig}")
+            return (
+                f"\n\n[ENUMERATION GUARD] The last {n + 1} probes of '{family}' returned "
+                "the SAME response — zero new information. Name one concrete hypothesis "
+                "(mechanism + exact request + expected response) that differs in "
+                "structure from everything you already sent, then send that."
+            )
+        return self._stall_hint()
 
-        if n >= _HARD_AFTER:
-            return (
-                f"\n\n[ENUMERATION GUARD] You have now probed this same path family "
-                f"{n} times ('{key.split('|')[-1]}'). This is not progress. "
-                "You MUST NOT send another request against this family. "
-                "Switch to a different mechanism now: parameter injection, auth bypass, "
-                "file read, SSTI, SSRF pivot, or read whatever access you already have. "
-                "If you already have code execution or DB read, USE IT to find the flag file."
-            )
-        if n >= _WARN_AFTER and key not in self.warned:
-            self.warned.add(key)
-            return (
-                f"\n\n[ENUMERATION GUARD] This is attempt {n} against the same path family "
-                f"('{key.split('|')[-1]}'). Stop enumerating names. State one concrete "
-                "exploitation hypothesis (mechanism + exact request + expected response) "
-                "and send it instead."
-            )
-        return None
+    def _stall_hint(self) -> str | None:
+        if self.stall < _STALL_AFTER:
+            return None
+        if (self.stall - _STALL_AFTER) % _STALL_REPEAT:
+            return None
+        self.stall_hits += 1
+        return (
+            f"\n\n[ENUMERATION GUARD] {self.stall} consecutive calls produced no new "
+            "observation (same bodies, same errors). Budget is burning without learning.\n"
+            "Before the next request: (1) write down the single most promising fact you "
+            "already have; (2) pick the mechanism that fact points at instead of probing "
+            "more names."
+        )
+
+    def observe(self, tool_name: str, args: str, result: Any = None) -> str | None:
+        """兼容旧接口：无 ``result`` 时只登记，有 ``result`` 时等价 begin+finish。
+
+        Args:
+            tool_name: 工具名。
+            args: 原始参数串。
+            result: 工具返回值；为 None 时不做信息增益判断。
+
+        Returns:
+            提示文本或 None。
+        """
+        token = self.begin(tool_name, args)
+        if result is None:
+            return None
+        return self.finish(token, result)
 
 
 def install() -> EnumerationGuard:
@@ -197,9 +315,10 @@ def install() -> EnumerationGuard:
         inner = tool.on_invoke_tool
 
         async def invoke(ctx: Any, raw_input: str) -> Any:
-            # 工具名从 tool 闭包取，多 agent 共用同一个守卫，计数是全局的。
-            hint = guard.observe(tool.name, raw_input)
+            # 工具名从 tool 闭包取；大 agent 共用同一个守卫，计数是全局的
+            token = guard.begin(tool.name, raw_input)
             result = await inner(ctx, raw_input)
+            hint = guard.finish(token, result)
             if hint:
                 # 结果体量不确定（可能不是 str），统一转成字符串追加。
                 return f"{result}{hint}"

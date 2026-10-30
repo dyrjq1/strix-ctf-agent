@@ -23,7 +23,7 @@ proof-of-concept: no
 
 > `nc chall.pwnable.tw 10203`
 >
-> Flag: `FLAG{FastBiN_C0rruption_t0_BUrN_7H3_G4rd3n}`
+> Flag: `FLAG{...}`
 
 ## Challenge Overview
 

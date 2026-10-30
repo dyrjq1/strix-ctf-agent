@@ -23,7 +23,7 @@ proof-of-concept: no
 
 > `nc chall.pwnable.tw 10000`
 >
-> Flag: `FLAG{Pwn4bl3_tW_1s_y0ur_st4rt}`
+> Flag: `FLAG{...}`
 
 ## Challenge Overview
 
