@@ -19,6 +19,8 @@ import contextlib
 import json
 import os
 import re
+import secrets
+import shutil
 import subprocess
 import time
 from pathlib import Path
@@ -271,7 +273,100 @@ def _parse_guard(log: str) -> dict[str, object]:
     return out
 
 
-def run_agent(target: str, turns: int, timeout_s: int, name: str, extra: str = "") -> tuple[str, float]:
+def _new_run_id(cid: str) -> str:
+    """生成一次运行的唯一名字。
+
+    它同时充当沙箱目录名和 agent name。唯一性不是审美问题：strix 用
+    ``strix_runs/<name>/.state/agents.db`` 认领 session，名字重复就等于
+    "接着上一轮继续跑"。随机后缀用来兜住同一秒内的两次调用。
+    """
+    # 后缀要够宽：``token_hex(2)`` 只有 16 位，同秒内生成 200 个就有约 30%
+    # 概率撞名（生日问题），撞名等于续跑。32 位把碰撞概率压到 1e-5 量级。
+    return f"{time.strftime('%Y%m%d-%H%M%S')}-{cid}-{secrets.token_hex(4)}"
+
+
+def _fresh_box(name: str, root: str | Path = "/tmp/ctfbox") -> tuple[Path, Path]:
+    """给一次运行准备**干净**的沙箱目录，返回 (box, log 路径)。
+
+    必须是"删了重建"而不是"存在就复用"：复用会让上一轮的
+    ``strix_runs/<name>/.state`` 留下来，strix 直接续跑同一个 agent
+    （同一 agent id、同一份 /tmp 沙箱、同一段对话历史）。这种污染不报错，
+    只表现为"今天状态特别好"，是最贵的一类假数据。
+
+    只清本题目录，不动 ``/tmp/ctfbox`` 下的其他题——并发时误删别人正在
+    跑的沙箱，会比污染更难查。
+
+    Args:
+        name: 运行名（唯一）。
+        root: 沙箱根目录，测试时可换成临时目录。
+
+    Returns:
+        (沙箱目录, 日志文件路径)，目录已存在且为空。
+    """
+    box = Path(root) / name
+    if box.exists():
+        shutil.rmtree(box, ignore_errors=True)
+    box.mkdir(parents=True, exist_ok=True)
+    return box, box / "run.log"
+
+
+def _git_commit(root: Path) -> str:
+    """取当前提交号，写进结果行。
+
+    没有它，一周后回看"这行 0.5 的通过率是哪版代码跑出来的"就无法回答，
+    而对照实验的全部意义就在于能回答这个问题。取不到不报错——仓库被拷成
+    tarball 时 git 可能不存在，这是正常情况，不是缺陷。
+    """
+    try:
+        out = subprocess.run(
+            ["git", "-C", str(root), "rev-parse", "--short", "HEAD"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if out.stdout.strip():
+            return out.stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        pass
+    # VM 上是"本地写、远程跑"，项目目录不是 git 仓库，取不到 HEAD。
+    # 退回到推送时写入的戳，否则这一列在真实运行里永远是 unknown——
+    # 一个永远为空的字段比没有这个字段更糟，因为它看起来像在记录。
+    try:
+        stamp = root / ".codex-commit"
+        if stamp.is_file():
+            return stamp.read_text(encoding="utf-8").strip()[:12] or "unknown"
+    except OSError:
+        pass
+    return "unknown"
+
+
+def _archive_run(box: Path, name: str, dest_root: Path) -> Path:
+    """把一题的取证材料整体拷到 ``dest_root/<name>/``。
+
+    归档的三样东西缺一不可：``run.log``（工具流）、
+    ``strix_runs/**/.state/agents.db``（完整 reasoning + 参数 + 输出）、
+    以及跑它的提交号（由调用方写进结果行）。只留 log 的话，"模型当时
+    为什么这么选"永远查不出来——009 的 12 次调用干了什么，就是靠 agents.db
+    回放才看出来的。
+    """
+    dest = dest_root / name
+    if dest.exists():
+        shutil.rmtree(dest, ignore_errors=True)
+    dest.mkdir(parents=True, exist_ok=True)
+    with contextlib.suppress(OSError):
+        shutil.copy2(box / "run.log", dest / "run.log")
+    src_runs = box / "strix_runs"
+    if src_runs.is_dir():
+        shutil.copytree(src_runs, dest / "strix_runs", dirs_exist_ok=True)
+    return dest
+
+
+def run_agent(
+    target: str,
+    turns: int,
+    timeout_s: int,
+    name: str,
+    extra: str = "",
+    archive_dir: Path | None = None,
+) -> tuple[str, float]:
     """跑一次 strix，返回 (完整日志, 墙钟耗时)。
 
     日志写文件而不是只在内存里：被强杀时还能从文件取证。
@@ -288,9 +383,8 @@ def run_agent(target: str, turns: int, timeout_s: int, name: str, extra: str = "
     goal = (root / "config" / "ctf_goal.txt").read_text(encoding="utf-8")
     instruction = f"{goal}\n\n{extra}" if extra else goal
 
-    box = Path("/tmp/ctfbox") / name
-    box.mkdir(parents=True, exist_ok=True)
-    log = box / "run.log"
+    # 每次都是全新沙箱：见 `_fresh_box` 里关于 session resume 的记录。
+    box, log = _fresh_box(name)
 
     env = {
         "PYTHONPATH": "src:vendor/src",
@@ -330,7 +424,10 @@ def run_agent(target: str, turns: int, timeout_s: int, name: str, extra: str = "
             fh.write(f"\n[WALLCLOCK TIMEOUT after {timeout_s}s]\n")
             fh.flush()
             _kill_group(proc)
-    return log.read_text(encoding="utf-8", errors="ignore"), time.time() - started
+    text = log.read_text(encoding="utf-8", errors="ignore")
+    if archive_dir is not None:
+        _archive_run(box, name, archive_dir)
+    return text, time.time() - started
 
 
 def _kill_group(proc: subprocess.Popen) -> None:
@@ -359,11 +456,23 @@ def main() -> int:
     p.add_argument("--wallclock", type=int, default=900, help="单题墙钟上限（秒）")
     p.add_argument("--out", default="/tmp/batch/results.jsonl")
     p.add_argument("--token", required=True)
+    p.add_argument(
+        "--archive-dir", default="~/runs",
+        help="取证归档根目录（run.log + agents.db），默认 ~/runs",
+    )
+    p.add_argument(
+        "--no-archive", action="store_true",
+        help="不归档，只适合冒烟验证（会丢掉事后回放轨迹的能力）",
+    )
     args = p.parse_args()
 
     plan = json.loads(Path(args.plan).read_text(encoding="utf-8"))
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
+    archive = Path(args.archive_dir).expanduser()
+    if not args.no_archive:
+        archive.mkdir(parents=True, exist_ok=True)
+    commit = _git_commit(Path(__file__).resolve().parent.parent)
     client = Client(args.token)
 
     # 按难度分层预算，但**上限要贴着实测值**，不能拍脑袋放大。
@@ -391,6 +500,11 @@ def main() -> int:
               f"budget: {turns} turns / {wallclock}s", flush=True)
 
         rec = {"idx": idx, "challenge": cid, "difficulty": diff, "started": time.time()}
+        # 每次运行一个唯一名字。它同时是沙箱目录名和 agent name，所以
+        # 唯一性直接等于"不会续跑"。随机后缀是防同一秒内的重复调用。
+        run_id = _new_run_id(cid)
+        rec["run_id"] = run_id
+        rec["git_commit"] = commit
         iid = None
         try:
             t0 = time.time()
@@ -420,7 +534,12 @@ def main() -> int:
             else:
                 print(f"  可达 ({detail})", flush=True)
 
-            log, wall = run_agent(target, turns, wallclock, f"batch-{idx:02d}-{cid}")
+            rec["budget_turns"] = turns
+            rec["budget_wall_s"] = wallclock
+            log, wall = run_agent(
+                target, turns, wallclock, run_id,
+                archive_dir=None if args.no_archive else archive,
+            )
             rec["agent_s"] = round(wall, 1)
             rec["tool_calls"] = log.count(" TOOL ")
             rec["turn_capped"] = "MaxTurnsExceeded" in log
