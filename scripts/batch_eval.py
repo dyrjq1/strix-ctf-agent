@@ -430,6 +430,96 @@ def _git_commit(root: Path) -> str:
     return "unknown"
 
 
+#: 平台 tag → 首个该试的动作。顺序即优先级：越具体的机制越靠前。
+#:
+#: 这些不是"提示"，是公开元数据（题目页面上的标签）到标准测试动作的映射。
+#: 依据是 OWASP WSTG 的测试项划分与 OWASP Top 10 for Agentic Applications
+#: (2025) 的分类——平台 tag 本身就是照那套分类命名的（goal_hijack /
+#: tool_misuse / identity_abuse / memory_poisoning ...）。CRAKEN 的实验说明
+#: "把知识压成一句可执行提示"比塞整篇文档有效，所以每条只留一个动作。
+_TAG_MOVES: tuple[tuple[tuple[str, ...], str], ...] = (
+    (("prompt_injection", "goal_hijack"),
+     "agentic: 把指令写进**数据**里（工单正文/文件名/用户资料），要求它读出配置、工具清单或 flag"),
+    (("tool_misuse", "excessive_agency", "auto_approval"),
+     "agentic: 让 agent 用攻击者选的参数调工具（退款单号、读文件路径、URL），看它有没有二次校验"),
+    (("identity_abuse", "credential_leak"),
+     "agentic: agent 可能带着别人的 token 干活——在日志/记忆/响应里找其他用户的凭据"),
+    (("memory_poisoning", "rag"),
+     "agentic: 污染检索库（上传文档/备注），看它跨会话是否把毒化内容当事实"),
+    (("inter_agent", "signature_bypass", "jwt_none", "rogue_agent"),
+     "agentic: 伪造 A2A 消息 / alg=none / 重放签名的任务包"),
+    (("cascading_failure", "fail_open"),
+     "agentic: 打挂一个依赖，走 fail-open 分支拿默认权限"),
+    (("predictable_code",),
+     "可预测: 优惠码/邀请码/token 多半由 user id 或时间派生——注册两个账号比对，再推算第三个"),
+    (("weak_hash", "unsigned_session", "unsigned_plugin"),
+     "弱完整性: 会话/插件未签名或弱哈希——改值、重放、拿已知明文反推"),
+    (("account_merge", "business_logic"),
+     "业务逻辑: 走完一遍正常流程，找「该被拒绝却被接受」的状态组合（负数、0、超大值、重复回调）"),
+    (("swallowed_exception", "error_handling"),
+     "异常吞噬: 制造畸形输入，观察是否回退到「默认成功」分支"),
+    (("sensitive_log_exposure",),
+     "日志泄漏: /logs /debug /api/logs、错误页堆栈、响应头里的内部路径"),
+    (("command_injection", "template_injection", "reverse_shell"),
+     "命令/模板注入: 参数里 ; | $() 与 {{7*7}} 并试，成功后直接读 /flag"),
+    (("mcp", "untrusted_plugins"),
+     "MCP/插件: 注册一个插件或 MCP server，看它是否被平台自动加载/执行"),
+    (("idor",),
+     "BAC: 换 id——自己的资源 id 改成邻居的（整数±1、uuid 从列表接口拿），并试 GET/PUT/DELETE"),
+    (("ssrf",),
+     "SSRF: http://127.0.0.1:PORT/、file:///etc/passwd、169.254.169.254，注意 3xx 跟随与 URL 解析差异"),
+    (("lfi", "path_traversal"),
+     "LFI: ../../../../etc/passwd、双重编码、/proc/self/root、绝对路径与截断"),
+    (("nosql_injection",),
+     "NoSQLi: JSON body 里塞 {\"$ne\":null} / {\"$gt\":\"\"} 绕登录"),
+    (("sqli",),
+     "SQLi: 每个参数单引号破引号，看报错；UNION 先定列数，再读 information_schema"),
+    (("ssti",),
+     "SSTI: {{7*7}} → <%= 7*7 %> → ${7*7}，命中后直接读文件/命令"),
+    (("prototype_pollution",),
+     "原型污染: body 里 __proto__/constructor.prototype 注入，再接一个 gadget 到 RCE"),
+    (("unsafe_deserialization",),
+     "反序列化: pickle / node-serialize / PHP phar / Java ysoserial 的入口在哪（cookie、上传、缓存）"),
+    (("jwt", "jwks"),
+     "JWT: alg=none、kid 路径穿越、HS256 拿公钥当密钥、弱口令爆破（离线）"),
+    (("2fa_bypass",),
+     "2FA: 响应篡改（返回 verified=true 的那一步）、验证码复用、竞态、无速率限制"),
+    (("default_credentials", "weak_password", "brute_force"),
+     "口令: 题面里的人名/邮箱直接当账号，试 admin/admin、默认口令；有登录框先注册再爆自己的账号"),
+    (("debug_endpoint",),
+     "调试面: /debug /actuator /__debug /@vite/client /_nuxt/builds/meta 这类默认暴露"),
+    (("sourcemap",),
+     "sourcemap: 找 .js.map 拿源码（比读 bundle 快一个数量级）"),
+    (("graphql", "apq"),
+     "GraphQL: introspection → 字段建议报错 → APQ 用 hash 直接发持久化查询"),
+    (("file_upload",),
+     "上传: 扩展名/Content-Type/魔数三处绕过，文件名里塞 ../，看静态目录是否可执行"),
+    (("multi_network", "lateral_movement", "pivot"),
+     "多网: 用 SSRF/webhook 当前置跳板打内网；先 env、/etc/hosts、内网 DNS 找第二跳"),
+)
+
+
+def _tag_moves(tags: list[str]) -> str:
+    """把平台 tag 翻成一组"先试什么"，最多 6 条。
+
+    Args:
+        tags: 题目 tag 列表。
+
+    Returns:
+        多行文本；没有命中时返回空串。
+    """
+    lowered = [t.lower() for t in tags]
+    picked: list[str] = []
+    for keys, move in _TAG_MOVES:
+        if any(k in t for t in lowered for k in keys) and move not in picked:
+            picked.append(move)
+    if not picked:
+        return ""
+    return "first moves by tag (one each, stop when one answers):\n" + "\n".join(
+        f"- {m}" for m in picked[:6]
+    ) + "\n"
+
+
 def _challenge_brief(detail: dict) -> str:
     """把平台题目详情压成一段"题面简报"，拼进 agent 的指令。
 
@@ -459,6 +549,9 @@ def _challenge_brief(detail: dict) -> str:
         lines.append("tags: " + ", ".join(tags[:12]) + "\n")
     if desc:
         lines.append(desc[:1500] + ("\n" if len(desc) <= 1500 else "…\n"))
+    moves = _tag_moves(tags)
+    if moves:
+        lines.append(moves)
     return "".join(lines)
 
 

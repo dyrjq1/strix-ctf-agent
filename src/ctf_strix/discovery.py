@@ -105,6 +105,62 @@ def _get(url: str, timeout: float = _TIMEOUT):
     return requests.get(url, timeout=timeout, verify=False, allow_redirects=True)
 
 
+#: 常见 API 动词。用途不是"扫字典"，而是把**页面自己的词汇**拼到已发现的前缀上。
+#: 009 两次运行的差异就在这里：13 次调用那次模型自己猜中了 ``/api/plugins/preview``，
+#: 33 次调用那次 route_map 只给出 stats/featured/categories 三条，模型于是去读
+#: bundle 原文。前端的按钮文案（"Submit for review"、"Preview"）本来就在首页上，
+#: 把它和 ``/api/plugins`` 拼起来就是未文档化入口。
+_VERB_HINTS: Final = (
+    "preview", "submit", "upload", "review", "approve", "reject", "export", "import",
+    "create", "update", "delete", "search", "list", "status", "stats", "config",
+    "settings", "admin", "health", "metrics", "logs", "debug", "token", "verify",
+    "reset", "refund", "redeem", "claim", "invite", "share", "download", "run",
+    "exec", "ping", "proxy", "webhook", "me", "users", "orders", "report",
+)
+
+#: 页面文本里出现这些词时，说明它是这个应用的动作词，值得拼进候选。
+_WORD_RE: Final = re.compile(r"[A-Za-z][A-Za-z0-9_]{3,20}")
+
+
+def _derived_candidates(counts: dict[str, int], blob: str, limit: int = 8) -> list[str]:
+    """把"已知 API 前缀 × 页面词汇"拼成未验证候选路径。
+
+    Args:
+        counts: 已发现的路径 → 出现次数。
+        blob: 首页与 chunk 的原文（用于判断某个词是不是这个应用的词汇）。
+        limit: 最多给几条。
+
+    Returns:
+        候选路径列表（不含已发现的），前缀权重高的排在前面。
+    """
+    # 前缀要从**已发现的具体路径**里截，不是去匹配整条路径：
+    # 计数表里只有 /api/plugins/stats 这种三段路径，直接 fullmatch 会一条都提不出来。
+    prefix_set: set[str] = set()
+    for path in counts:
+        m = re.match(r"^(/api(?:/[a-z0-9_\-]{2,20})?)", path)
+        if m:
+            prefix_set.add(m.group(1))
+    prefixes = sorted(prefix_set, key=lambda p: (-_weight(p), -counts.get(p, 0), p))
+    if not prefixes:
+        return []
+    lowered = blob.lower()
+    vocab = {w.lower() for w in _WORD_RE.findall(blob)}
+    verbs = [v for v in _VERB_HINTS if v in vocab or v in lowered]
+    # 页面词汇不足时退回静态动词表——宁可多给几条可验证的候选，也不要空手。
+    if len(verbs) < 4:
+        verbs = list(_VERB_HINTS)
+    out: list[str] = []
+    for prefix in prefixes:
+        for verb in verbs:
+            path = f"{prefix}/{verb}"
+            if path in counts or path in out:
+                continue
+            out.append(path)
+            if len(out) >= limit:
+                return out
+    return out
+
+
 async def route_map(base_url: str, max_chunks: int = _MAX_CHUNKS) -> str:
     """从首页和它引用的 JS 里提取后端路径候选（只读 GET，一次调用完成）。
 
@@ -141,6 +197,7 @@ async def route_map(base_url: str, max_chunks: int = _MAX_CHUNKS) -> str:
 
     counts: dict[str, int] = {}
     origin: dict[str, str] = {}
+    blobs: list[str] = []
     fetched = 0
     for ref in refs:
         try:
@@ -149,6 +206,7 @@ async def route_map(base_url: str, max_chunks: int = _MAX_CHUNKS) -> str:
             continue
         fetched += 1
         name = ref.rsplit("/", 1)[-1]
+        blobs.append((resp.text or "")[:200_000])
         for m in _ROUTE_RE.finditer(resp.text or ""):
             path = m.group(1).rstrip("/")
             if not path or _NOT_ROUTE.search(path):
@@ -190,9 +248,13 @@ async def route_map(base_url: str, max_chunks: int = _MAX_CHUNKS) -> str:
     ]
     if len(counts) > len(ranked):
         lines.append(f"…另有 {len(counts) - len(ranked)} 条低频路径未列")
+    derived = _derived_candidates(counts, html + "\n" + "\n".join(blobs))
+    if derived:
+        lines.append("候选（页面词汇 × API 前缀，未验证，先 method_sweep）：")
+        lines.extend(f"  ? {p}" for p in derived)
     lines.append(
-        "next: 把这些路径喂给 method_sweep（同一个路径换 POST/PUT/OPTIONS 是最容易"
-        "撞出未文档化入口的动作）。不要再去读 bundle 原文。"
+        "next: 把这些路径（含上面的 ? 候选）喂给 method_sweep——同一个路径换 POST/PUT "
+        "是最容易撞出未文档化入口的动作。不要再去读 bundle 原文。"
     )
     return "\n".join(lines)
 

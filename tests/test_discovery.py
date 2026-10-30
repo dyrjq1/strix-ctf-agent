@@ -163,3 +163,31 @@ def test_route_map_rejects_bundle_rereading_at_the_top(base_url):
     out = run(route_map(base_url))
     head = out.splitlines()[:3]
     assert any("不要再下载或阅读 bundle" in line for line in head), head
+
+
+def test_derived_candidates_use_page_vocabulary() -> None:
+    """页面文案里的动词要能拼到已发现的 API 前缀上。
+
+    009 的教训：route_map 只给 stats/featured/categories 三条时，模型会去读
+    bundle 原文；给出 ``/api/plugins/preview`` 时它直接就打了那个入口。
+    """
+    from ctf_strix.discovery import _derived_candidates
+
+    counts = {
+        "/api/plugins/stats": 1,
+        "/api/plugins/featured": 1,
+        "/api/plugins/categories": 1,
+    }
+    blob = "Submit a plugin for review. Preview how it behaves before publishing."
+    got = _derived_candidates(counts, blob)
+    assert "/api/plugins/preview" in got
+    assert "/api/plugins/submit" in got
+    assert all(p not in counts for p in got), "已发现的路径不该混进候选"
+
+
+def test_derived_candidates_empty_without_api_prefix() -> None:
+    """没有 /api 前缀时不要凭空造候选。"""
+    from ctf_strix.discovery import _derived_candidates
+
+    assert _derived_candidates({"/login": 2, "/static/x": 1}, "preview submit") == []
+

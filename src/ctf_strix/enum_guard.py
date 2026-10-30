@@ -128,6 +128,13 @@ def _fingerprint(tool_name: str, args: str) -> str | None:
     return f"{tool_name}|{host}|{sorted(families)[0]}"
 
 
+#: "又在读前端 bundle" 的特征：curl/wget 一个 .js、cat 一个 .js、或 read_file 到 .js。
+#: 这不是浪费一次调用的问题——009/018 实测各花 4-6 次调用把 chunk 逐段 cat 出来，
+#: 而 route_map 一次就能给路径表。工具已经给出答案时，旧习惯仍会覆盖它。
+_BUNDLE_RE = re.compile(
+    r"(?:curl|wget)[^\n]*\.js\b|cat[^\n]*\.js\b|read_file[^\n]*\.js|head[^\n]*\.js\b"
+)
+
 _URL_RE = re.compile(r"https?://[^\s\"'<>|)}\]]+")
 
 
@@ -198,6 +205,8 @@ class EnumerationGuard:
         self._global: set[tuple[str | None, str]] = set()
         self.stall: int = 0
         self.stall_hits: int = 0
+        #: 读 bundle 原文的次数（含 curl/wget/cat .js）。
+        self.bundle_hits: int = 0
 
     def begin(self, tool_name: str, args: str) -> tuple[str | None, str]:
         """调用前登记。
@@ -223,6 +232,15 @@ class EnumerationGuard:
             提示文本；无需提示时返回 None。
         """
         key, args = token
+        if _BUNDLE_RE.search(args or ""):
+            self.bundle_hits += 1
+            if self.bundle_hits in (2, 4):
+                return (
+                    "\n\n[BUNDLE GUARD] You are reading front-end bundle source again. "
+                    "route_map already listed the API paths (and its '?' candidates). "
+                    "Stop downloading/cat-ing .js: feed those paths to method_sweep, "
+                    "then POST to the most plausible one."
+                )
         sig = _obs_signature(result, args)
         fresh = (key, sig) not in self._global
         self._global.add((key, sig))

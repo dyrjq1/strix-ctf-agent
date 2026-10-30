@@ -70,7 +70,7 @@ def iter_files(root: pathlib.Path):
     for path in root.rglob("*"):
         if any(part in _SKIP_DIRS for part in path.parts):
             continue
-        if path.is_file() and path.suffix.lower() in {".md", ".txt", ".json", ".jsonl", ".yaml", ".yml"}:
+        if path.is_file() and path.suffix.lower() in {".md", ".txt", ".json", ".jsonl", ".yaml", ".yml", ".log", ".html"}:
             yield path
 
 
