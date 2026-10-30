@@ -551,14 +551,23 @@ def main() -> int:
             #   2. 模板占位符：prompt 里的 FLAG{...}
             #   3. 日志截断：flag 跨在 event_sink 截断边界上
             # 判据必须带本题靶机 host，否则分不清"这题的证据"和"别题的残留"。
-            from ctf_strix.flag_extract import best_flag, host_of
+            from ctf_strix.flag_extract import best_flag, fallback_flag, host_of
 
             # 守卫是否真的介入了，必须进数据。上一轮枚举守卫装在代码里、
             # 单测通过、真实日志重放也通过，但真实运行里一次都没触发——
             # 如果不记录，这种"装了等于没装"在结果表里完全看不出来。
             rec["guard"] = _parse_guard(log)
 
-            flag = best_flag(log, host_of(target))
+            own = host_of(target)
+            flag = best_flag(log, own)
+            # 主判据挑不出时，用"唯一候选"兜底。理由见 fallback_flag 的 docstring：
+            # 009 复跑里 agent 真的解出来了，却因为 host 与 flag 隔着一个
+            # heredoc 而被判无证据——**解出来不提交，比交错更亏**。
+            rec["flag_confidence"] = "high" if flag else None
+            if flag is None:
+                flag = fallback_flag(log, own)
+                if flag:
+                    rec["flag_confidence"] = "low"
             rec["flags_found"] = [flag] if flag else []
             if flag:
                 rec["flag_submitted"] = flag
