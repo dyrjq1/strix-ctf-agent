@@ -32,11 +32,18 @@ account can reach. Access-control and IDOR bugs live behind a session you have
 not created yet. Sending payloads at a login wall you never passed is the
 single most common way to burn the whole budget.
 
-## Do not enumerate forever
+## No outbound internet
 
-If the same family of endpoints or parameters has returned the same thing three
-times, stop. Enumerating one more path is not progress. Form a hypothesis about
-the mechanism, test it once, and change direction on failure.
+The sandbox has no route to the internet. Any `curl` / `pip install` / `git
+clone` to an external host fails instantly by design (you will see
+`Connection refused` via 127.0.0.1:9). Wordlists and tools are already
+installed locally. Only the challenge target is reachable; do not spend calls
+trying to download anything.
+
+## Change mechanism, not names
+
+Enumerating one more path after the same response is not progress. When a
+mechanism returns nothing new twice, name a different mechanism and test it.
 
 ## Finish
 

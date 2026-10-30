@@ -203,6 +203,15 @@ class Client:
         for i in range(attempts):
             try:
                 r = self.s.get(url, timeout=20, verify=False, allow_redirects=False)
+                # ⚠️ 502/503/504 是**边缘代理**的错误，不是题目的 4xx。
+                # 实测：009 这次拿到一个 502 实例，判成"可达"后 agent 在死应用上
+                # 烧了 9 分钟 18 次调用，最后照样没解——典型的"跑得挺像在解题"。
+                # 网关错误一律按不可达处理，交给上层换实例。
+                if r.status_code in (502, 503, 504):
+                    last = f"HTTP {r.status_code} (gateway, app not up)"
+                    if i + 1 < attempts:
+                        time.sleep(3)
+                    continue
                 return True, f"HTTP {r.status_code}"
             except requests.RequestException as exc:
                 last = f"{type(exc).__name__}: {str(exc)[:120]}"
@@ -217,6 +226,24 @@ class Client:
             timeout=60,
         )
         return r.json()
+
+    def detail(self, challenge_id: str) -> dict:
+        """取题目详情（描述 + 标签）。拿不到就返回空字典，不阻断评测。
+
+        Args:
+            challenge_id: 题号。
+
+        Returns:
+            平台返回的题目对象；失败时 ``{}``。
+        """
+        try:
+            r = self.s.get(f"{PLATFORM}/api/v1/challenges/{challenge_id}", timeout=30)
+            if r.status_code >= 400:
+                return {}
+            d = r.json()
+            return d.get("data", d)
+        except Exception:  # noqa: BLE001 — 描述拿不到不影响解题
+            return {}
 
     def teardown(self, iid: str) -> None:
         try:
@@ -401,6 +428,38 @@ def _git_commit(root: Path) -> str:
     except OSError:
         pass
     return "unknown"
+
+
+def _challenge_brief(detail: dict) -> str:
+    """把平台题目详情压成一段"题面简报"，拼进 agent 的指令。
+
+    为什么要给：题面里的 ``tags`` 就是出题人标的技术栈与预期机制
+    （``ssrf`` / ``idor`` / ``predictable_code``），``description`` 也写着
+    业务背景。人类选手看得到同样的信息；不给 agent 等于让它盲猜方向。
+    2026-10-30 的批测里 agent 全靠黑盒探路，009 花了 13 次调用才撞上
+    ``/api/plugins/preview``，而题面第一句就写着"提交的 base64 JS 会被
+    preview 执行"。
+
+    Args:
+        detail: :meth:`Client.detail` 的返回值。
+
+    Returns:
+        多行简报；详情为空时返回空串。
+    """
+    desc = (detail.get("description") or "").strip()
+    tags = [t for t in (detail.get("tags") or []) if isinstance(t, str)]
+    if not desc and not tags:
+        return ""
+    head = "## 题面（平台提供，不是提示）\n"
+    meta = " / ".join(
+        x for x in (detail.get("name"), detail.get("category"), detail.get("difficulty")) if x
+    )
+    lines = [head + (f"{meta}\n" if meta else "")]
+    if tags:
+        lines.append("tags: " + ", ".join(tags[:12]) + "\n")
+    if desc:
+        lines.append(desc[:1500] + ("\n" if len(desc) <= 1500 else "…\n"))
+    return "".join(lines)
 
 
 def _archive_run(box: Path, name: str, dest_root: Path) -> Path:
@@ -609,8 +668,12 @@ def main() -> int:
 
             rec["budget_turns"] = turns
             rec["budget_wall_s"] = wallclock
+            # 题面是公开信息（人类选手在页面上就能看到），不给等于让 agent 盲猜。
+            brief = _challenge_brief(client.detail(cid))
+            rec["brief_chars"] = len(brief)
             log, wall = run_agent(
                 target, turns, wallclock, run_id,
+                extra=brief,
                 archive_dir=None if args.no_archive else archive,
             )
             rec["agent_s"] = round(wall, 1)
