@@ -1,0 +1,5525 @@
+[
+ {
+  "component": "9router",
+  "vendor": "decolua",
+  "product": null,
+  "rule_file": "9router.yaml",
+  "display": "9router",
+  "probes": [
+   {
+    "path": "/",
+    "method": "GET",
+    "kind": "fp",
+    "matchers": [
+     {
+      "type": "body",
+      "value": [
+       "<title>9Router"
+      ],
+      "negative": false
+     }
+    ]
+   },
+   {
+    "path": "/dashboard",
+    "method": "GET",
+    "kind": "fp",
+    "matchers": [
+     {
+      "type": "body",
+      "value": [
+       "<title>9Router"
+      ],
+      "negative": false
+     }
+    ]
+   }
+  ],
+  "keywords": [
+   "<title>9Router"
+  ],
+  "has_version_detect": false
+ },
+ {
+  "component": "agentic-flow",
+  "vendor": "ruvnet",
+  "product": null,
+  "rule_file": "agentic-flow.yaml",
+  "display": "Agentic-Flow",
+  "probes": [
+   {
+    "path": "/health",
+    "method": "GET",
+    "kind": "fp"
+   },
+   {
+    "path": "/health",
+    "method": "GET",
+    "kind": "ver",
+    "version_regex": "\"version\"\\s*:\\s*\"([0-9][0-9.a-zA-Z\\-]+)\"",
+    "version_group": 1,
+    "version_part": "body"
+   }
+  ],
+  "keywords": [],
+  "has_version_detect": true
+ },
+ {
+  "component": "agenticmail",
+  "vendor": "agenticmail",
+  "product": null,
+  "rule_file": "agenticmail.yaml",
+  "display": "AgenticMail",
+  "probes": [
+   {
+    "path": "/api/agenticmail/health",
+    "method": "GET",
+    "kind": "fp"
+   },
+   {
+    "path": "/api/agenticmail/health",
+    "method": "GET",
+    "kind": "ver",
+    "version_regex": "\"version\"\\s*:\\s*\"([0-9][0-9.a-zA-Z\\-]+)\"",
+    "version_group": 1,
+    "version_part": "body"
+   }
+  ],
+  "keywords": [],
+  "has_version_detect": true
+ },
+ {
+  "component": "ai-agent-config",
+  "vendor": "various",
+  "product": null,
+  "rule_file": "ai-agent-config.yaml",
+  "display": "AI-Agent-Config",
+  "probes": [
+   {
+    "path": "/claude_desktop_config.json",
+    "method": "GET",
+    "kind": "fp"
+   },
+   {
+    "path": "/.claude.json",
+    "method": "GET",
+    "kind": "fp"
+   },
+   {
+    "path": "/.mcp.json",
+    "method": "GET",
+    "kind": "fp"
+   },
+   {
+    "path": "/.cursor/mcp.json",
+    "method": "GET",
+    "kind": "fp"
+   },
+   {
+    "path": "/.trae/mcp.json",
+    "method": "GET",
+    "kind": "fp"
+   },
+   {
+    "path": "/mcp_settings.json",
+    "method": "GET",
+    "kind": "fp"
+   },
+   {
+    "path": "/.continue/config.json",
+    "method": "GET",
+    "kind": "fp"
+   },
+   {
+    "path": "/cline_mcp_settings.json",
+    "method": "GET",
+    "kind": "fp"
+   },
+   {
+    "path": "/mcp_config.json",
+    "method": "GET",
+    "kind": "fp"
+   },
+   {
+    "path": "/.vscode/mcp.json",
+    "method": "GET",
+    "kind": "fp"
+   },
+   {
+    "path": "/.config/zed/settings.json",
+    "method": "GET",
+    "kind": "fp"
+   },
+   {
+    "path": "/.config/goose/config.yaml",
+    "method": "GET",
+    "kind": "fp",
+    "matchers": [
+     {
+      "type": "body",
+      "value": [
+       "GOOSE_PROVIDER:"
+      ],
+      "negative": false
+     },
+     {
+      "type": "body",
+      "value": [
+       "GOOSE_MODEL:"
+      ],
+      "negative": false
+     },
+     {
+      "type": "body",
+      "value": [
+       "extensions:"
+      ],
+      "negative": false
+     },
+     {
+      "type": "body",
+      "value": [
+       "enabled:"
+      ],
+      "negative": false
+     }
+    ]
+   },
+   {
+    "path": "/.env",
+    "method": "GET",
+    "kind": "fp"
+   }
+  ],
+  "keywords": [
+   "GOOSE_MODEL:",
+   "GOOSE_PROVIDER:",
+   "enabled:",
+   "extensions:"
+  ],
+  "has_version_detect": false
+ },
+ {
+  "component": "ai-chatbot",
+  "vendor": "ai-chatbot",
+  "product": null,
+  "rule_file": "ai-chatbot.yaml",
+  "display": "ai-chatbot",
+  "probes": [
+   {
+    "path": "/",
+    "method": "GET",
+    "kind": "fp",
+    "matchers": [
+     {
+      "type": "body",
+      "value": [
+       "<title>Next.js Chatbot Template</title>"
+      ],
+      "negative": false
+     }
+    ]
+   }
+  ],
+  "keywords": [
+   "<title>Next.js Chatbot Template</title>"
+  ],
+  "has_version_detect": false
+ },
+ {
+  "component": "ai-copilot",
+  "vendor": "quadlayers",
+  "product": null,
+  "rule_file": "ai-copilot.yaml",
+  "display": "AI Copilot",
+  "probes": [
+   {
+    "path": "/",
+    "method": "GET",
+    "kind": "fp",
+    "matchers": [
+     {
+      "type": "body",
+      "value": [
+       "aicp__chatbot"
+      ],
+      "negative": false
+     },
+     {
+      "type": "body",
+      "value": [
+       "aicp__app"
+      ],
+      "negative": false
+     }
+    ]
+   },
+   {
+    "path": "/wp-content/plugins/ai-copilot/readme.txt",
+    "method": "GET",
+    "kind": "ver",
+    "version_regex": "Stable tag:\\s*([0-9][0-9.]*)",
+    "version_group": 1,
+    "version_part": "body"
+   }
+  ],
+  "keywords": [
+   "aicp__app",
+   "aicp__chatbot"
+  ],
+  "has_version_detect": true
+ },
+ {
+  "component": "ai-engine-wordpress",
+  "vendor": "meow-apps",
+  "product": null,
+  "rule_file": "ai-engine-wordpress.yaml",
+  "display": "ai-engine-wordpress",
+  "probes": [
+   {
+    "path": "/wp-content/plugins/ai-engine/readme.txt",
+    "method": "GET",
+    "kind": "fp",
+    "matchers": [
+     {
+      "type": "body",
+      "value": [
+       "=== AI Engine"
+      ],
+      "negative": false
+     },
+     {
+      "type": "body",
+      "value": [
+       "Contributors: TigrouMeow"
+      ],
+      "negative": false
+     }
+    ]
+   },
+   {
+    "path": "/wp-content/plugins/ai-engine/readme.txt",
+    "method": "GET",
+    "kind": "ver",
+    "version_regex": "Stable tag:\\s*([0-9][0-9.]*)",
+    "version_group": 1,
+    "version_part": "body"
+   }
+  ],
+  "keywords": [
+   "=== AI Engine",
+   "Contributors: TigrouMeow"
+  ],
+  "has_version_detect": true
+ },
+ {
+  "component": "anythingllm",
+  "vendor": "anythingllm",
+  "product": null,
+  "rule_file": "anythingllm.yaml",
+  "display": "anythingllm",
+  "probes": [
+   {
+    "path": "/",
+    "method": "GET",
+    "kind": "fp",
+    "matchers": [
+     {
+      "type": "body",
+      "value": [
+       "<title>AnythingLLM | Your personal LLM trained on anything</title>"
+      ],
+      "negative": false
+     }
+    ]
+   },
+   {
+    "path": "/api/setup-complete",
+    "method": "GET",
+    "kind": "fp",
+    "matchers": [
+     {
+      "type": "body",
+      "value": [
+       "AnythingLLMOllamaModelPref"
+      ],
+      "negative": false
+     }
+    ]
+   }
+  ],
+  "keywords": [
+   "<title>AnythingLLM | Your personal LLM trained on anything</title>",
+   "AnythingLLMOllamaModelPref"
+  ],
+  "has_version_detect": false
+ },
+ {
+  "component": "aphrodite-engine",
+  "vendor": "aphrodite-engine",
+  "product": null,
+  "rule_file": "aphrodite-engine.yaml",
+  "display": "aphrodite-engine",
+  "probes": [
+   {
+    "path": "/.well-known/serviceinfo",
+    "method": "GET",
+    "kind": "fp"
+   }
+  ],
+  "keywords": [],
+  "has_version_detect": false
+ },
+ {
+  "component": "astrbot",
+  "vendor": "astrbot",
+  "product": null,
+  "rule_file": "astrbot.yaml",
+  "display": "astrbot",
+  "probes": [
+   {
+    "path": "/",
+    "method": "GET",
+    "kind": "fp",
+    "matchers": [
+     {
+      "type": "body",
+      "value": [
+       "<title>AstrBot"
+      ],
+      "negative": false
+     },
+     {
+      "type": "body",
+      "value": [
+       "AstrBot Dashboard"
+      ],
+      "negative": false
+     }
+    ]
+   }
+  ],
+  "keywords": [
+   "<title>AstrBot",
+   "AstrBot Dashboard"
+  ],
+  "has_version_detect": false
+ },
+ {
+  "component": "astron-agent",
+  "vendor": "iflytek",
+  "product": null,
+  "rule_file": "astron-agent.yaml",
+  "display": "astron-agent",
+  "probes": [
+   {
+    "path": "/",
+    "method": "GET",
+    "kind": "fp",
+    "matchers": [
+     {
+      "type": "body",
+      "value": [
+       "<title>Astron Agent</title>"
+      ],
+      "negative": false
+     }
+    ]
+   }
+  ],
+  "keywords": [
+   "<title>Astron Agent</title>"
+  ],
+  "has_version_detect": false
+ },
+ {
+  "component": "autogen-studio",
+  "vendor": "microsoft",
+  "product": null,
+  "rule_file": "autogen-studio.yaml",
+  "display": "autogen-studio",
+  "probes": [
+   {
+    "path": "/",
+    "method": "GET",
+    "kind": "fp",
+    "matchers": [
+     {
+      "type": "body",
+      "value": [
+       "<title>AutoGen Studio"
+      ],
+      "negative": false
+     }
+    ]
+   },
+   {
+    "path": "/api/version",
+    "method": "GET",
+    "kind": "fp",
+    "matchers": [
+     {
+      "type": "body",
+      "value": [
+       "Version retrieved successfully"
+      ],
+      "negative": false
+     }
+    ]
+   },
+   {
+    "path": "/api/version",
+    "method": "GET",
+    "kind": "ver",
+    "version_regex": "\"version\":\\s*\"(\\d+\\.\\d+(?:\\.\\d+)?)",
+    "version_group": 1,
+    "version_part": "body"
+   }
+  ],
+  "keywords": [
+   "<title>AutoGen Studio",
+   "Version retrieved successfully"
+  ],
+  "has_version_detect": true
+ },
+ {
+  "component": "autogpt",
+  "vendor": "significant-gravitas",
+  "product": null,
+  "rule_file": "autogpt.yaml",
+  "display": "AutoGPT",
+  "probes": [
+   {
+    "path": "/",
+    "method": "GET",
+    "kind": "fp",
+    "matchers": [
+     {
+      "type": "body",
+      "value": [
+       "<title>AutoGPT Platform</title>"
+      ],
+      "negative": false
+     }
+    ]
+   }
+  ],
+  "keywords": [
+   "<title>AutoGPT Platform</title>"
+  ],
+  "has_version_detect": false
+ },
+ {
+  "component": "axolotl",
+  "vendor": "axolotl-ai-cloud",
+  "product": null,
+  "rule_file": "axolotl.yaml",
+  "display": "axolotl",
+  "probes": [
+   {
+    "path": "/",
+    "method": "GET",
+    "kind": "fp",
+    "matchers": [
+     {
+      "type": "body",
+      "value": [
+       "Axolotl Gradio Interface"
+      ],
+      "negative": false
+     }
+    ]
+   },
+   {
+    "path": "/",
+    "method": "GET",
+    "kind": "fp",
+    "matchers": [
+     {
+      "type": "body",
+      "value": [
+       "Axolotl Diffusion Interface"
+      ],
+      "negative": false
+     }
+    ]
+   }
+  ],
+  "keywords": [
+   "Axolotl Diffusion Interface",
+   "Axolotl Gradio Interface"
+  ],
+  "has_version_detect": false
+ },
+ {
+  "component": "baseten-truss",
+  "vendor": "baseten",
+  "product": null,
+  "rule_file": "baseten-truss.yaml",
+  "display": "baseten-truss",
+  "probes": [
+   {
+    "path": "/openapi.json",
+    "method": "GET",
+    "kind": "fp",
+    "matchers": [
+     {
+      "type": "body",
+      "value": [
+       "Baseten Inference Server"
+      ],
+      "negative": false
+     }
+    ]
+   }
+  ],
+  "keywords": [
+   "Baseten Inference Server"
+  ],
+  "has_version_detect": false
+ },
+ {
+  "component": "bentoml",
+  "vendor": "bentoml",
+  "product": null,
+  "rule_file": "bentoml.yaml",
+  "display": "bentoml",
+  "probes": [
+   {
+    "path": "/",
+    "method": "GET",
+    "kind": "fp",
+    "matchers": [
+     {
+      "type": "body",
+      "value": [
+       "BentoML Prediction Service"
+      ],
+      "negative": false
+     }
+    ]
+   },
+   {
+    "path": "/docs.json",
+    "method": "GET",
+    "kind": "fp",
+    "matchers": [
+     {
+      "type": "body",
+      "value": [
+       "BentoML Team"
+      ],
+      "negative": false
+     },
+     {
+      "type": "body",
+      "value": [
+       "contact@bentoml.com"
+      ],
+      "negative": false
+     }
+    ]
+   },
+   {
+    "path": "/metrics",
+    "method": "GET",
+    "kind": "fp",
+    "matchers": [
+     {
+      "type": "body",
+      "value": [
+       "bentoml_api_server"
+      ],
+      "negative": false
+     }
+    ]
+   }
+  ],
+  "keywords": [
+   "BentoML Prediction Service",
+   "BentoML Team",
+   "bentoml_api_server",
+   "contact@bentoml.com"
+  ],
+  "has_version_detect": false
+ },
+ {
+  "component": "betterchatgpt",
+  "vendor": "betterchatgpt",
+  "product": null,
+  "rule_file": "betterchatgpt.yaml",
+  "display": "betterchatgpt",
+  "probes": [
+   {
+    "path": "/",
+    "method": "GET",
+    "kind": "fp",
+    "matchers": [
+     {
+      "type": "body",
+      "value": [
+       "Better ChatGPT"
+      ],
+      "negative": false
+     },
+     {
+      "type": "body",
+      "value": [
+       "Play and chat smarter with BetterChatGPT"
+      ],
+      "negative": false
+     }
+    ]
+   }
+  ],
+  "keywords": [
+   "Better ChatGPT",
+   "Play and chat smarter with BetterChatGPT"
+  ],
+  "has_version_detect": false
+ },
+ {
+  "component": "bifrost",
+  "vendor": "maximhq",
+  "product": null,
+  "rule_file": "bifrost.yaml",
+  "display": "bifrost",
+  "probes": [
+   {
+    "path": "/api/config",
+    "method": "GET",
+    "kind": "fp"
+   },
+   {
+    "path": "/health",
+    "method": "GET",
+    "kind": "fp"
+   }
+  ],
+  "keywords": [],
+  "has_version_detect": false
+ },
+ {
+  "component": "blinko",
+  "vendor": "blinkospace",
+  "product": null,
+  "rule_file": "blinko.yaml",
+  "display": "blinko",
+  "probes": [
+   {
+    "path": "/",
+    "method": "GET",
+    "kind": "fp",
+    "matchers": [
+     {
+      "type": "body",
+      "value": [
+       "<title>Blinko</title>"
+      ],
+      "negative": false
+     }
+    ]
+   }
+  ],
+  "keywords": [
+   "<title>Blinko</title>"
+  ],
+  "has_version_detect": false
+ },
+ {
+  "component": "boxlite",
+  "vendor": "boxlite-ai",
+  "product": null,
+  "rule_file": "boxlite.yaml",
+  "display": "boxlite",
+  "probes": [
+   {
+    "path": "/v1/config",
+    "method": "GET",
+    "kind": "fp",
+    "matchers": [
+     {
+      "type": "body",
+      "value": [
+       "snapshots_enabled"
+      ],
+      "negative": false
+     },
+     {
+      "type": "body",
+      "value": [
+       "clone_enabled"
+      ],
+      "negative": false
+     },
+     {
+      "type": "body",
+      "value": [
+       "inbound_update_enabled"
+      ],
+      "negative": false
+     }
+    ]
+   },
+   {
+    "path": "/v1/config",
+    "method": "GET",
+    "kind": "ver",
+    "version_regex": "(?i)x-boxlite-version:\\s*([\\d.]+)",
+    "version_group": 1,
+    "version_part": "header"
+   }
+  ],
+  "keywords": [
+   "clone_enabled",
+   "inbound_update_enabled",
+   "snapshots_enabled"
+  ],
+  "has_version_detect": true
+ },
+ {
+  "component": "chat-langchain",
+  "vendor": "LangChain",
+  "product": null,
+  "rule_file": "chat-langchain.yaml",
+  "display": "langchain",
+  "probes": [
+   {
+    "path": "/",
+    "method": "GET",
+    "kind": "fp",
+    "matchers": [
+     {
+      "type": "body",
+      "value": [
+       "<title>Chat LangChain</title>"
+      ],
+      "negative": false
+     }
+    ]
+   }
+  ],
+  "keywords": [
+   "<title>Chat LangChain</title>"
+  ],
+  "has_version_detect": false
+ },
+ {
+  "component": "chroma",
+  "vendor": "chromadb",
+  "product": null,
+  "rule_file": "chroma.yaml",
+  "display": "chroma",
+  "probes": [
+   {
+    "path": "/api/v2/heartbeat",
+    "method": "GET",
+    "kind": "fp",
+    "matchers": [
+     {
+      "type": "body",
+      "value": [
+       "nanosecond heartbeat"
+      ],
+      "negative": false
+     }
+    ]
+   },
+   {
+    "path": "/api/v1/heartbeat",
+    "method": "GET",
+    "kind": "fp",
+    "matchers": [
+     {
+      "type": "body",
+      "value": [
+       "nanosecond heartbeat"
+      ],
+      "negative": false
+     }
+    ]
+   },
+   {
+    "path": "/api/v2/version",
+    "method": "GET",
+    "kind": "ver",
+    "version_regex": "\"(\\d+\\.\\d+\\.?\\d+?)\"",
+    "version_group": 1,
+    "version_part": "body"
+   },
+   {
+    "path": "/api/v1/version",
+    "method": "GET",
+    "kind": "ver",
+    "version_regex": "\"(\\d+\\.\\d+\\.?\\d+?)\"",
+    "version_group": 1,
+    "version_part": "body"
+   }
+  ],
+  "keywords": [
+   "nanosecond heartbeat"
+  ],
+  "has_version_detect": true
+ },
+ {
+  "component": "chuanhugpt",
+  "vendor": "Chuanhugpt",
+  "product": null,
+  "rule_file": "chuanhugpt.yaml",
+  "display": "Chuanhugpt",
+  "probes": [
+   {
+    "path": "/",
+    "method": "GET",
+    "kind": "fp"
+   }
+  ],
+  "keywords": [],
+  "has_version_detect": false
+ },
+ {
+  "component": "clawdbot",
+  "vendor": "Clawdbot Gateway",
+  "product": null,
+  "rule_file": "clawdbot.yaml",
+  "display": "Clawdbot Gateway",
+  "probes": [
+   {
+    "path": "/",
+    "method": "GET",
+    "kind": "fp",
+    "matchers": [
+     {
+      "type": "body",
+      "value": [
+       "<title>Clawdbot Control</title>"
+      ],
+      "negative": false
+     },
+     {
+      "type": "body",
+      "value": [
+       "<clawdbot-app></clawdbot-app>"
+      ],
+      "negative": false
+     }
+    ]
+   }
+  ],
+  "keywords": [
+   "<clawdbot-app></clawdbot-app>",
+   "<title>Clawdbot Control</title>"
+  ],
+  "has_version_detect": false
+ },
+ {
+  "component": "clickhouse",
+  "vendor": "clickhouse",
+  "product": null,
+  "rule_file": "clickhouse.yaml",
+  "display": "clickhouse",
+  "probes": [
+   {
+    "path": "/",
+    "method": "GET",
+    "kind": "fp"
+   }
+  ],
+  "keywords": [],
+  "has_version_detect": false
+ },
+ {
+  "component": "cloudflare-ai-gateway",
+  "vendor": "cloudflare",
+  "product": null,
+  "rule_file": "cloudflare-ai-gateway.yaml",
+  "display": "cloudflare-ai-gateway",
+  "probes": [
+   {
+    "path": "/v1/models",
+    "method": "GET",
+    "kind": "fp"
+   }
+  ],
+  "keywords": [],
+  "has_version_detect": false
+ },
+ {
+  "component": "cognee",
+  "vendor": "topoteretes",
+  "product": null,
+  "rule_file": "cognee.yaml",
+  "display": "cognee",
+  "probes": [
+   {
+    "path": "/",
+    "method": "GET",
+    "kind": "fp",
+    "matchers": [
+     {
+      "type": "body",
+      "value": [
+       "<title>Cognee</title>"
+      ],
+      "negative": false
+     }
+    ]
+   },
+   {
+    "path": "/docs",
+    "method": "GET",
+    "kind": "fp",
+    "matchers": [
+     {
+      "type": "body",
+      "value": [
+       "Cognee API"
+      ],
+      "negative": false
+     },
+     {
+      "type": "body",
+      "value": [
+       "FastAPI"
+      ],
+      "negative": false
+     }
+    ]
+   },
+   {
+    "path": "/health",
+    "method": "GET",
+    "kind": "fp"
+   },
+   {
+    "path": "/health",
+    "method": "GET",
+    "kind": "ver",
+    "version_regex": "\"version\":\\s*\"(\\d+\\.+\\d+\\.?\\d*[^\"]*)\"",
+    "version_group": 1,
+    "version_part": "body"
+   }
+  ],
+  "keywords": [
+   "<title>Cognee</title>",
+   "Cognee API",
+   "FastAPI"
+  ],
+  "has_version_detect": true
+ },
+ {
+  "component": "context7",
+  "vendor": "upstash",
+  "product": null,
+  "rule_file": "context7.yaml",
+  "display": "Context7",
+  "probes": [
+   {
+    "path": "/.well-known/oauth-protected-resource",
+    "method": "GET",
+    "kind": "fp",
+    "matchers": [
+     {
+      "type": "body",
+      "value": [
+       "mcp.context7.com"
+      ],
+      "negative": false
+     },
+     {
+      "type": "body",
+      "value": [
+       "authorization_servers"
+      ],
+      "negative": false
+     }
+    ]
+   },
+   {
+    "path": "/mcp",
+    "method": "GET",
+    "kind": "fp"
+   }
+  ],
+  "keywords": [
+   "authorization_servers",
+   "mcp.context7.com"
+  ],
+  "has_version_detect": false
+ },
+ {
+  "component": "crawl4ai",
+  "vendor": "crawl4ai",
+  "product": null,
+  "rule_file": "crawl4ai.yaml",
+  "display": "crawl4ai",
+  "probes": [
+   {
+    "path": "/",
+    "method": "GET",
+    "kind": "fp",
+    "matchers": [
+     {
+      "type": "body",
+      "value": [
+       "<title>Home - Crawl4AI Documentation</title>"
+      ],
+      "negative": false
+     }
+    ]
+   },
+   {
+    "path": "/playground",
+    "method": "GET",
+    "kind": "fp",
+    "matchers": [
+     {
+      "type": "body",
+      "value": [
+       "Crawl4AI"
+      ],
+      "negative": false
+     }
+    ]
+   }
+  ],
+  "keywords": [
+   "<title>Home - Crawl4AI Documentation</title>",
+   "Crawl4AI"
+  ],
+  "has_version_detect": false
+ },
+ {
+  "component": "crewai",
+  "vendor": "crewaiinc",
+  "product": null,
+  "rule_file": "crewai.yaml",
+  "display": "crewai",
+  "probes": [
+   {
+    "path": "/auth/login",
+    "method": "GET",
+    "kind": "fp",
+    "matchers": [
+     {
+      "type": "body",
+      "value": [
+       "CrewAI Studio"
+      ],
+      "negative": false
+     },
+     {
+      "type": "body",
+      "value": [
+       "app.crewai.com"
+      ],
+      "negative": false
+     }
+    ]
+   }
+  ],
+  "keywords": [
+   "CrewAI Studio",
+   "app.crewai.com"
+  ],
+  "has_version_detect": false
+ },
+ {
+  "component": "dask_http",
+  "vendor": "dask",
+  "product": null,
+  "rule_file": "dask_http.yaml",
+  "display": "dask",
+  "probes": [
+   {
+    "path": "/info/main/logs.html",
+    "method": "GET",
+    "kind": "fp",
+    "matchers": [
+     {
+      "type": "body",
+      "value": [
+       "Scheduler at"
+      ],
+      "negative": false
+     }
+    ]
+   },
+   {
+    "path": "/",
+    "method": "GET",
+    "kind": "fp"
+   }
+  ],
+  "keywords": [
+   "Scheduler at"
+  ],
+  "has_version_detect": false
+ },
+ {
+  "component": "dbhub",
+  "vendor": "bytebase",
+  "product": null,
+  "rule_file": "dbhub.yaml",
+  "display": "DBHub",
+  "probes": [
+   {
+    "path": "/",
+    "method": "GET",
+    "kind": "fp",
+    "matchers": [
+     {
+      "type": "body",
+      "value": [
+       "<title>DBHub - Minimal Database MCP Server</title>"
+      ],
+      "negative": false
+     }
+    ]
+   }
+  ],
+  "keywords": [
+   "<title>DBHub - Minimal Database MCP Server</title>"
+  ],
+  "has_version_detect": false
+ },
+ {
+  "component": "decepticon",
+  "vendor": "bittersecurity",
+  "product": null,
+  "rule_file": "decepticon.yaml",
+  "display": "Decepticon",
+  "probes": [
+   {
+    "path": "/",
+    "method": "GET",
+    "kind": "fp",
+    "matchers": [
+     {
+      "type": "body",
+      "value": [
+       "Decepticon — Autonomous Red Team Platform"
+      ],
+      "negative": false
+     }
+    ]
+   },
+   {
+    "path": "/api/health",
+    "method": "GET",
+    "kind": "fp"
+   }
+  ],
+  "keywords": [
+   "Decepticon — Autonomous Red Team Platform"
+  ],
+  "has_version_detect": false
+ },
+ {
+  "component": "deepspeed-mii",
+  "vendor": "microsoft",
+  "product": null,
+  "rule_file": "deepspeed-mii.yaml",
+  "display": "deepspeed-mii",
+  "probes": [
+   {
+    "path": "/v1/models",
+    "method": "GET",
+    "kind": "fp"
+   }
+  ],
+  "keywords": [],
+  "has_version_detect": false
+ },
+ {
+  "component": "devika",
+  "vendor": "stitionai",
+  "product": null,
+  "rule_file": "devika.yaml",
+  "display": "devika",
+  "probes": [
+   {
+    "path": "/",
+    "method": "GET",
+    "kind": "fp",
+    "matchers": [
+     {
+      "type": "body",
+      "value": [
+       "<title>Devika AI</title>"
+      ],
+      "negative": false
+     }
+    ]
+   },
+   {
+    "path": "/api/status",
+    "method": "GET",
+    "kind": "fp",
+    "matchers": [
+     {
+      "type": "body",
+      "value": [
+       "server is running!"
+      ],
+      "negative": false
+     }
+    ]
+   }
+  ],
+  "keywords": [
+   "<title>Devika AI</title>",
+   "server is running!"
+  ],
+  "has_version_detect": false
+ },
+ {
+  "component": "dify",
+  "vendor": "dify",
+  "product": null,
+  "rule_file": "dify.yaml",
+  "display": "dify",
+  "probes": [
+   {
+    "path": "/",
+    "method": "GET",
+    "kind": "fp",
+    "matchers": [
+     {
+      "type": "body",
+      "value": [
+       "<title>Dify</title>"
+      ],
+      "negative": false
+     }
+    ]
+   },
+   {
+    "path": "/apps",
+    "method": "GET",
+    "kind": "fp",
+    "matchers": [
+     {
+      "type": "body",
+      "value": [
+       "<title>Dify</title>"
+      ],
+      "negative": false
+     },
+     {
+      "type": "body",
+      "value": [
+       "data-public-edition"
+      ],
+      "negative": false
+     }
+    ]
+   },
+   {
+    "path": "/health",
+    "method": "GET",
+    "kind": "ver",
+    "version_regex": "x-version:\\s*(\\d+\\.\\d+\\.?\\d*)",
+    "version_group": 1,
+    "version_part": "header"
+   },
+   {
+    "path": "/console/api/version",
+    "method": "GET",
+    "kind": "ver",
+    "version_regex": "x-version:\\s*(\\d+\\.\\d+\\.?\\d*)",
+    "version_group": 1,
+    "version_part": "header"
+   }
+  ],
+  "keywords": [
+   "<title>Dify</title>",
+   "data-public-edition"
+  ],
+  "has_version_detect": true
+ },
+ {
+  "component": "dynamo",
+  "vendor": "nvidia",
+  "product": null,
+  "rule_file": "dynamo.yaml",
+  "display": "Dynamo",
+  "probes": [
+   {
+    "path": "/openapi.json",
+    "method": "GET",
+    "kind": "fp",
+    "matchers": [
+     {
+      "type": "body",
+      "value": [
+       "NVIDIA Dynamo OpenAI Frontend"
+      ],
+      "negative": false
+     },
+     {
+      "type": "body",
+      "value": [
+       "OpenAI-compatible HTTP API for NVIDIA Dynamo"
+      ],
+      "negative": false
+     }
+    ]
+   },
+   {
+    "path": "/metrics",
+    "method": "GET",
+    "kind": "fp",
+    "matchers": [
+     {
+      "type": "body",
+      "value": [
+       "dynamo_frontend_"
+      ],
+      "negative": false
+     }
+    ]
+   },
+   {
+    "path": "/openapi.json",
+    "method": "GET",
+    "kind": "ver"
+   }
+  ],
+  "keywords": [
+   "NVIDIA Dynamo OpenAI Frontend",
+   "OpenAI-compatible HTTP API for NVIDIA Dynamo",
+   "dynamo_frontend_"
+  ],
+  "has_version_detect": false
+ },
+ {
+  "component": "eclipse-theia",
+  "vendor": "eclipse",
+  "product": null,
+  "rule_file": "eclipse-theia.yaml",
+  "display": "Eclipse Theia",
+  "probes": [
+   {
+    "path": "/",
+    "method": "GET",
+    "kind": "fp",
+    "matchers": [
+     {
+      "type": "body",
+      "value": [
+       "<title>Eclipse Theia</title>"
+      ],
+      "negative": false
+     },
+     {
+      "type": "body",
+      "value": [
+       "theia-preload"
+      ],
+      "negative": false
+     }
+    ]
+   },
+   {
+    "path": "/bundle.js",
+    "method": "GET",
+    "kind": "fp",
+    "matchers": [
+     {
+      "type": "body",
+      "value": [
+       "FrontendApplicationConfigProvider"
+      ],
+      "negative": false
+     },
+     {
+      "type": "body",
+      "value": [
+       "@theia/core"
+      ],
+      "negative": false
+     }
+    ]
+   }
+  ],
+  "keywords": [
+   "<title>Eclipse Theia</title>",
+   "@theia/core",
+   "FrontendApplicationConfigProvider",
+   "theia-preload"
+  ],
+  "has_version_detect": false
+ },
+ {
+  "component": "emlog",
+  "vendor": "emlog",
+  "product": null,
+  "rule_file": "emlog.yaml",
+  "display": "Emlog",
+  "probes": [
+   {
+    "path": "/",
+    "method": "GET",
+    "kind": "fp",
+    "matchers": [
+     {
+      "type": "body",
+      "value": [
+       "window.emAuthConfig"
+      ],
+      "negative": false
+     },
+     {
+      "type": "body",
+      "value": [
+       "rss.php"
+      ],
+      "negative": false
+     }
+    ]
+   }
+  ],
+  "keywords": [
+   "rss.php",
+   "window.emAuthConfig"
+  ],
+  "has_version_detect": false
+ },
+ {
+  "component": "envoy-ai-gateway",
+  "vendor": "envoyproxy",
+  "product": null,
+  "rule_file": "envoy-ai-gateway.yaml",
+  "display": "envoy-ai-gateway",
+  "probes": [
+   {
+    "path": "/v1/models",
+    "method": "GET",
+    "kind": "fp"
+   }
+  ],
+  "keywords": [],
+  "has_version_detect": false
+ },
+ {
+  "component": "f5-tts",
+  "vendor": "swivid",
+  "product": null,
+  "rule_file": "f5-tts.yaml",
+  "display": "f5-tts",
+  "probes": [
+   {
+    "path": "/",
+    "method": "GET",
+    "kind": "fp",
+    "matchers": [
+     {
+      "type": "body",
+      "value": [
+       "Basic-TTS"
+      ],
+      "negative": false
+     },
+     {
+      "type": "body",
+      "value": [
+       "Multi-Speech"
+      ],
+      "negative": false
+     }
+    ]
+   }
+  ],
+  "keywords": [
+   "Basic-TTS",
+   "Multi-Speech"
+  ],
+  "has_version_detect": false
+ },
+ {
+  "component": "fastchat-webui",
+  "vendor": "lm-sys",
+  "product": null,
+  "rule_file": "fastchat-webui.yaml",
+  "display": "fastchat-webui",
+  "probes": [
+   {
+    "path": "/",
+    "method": "GET",
+    "kind": "fp"
+   }
+  ],
+  "keywords": [],
+  "has_version_detect": false
+ },
+ {
+  "component": "fastchat",
+  "vendor": "lm-sys",
+  "product": null,
+  "rule_file": "fastchat.yaml",
+  "display": "fastchat",
+  "probes": [
+   {
+    "path": "/worker_get_status",
+    "method": "POST",
+    "kind": "fp",
+    "matchers": [
+     {
+      "type": "body",
+      "value": [
+       "model_names"
+      ],
+      "negative": false
+     }
+    ]
+   }
+  ],
+  "keywords": [
+   "model_names"
+  ],
+  "has_version_detect": false
+ },
+ {
+  "component": "fastgpt",
+  "vendor": "labring",
+  "product": null,
+  "rule_file": "fastgpt.yaml",
+  "display": "fastgpt",
+  "probes": [
+   {
+    "path": "/login",
+    "method": "GET",
+    "kind": "fp",
+    "matchers": [
+     {
+      "type": "body",
+      "value": [
+       "<title>FastGPT</title>"
+      ],
+      "negative": false
+     }
+    ]
+   }
+  ],
+  "keywords": [
+   "<title>FastGPT</title>"
+  ],
+  "has_version_detect": false
+ },
+ {
+  "component": "feast",
+  "vendor": "feast",
+  "product": null,
+  "rule_file": "feast.yaml",
+  "display": "feast",
+  "probes": [
+   {
+    "path": "/",
+    "method": "GET",
+    "kind": "fp",
+    "matchers": [
+     {
+      "type": "body",
+      "value": [
+       "/feast-favicon-300x300.png"
+      ],
+      "negative": false
+     },
+     {
+      "type": "body",
+      "value": [
+       "<title>Feast Feature Store</title>"
+      ],
+      "negative": false
+     }
+    ]
+   }
+  ],
+  "keywords": [
+   "/feast-favicon-300x300.png",
+   "<title>Feast Feature Store</title>"
+  ],
+  "has_version_detect": false
+ },
+ {
+  "component": "fireworks-ai",
+  "vendor": "fireworks",
+  "product": null,
+  "rule_file": "fireworks-ai.yaml",
+  "display": "fireworks-ai",
+  "probes": [
+   {
+    "path": "/inference/v1/models",
+    "method": "GET",
+    "kind": "fp",
+    "matchers": [
+     {
+      "type": "body",
+      "value": [
+       "accounts/fireworks/models/"
+      ],
+      "negative": false
+     }
+    ]
+   }
+  ],
+  "keywords": [
+   "accounts/fireworks/models/"
+  ],
+  "has_version_detect": false
+ },
+ {
+  "component": "flowise",
+  "vendor": "flowiseai",
+  "product": null,
+  "rule_file": "flowise.yaml",
+  "display": "flowise",
+  "probes": [
+   {
+    "path": "/",
+    "method": "GET",
+    "kind": "fp",
+    "matchers": [
+     {
+      "type": "body",
+      "value": [
+       "<title>Flowise</title>"
+      ],
+      "negative": false
+     },
+     {
+      "type": "body",
+      "value": [
+       "flowiseai.com"
+      ],
+      "negative": false
+     },
+     {
+      "type": "body",
+      "value": [
+       "FlowiseAI"
+      ],
+      "negative": false
+     }
+    ]
+   },
+   {
+    "path": "/api/v1/chatflows",
+    "method": "GET",
+    "kind": "fp"
+   },
+   {
+    "path": "/api/v1/version",
+    "method": "GET",
+    "kind": "ver",
+    "version_regex": "\"version\"\\s*:\\s*\"(\\d+\\.\\d+\\.?\\d*?)\"",
+    "version_group": 1,
+    "version_part": "body"
+   }
+  ],
+  "keywords": [
+   "<title>Flowise</title>",
+   "FlowiseAI",
+   "flowiseai.com"
+  ],
+  "has_version_detect": true
+ },
+ {
+  "component": "flyto2",
+  "vendor": "flytohub",
+  "product": null,
+  "rule_file": "flyto2.yaml",
+  "display": "Flyto2",
+  "probes": [
+   {
+    "path": "/v1/info",
+    "method": "GET",
+    "kind": "fp"
+   },
+   {
+    "path": "/openapi.json",
+    "method": "GET",
+    "kind": "fp"
+   },
+   {
+    "path": "/health",
+    "method": "GET",
+    "kind": "ver",
+    "version_regex": "\"version\"\\s*:\\s*\"([0-9][0-9.a-zA-Z\\-]+)\"",
+    "version_group": 1,
+    "version_part": "body"
+   }
+  ],
+  "keywords": [],
+  "has_version_detect": true
+ },
+ {
+  "component": "gpt-sovits",
+  "vendor": "RVC-Boss",
+  "product": null,
+  "rule_file": "gpt-sovits.yaml",
+  "display": "gpt-sovits",
+  "probes": [
+   {
+    "path": "/",
+    "method": "GET",
+    "kind": "fp",
+    "matchers": [
+     {
+      "type": "body",
+      "value": [
+       "GPT-SoVITS WebUI"
+      ],
+      "negative": false
+     },
+     {
+      "type": "body",
+      "value": [
+       "gradio"
+      ],
+      "negative": false
+     }
+    ]
+   },
+   {
+    "path": "/config",
+    "method": "GET",
+    "kind": "fp"
+   },
+   {
+    "path": "/",
+    "method": "GET",
+    "kind": "ver",
+    "version_regex": "GPT-SoVITS[_\\s]+v?(\\d{8}v?\\d*(?:pro)?)",
+    "version_group": 1,
+    "version_part": "body"
+   }
+  ],
+  "keywords": [
+   "GPT-SoVITS WebUI",
+   "gradio"
+  ],
+  "has_version_detect": true
+ },
+ {
+  "component": "gpt4all",
+  "vendor": "nomic",
+  "product": null,
+  "rule_file": "gpt4all.yaml",
+  "display": "gpt4all",
+  "probes": [
+   {
+    "path": "/v1/models",
+    "method": "GET",
+    "kind": "fp"
+   }
+  ],
+  "keywords": [],
+  "has_version_detect": false
+ },
+ {
+  "component": "gradio",
+  "vendor": "gradio",
+  "product": null,
+  "rule_file": "gradio.yaml",
+  "display": "gradio",
+  "probes": [
+   {
+    "path": "/",
+    "method": "GET",
+    "kind": "fp",
+    "matchers": [
+     {
+      "type": "body",
+      "value": [
+       "<script>window.gradio_config = {"
+      ],
+      "negative": false
+     }
+    ]
+   },
+   {
+    "path": "/",
+    "method": "GET",
+    "kind": "ver",
+    "version_regex": "window.gradio_config = {\"version\":\"(\\d+\\.\\d+\\.?\\d+?)\"",
+    "version_group": 1,
+    "version_part": "body"
+   }
+  ],
+  "keywords": [
+   "<script>window.gradio_config = {"
+  ],
+  "has_version_detect": true
+ },
+ {
+  "component": "graphiti",
+  "vendor": "getzep",
+  "product": null,
+  "rule_file": "graphiti.yaml",
+  "display": "graphiti",
+  "probes": [
+   {
+    "path": "/healthcheck",
+    "method": "GET",
+    "kind": "fp",
+    "matchers": [
+     {
+      "type": "body",
+      "value": [
+       "/clear"
+      ],
+      "negative": false
+     },
+     {
+      "type": "body",
+      "value": [
+       "/episodes/{group_id}"
+      ],
+      "negative": false
+     }
+    ]
+   }
+  ],
+  "keywords": [
+   "/clear",
+   "/episodes/{group_id}"
+  ],
+  "has_version_detect": false
+ },
+ {
+  "component": "groq",
+  "vendor": "groq",
+  "product": null,
+  "rule_file": "groq.yaml",
+  "display": "groq",
+  "probes": [
+   {
+    "path": "/openai/v1/models",
+    "method": "GET",
+    "kind": "fp"
+   },
+   {
+    "path": "/",
+    "method": "GET",
+    "kind": "fp",
+    "matchers": [
+     {
+      "type": "body",
+      "value": [
+       "Welcome to the Groq API"
+      ],
+      "negative": false
+     }
+    ]
+   }
+  ],
+  "keywords": [
+   "Welcome to the Groq API"
+  ],
+  "has_version_detect": false
+ },
+ {
+  "component": "h2ogpt",
+  "vendor": "h2oai",
+  "product": null,
+  "rule_file": "h2ogpt.yaml",
+  "display": "h2ogpt",
+  "probes": [
+   {
+    "path": "/",
+    "method": "GET",
+    "kind": "fp",
+    "matchers": [
+     {
+      "type": "body",
+      "value": [
+       "h2oGPT"
+      ],
+      "negative": false
+     },
+     {
+      "type": "body",
+      "value": [
+       "submit_nochat_api"
+      ],
+      "negative": false
+     }
+    ]
+   },
+   {
+    "path": "/info",
+    "method": "GET",
+    "kind": "fp",
+    "matchers": [
+     {
+      "type": "body",
+      "value": [
+       "submit_nochat_api"
+      ],
+      "negative": false
+     }
+    ]
+   }
+  ],
+  "keywords": [
+   "h2oGPT",
+   "submit_nochat_api"
+  ],
+  "has_version_detect": false
+ },
+ {
+  "component": "hatchet",
+  "vendor": "hatchet-dev",
+  "product": null,
+  "rule_file": "hatchet.yaml",
+  "display": "Hatchet",
+  "probes": [
+   {
+    "path": "/",
+    "method": "GET",
+    "kind": "fp",
+    "matchers": [
+     {
+      "type": "body",
+      "value": [
+       "<title>Hatchet</title>"
+      ],
+      "negative": false
+     }
+    ]
+   },
+   {
+    "path": "/api/v1/meta",
+    "method": "GET",
+    "kind": "fp"
+   },
+   {
+    "path": "/api/v1/version",
+    "method": "GET",
+    "kind": "ver",
+    "version_regex": "\"version\"\\s*:\\s*\"([0-9]+\\.[0-9]+\\.[0-9]+[^\"]*)\"",
+    "version_group": 1,
+    "version_part": "body"
+   }
+  ],
+  "keywords": [
+   "<title>Hatchet</title>"
+  ],
+  "has_version_detect": true
+ },
+ {
+  "component": "hayhooks",
+  "vendor": "deepset",
+  "product": null,
+  "rule_file": "hayhooks.yaml",
+  "display": "hayhooks",
+  "probes": [
+   {
+    "path": "/status",
+    "method": "GET",
+    "kind": "fp",
+    "matchers": [
+     {
+      "type": "body",
+      "value": [
+       "Hayhooks"
+      ],
+      "negative": false
+     }
+    ]
+   },
+   {
+    "path": "/docs",
+    "method": "GET",
+    "kind": "fp",
+    "matchers": [
+     {
+      "type": "body",
+      "value": [
+       "Hayhooks"
+      ],
+      "negative": false
+     }
+    ]
+   }
+  ],
+  "keywords": [
+   "Hayhooks"
+  ],
+  "has_version_detect": false
+ },
+ {
+  "component": "helicone",
+  "vendor": "helicone",
+  "product": null,
+  "rule_file": "helicone.yaml",
+  "display": "helicone",
+  "probes": [
+   {
+    "path": "/healthcheck",
+    "method": "GET",
+    "kind": "fp"
+   },
+   {
+    "path": "/download/swagger.json",
+    "method": "GET",
+    "kind": "fp",
+    "matchers": [
+     {
+      "type": "body",
+      "value": [
+       "Helicone"
+      ],
+      "negative": false
+     }
+    ]
+   }
+  ],
+  "keywords": [
+   "Helicone"
+  ],
+  "has_version_detect": false
+ },
+ {
+  "component": "hermes",
+  "vendor": "nesquena",
+  "product": null,
+  "rule_file": "hermes.yaml",
+  "display": "hermes",
+  "probes": [
+   {
+    "path": "/",
+    "method": "GET",
+    "kind": "fp"
+   },
+   {
+    "path": "/health",
+    "method": "GET",
+    "kind": "ver",
+    "version_regex": "HermesWebUI/(\\d+\\.\\d+\\.\\d+)",
+    "version_group": 1,
+    "version_part": "header"
+   }
+  ],
+  "keywords": [],
+  "has_version_detect": true
+ },
+ {
+  "component": "huggingface-chat-ui",
+  "vendor": "huggingface",
+  "product": null,
+  "rule_file": "huggingface-chat-ui.yaml",
+  "display": "huggingface-chat-ui",
+  "probes": [
+   {
+    "path": "/api/v2/public-config",
+    "method": "GET",
+    "kind": "fp"
+   }
+  ],
+  "keywords": [],
+  "has_version_detect": false
+ },
+ {
+  "component": "huggingface-tgi",
+  "vendor": "huggingface",
+  "product": null,
+  "rule_file": "huggingface-tgi.yaml",
+  "display": "huggingface-tgi",
+  "probes": [
+   {
+    "path": "/info",
+    "method": "GET",
+    "kind": "fp"
+   }
+  ],
+  "keywords": [],
+  "has_version_detect": false
+ },
+ {
+  "component": "instructlab",
+  "vendor": "redhat",
+  "product": null,
+  "rule_file": "instructlab.yaml",
+  "display": "instructlab",
+  "probes": [
+   {
+    "path": "/",
+    "method": "GET",
+    "kind": "fp",
+    "matchers": [
+     {
+      "type": "body",
+      "value": [
+       "Hello from InstructLab! Visit us at https://instructlab.ai"
+      ],
+      "negative": false
+     }
+    ]
+   }
+  ],
+  "keywords": [
+   "Hello from InstructLab! Visit us at https://instructlab.ai"
+  ],
+  "has_version_detect": false
+ },
+ {
+  "component": "jan",
+  "vendor": "jan-ai",
+  "product": null,
+  "rule_file": "jan.yaml",
+  "display": "jan",
+  "probes": [
+   {
+    "path": "/openapi.json",
+    "method": "GET",
+    "kind": "fp"
+   }
+  ],
+  "keywords": [],
+  "has_version_detect": false
+ },
+ {
+  "component": "junoclaw",
+  "vendor": "dragonmonk111",
+  "product": null,
+  "rule_file": "junoclaw.yaml",
+  "display": "junoclaw",
+  "probes": [
+   {
+    "path": "/",
+    "method": "GET",
+    "kind": "fp",
+    "matchers": [
+     {
+      "type": "body",
+      "value": [
+       "<title>JunoClaw</title>"
+      ],
+      "negative": false
+     }
+    ]
+   },
+   {
+    "path": "/api/health",
+    "method": "GET",
+    "kind": "fp",
+    "matchers": [
+     {
+      "type": "body",
+      "value": [
+       "junoclaw-daemon"
+      ],
+      "negative": false
+     }
+    ]
+   },
+   {
+    "path": "/api/health",
+    "method": "GET",
+    "kind": "ver",
+    "version_regex": "\"version\"\\s*:\\s*\"([^\"]+)\"",
+    "version_group": 1,
+    "version_part": "body"
+   }
+  ],
+  "keywords": [
+   "<title>JunoClaw</title>",
+   "junoclaw-daemon"
+  ],
+  "has_version_detect": true
+ },
+ {
+  "component": "jupyter-lab",
+  "vendor": "jupyter",
+  "product": null,
+  "rule_file": "jupyter-lab.yaml",
+  "display": "jupyterlab",
+  "probes": [
+   {
+    "path": "/",
+    "method": "GET",
+    "kind": "fp",
+    "matchers": [
+     {
+      "type": "body",
+      "value": [
+       "<title>JupyterLab</title>"
+      ],
+      "negative": false
+     }
+    ]
+   }
+  ],
+  "keywords": [
+   "<title>JupyterLab</title>"
+  ],
+  "has_version_detect": false
+ },
+ {
+  "component": "jupyter-notebook",
+  "vendor": "jupyter",
+  "product": null,
+  "rule_file": "jupyter-notebook.yaml",
+  "display": "jupyter-notebook",
+  "probes": [
+   {
+    "path": "/",
+    "method": "GET",
+    "kind": "fp",
+    "matchers": [
+     {
+      "type": "body",
+      "value": [
+       "<title>Jupyter Notebook</title>"
+      ],
+      "negative": false
+     }
+    ]
+   }
+  ],
+  "keywords": [
+   "<title>Jupyter Notebook</title>"
+  ],
+  "has_version_detect": false
+ },
+ {
+  "component": "jupyter-server",
+  "vendor": "jupyter",
+  "product": null,
+  "rule_file": "jupyter-server.yaml",
+  "display": "jupyter-server",
+  "probes": [
+   {
+    "path": "/",
+    "method": "GET",
+    "kind": "fp",
+    "matchers": [
+     {
+      "type": "body",
+      "value": [
+       "<title>Jupyter Server</title>"
+      ],
+      "negative": false
+     }
+    ]
+   },
+   {
+    "path": "/tree",
+    "method": "GET",
+    "kind": "ver",
+    "version_regex": "\"appVersion\":\"(\\d+\\.\\d+\\.?\\d*)\"",
+    "version_group": 1,
+    "version_part": "body"
+   }
+  ],
+  "keywords": [
+   "<title>Jupyter Server</title>"
+  ],
+  "has_version_detect": true
+ },
+ {
+  "component": "koboldcpp",
+  "vendor": "koboldcpp",
+  "product": null,
+  "rule_file": "koboldcpp.yaml",
+  "display": "koboldcpp",
+  "probes": [
+   {
+    "path": "/api/extra/version",
+    "method": "GET",
+    "kind": "fp"
+   },
+   {
+    "path": "/v1/models",
+    "method": "GET",
+    "kind": "fp"
+   }
+  ],
+  "keywords": [],
+  "has_version_detect": false
+ },
+ {
+  "component": "kubeai",
+  "vendor": "kubeai-project",
+  "product": null,
+  "rule_file": "kubeai.yaml",
+  "display": "kubeai",
+  "probes": [
+   {
+    "path": "/",
+    "method": "GET",
+    "kind": "fp",
+    "matchers": [
+     {
+      "type": "body",
+      "value": [
+       "<title>KubeAI</title>"
+      ],
+      "negative": false
+     }
+    ]
+   }
+  ],
+  "keywords": [
+   "<title>KubeAI</title>"
+  ],
+  "has_version_detect": false
+ },
+ {
+  "component": "kubeflow",
+  "vendor": "kubeflow",
+  "product": null,
+  "rule_file": "kubeflow.yaml",
+  "display": "kubeflow",
+  "probes": [
+   {
+    "path": "/",
+    "method": "GET",
+    "kind": "fp",
+    "matchers": [
+     {
+      "type": "body",
+      "value": [
+       "<title>Kubeflow Central Dashboard</title>"
+      ],
+      "negative": false
+     }
+    ]
+   },
+   {
+    "path": "/api/workgroup/env-info",
+    "method": "GET",
+    "kind": "ver",
+    "version_regex": "\"kubeflowVersion\":\"([^\"]+)\"",
+    "version_group": 1,
+    "version_part": "body"
+   }
+  ],
+  "keywords": [
+   "<title>Kubeflow Central Dashboard</title>"
+  ],
+  "has_version_detect": true
+ },
+ {
+  "component": "kubepi",
+  "vendor": "1Panel",
+  "product": null,
+  "rule_file": "kubepi.yaml",
+  "display": "KubePi",
+  "probes": [
+   {
+    "path": "/",
+    "method": "GET",
+    "kind": "fp",
+    "matchers": [
+     {
+      "type": "body",
+      "value": [
+       "<title>KubePi</title>"
+      ],
+      "negative": false
+     }
+    ]
+   },
+   {
+    "path": "/",
+    "method": "GET",
+    "kind": "ver",
+    "version_regex": "version.*?v(\\d+\\.\\d+\\.\\d+)",
+    "version_group": 1,
+    "version_part": "body"
+   }
+  ],
+  "keywords": [
+   "<title>KubePi</title>"
+  ],
+  "has_version_detect": true
+ },
+ {
+  "component": "langbot",
+  "vendor": "langbot",
+  "product": null,
+  "rule_file": "langbot.yaml",
+  "display": "langbot",
+  "probes": [
+   {
+    "path": "/login",
+    "method": "GET",
+    "kind": "fp",
+    "matchers": [
+     {
+      "type": "body",
+      "value": [
+       "<title>LangBot</title>"
+      ],
+      "negative": false
+     },
+     {
+      "type": "body",
+      "value": [
+       "Production-grade platform for building agentic IM bots"
+      ],
+      "negative": false
+     }
+    ]
+   },
+   {
+    "path": "/api/v1/system/info",
+    "method": "GET",
+    "kind": "ver",
+    "version_regex": "\"version\"\\s*:\\s*\"v?([0-9][0-9.]*)\"",
+    "version_group": 1,
+    "version_part": "body"
+   }
+  ],
+  "keywords": [
+   "<title>LangBot</title>",
+   "Production-grade platform for building agentic IM bots"
+  ],
+  "has_version_detect": true
+ },
+ {
+  "component": "langflow",
+  "vendor": "langflow-ai",
+  "product": null,
+  "rule_file": "langflow.yaml",
+  "display": "langflow",
+  "probes": [
+   {
+    "path": "/",
+    "method": "GET",
+    "kind": "fp",
+    "matchers": [
+     {
+      "type": "body",
+      "value": [
+       "<title>Langflow</title>"
+      ],
+      "negative": false
+     }
+    ]
+   },
+   {
+    "path": "/api/v1/version",
+    "method": "GET",
+    "kind": "fp",
+    "matchers": [
+     {
+      "type": "body",
+      "value": [
+       "Langflow"
+      ],
+      "negative": false
+     }
+    ]
+   },
+   {
+    "path": "/health_check",
+    "method": "GET",
+    "kind": "fp"
+   },
+   {
+    "path": "/api/v1/version",
+    "method": "GET",
+    "kind": "ver",
+    "version_regex": "\"version\":\"(.*?)\",",
+    "version_group": 1,
+    "version_part": "body"
+   }
+  ],
+  "keywords": [
+   "<title>Langflow</title>",
+   "Langflow"
+  ],
+  "has_version_detect": true
+ },
+ {
+  "component": "langfuse",
+  "vendor": "langfuse",
+  "product": null,
+  "rule_file": "langfuse.yaml",
+  "display": "langfuse",
+  "probes": [
+   {
+    "path": "/",
+    "method": "GET",
+    "kind": "fp"
+   },
+   {
+    "path": "/api/trpc/public.checkUpdate",
+    "method": "GET",
+    "kind": "ver",
+    "version_regex": "\"currentVersion\":\"v(\\d+\\.\\d+\\.\\d+)\"",
+    "version_group": 1,
+    "version_part": "body"
+   }
+  ],
+  "keywords": [],
+  "has_version_detect": true
+ },
+ {
+  "component": "langroid",
+  "vendor": "langroid",
+  "product": null,
+  "rule_file": "langroid.yaml",
+  "display": "langroid",
+  "probes": [
+   {
+    "path": "/",
+    "method": "GET",
+    "kind": "fp",
+    "matchers": [
+     {
+      "type": "body",
+      "value": [
+       "Langroid Chat API"
+      ],
+      "negative": false
+     },
+     {
+      "type": "body",
+      "value": [
+       "langroid"
+      ],
+      "negative": false
+     }
+    ]
+   },
+   {
+    "path": "/health",
+    "method": "GET",
+    "kind": "fp",
+    "matchers": [
+     {
+      "type": "body",
+      "value": [
+       "langroid"
+      ],
+      "negative": false
+     },
+     {
+      "type": "body",
+      "value": [
+       "healthy"
+      ],
+      "negative": false
+     }
+    ]
+   },
+   {
+    "path": "/docs",
+    "method": "GET",
+    "kind": "fp",
+    "matchers": [
+     {
+      "type": "body",
+      "value": [
+       "Langroid Chat UI Backend"
+      ],
+      "negative": false
+     }
+    ]
+   }
+  ],
+  "keywords": [
+   "Langroid Chat API",
+   "Langroid Chat UI Backend",
+   "healthy",
+   "langroid"
+  ],
+  "has_version_detect": false
+ },
+ {
+  "component": "langserve",
+  "vendor": "langchain-ai",
+  "product": null,
+  "rule_file": "langserve.yaml",
+  "display": "langserve",
+  "probes": [
+   {
+    "path": "/playground/index.html",
+    "method": "GET",
+    "kind": "fp",
+    "matchers": [
+     {
+      "type": "body",
+      "value": [
+       "____LANGSERVE_BASE_URL"
+      ],
+      "negative": false
+     }
+    ]
+   }
+  ],
+  "keywords": [
+   "____LANGSERVE_BASE_URL"
+  ],
+  "has_version_detect": false
+ },
+ {
+  "component": "librechat",
+  "vendor": "librechat",
+  "product": null,
+  "rule_file": "librechat.yaml",
+  "display": "librechat",
+  "probes": [
+   {
+    "path": "/",
+    "method": "GET",
+    "kind": "fp",
+    "matchers": [
+     {
+      "type": "body",
+      "value": [
+       "<title>LibreChat</title>"
+      ],
+      "negative": false
+     }
+    ]
+   },
+   {
+    "path": "/api/config",
+    "method": "GET",
+    "kind": "fp",
+    "matchers": [
+     {
+      "type": "body",
+      "value": [
+       "librechat.ai"
+      ],
+      "negative": false
+     }
+    ]
+   },
+   {
+    "path": "/api/version",
+    "method": "GET",
+    "kind": "ver",
+    "version_regex": "\"version\"\\s*:\\s*\"(\\d+\\.\\d+\\.?\\d*?)\"",
+    "version_group": 1,
+    "version_part": "body"
+   }
+  ],
+  "keywords": [
+   "<title>LibreChat</title>",
+   "librechat.ai"
+  ],
+  "has_version_detect": true
+ },
+ {
+  "component": "lightllm",
+  "vendor": "ModelTC",
+  "product": null,
+  "rule_file": "lightllm.yaml",
+  "display": "lightllm",
+  "probes": [
+   {
+    "path": "/v1/models",
+    "method": "GET",
+    "kind": "fp"
+   },
+   {
+    "path": "/token_load",
+    "method": "GET",
+    "kind": "fp"
+   }
+  ],
+  "keywords": [],
+  "has_version_detect": false
+ },
+ {
+  "component": "lightrag",
+  "vendor": "HKUDS",
+  "product": null,
+  "rule_file": "lightrag.yaml",
+  "display": "LightRAG",
+  "probes": [
+   {
+    "path": "/health",
+    "method": "GET",
+    "kind": "fp"
+   },
+   {
+    "path": "/openapi.json",
+    "method": "GET",
+    "kind": "fp"
+   },
+   {
+    "path": "/health",
+    "method": "GET",
+    "kind": "ver",
+    "version_regex": "\"core_version\":\"([0-9]+\\.[0-9]+\\.[0-9]+[^\"]*)\"",
+    "version_group": 1,
+    "version_part": "body"
+   }
+  ],
+  "keywords": [],
+  "has_version_detect": true
+ },
+ {
+  "component": "litellm",
+  "vendor": "LiteLLM",
+  "product": null,
+  "rule_file": "litellm.yaml",
+  "display": "LiteLLM",
+  "probes": [
+   {
+    "path": "/",
+    "method": "GET",
+    "kind": "fp",
+    "matchers": [
+     {
+      "type": "body",
+      "value": [
+       "LiteLLM API"
+      ],
+      "negative": false
+     },
+     {
+      "type": "body",
+      "value": [
+       "Proxy Server to call 100+ LLMs in the OpenAI format"
+      ],
+      "negative": false
+     },
+     {
+      "type": "body",
+      "value": [
+       "LiteLLM Admin Panel on /ui"
+      ],
+      "negative": false
+     }
+    ]
+   },
+   {
+    "path": "/health",
+    "method": "GET",
+    "kind": "fp"
+   },
+   {
+    "path": "/health/readiness",
+    "method": "GET",
+    "kind": "fp"
+   },
+   {
+    "path": "/openapi.json",
+    "method": "GET",
+    "kind": "ver",
+    "version_regex": "\"version\":\"([0-9]+\\.[0-9]+\\.[0-9]+)\"",
+    "version_group": 1,
+    "version_part": "body"
+   }
+  ],
+  "keywords": [
+   "LiteLLM API",
+   "LiteLLM Admin Panel on /ui",
+   "Proxy Server to call 100+ LLMs in the OpenAI format"
+  ],
+  "has_version_detect": true
+ },
+ {
+  "component": "llama-cpp",
+  "vendor": "llama-cpp",
+  "product": null,
+  "rule_file": "llama-cpp.yaml",
+  "display": "llama-cpp",
+  "probes": [
+   {
+    "path": "/v1/models",
+    "method": "GET",
+    "kind": "fp"
+   },
+   {
+    "path": "/health",
+    "method": "GET",
+    "kind": "fp"
+   }
+  ],
+  "keywords": [],
+  "has_version_detect": false
+ },
+ {
+  "component": "llama-factory",
+  "vendor": "llama-factory",
+  "product": null,
+  "rule_file": "llama-factory.yaml",
+  "display": "llamafactory",
+  "probes": [
+   {
+    "path": "/",
+    "method": "GET",
+    "kind": "fp"
+   }
+  ],
+  "keywords": [],
+  "has_version_detect": false
+ },
+ {
+  "component": "llmstudio",
+  "vendor": "lmstudio",
+  "product": null,
+  "rule_file": "llmstudio.yaml",
+  "display": "llmstudio",
+  "probes": [
+   {
+    "path": "/zuqu3",
+    "method": "GET",
+    "kind": "fp",
+    "matchers": [
+     {
+      "type": "body",
+      "value": [
+       "Unexpected endpoint or method. (GET /zuqu3)"
+      ],
+      "negative": false
+     }
+    ]
+   },
+   {
+    "path": "/",
+    "method": "GET",
+    "kind": "ver",
+    "version_regex": "v(\\d+\\.\\d+\\.?\\d*)",
+    "version_group": 1,
+    "version_part": "body"
+   }
+  ],
+  "keywords": [
+   "Unexpected endpoint or method. (GET /zuqu3)"
+  ],
+  "has_version_detect": true
+ },
+ {
+  "component": "lm-studio",
+  "vendor": "lmstudio",
+  "product": null,
+  "rule_file": "lm-studio.yaml",
+  "display": "lm-studio",
+  "probes": [
+   {
+    "path": "/lmstudio-greeting",
+    "method": "GET",
+    "kind": "fp",
+    "matchers": [
+     {
+      "type": "body",
+      "value": [
+       "true"
+      ],
+      "negative": false
+     }
+    ]
+   },
+   {
+    "path": "/api/v0/models",
+    "method": "GET",
+    "kind": "fp"
+   }
+  ],
+  "keywords": [
+   "true"
+  ],
+  "has_version_detect": false
+ },
+ {
+  "component": "lmdeploy",
+  "vendor": "internlm",
+  "product": null,
+  "rule_file": "lmdeploy.yaml",
+  "display": "lmdeploy",
+  "probes": [
+   {
+    "path": "/docs",
+    "method": "GET",
+    "kind": "fp",
+    "matchers": [
+     {
+      "type": "body",
+      "value": [
+       "LMDeploy API Server - Swagger UI"
+      ],
+      "negative": false
+     }
+    ]
+   },
+   {
+    "path": "/openapi.json",
+    "method": "GET",
+    "kind": "ver",
+    "version_regex": "\"version\"\\s*:\\s*\"([0-9]+\\.[0-9]+\\.[0-9]+)\"",
+    "version_group": 1,
+    "version_part": "body"
+   }
+  ],
+  "keywords": [
+   "LMDeploy API Server - Swagger UI"
+  ],
+  "has_version_detect": true
+ },
+ {
+  "component": "lobechat",
+  "vendor": "LobeChat",
+  "product": null,
+  "rule_file": "lobechat.yaml",
+  "display": "LobeChat",
+  "probes": [
+   {
+    "path": "/",
+    "method": "GET",
+    "kind": "fp",
+    "matchers": [
+     {
+      "type": "body",
+      "value": [
+       "<title>LobeChat</title>"
+      ],
+      "negative": false
+     }
+    ]
+   },
+   {
+    "path": "/manifest.webmanifest",
+    "method": "GET",
+    "kind": "fp"
+   }
+  ],
+  "keywords": [
+   "<title>LobeChat</title>"
+  ],
+  "has_version_detect": false
+ },
+ {
+  "component": "localai",
+  "vendor": "localai",
+  "product": null,
+  "rule_file": "localai.yaml",
+  "display": "localai",
+  "probes": [
+   {
+    "path": "/metrics",
+    "method": "GET",
+    "kind": "fp",
+    "matchers": [
+     {
+      "type": "body",
+      "value": [
+       "localai_"
+      ],
+      "negative": false
+     }
+    ]
+   }
+  ],
+  "keywords": [
+   "localai_"
+  ],
+  "has_version_detect": false
+ },
+ {
+  "component": "lollms",
+  "vendor": "parisneo",
+  "product": null,
+  "rule_file": "lollms.yaml",
+  "display": "lollms",
+  "probes": [
+   {
+    "path": "/",
+    "method": "GET",
+    "kind": "fp",
+    "matchers": [
+     {
+      "type": "body",
+      "value": [
+       "<title>LoLLMS WebUI</title>"
+      ],
+      "negative": false
+     }
+    ]
+   }
+  ],
+  "keywords": [
+   "<title>LoLLMS WebUI</title>"
+  ],
+  "has_version_detect": false
+ },
+ {
+  "component": "lumiverse",
+  "vendor": "prolix-oc",
+  "product": null,
+  "rule_file": "lumiverse.yaml",
+  "display": "Lumiverse",
+  "probes": [
+   {
+    "path": "/",
+    "method": "GET",
+    "kind": "fp",
+    "matchers": [
+     {
+      "type": "body",
+      "value": [
+       "<title>Lumiverse</title>"
+      ],
+      "negative": false
+     }
+    ]
+   }
+  ],
+  "keywords": [
+   "<title>Lumiverse</title>"
+  ],
+  "has_version_detect": false
+ },
+ {
+  "component": "marimo",
+  "vendor": "marimo",
+  "product": null,
+  "rule_file": "marimo.yaml",
+  "display": "marimo",
+  "probes": [
+   {
+    "path": "/",
+    "method": "GET",
+    "kind": "fp",
+    "matchers": [
+     {
+      "type": "body",
+      "value": [
+       "<title>marimo</title>"
+      ],
+      "negative": false
+     }
+    ]
+   },
+   {
+    "path": "/api/version",
+    "method": "GET",
+    "kind": "ver",
+    "version_regex": "(\\d+\\.\\d+\\.\\d+)",
+    "version_group": 1,
+    "version_part": "body"
+   }
+  ],
+  "keywords": [
+   "<title>marimo</title>"
+  ],
+  "has_version_detect": true
+ },
+ {
+  "component": "maxkb",
+  "vendor": "1panel-dev",
+  "product": null,
+  "rule_file": "maxkb.yaml",
+  "display": "maxkb",
+  "probes": [
+   {
+    "path": "/",
+    "method": "GET",
+    "kind": "fp",
+    "matchers": [
+     {
+      "type": "body",
+      "value": [
+       "<title>MaxKB</title>"
+      ],
+      "negative": false
+     }
+    ]
+   }
+  ],
+  "keywords": [
+   "<title>MaxKB</title>"
+  ],
+  "has_version_detect": false
+ },
+ {
+  "component": "mcp-atlassian",
+  "vendor": "sooperset",
+  "product": null,
+  "rule_file": "mcp-atlassian.yaml",
+  "display": "mcp-atlassian",
+  "probes": [
+   {
+    "path": "/mcp",
+    "method": "POST",
+    "kind": "fp",
+    "matchers": [
+     {
+      "type": "body",
+      "value": [
+       "Atlassian MCP"
+      ],
+      "negative": false
+     },
+     {
+      "type": "body",
+      "value": [
+       "serverInfo"
+      ],
+      "negative": false
+     }
+    ]
+   }
+  ],
+  "keywords": [
+   "Atlassian MCP",
+   "serverInfo"
+  ],
+  "has_version_detect": false
+ },
+ {
+  "component": "mcp-documentation-server",
+  "vendor": "andrea9293",
+  "product": null,
+  "rule_file": "mcp-documentation-server.yaml",
+  "display": "mcp-documentation-server",
+  "probes": [
+   {
+    "path": "/",
+    "method": "GET",
+    "kind": "fp",
+    "matchers": [
+     {
+      "type": "body",
+      "value": [
+       "<title>MCP Documentation Server</title>"
+      ],
+      "negative": false
+     }
+    ]
+   },
+   {
+    "path": "/api/config",
+    "method": "GET",
+    "kind": "fp"
+   }
+  ],
+  "keywords": [
+   "<title>MCP Documentation Server</title>"
+  ],
+  "has_version_detect": false
+ },
+ {
+  "component": "mcp-searxng",
+  "vendor": "ihor-sokoliuk",
+  "product": null,
+  "rule_file": "mcp-searxng.yaml",
+  "display": "mcp-searxng",
+  "probes": [
+   {
+    "path": "/health",
+    "method": "GET",
+    "kind": "fp",
+    "matchers": [
+     {
+      "type": "body",
+      "value": [
+       "ihor-sokoliuk/mcp-searxng"
+      ],
+      "negative": false
+     },
+     {
+      "type": "body",
+      "value": [
+       "healthy"
+      ],
+      "negative": false
+     }
+    ]
+   },
+   {
+    "path": "/health",
+    "method": "GET",
+    "kind": "ver",
+    "version_regex": "\"version\"\\s*:\\s*\"([0-9][0-9a-zA-Z.\\-]*)\"",
+    "version_group": 1,
+    "version_part": "body"
+   }
+  ],
+  "keywords": [
+   "healthy",
+   "ihor-sokoliuk/mcp-searxng"
+  ],
+  "has_version_detect": true
+ },
+ {
+  "component": "mcp-server",
+  "vendor": "pipeboard-co",
+  "product": null,
+  "rule_file": "mcp-server.yaml",
+  "display": "meta-ads-mcp",
+  "probes": [
+   {
+    "path": "/mcp",
+    "method": "POST",
+    "kind": "fp",
+    "matchers": [
+     {
+      "type": "body",
+      "value": [
+       "jsonrpc"
+      ],
+      "negative": false
+     },
+     {
+      "type": "body",
+      "value": [
+       "meta-ads-mcp"
+      ],
+      "negative": false
+     }
+    ]
+   }
+  ],
+  "keywords": [
+   "jsonrpc",
+   "meta-ads-mcp"
+  ],
+  "has_version_detect": false
+ },
+ {
+  "component": "mcp",
+  "vendor": "Anthropic",
+  "product": null,
+  "rule_file": "mcp.yaml",
+  "display": "mcp sse",
+  "probes": [
+   {
+    "path": "/messages/",
+    "method": "GET",
+    "kind": "fp",
+    "matchers": [
+     {
+      "type": "body",
+      "value": [
+       "session_id is required"
+      ],
+      "negative": false
+     }
+    ]
+   }
+  ],
+  "keywords": [
+   "session_id is required"
+  ],
+  "has_version_detect": false
+ },
+ {
+  "component": "mcphub",
+  "vendor": "samanhappy",
+  "product": null,
+  "rule_file": "mcphub.yaml",
+  "display": "MCPHub",
+  "probes": [
+   {
+    "path": "/",
+    "method": "GET",
+    "kind": "fp",
+    "matchers": [
+     {
+      "type": "body",
+      "value": [
+       "<title>MCPHub Dashboard</title>"
+      ],
+      "negative": false
+     }
+    ]
+   },
+   {
+    "path": "/config",
+    "method": "GET",
+    "kind": "ver",
+    "version_regex": "\"version\"\\s*:\\s*\"([0-9][0-9a-zA-Z.\\-]*)\"",
+    "version_group": 1,
+    "version_part": "body"
+   }
+  ],
+  "keywords": [
+   "<title>MCPHub Dashboard</title>"
+  ],
+  "has_version_detect": true
+ },
+ {
+  "component": "mem0",
+  "vendor": "mem0ai",
+  "product": null,
+  "rule_file": "mem0.yaml",
+  "display": "mem0",
+  "probes": [
+   {
+    "path": "/openapi.json",
+    "method": "GET",
+    "kind": "fp",
+    "matchers": [
+     {
+      "type": "body",
+      "value": [
+       "Mem0 REST APIs"
+      ],
+      "negative": false
+     }
+    ]
+   }
+  ],
+  "keywords": [
+   "Mem0 REST APIs"
+  ],
+  "has_version_detect": false
+ },
+ {
+  "component": "memos",
+  "vendor": "memtensor",
+  "product": null,
+  "rule_file": "memos.yaml",
+  "display": "memos",
+  "probes": [
+   {
+    "path": "/health",
+    "method": "GET",
+    "kind": "fp"
+   },
+   {
+    "path": "/openapi.json",
+    "method": "GET",
+    "kind": "fp",
+    "matchers": [
+     {
+      "type": "body",
+      "value": [
+       "MemOS Server REST APIs"
+      ],
+      "negative": false
+     }
+    ]
+   },
+   {
+    "path": "/docs",
+    "method": "GET",
+    "kind": "fp",
+    "matchers": [
+     {
+      "type": "body",
+      "value": [
+       "MemOS Server REST APIs"
+      ],
+      "negative": false
+     },
+     {
+      "type": "body",
+      "value": [
+       "swagger"
+      ],
+      "negative": false
+     }
+    ]
+   },
+   {
+    "path": "/health",
+    "method": "GET",
+    "kind": "ver",
+    "version_regex": "\"version\"\\s*:\\s*\"([0-9][0-9.a-zA-Z\\-]+)\"",
+    "version_group": 1,
+    "version_part": "body"
+   }
+  ],
+  "keywords": [
+   "MemOS Server REST APIs",
+   "swagger"
+  ],
+  "has_version_detect": true
+ },
+ {
+  "component": "meta-ads-mcp",
+  "vendor": "pipeboard-co",
+  "product": null,
+  "rule_file": "meta-ads-mcp.yaml",
+  "display": "meta-ads-mcp",
+  "probes": [
+   {
+    "path": "/mcp",
+    "method": "POST",
+    "kind": "fp",
+    "matchers": [
+     {
+      "type": "body",
+      "value": [
+       "jsonrpc"
+      ],
+      "negative": false
+     },
+     {
+      "type": "body",
+      "value": [
+       "meta-ads"
+      ],
+      "negative": false
+     }
+    ]
+   }
+  ],
+  "keywords": [
+   "jsonrpc",
+   "meta-ads"
+  ],
+  "has_version_detect": false
+ },
+ {
+  "component": "milvus",
+  "vendor": "milvus-io",
+  "product": null,
+  "rule_file": "milvus.yaml",
+  "display": "Milvus",
+  "probes": [
+   {
+    "path": "/webui/",
+    "method": "GET",
+    "kind": "fp",
+    "matchers": [
+     {
+      "type": "body",
+      "value": [
+       "<title>Milvus Management</title>"
+      ],
+      "negative": false
+     },
+     {
+      "type": "body",
+      "value": [
+       "milvus-logo"
+      ],
+      "negative": false
+     }
+    ]
+   }
+  ],
+  "keywords": [
+   "<title>Milvus Management</title>",
+   "milvus-logo"
+  ],
+  "has_version_detect": false
+ },
+ {
+  "component": "mlc-llm",
+  "vendor": "mlc-ai",
+  "product": null,
+  "rule_file": "mlc-llm.yaml",
+  "display": "mlc-llm",
+  "probes": [
+   {
+    "path": "/v1/models",
+    "method": "GET",
+    "kind": "fp"
+   },
+   {
+    "path": "/openapi.json",
+    "method": "GET",
+    "kind": "fp",
+    "matchers": [
+     {
+      "type": "body",
+      "value": [
+       "/microserving/prep_recv"
+      ],
+      "negative": false
+     }
+    ]
+   }
+  ],
+  "keywords": [
+   "/microserving/prep_recv"
+  ],
+  "has_version_detect": false
+ },
+ {
+  "component": "mlflow",
+  "vendor": "mlflow",
+  "product": null,
+  "rule_file": "mlflow.yaml",
+  "display": "mlflow",
+  "probes": [
+   {
+    "path": "/",
+    "method": "GET",
+    "kind": "fp",
+    "matchers": [
+     {
+      "type": "body",
+      "value": [
+       "<title>MLflow</title>"
+      ],
+      "negative": false
+     },
+     {
+      "type": "body",
+      "value": [
+       "mlflow-ui-container"
+      ],
+      "negative": false
+     }
+    ]
+   },
+   {
+    "path": "/version",
+    "method": "GET",
+    "kind": "ver",
+    "version_regex": "^(\\d+\\.\\d+\\.\\d+.*)$",
+    "version_group": 1,
+    "version_part": "body"
+   }
+  ],
+  "keywords": [
+   "<title>MLflow</title>",
+   "mlflow-ui-container"
+  ],
+  "has_version_detect": true
+ },
+ {
+  "component": "modal",
+  "vendor": "modal",
+  "product": null,
+  "rule_file": "modal.yaml",
+  "display": "modal",
+  "probes": [
+   {
+    "path": "/",
+    "method": "GET",
+    "kind": "fp",
+    "matchers": [
+     {
+      "type": "body",
+      "value": [
+       "modal-http: invalid function call"
+      ],
+      "negative": false
+     }
+    ]
+   }
+  ],
+  "keywords": [
+   "modal-http: invalid function call"
+  ],
+  "has_version_detect": false
+ },
+ {
+  "component": "ms-swift",
+  "vendor": "modelscope",
+  "product": null,
+  "rule_file": "ms-swift.yaml",
+  "display": "ms-swift",
+  "probes": [
+   {
+    "path": "/v1/models",
+    "method": "GET",
+    "kind": "fp"
+   }
+  ],
+  "keywords": [],
+  "has_version_detect": false
+ },
+ {
+  "component": "n8n-mcp",
+  "vendor": "czlonkowski",
+  "product": null,
+  "rule_file": "n8n-mcp.yaml",
+  "display": "n8n-mcp",
+  "probes": [
+   {
+    "path": "/mcp",
+    "method": "GET",
+    "kind": "fp"
+   }
+  ],
+  "keywords": [],
+  "has_version_detect": false
+ },
+ {
+  "component": "n8n.io",
+  "vendor": "n8n-io",
+  "product": null,
+  "rule_file": "n8n.io.yaml",
+  "display": "n8n",
+  "probes": [
+   {
+    "path": "/",
+    "method": "GET",
+    "kind": "fp",
+    "matchers": [
+     {
+      "type": "body",
+      "value": [
+       "<title>n8n.io - Workflow Automation</title>"
+      ],
+      "negative": false
+     }
+    ]
+   }
+  ],
+  "keywords": [
+   "<title>n8n.io - Workflow Automation</title>"
+  ],
+  "has_version_detect": false
+ },
+ {
+  "component": "netlicensing-mcp",
+  "vendor": "Labs64",
+  "product": null,
+  "rule_file": "netlicensing-mcp.yaml",
+  "display": "netlicensing-mcp",
+  "probes": [
+   {
+    "path": "/health",
+    "method": "GET",
+    "kind": "fp"
+   },
+   {
+    "path": "/mcp",
+    "method": "POST",
+    "kind": "fp"
+   }
+  ],
+  "keywords": [],
+  "has_version_detect": false
+ },
+ {
+  "component": "network-ai",
+  "vendor": "jovancoding",
+  "product": null,
+  "rule_file": "network-ai.yaml",
+  "display": "Network-AI",
+  "probes": [
+   {
+    "path": "/health",
+    "method": "GET",
+    "kind": "fp"
+   },
+   {
+    "path": "/mcp",
+    "method": "POST",
+    "kind": "ver",
+    "version_regex": "\"version\"\\s*:\\s*\"([0-9][0-9.a-zA-Z\\-]+)\"",
+    "version_group": 1,
+    "version_part": "body"
+   }
+  ],
+  "keywords": [],
+  "has_version_detect": true
+ },
+ {
+  "component": "new-api",
+  "vendor": "quantumnous",
+  "product": null,
+  "rule_file": "new-api.yaml",
+  "display": "new-api",
+  "probes": [
+   {
+    "path": "/",
+    "method": "GET",
+    "kind": "fp",
+    "matchers": [
+     {
+      "type": "body",
+      "value": [
+       "<title>New API</title>"
+      ],
+      "negative": false
+     }
+    ]
+   },
+   {
+    "path": "/api/status",
+    "method": "GET",
+    "kind": "ver",
+    "version_regex": "\"version\"\\s*:\\s*\"(v[0-9]+\\.[0-9]+\\.[0-9]+[^\"]*)\"",
+    "version_group": 1,
+    "version_part": "body"
+   }
+  ],
+  "keywords": [
+   "<title>New API</title>"
+  ],
+  "has_version_detect": true
+ },
+ {
+  "component": "nextchat",
+  "vendor": "nextchat",
+  "product": null,
+  "rule_file": "nextchat.yaml",
+  "display": "nextchat",
+  "probes": [
+   {
+    "path": "/",
+    "method": "GET",
+    "kind": "fp",
+    "matchers": [
+     {
+      "type": "body",
+      "value": [
+       "<title>NextChat</title>"
+      ],
+      "negative": false
+     }
+    ]
+   },
+   {
+    "path": "/site.webmanifest",
+    "method": "GET",
+    "kind": "fp"
+   },
+   {
+    "path": "/api/config",
+    "method": "GET",
+    "kind": "fp"
+   }
+  ],
+  "keywords": [
+   "<title>NextChat</title>"
+  ],
+  "has_version_detect": false
+ },
+ {
+  "component": "nocobase",
+  "vendor": "nocobase",
+  "product": null,
+  "rule_file": "nocobase.yaml",
+  "display": "nocobase",
+  "probes": [
+   {
+    "path": "/",
+    "method": "GET",
+    "kind": "fp",
+    "matchers": [
+     {
+      "type": "body",
+      "value": [
+       "__nocobase_api_base_url__"
+      ],
+      "negative": false
+     }
+    ]
+   },
+   {
+    "path": "/api/app:getInfo",
+    "method": "GET",
+    "kind": "fp"
+   }
+  ],
+  "keywords": [
+   "__nocobase_api_base_url__"
+  ],
+  "has_version_detect": false
+ },
+ {
+  "component": "notebooklm-mcp",
+  "vendor": "roomi-fields",
+  "product": null,
+  "rule_file": "notebooklm-mcp.yaml",
+  "display": "NotebookLM MCP",
+  "probes": [
+   {
+    "path": "/",
+    "method": "GET",
+    "kind": "fp",
+    "matchers": [
+     {
+      "type": "body",
+      "value": [
+       "NotebookLM MCP HTTP Server"
+      ],
+      "negative": false
+     }
+    ]
+   },
+   {
+    "path": "/",
+    "method": "GET",
+    "kind": "ver",
+    "version_regex": "\"version\"\\s*:\\s*\"([0-9][0-9a-zA-Z.\\-]*)\"",
+    "version_group": 1,
+    "version_part": "body"
+   }
+  ],
+  "keywords": [
+   "NotebookLM MCP HTTP Server"
+  ],
+  "has_version_detect": true
+ },
+ {
+  "component": "nvidia-nim",
+  "vendor": "nvidia",
+  "product": null,
+  "rule_file": "nvidia-nim.yaml",
+  "display": "nvidia-nim",
+  "probes": [
+   {
+    "path": "/v1/metadata",
+    "method": "GET",
+    "kind": "fp"
+   }
+  ],
+  "keywords": [],
+  "has_version_detect": false
+ },
+ {
+  "component": "obot",
+  "vendor": "obot-platform",
+  "product": null,
+  "rule_file": "obot.yaml",
+  "display": "Obot",
+  "probes": [
+   {
+    "path": "/",
+    "method": "GET",
+    "kind": "fp",
+    "matchers": [
+     {
+      "type": "body",
+      "value": [
+       "<title>Obot - Build AI agents with MCP</title>"
+      ],
+      "negative": false
+     }
+    ]
+   },
+   {
+    "path": "/api/version",
+    "method": "GET",
+    "kind": "fp"
+   },
+   {
+    "path": "/api/version",
+    "method": "GET",
+    "kind": "ver",
+    "version_regex": "\"obot\"\\s*:\\s*\"([^\"]+)\"",
+    "version_group": 1,
+    "version_part": "body"
+   }
+  ],
+  "keywords": [
+   "<title>Obot - Build AI agents with MCP</title>"
+  ],
+  "has_version_detect": true
+ },
+ {
+  "component": "ollama",
+  "vendor": "ollama",
+  "product": null,
+  "rule_file": "ollama.yaml",
+  "display": "ollama",
+  "probes": [
+   {
+    "path": "/",
+    "method": "GET",
+    "kind": "fp",
+    "matchers": [
+     {
+      "type": "body",
+      "value": [
+       "Ollama is running"
+      ],
+      "negative": false
+     }
+    ]
+   },
+   {
+    "path": "/api/version",
+    "method": "GET",
+    "kind": "ver",
+    "version_regex": "{\"version\":\"(\\d+\\.\\d+\\.?\\d+?)\"}",
+    "version_group": 1,
+    "version_part": "body"
+   }
+  ],
+  "keywords": [
+   "Ollama is running"
+  ],
+  "has_version_detect": true
+ },
+ {
+  "component": "omnigent",
+  "vendor": "omnigent-ai",
+  "product": null,
+  "rule_file": "omnigent.yaml",
+  "display": "Omnigent",
+  "probes": [
+   {
+    "path": "/openapi.json",
+    "method": "GET",
+    "kind": "fp"
+   },
+   {
+    "path": "/v1/info",
+    "method": "GET",
+    "kind": "fp"
+   },
+   {
+    "path": "/api/version",
+    "method": "GET",
+    "kind": "ver",
+    "version_regex": "\"version\"\\s*:\\s*\"([0-9][0-9.a-zA-Z\\-]+)\"",
+    "version_group": 1,
+    "version_part": "body"
+   }
+  ],
+  "keywords": [],
+  "has_version_detect": true
+ },
+ {
+  "component": "omniroute",
+  "vendor": "omniroute",
+  "product": null,
+  "rule_file": "omniroute.yaml",
+  "display": "omniroute",
+  "probes": [
+   {
+    "path": "/api/cache",
+    "method": "GET",
+    "kind": "fp",
+    "matchers": [
+     {
+      "type": "body",
+      "value": [
+       "semanticCache"
+      ],
+      "negative": false
+     }
+    ]
+   }
+  ],
+  "keywords": [
+   "semanticCache"
+  ],
+  "has_version_detect": false
+ },
+ {
+  "component": "onyx",
+  "vendor": "onyx",
+  "product": null,
+  "rule_file": "onyx.yaml",
+  "display": "onyx",
+  "probes": [
+   {
+    "path": "/openapi.json",
+    "method": "GET",
+    "kind": "fp"
+   },
+   {
+    "path": "/api/docs",
+    "method": "GET",
+    "kind": "fp",
+    "matchers": [
+     {
+      "type": "body",
+      "value": [
+       "<title>Onyx Backend - Swagger UI</title>"
+      ],
+      "negative": false
+     }
+    ]
+   }
+  ],
+  "keywords": [
+   "<title>Onyx Backend - Swagger UI</title>"
+  ],
+  "has_version_detect": false
+ },
+ {
+  "component": "open-genai-stack",
+  "vendor": "ogx-ai",
+  "product": null,
+  "rule_file": "open-genai-stack.yaml",
+  "display": "Open GenAI Stack",
+  "probes": [
+   {
+    "path": "/v1/inspect/routes",
+    "method": "GET",
+    "kind": "fp"
+   },
+   {
+    "path": "/v1/version",
+    "method": "GET",
+    "kind": "ver",
+    "version_regex": "\"version\":\\s*\"([^\"]+)\"",
+    "version_group": 1,
+    "version_part": "body"
+   }
+  ],
+  "keywords": [],
+  "has_version_detect": true
+ },
+ {
+  "component": "open-generative-ai",
+  "vendor": "anil-matcha",
+  "product": null,
+  "rule_file": "open-generative-ai.yaml",
+  "display": "Open-Generative-AI",
+  "probes": [
+   {
+    "path": "/studio",
+    "method": "GET",
+    "kind": "fp",
+    "matchers": [
+     {
+      "type": "body",
+      "value": [
+       "<title>Studio"
+      ],
+      "negative": false
+     },
+     {
+      "type": "body",
+      "value": [
+       "Open Generative AI</title>"
+      ],
+      "negative": false
+     }
+    ]
+   },
+   {
+    "path": "/studio",
+    "method": "GET",
+    "kind": "fp",
+    "matchers": [
+     {
+      "type": "body",
+      "value": [
+       "Generate AI images and videos using 200+ models"
+      ],
+      "negative": false
+     },
+     {
+      "type": "body",
+      "value": [
+       "Open Generative AI"
+      ],
+      "negative": false
+     }
+    ]
+   }
+  ],
+  "keywords": [
+   "<title>Studio",
+   "Generate AI images and videos using 200+ models",
+   "Open Generative AI",
+   "Open Generative AI</title>"
+  ],
+  "has_version_detect": false
+ },
+ {
+  "component": "openai-compatible",
+  "vendor": "generic",
+  "product": null,
+  "rule_file": "openai-compatible.yaml",
+  "display": "openai-compatible",
+  "probes": [
+   {
+    "path": "/v1/models",
+    "method": "GET",
+    "kind": "fp"
+   }
+  ],
+  "keywords": [],
+  "has_version_detect": false
+ },
+ {
+  "component": "openclaw",
+  "vendor": "openclaw",
+  "product": null,
+  "rule_file": "openclaw.yaml",
+  "display": "OpenClaw",
+  "probes": [
+   {
+    "path": "/",
+    "method": "GET",
+    "kind": "fp",
+    "matchers": [
+     {
+      "type": "body",
+      "value": [
+       "<openclaw-app>"
+      ],
+      "negative": false
+     },
+     {
+      "type": "body",
+      "value": [
+       "<title>OpenClaw Control</title>"
+      ],
+      "negative": false
+     },
+     {
+      "type": "body",
+      "value": [
+       "<title>Clawdbot Control</title>"
+      ],
+      "negative": false
+     },
+     {
+      "type": "body",
+      "value": [
+       "<title>Moltbot Control</title>"
+      ],
+      "negative": false
+     }
+    ]
+   },
+   {
+    "path": "/__openclaw/control-ui-config.json",
+    "method": "GET",
+    "kind": "ver",
+    "version_regex": "\"serverVersion\":\\s?\"([\\d.]+[^\"]*)\"",
+    "version_group": 1,
+    "version_part": "body"
+   }
+  ],
+  "keywords": [
+   "<openclaw-app>",
+   "<title>Clawdbot Control</title>",
+   "<title>Moltbot Control</title>",
+   "<title>OpenClaw Control</title>"
+  ],
+  "has_version_detect": true
+ },
+ {
+  "component": "openwebui",
+  "vendor": "open-webui",
+  "product": null,
+  "rule_file": "openwebui.yaml",
+  "display": "openwebui",
+  "probes": [
+   {
+    "path": "/",
+    "method": "GET",
+    "kind": "fp"
+   },
+   {
+    "path": "/api/config",
+    "method": "GET",
+    "kind": "fp"
+   },
+   {
+    "path": "/api/version",
+    "method": "GET",
+    "kind": "ver",
+    "version_regex": "{\"version\":\"(\\d+\\.\\d+\\.?\\d+?)\"",
+    "version_group": 1,
+    "version_part": "body"
+   }
+  ],
+  "keywords": [],
+  "has_version_detect": true
+ },
+ {
+  "component": "paperclip",
+  "vendor": "paperclipai",
+  "product": null,
+  "rule_file": "paperclip.yaml",
+  "display": "paperclip",
+  "probes": [
+   {
+    "path": "/",
+    "method": "GET",
+    "kind": "fp",
+    "matchers": [
+     {
+      "type": "body",
+      "value": [
+       "<title>Paperclip</title>"
+      ],
+      "negative": false
+     },
+     {
+      "type": "body",
+      "value": [
+       "PAPERCLIP_FAVICON_START"
+      ],
+      "negative": false
+     },
+     {
+      "type": "body",
+      "value": [
+       "paperclip-startup-title"
+      ],
+      "negative": false
+     }
+    ]
+   }
+  ],
+  "keywords": [
+   "<title>Paperclip</title>",
+   "PAPERCLIP_FAVICON_START",
+   "paperclip-startup-title"
+  ],
+  "has_version_detect": false
+ },
+ {
+  "component": "petals",
+  "vendor": "bigscience",
+  "product": null,
+  "rule_file": "petals.yaml",
+  "display": "petals",
+  "probes": [
+   {
+    "path": "/",
+    "method": "GET",
+    "kind": "fp",
+    "matchers": [
+     {
+      "type": "body",
+      "value": [
+       "Decentralized platform for running large language models"
+      ],
+      "negative": false
+     },
+     {
+      "type": "body",
+      "value": [
+       "petals-infra"
+      ],
+      "negative": false
+     }
+    ]
+   }
+  ],
+  "keywords": [
+   "Decentralized platform for running large language models",
+   "petals-infra"
+  ],
+  "has_version_detect": false
+ },
+ {
+  "component": "pinchtab",
+  "vendor": "pinchtab",
+  "product": null,
+  "rule_file": "pinchtab.yaml",
+  "display": "pinchtab",
+  "probes": [
+   {
+    "path": "/instances",
+    "method": "GET",
+    "kind": "fp"
+   },
+   {
+    "path": "/health",
+    "method": "GET",
+    "kind": "ver",
+    "version_regex": "\"version\":\"([^\"]+)\"",
+    "version_group": 1,
+    "version_part": "body"
+   }
+  ],
+  "keywords": [],
+  "has_version_detect": true
+ },
+ {
+  "component": "pipecat",
+  "vendor": "pipecat-ai",
+  "product": null,
+  "rule_file": "pipecat.yaml",
+  "display": "pipecat",
+  "probes": [
+   {
+    "path": "/",
+    "method": "GET",
+    "kind": "fp",
+    "matchers": [
+     {
+      "type": "body",
+      "value": [
+       "<title>Pipecat UI</title>"
+      ],
+      "negative": false
+     }
+    ]
+   }
+  ],
+  "keywords": [
+   "<title>Pipecat UI</title>"
+  ],
+  "has_version_detect": false
+ },
+ {
+  "component": "portkey-ai-gateway",
+  "vendor": "portkey",
+  "product": null,
+  "rule_file": "portkey-ai-gateway.yaml",
+  "display": "portkey-ai-gateway",
+  "probes": [
+   {
+    "path": "/",
+    "method": "GET",
+    "kind": "fp",
+    "matchers": [
+     {
+      "type": "body",
+      "value": [
+       "AI Gateway says hey!"
+      ],
+      "negative": false
+     }
+    ]
+   }
+  ],
+  "keywords": [
+   "AI Gateway says hey!"
+  ],
+  "has_version_detect": false
+ },
+ {
+  "component": "praisonai",
+  "vendor": "mervinpraison",
+  "product": null,
+  "rule_file": "praisonai.yaml",
+  "display": "praisonai",
+  "probes": [
+   {
+    "path": "/",
+    "method": "GET",
+    "kind": "fp",
+    "matchers": [
+     {
+      "type": "body",
+      "value": [
+       "<title>PraisonAI</title>"
+      ],
+      "negative": false
+     }
+    ]
+   }
+  ],
+  "keywords": [
+   "<title>PraisonAI</title>"
+  ],
+  "has_version_detect": false
+ },
+ {
+  "component": "privategpt",
+  "vendor": "zylon-ai",
+  "product": null,
+  "rule_file": "privategpt.yaml",
+  "display": "privategpt",
+  "probes": [
+   {
+    "path": "/v1/ingest/list",
+    "method": "GET",
+    "kind": "fp"
+   }
+  ],
+  "keywords": [],
+  "has_version_detect": false
+ },
+ {
+  "component": "qanything",
+  "vendor": "netease-youdao",
+  "product": null,
+  "rule_file": "qanything.yaml",
+  "display": "qanything",
+  "probes": [
+   {
+    "path": "/qanything",
+    "method": "GET",
+    "kind": "fp",
+    "matchers": [
+     {
+      "type": "body",
+      "value": [
+       "<title>QAnything</title>"
+      ],
+      "negative": false
+     }
+    ]
+   },
+   {
+    "path": "/",
+    "method": "GET",
+    "kind": "fp",
+    "matchers": [
+     {
+      "type": "body",
+      "value": [
+       "<title>Application QAnything cannot handle your request</title>"
+      ],
+      "negative": false
+     }
+    ]
+   }
+  ],
+  "keywords": [
+   "<title>Application QAnything cannot handle your request</title>",
+   "<title>QAnything</title>"
+  ],
+  "has_version_detect": false
+ },
+ {
+  "component": "qdrant",
+  "vendor": "qdrant",
+  "product": null,
+  "rule_file": "qdrant.yaml",
+  "display": "qdrant",
+  "probes": [
+   {
+    "path": "/",
+    "method": "GET",
+    "kind": "fp",
+    "matchers": [
+     {
+      "type": "body",
+      "value": [
+       "qdrant - vector search engine"
+      ],
+      "negative": false
+     }
+    ]
+   },
+   {
+    "path": "/collections",
+    "method": "GET",
+    "kind": "fp"
+   },
+   {
+    "path": "/",
+    "method": "GET",
+    "kind": "ver",
+    "version_regex": "\"version\":\"(\\d+\\.\\d+\\.?\\d+?)\"",
+    "version_group": 1,
+    "version_part": "body"
+   }
+  ],
+  "keywords": [
+   "qdrant - vector search engine"
+  ],
+  "has_version_detect": true
+ },
+ {
+  "component": "qnabot-on-aws",
+  "vendor": "aws",
+  "product": null,
+  "rule_file": "qnabot-on-aws.yaml",
+  "display": "qnabot-on-aws",
+  "probes": [
+   {
+    "path": "/",
+    "method": "GET",
+    "kind": "fp",
+    "matchers": [
+     {
+      "type": "body",
+      "value": [
+       "<title>QnABot"
+      ],
+      "negative": false
+     }
+    ]
+   }
+  ],
+  "keywords": [
+   "<title>QnABot"
+  ],
+  "has_version_detect": false
+ },
+ {
+  "component": "quivr",
+  "vendor": "quivrhq",
+  "product": null,
+  "rule_file": "quivr.yaml",
+  "display": "quivr",
+  "probes": [
+   {
+    "path": "/openapi.json",
+    "method": "GET",
+    "kind": "fp",
+    "matchers": [
+     {
+      "type": "body",
+      "value": [
+       "/brains/"
+      ],
+      "negative": false
+     },
+     {
+      "type": "body",
+      "value": [
+       "/knowledge/"
+      ],
+      "negative": false
+     },
+     {
+      "type": "body",
+      "value": [
+       "/chat/"
+      ],
+      "negative": false
+     }
+    ]
+   }
+  ],
+  "keywords": [
+   "/brains/",
+   "/chat/",
+   "/knowledge/"
+  ],
+  "has_version_detect": false
+ },
+ {
+  "component": "qwed",
+  "vendor": "qwed-ai",
+  "product": null,
+  "rule_file": "qwed.yaml",
+  "display": "qwed",
+  "probes": [
+   {
+    "path": "/",
+    "method": "GET",
+    "kind": "fp",
+    "matchers": [
+     {
+      "type": "body",
+      "value": [
+       "QWED OS is Running"
+      ],
+      "negative": false
+     }
+    ]
+   },
+   {
+    "path": "/docs",
+    "method": "GET",
+    "kind": "fp",
+    "matchers": [
+     {
+      "type": "body",
+      "value": [
+       "QWED API"
+      ],
+      "negative": false
+     },
+     {
+      "type": "body",
+      "value": [
+       "Deterministic Verification Protocol"
+      ],
+      "negative": false
+     }
+    ]
+   },
+   {
+    "path": "/health",
+    "method": "GET",
+    "kind": "fp"
+   },
+   {
+    "path": "/health",
+    "method": "GET",
+    "kind": "ver",
+    "version_regex": "\"version\":\\s*\"(\\d+\\.+\\d+\\.?\\d*[^\"]*)\"",
+    "version_group": 1,
+    "version_part": "body"
+   }
+  ],
+  "keywords": [
+   "Deterministic Verification Protocol",
+   "QWED API",
+   "QWED OS is Running"
+  ],
+  "has_version_detect": true
+ },
+ {
+  "component": "ragflow",
+  "vendor": "ragflow",
+  "product": null,
+  "rule_file": "ragflow.yaml",
+  "display": "ragflow",
+  "probes": [
+   {
+    "path": "/",
+    "method": "GET",
+    "kind": "fp",
+    "matchers": [
+     {
+      "type": "body",
+      "value": [
+       "<title>RAGFlow</title>"
+      ],
+      "negative": false
+     }
+    ]
+   },
+   {
+    "path": "/v1/system/healthz",
+    "method": "GET",
+    "kind": "fp"
+   }
+  ],
+  "keywords": [
+   "<title>RAGFlow</title>"
+  ],
+  "has_version_detect": false
+ },
+ {
+  "component": "ray",
+  "vendor": "ray",
+  "product": null,
+  "rule_file": "ray.yaml",
+  "display": "ray",
+  "probes": [
+   {
+    "path": "/api/cluster_status",
+    "method": "GET",
+    "kind": "fp",
+    "matchers": [
+     {
+      "type": "body",
+      "value": [
+       "Got cluster status"
+      ],
+      "negative": false
+     }
+    ]
+   },
+   {
+    "path": "/",
+    "method": "GET",
+    "kind": "fp"
+   },
+   {
+    "path": "/api/serve/applications/",
+    "method": "GET",
+    "kind": "fp",
+    "matchers": [
+     {
+      "type": "body",
+      "value": [
+       "SERVE_CONTROLLER_ACTOR"
+      ],
+      "negative": false
+     }
+    ]
+   },
+   {
+    "path": "/api/version",
+    "method": "GET",
+    "kind": "ver",
+    "version_regex": "\"ray_version\":\\s*\"([0-9]+\\.[0-9]+\\.[0-9]+)\"",
+    "version_group": 1,
+    "version_part": "body"
+   }
+  ],
+  "keywords": [
+   "Got cluster status",
+   "SERVE_CONTROLLER_ACTOR"
+  ],
+  "has_version_detect": true
+ },
+ {
+  "component": "ruflo",
+  "vendor": "ruvnet",
+  "product": null,
+  "rule_file": "ruflo.yaml",
+  "display": "ruflo",
+  "probes": [
+   {
+    "path": "/",
+    "method": "GET",
+    "kind": "fp",
+    "matchers": [
+     {
+      "type": "body",
+      "value": [
+       "RuVocal"
+      ],
+      "negative": false
+     },
+     {
+      "type": "body",
+      "value": [
+       "ruflo"
+      ],
+      "negative": false
+     }
+    ]
+   },
+   {
+    "path": "/health",
+    "method": "GET",
+    "kind": "ver",
+    "version_regex": "\"version\":\"([0-9][0-9.a-zA-Z\\-]+)\"",
+    "version_group": 1,
+    "version_part": "body"
+   }
+  ],
+  "keywords": [
+   "RuVocal",
+   "ruflo"
+  ],
+  "has_version_detect": true
+ },
+ {
+  "component": "salesforce-einstein",
+  "vendor": "salesforce",
+  "product": null,
+  "rule_file": "salesforce-einstein.yaml",
+  "display": "salesforce-einstein",
+  "probes": [
+   {
+    "path": "/iamessage/api/v2/authorization/unauthenticated/access-token",
+    "method": "POST",
+    "kind": "fp",
+    "matchers": [
+     {
+      "type": "body",
+      "value": [
+       "INVALID_"
+      ],
+      "negative": false
+     }
+    ]
+   }
+  ],
+  "keywords": [
+   "INVALID_"
+  ],
+  "has_version_detect": false
+ },
+ {
+  "component": "sglang",
+  "vendor": "sgl-project",
+  "product": null,
+  "rule_file": "sglang.yaml",
+  "display": "sglang",
+  "probes": [
+   {
+    "path": "/server_info",
+    "method": "GET",
+    "kind": "fp",
+    "matchers": [
+     {
+      "type": "body",
+      "value": [
+       "radix_eviction_policy"
+      ],
+      "negative": false
+     },
+     {
+      "type": "body",
+      "value": [
+       "weight_version"
+      ],
+      "negative": false
+     },
+     {
+      "type": "body",
+      "value": [
+       "tokenizer_path"
+      ],
+      "negative": false
+     }
+    ]
+   },
+   {
+    "path": "/model_info",
+    "method": "GET",
+    "kind": "fp"
+   },
+   {
+    "path": "/v1/models",
+    "method": "GET",
+    "kind": "fp"
+   },
+   {
+    "path": "/server_info",
+    "method": "GET",
+    "kind": "ver",
+    "version_regex": "\"version\":\"([^\"]+)\"",
+    "version_group": 1,
+    "version_part": "body"
+   }
+  ],
+  "keywords": [
+   "radix_eviction_policy",
+   "tokenizer_path",
+   "weight_version"
+  ],
+  "has_version_detect": true
+ },
+ {
+  "component": "sillytavern",
+  "vendor": "sillytavern",
+  "product": null,
+  "rule_file": "sillytavern.yaml",
+  "display": "sillytavern",
+  "probes": [
+   {
+    "path": "/manifest.json",
+    "method": "GET",
+    "kind": "fp"
+   },
+   {
+    "path": "/version",
+    "method": "GET",
+    "kind": "fp",
+    "matchers": [
+     {
+      "type": "body",
+      "value": [
+       "SillyTavern"
+      ],
+      "negative": false
+     }
+    ]
+   }
+  ],
+  "keywords": [
+   "SillyTavern"
+  ],
+  "has_version_detect": false
+ },
+ {
+  "component": "sub2api",
+  "vendor": "wei-shaw",
+  "product": null,
+  "rule_file": "sub2api.yaml",
+  "display": "sub2api",
+  "probes": [
+   {
+    "path": "/",
+    "method": "GET",
+    "kind": "fp",
+    "matchers": [
+     {
+      "type": "body",
+      "value": [
+       "<title>Sub2API - AI API Gateway</title>"
+      ],
+      "negative": false
+     }
+    ]
+   },
+   {
+    "path": "/setup/status",
+    "method": "GET",
+    "kind": "fp"
+   },
+   {
+    "path": "/api/v1/settings/public",
+    "method": "GET",
+    "kind": "fp"
+   },
+   {
+    "path": "/api/v1/settings/public",
+    "method": "GET",
+    "kind": "ver",
+    "version_regex": "\"version\":\\s*\"([^\"]+)\"",
+    "version_group": 1,
+    "version_part": "body"
+   }
+  ],
+  "keywords": [
+   "<title>Sub2API - AI API Gateway</title>"
+  ],
+  "has_version_detect": true
+ },
+ {
+  "component": "suna",
+  "vendor": "kortix-ai",
+  "product": null,
+  "rule_file": "suna.yaml",
+  "display": "Suna",
+  "probes": [
+   {
+    "path": "/",
+    "method": "GET",
+    "kind": "fp",
+    "matchers": [
+     {
+      "type": "body",
+      "value": [
+       "__KORTIX_RUNTIME_CONFIG"
+      ],
+      "negative": false
+     }
+    ]
+   },
+   {
+    "path": "/health",
+    "method": "GET",
+    "kind": "ver",
+    "version_regex": "\"version\":\"([0-9]+\\.[0-9]+\\.[0-9]+)\"",
+    "version_group": 1,
+    "version_part": "body"
+   }
+  ],
+  "keywords": [
+   "__KORTIX_RUNTIME_CONFIG"
+  ],
+  "has_version_detect": true
+ },
+ {
+  "component": "superagi",
+  "vendor": "transformeroptimus",
+  "product": null,
+  "rule_file": "superagi.yaml",
+  "display": "superagi",
+  "probes": [
+   {
+    "path": "/",
+    "method": "GET",
+    "kind": "fp",
+    "matchers": [
+     {
+      "type": "body",
+      "value": [
+       "<title>SuperAGI</title>"
+      ],
+      "negative": false
+     },
+     {
+      "type": "body",
+      "value": [
+       "/_next/"
+      ],
+      "negative": false
+     }
+    ]
+   }
+  ],
+  "keywords": [
+   "/_next/",
+   "<title>SuperAGI</title>"
+  ],
+  "has_version_detect": false
+ },
+ {
+  "component": "tabbyapi",
+  "vendor": "theroyallab",
+  "product": null,
+  "rule_file": "tabbyapi.yaml",
+  "display": "tabbyapi",
+  "probes": [
+   {
+    "path": "/.well-known/serviceinfo",
+    "method": "GET",
+    "kind": "fp"
+   }
+  ],
+  "keywords": [],
+  "has_version_detect": false
+ },
+ {
+  "component": "tensorboard",
+  "vendor": "tensorboard",
+  "product": null,
+  "rule_file": "tensorboard.yaml",
+  "display": "tensorboard",
+  "probes": [
+   {
+    "path": "/",
+    "method": "GET",
+    "kind": "fp",
+    "matchers": [
+     {
+      "type": "body",
+      "value": [
+       "title>TensorBoard</title"
+      ],
+      "negative": false
+     }
+    ]
+   }
+  ],
+  "keywords": [
+   "title>TensorBoard</title"
+  ],
+  "has_version_detect": false
+ },
+ {
+  "component": "tensorrt-llm",
+  "vendor": "nvidia",
+  "product": null,
+  "rule_file": "tensorrt-llm.yaml",
+  "display": "tensorrt-llm",
+  "probes": [
+   {
+    "path": "/metrics",
+    "method": "GET",
+    "kind": "fp",
+    "matchers": [
+     {
+      "type": "body",
+      "value": [
+       "inflightBatchingStats"
+      ],
+      "negative": false
+     },
+     {
+      "type": "body",
+      "value": [
+       "kvCacheStats"
+      ],
+      "negative": false
+     }
+    ]
+   },
+   {
+    "path": "/health_generate",
+    "method": "GET",
+    "kind": "fp",
+    "matchers": [
+     {
+      "type": "body",
+      "value": [
+       "Generation health check OK"
+      ],
+      "negative": false
+     }
+    ]
+   },
+   {
+    "path": "/v1/models",
+    "method": "GET",
+    "kind": "fp"
+   }
+  ],
+  "keywords": [
+   "Generation health check OK",
+   "inflightBatchingStats",
+   "kvCacheStats"
+  ],
+  "has_version_detect": false
+ },
+ {
+  "component": "tensorzero",
+  "vendor": "tensorzero",
+  "product": null,
+  "rule_file": "tensorzero.yaml",
+  "display": "tensorzero",
+  "probes": [
+   {
+    "path": "/metrics",
+    "method": "GET",
+    "kind": "fp",
+    "matchers": [
+     {
+      "type": "body",
+      "value": [
+       "tensorzero_inferences_total"
+      ],
+      "negative": false
+     }
+    ]
+   }
+  ],
+  "keywords": [
+   "tensorzero_inferences_total"
+  ],
+  "has_version_detect": false
+ },
+ {
+  "component": "text-generation-webui",
+  "vendor": "oobabooga",
+  "product": null,
+  "rule_file": "text-generation-webui.yaml",
+  "display": "text-generation-webui",
+  "probes": [
+   {
+    "path": "/",
+    "method": "GET",
+    "kind": "fp",
+    "matchers": [
+     {
+      "type": "body",
+      "value": [
+       "gradio_config"
+      ],
+      "negative": false
+     },
+     {
+      "type": "body",
+      "value": [
+       "gradio_config"
+      ],
+      "negative": false
+     }
+    ]
+   }
+  ],
+  "keywords": [
+   "gradio_config"
+  ],
+  "has_version_detect": false
+ },
+ {
+  "component": "together-ai",
+  "vendor": "together",
+  "product": null,
+  "rule_file": "together-ai.yaml",
+  "display": "together-ai",
+  "probes": [
+   {
+    "path": "/v1/hardware",
+    "method": "GET",
+    "kind": "fp",
+    "matchers": [
+     {
+      "type": "body",
+      "value": [
+       "You can find your API key at https://api.together.xyz"
+      ],
+      "negative": false
+     }
+    ]
+   }
+  ],
+  "keywords": [
+   "You can find your API key at https://api.together.xyz"
+  ],
+  "has_version_detect": false
+ },
+ {
+  "component": "trek",
+  "vendor": "liketrek",
+  "product": null,
+  "rule_file": "trek.yaml",
+  "display": "TREK",
+  "probes": [
+   {
+    "path": "/",
+    "method": "GET",
+    "kind": "fp",
+    "matchers": [
+     {
+      "type": "body",
+      "value": [
+       "<title>TREK</title>"
+      ],
+      "negative": false
+     },
+     {
+      "type": "body",
+      "value": [
+       "theme-boot.js"
+      ],
+      "negative": false
+     }
+    ]
+   }
+  ],
+  "keywords": [
+   "<title>TREK</title>",
+   "theme-boot.js"
+  ],
+  "has_version_detect": false
+ },
+ {
+  "component": "trigger.dev",
+  "vendor": "triggerdotdev",
+  "product": null,
+  "rule_file": "trigger.dev.yaml",
+  "display": "Trigger.dev",
+  "probes": [
+   {
+    "path": "/",
+    "method": "GET",
+    "kind": "fp",
+    "matchers": [
+     {
+      "type": "body",
+      "value": [
+       "Login to Trigger.dev"
+      ],
+      "negative": false
+     }
+    ]
+   }
+  ],
+  "keywords": [
+   "Login to Trigger.dev"
+  ],
+  "has_version_detect": false
+ },
+ {
+  "component": "triton",
+  "vendor": "NVIDIA",
+  "product": null,
+  "rule_file": "triton.yaml",
+  "display": "triton-inference-server",
+  "probes": [
+   {
+    "path": "/v2",
+    "method": "GET",
+    "kind": "fp"
+   }
+  ],
+  "keywords": [],
+  "has_version_detect": false
+ },
+ {
+  "component": "upsonic",
+  "vendor": "upsonic",
+  "product": null,
+  "rule_file": "upsonic.yaml",
+  "display": "upsonic",
+  "probes": [
+   {
+    "path": "/",
+    "method": "GET",
+    "kind": "fp",
+    "matchers": [
+     {
+      "type": "body",
+      "value": [
+       "<title>Upsonic</title>"
+      ],
+      "negative": false
+     }
+    ]
+   }
+  ],
+  "keywords": [
+   "<title>Upsonic</title>"
+  ],
+  "has_version_detect": false
+ },
+ {
+  "component": "vertex-ai",
+  "vendor": "google",
+  "product": null,
+  "rule_file": "vertex-ai.yaml",
+  "display": "vertex-ai",
+  "probes": [
+   {
+    "path": "/$discovery/rest",
+    "method": "GET",
+    "kind": "fp"
+   }
+  ],
+  "keywords": [],
+  "has_version_detect": false
+ },
+ {
+  "component": "vllm",
+  "vendor": "vllm-project",
+  "product": null,
+  "rule_file": "vllm.yaml",
+  "display": "vllm",
+  "probes": [
+   {
+    "path": "/v1/models",
+    "method": "GET",
+    "kind": "fp"
+   },
+   {
+    "path": "/version",
+    "method": "GET",
+    "kind": "ver",
+    "version_regex": "^\\{\"version\":\"(\\d+\\.\\d+\\.\\d+)",
+    "version_group": 1,
+    "version_part": "body"
+   }
+  ],
+  "keywords": [],
+  "has_version_detect": true
+ },
+ {
+  "component": "weaviate",
+  "vendor": "weaviate",
+  "product": null,
+  "rule_file": "weaviate.yaml",
+  "display": "weaviate",
+  "probes": [
+   {
+    "path": "/v1/meta",
+    "method": "GET",
+    "kind": "fp"
+   },
+   {
+    "path": "/v1/meta",
+    "method": "GET",
+    "kind": "ver",
+    "version_regex": "\"version\":\"(\\d+\\.\\d+\\.?\\d+?)\"",
+    "version_group": 1,
+    "version_part": "body"
+   }
+  ],
+  "keywords": [],
+  "has_version_detect": true
+ },
+ {
+  "component": "weknora",
+  "vendor": "tencent",
+  "product": null,
+  "rule_file": "weknora.yaml",
+  "display": "weknora",
+  "probes": [
+   {
+    "path": "/",
+    "method": "GET",
+    "kind": "fp",
+    "matchers": [
+     {
+      "type": "body",
+      "value": [
+       "<title>WeKnora</title>"
+      ],
+      "negative": false
+     }
+    ]
+   }
+  ],
+  "keywords": [
+   "<title>WeKnora</title>"
+  ],
+  "has_version_detect": false
+ },
+ {
+  "component": "xinference",
+  "vendor": "xorbitsai",
+  "product": null,
+  "rule_file": "xinference.yaml",
+  "display": "Xinference",
+  "probes": [
+   {
+    "path": "/ui/",
+    "method": "GET",
+    "kind": "fp",
+    "matchers": [
+     {
+      "type": "body",
+      "value": [
+       "<title>Xinference</title>"
+      ],
+      "negative": false
+     }
+    ]
+   },
+   {
+    "path": "/v1/cluster/version",
+    "method": "GET",
+    "kind": "ver",
+    "version_regex": "\"version\":\"(.*?)\"}",
+    "version_group": 1,
+    "version_part": "body"
+   }
+  ],
+  "keywords": [
+   "<title>Xinference</title>"
+  ],
+  "has_version_detect": true
+ },
+ {
+  "component": "comfyui-comfy-mtb",
+  "vendor": "comfyui",
+  "product": null,
+  "rule_file": "comfyui/comfyui-comfy-mtb.yaml",
+  "display": "comfy_mtb",
+  "probes": [
+   {
+    "path": "/extensions",
+    "method": "GET",
+    "kind": "fp",
+    "matchers": [
+     {
+      "type": "body",
+      "value": [
+       "extensions/comfy_mtb/"
+      ],
+      "negative": false
+     }
+    ]
+   }
+  ],
+  "keywords": [
+   "extensions/comfy_mtb/"
+  ],
+  "has_version_detect": false
+ },
+ {
+  "component": "comfyui-custom-preview",
+  "vendor": "comfyui",
+  "product": null,
+  "rule_file": "comfyui/comfyui-custom-preview.yaml",
+  "display": "ComfyUI-Prompt-Preview",
+  "probes": [
+   {
+    "path": "/extensions",
+    "method": "GET",
+    "kind": "fp",
+    "matchers": [
+     {
+      "type": "body",
+      "value": [
+       "extensions/ComfyUI-Prompt-Preview/js"
+      ],
+      "negative": false
+     }
+    ]
+   }
+  ],
+  "keywords": [
+   "extensions/ComfyUI-Prompt-Preview/js"
+  ],
+  "has_version_detect": false
+ },
+ {
+  "component": "comfyui-custom-scripts",
+  "vendor": "comfyui",
+  "product": null,
+  "rule_file": "comfyui/comfyui-custom-scripts.yaml",
+  "display": "ComfyUI-Custom-Scripts",
+  "probes": [
+   {
+    "path": "/extensions",
+    "method": "GET",
+    "kind": "fp",
+    "matchers": [
+     {
+      "type": "body",
+      "value": [
+       "extensions/ComfyUI-Custom-Scripts/js"
+      ],
+      "negative": false
+     }
+    ]
+   }
+  ],
+  "keywords": [
+   "extensions/ComfyUI-Custom-Scripts/js"
+  ],
+  "has_version_detect": false
+ },
+ {
+  "component": "comfyui",
+  "vendor": "comfyui",
+  "product": null,
+  "rule_file": "comfyui/comfyui.yaml",
+  "display": "comfyui",
+  "probes": [
+   {
+    "path": "/",
+    "method": "GET",
+    "kind": "fp",
+    "matchers": [
+     {
+      "type": "body",
+      "value": [
+       "<title>ComfyUI</title>"
+      ],
+      "negative": false
+     }
+    ]
+   },
+   {
+    "path": "/system_stats",
+    "method": "GET",
+    "kind": "ver",
+    "version_regex": "\"comfyui_version\":\\s?\"(.*?)\"",
+    "version_group": 1,
+    "version_part": "body"
+   }
+  ],
+  "keywords": [
+   "<title>ComfyUI</title>"
+  ],
+  "has_version_detect": true
+ }
+]

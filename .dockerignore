@@ -1,0 +1,32 @@
+# 镜像只需要 src / vendor/src / config / docker / requirements.lock。
+# 其余全是本地调试残留（CTF 练习题、评测日志、虚拟环境），
+# 不排掉会让 build context 从 30MB 涨到几百 MB，每次 build 白传一遍。
+.git
+.venv
+__pycache__
+*.pyc
+.pytest_cache
+strix_runs
+reports
+docs
+tests
+*.tar.gz
+*.log
+*.json.bak
+cands.json
+recon*
+# ⚠️ 不要写 `ctf_*`：`config/ctf_goal.txt` 和 `config/ctf_goal_engagement.txt`
+# 正好命中，镜像里就没有 goal 文件，agent 只能吃内置兜底文案。要排的是
+# 仓库根上的调试残留，用具体名字。
+ctf_recon.md
+ctf_notes.md
+js*
+*.html
+*.py
+!src/**/*.py
+!vendor/**/*.py
+!docker/*.sh
+!config/*
+.env
+.env.*
+!env.example

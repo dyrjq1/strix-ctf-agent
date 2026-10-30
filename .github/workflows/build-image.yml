@@ -1,0 +1,92 @@
+name: build-image
+
+# 为什么在 CI 里构建：本地（国内网络）到 deb.debian.org 和 pypi.org 都是几分钟起步，
+# 一次 build 十几分钟还可能超时；GitHub runner 在境外，官方源反而最快。
+# 构建完直接推 ghcr.io，平台那边填的就是这个地址。
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "镜像 tag"
+        required: false
+        default: "1.0.0"
+  push:
+    branches: [main]
+    tags: ["v*"]
+
+env:
+  IMAGE: ghcr.io/${{ github.repository_owner }}/strix-ctf-agent
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write        # 推 ghcr 必需
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: 登录 ghcr
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 构建并推送（只出 amd64）
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile
+          # 平台 worker 是 amd64；不指定 platforms 时 buildx 默认就是宿主架构，
+          # 这里显式写死，避免以后 runner 换成 arm 时静默产出拉不动的镜像。
+          platforms: linux/amd64
+          push: true
+          tags: |
+            ${{ env.IMAGE }}:${{ inputs.tag || '1.0.0' }}
+            ${{ env.IMAGE }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # 平台的两条 blocking 判据（did_not_start / no_result_file）在 CI 里先过一遍。
+      # 构建成功 ≠ conformance 通过，这一步才是真正的门。
+      - name: conformance 自检（无 task.json）
+        run: |
+          set -eux
+          mkdir -p /tmp/w1 && rm -rf /tmp/w1/*
+          docker run --rm -w /ctfy/work -e CTFY_WORK_DIR=/ctfy/work \
+            -v /tmp/w1:/ctfy/work "${{ env.IMAGE }}:${{ inputs.tag || '1.0.0' }}"
+          test -s /tmp/w1/result.json
+          python3 -c "import json;d=json.load(open('/tmp/w1/result.json'));print(d)"
+
+      - name: conformance 自检（dry_run + 自定义 result 路径）
+        run: |
+          set -eux
+          mkdir -p /tmp/w2/out && rm -rf /tmp/w2/out/*
+          cat > /tmp/w2/task.json <<'JSON'
+          {"schema_version": 2, "dry_run": true, "run_mode": "instance",
+           "challenge": {"name": "smoke"}, "scope": [],
+           "result": {"path": "out/result.json"}}
+          JSON
+          docker run --rm -w /ctfy/work -e CTFY_WORK_DIR=/ctfy/work \
+            -v /tmp/w2:/ctfy/work "${{ env.IMAGE }}:${{ inputs.tag || '1.0.0' }}"
+          test -s /tmp/w2/out/result.json
+          python3 -c "import json;d=json.load(open('/tmp/w2/out/result.json'));assert d.get('schema_version')==2;print(d.get('stop_reason'))"
+
+      - name: 摘要
+        run: |
+          {
+            echo "### 镜像已推送"
+            echo ""
+            echo '```'
+            echo "${{ env.IMAGE }}:${{ inputs.tag || '1.0.0' }}"
+            echo "digest: ${{ steps.build.outputs.digest }}"
+            echo '```'
+            echo ""
+            echo "提交到 CTFY 时填上面那行地址。"
+          } >> "$GITHUB_STEP_SUMMARY"

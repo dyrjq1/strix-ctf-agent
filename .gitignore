@@ -1,0 +1,17 @@
+﻿# 运行期产物：不进版本库
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+strix_runs/
+.strix/
+
+# 跑批产物与取证
+results*.jsonl
+run*.log
+logs/
+
+# 本地凭据（键只能来自环境变量）
+.env
+.env.local
+*.key

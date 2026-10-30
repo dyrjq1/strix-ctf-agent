@@ -1,0 +1,5 @@
+strix-ctf-agent 1.0
+构建日期：2026-10-29
+基线：strix 1.7.0（Apache-2.0，vendored 未改）
+回归测试：63 条
+评测：TPCTF 2026 SAMPLE 套题 11/11 可测题通过
