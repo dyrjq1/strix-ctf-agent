@@ -209,12 +209,19 @@ async def main() -> int:
         from ctf_strix.aisec import aig_probe
         from ctf_strix.aisec import tools as aisec_tools
 
-        if aig_probe.data_dir():
+        # 默认不注册。理由：旧总账里 "aisec 收益验证" 一栏的结论是
+        # "本批全是传统 CTF 题，AI 组件指纹没用上"；而这 3 个工具 schema
+        # 会常驻每次调用的 prompt。CTF 里 20 次调用 × ~500 token 不值。
+        # 需要时 CTF_AISEC=1 打开。
+        enabled = os.environ.get("CTF_AISEC", "").strip() in ("1", "true", "yes")
+        if enabled and aig_probe.data_dir():
             registered = aisec_tools.register()
             print(f"[aisec] registered {len(registered)} tools: {', '.join(registered)}")
             print(f"[aisec] rules={aig_probe.data_dir()} allow={os.environ.get('CTF_AISEC_ALLOW', '(none)')}")
-        else:
+        elif enabled:
             print("[aisec] rules missing, AI-security tools NOT registered")
+        else:
+            print("[aisec] disabled by default (set CTF_AISEC=1 to enable)")
     except Exception as e:  # noqa: BLE001 — 增强能力失败不能让整题跑不动
         print(f"[aisec] registration failed: {type(e).__name__}: {e}")
 

@@ -215,6 +215,11 @@ async def method_sweep(
     Returns:
         命中的组合（状态码 + 方法 + 路径 + 长度 + body 片段），按信息量排序；
         404 全部省略，405 只在带 Allow 头时保留。末尾给下一步建议。
+
+    Note:
+        默认方法里**不含 DELETE**：PortSwigger 的方法测试指引明确要求"打低价值
+        对象，避免产生副作用"。本题靶机可能是共享资源，用 DELETE 扫一遍等于
+        在别人的题上删数据。确需 DELETE 时手工单独发。
     """
     base_url = (base_url or "").strip()
     raw = [u.strip() for u in re.split(r"[\s,]+", urls or "") if u.strip()]
@@ -313,6 +318,17 @@ async def method_sweep(
         )
     if len(kept) > len(shown):
         lines.append(f"…另有 {len(kept) - len(shown)} 条省略")
+
+    # PortSwigger 的 API 测试方法论里，"识别支持的方法"之后的下一步就是
+    # "识别支持的内容类型"——同一个端点换成 form/xml 往往走不同的解析分支，
+    # XML 分支常直接通向 XXE。这一步不自动做（请求量翻三倍），但必须提示。
+    body_methods = [r for r in kept if str(r.get("method")) in ("POST", "PUT", "PATCH")]
+    if body_methods:
+        lines.append(
+            "next: 这些带 body 的端点也值得换 Content-Type 再试一次："
+            "application/json / application/x-www-form-urlencoded / application/xml"
+            "（XML 分支常能撬出 XXE）。"
+        )
 
     has_param_hint = any(
         "required" in str(r.get("body", "")).lower() or int(r["status"]) in (400, 422) for r in kept
