@@ -264,6 +264,46 @@ def api(token: str) -> requests.Session:
     return s
 
 
+def fetch_json(
+    s: requests.Session,
+    url: str,
+    *,
+    params: dict | None = None,
+    attempts: int = 5,
+    timeout: int = 60,
+):
+    """GET 一个 JSON，遇到 429/5xx/非 JSON 就退避重试。
+
+    为什么必须重试：2026-10-30 16:05 平台返回 503 的 HTML，``resp.json()``
+    直接抛 JSONDecodeError，把 SECQA 从 70/210 打断——**一道题都没交错，
+    但整个 suite 停了**。这类失败是平台侧抖动，不是我们的逻辑问题。
+
+    Args:
+        s: 带 token 的会话。
+        url: 完整地址。
+        params: 查询参数。
+        attempts: 最多尝试次数。
+        timeout: 单次超时（秒）。
+
+    Returns:
+        解析后的 JSON。
+
+    Raises:
+        RuntimeError: 重试用尽仍拿不到 JSON。
+    """
+    last: object = None
+    for i in range(max(1, attempts)):
+        try:
+            r = s.get(url, params=params, timeout=timeout)
+            if r.status_code in (429, 500, 502, 503, 504):
+                raise RuntimeError(f"HTTP {r.status_code}")
+            return r.json()
+        except (requests.RequestException, ValueError, RuntimeError) as exc:
+            last = exc
+            time.sleep(min(30, 2 * (i + 1)))
+    raise RuntimeError(f"取 {url} 失败：{last}")
+
+
 def register_solo(s: requests.Session, competition_id: str) -> int:
     """加入一个 suite（``POST /competitions/{id}/teams {"mode":"solo"}``）。"""
     r = s.post(f"{PLATFORM}/api/v1/competitions/{competition_id}/teams", json={"mode": "solo"}, timeout=60)
@@ -335,9 +375,7 @@ def main(argv: list[str] | None = None) -> int:
         code = register_solo(s, comp)
         print(f"[register] {args.suite} -> HTTP {code}")
 
-    r = s.get(f"{PLATFORM}/api/v1/qa/challenges", params={"competition_id": comp}, timeout=60)
-    r.raise_for_status()
-    items = r.json()
+    items = fetch_json(s, f"{PLATFORM}/api/v1/qa/challenges", params={"competition_id": comp})
     out = Path(args.out).expanduser()
     done = load_done(out)
     todo = [c for c in items if c["id"] not in done]
@@ -375,12 +413,26 @@ def main(argv: list[str] | None = None) -> int:
         if not args.submit:
             print(f"  {c['id']} -> {choice}  votes={votes}")
         elif choice and agree >= args.min_agree:
-            resp = s.post(
-                f"{PLATFORM}/api/v1/qa/submissions",
-                json={"challenge_id": c["id"], "competition_id": comp, "question_id": "answer", "answer": choice},
-                timeout=60,
-            )
-            body = resp.json() if resp.content else {}
+            body = None
+            for attempt in range(3):
+                resp = s.post(
+                    f"{PLATFORM}/api/v1/qa/submissions",
+                    json={"challenge_id": c["id"], "competition_id": comp, "question_id": "answer", "answer": choice},
+                    timeout=60,
+                )
+                try:
+                    body = resp.json() if resp.content else {}
+                    break
+                except ValueError:
+                    # 503 的 HTML 页面。重发一次是安全的：判分是幂等的，
+                    # 同答案重复提交不会额外扣机会。
+                    time.sleep(3 * (attempt + 1))
+            if body is None:
+                rec["skipped"] = "submit_unavailable"
+                print(f"  {c['id']} -> {choice} 提交失败（平台非 JSON）")
+                with out.open("a", encoding="utf-8") as fh:
+                    fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+                continue
             rec.update(
                 submitted=True,
                 status=resp.status_code,
