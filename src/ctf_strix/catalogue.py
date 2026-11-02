@@ -225,7 +225,10 @@ def for_kind(
         for info in CATALOGUE
         if info.applies(kind)
         and (groups is None or info.group in groups)
-        and (names is None or info.name in names)
+        # ``base`` tools are vendor built-ins: they live in the factory's base
+        # set, never in the extendable registry, so a name check against that
+        # registry would silently drop ``exec_command`` from the prompt.
+        and (names is None or info.group == "base" or info.name in names)
     ]
 
 
@@ -258,6 +261,10 @@ def prompt_block(
     return "\n".join(lines)
 
 
-def registered_names(kind: str, groups: tuple[str, ...] | None = None) -> set[str]:
+def registered_names(
+    kind: str,
+    groups: tuple[str, ...] | None = None,
+    names: frozenset[str] | set[str] | None = None,
+) -> set[str]:
     """Names the prompt will promise for ``kind``; used by the wiring tests."""
-    return {info.name for info in for_kind(kind, groups)}
+    return {info.name for info in for_kind(kind, groups, names)}

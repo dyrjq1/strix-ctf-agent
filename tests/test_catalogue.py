@@ -141,3 +141,22 @@ def test_activate_defaults_to_web_so_unit_tests_keep_working():
 
     prompt.activate("")
     assert prompt.active()[0] == "web"
+
+def test_name_filter_never_drops_vendor_base_tools():
+    """``exec_command`` is a vendor base tool, not an extra one.
+
+    Filtering the Tools section by "names measured in ``_EXTRA_TOOLS``" dropped
+    the shell from the prompt during this change's own smoke test: base tools
+    are registered in a different list.  A prompt without ``exec_command`` is
+    worse than one with an extra line.
+    """
+    from ctf_strix import catalogue
+
+    measured = {"http_probe", "route_map", "method_sweep", "path_variants"}
+    names = catalogue.registered_names("web", None, measured)
+    assert {"exec_command", "load_skill", "think"} <= names
+    assert "http_probe" in names
+
+    empty = catalogue.registered_names("web", None, frozenset())
+    assert {"exec_command", "load_skill", "think"} <= empty
+    assert "http_probe" not in empty

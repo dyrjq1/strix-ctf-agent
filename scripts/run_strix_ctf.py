@@ -340,7 +340,19 @@ async def main() -> int:
         from ctf_strix import context as ctf_context
         from ctf_strix import prompt as ctf_prompt
 
-        ctf_prompt.activate(args.target_kind, tuple(groups))
+        # Filter by measured tool names, not by group: one installer can fail
+        # halfway through its group, and a promised tool that cannot be called
+        # is exactly the drift this change exists to remove.  Same rule as the
+        # official entrypoint (agent.registered_names).
+        present: frozenset[str] = frozenset()
+        try:
+            from strix.agents import factory
+
+            present = frozenset(getattr(tool, "name", "") for tool in factory.registered_agent_tools())
+        except Exception as e:  # noqa: BLE001
+            print(f"[ctx] registry probe failed: {type(e).__name__}: {e}")
+
+        ctf_prompt.activate(args.target_kind, tuple(groups), present)
         ctf_prompt.install()
         capper = ctf_context.install()
         print(
