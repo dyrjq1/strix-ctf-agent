@@ -1,0 +1,6 @@
+[
+ {"id": "CTFARENA-074", "difficulty": "hard", "model": "openai/GLM-5.3-EV"},
+ {"id": "CTFARENA-074", "difficulty": "hard", "model": "openai/DeepSeek-V4.1-Flash"},
+ {"id": "CTFARENA-095", "difficulty": "hard", "model": "openai/DeepSeek-V4.1-Flash"},
+ {"id": "CTFARENA-095", "difficulty": "hard", "model": "openai/GLM-5.3-EV"}
+]

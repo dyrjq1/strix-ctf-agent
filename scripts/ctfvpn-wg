@@ -1,0 +1,22 @@
+#!/bin/bash
+# 把 stdin 上的 WireGuard 配置交给本机 wg 接口。
+#
+# 为什么需要这层包装：Ubuntu 的 /etc/apparmor.d/wg 只允许 wg 读
+# /etc/wireguard/**，且不给 dac_override。于是 `wg setconf <if> /tmp/x.wg`
+# 即使在 root 下也是 `fopen: Permission denied`（dmesg 里是
+# apparmor="DENIED" profile="wg"）。这里把配置落到 profile 明确放行的
+# /etc/wireguard/，设 0600 root:root，setconf 完立刻删掉——私钥不落盘留存。
+#
+# 用法：ctfvpn-wg <iface>        # 配置从 stdin 读
+set -euo pipefail
+iface="${1:?usage: ctfvpn-wg <iface>}"
+case "$iface" in
+  *[!A-Za-z0-9_-]*|"") echo "bad iface: $iface" >&2; exit 2 ;;
+esac
+conf="/etc/wireguard/${iface}.conf"
+umask 077
+cat > "$conf"
+chown root:root "$conf"
+chmod 600 "$conf"
+trap 'rm -f "$conf"' EXIT
+wg setconf "$iface" "$conf"

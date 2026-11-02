@@ -14,7 +14,9 @@
 | N4 | Anthropic, Writing effective tools for agents（2025） | 工具返回要携带可判断的信号，不是原始日志 | 入口动作必须直接给出下一步 |
 
 结论：非 web 只做一个入口原语 + 本地解题循环，不铺开十个工具。
-本赛 115 题全 web；非 web 的现实目标是平台另外 9 道动手题（SAMPLE-*）。
+练习赛 CTFARENA 115 题全 web；但**正式赛不是全 web**——QA#26 明确智能体赛道
+解题赛制六类全含，QA#31 只把 11-22 决赛限定为 Web/Pwn/AI。因此非 web 不是"只做 SAMPLE"：
+Crypto/RE/Misc 要在 11-14/15 入围与初赛保底，Pwn 是初赛与决赛都考的重点。
 
 ## 2. 本次装了什么（VM，2026-10-30 15:40 UTC）
 

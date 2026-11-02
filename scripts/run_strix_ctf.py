@@ -115,6 +115,13 @@ async def main() -> int:
     from ctf_strix.usage_meter import install as install_usage_meter
     from ctf_strix.usage_meter import snapshot as usage_snapshot
 
+    # 把快照路径也写进子进程环境，让 usage_meter 每次调用后原子落盘：
+    # batch_eval 已经在父进程侧 export 了 CTF_USAGE_PATH，但直接跑
+    # `run_strix_ctf.py`（调试/单题）时没有，这里补一个默认值。
+    import os as _os
+
+    if not _os.environ.get("CTF_USAGE_PATH"):
+        _os.environ["CTF_USAGE_PATH"] = str(_os.path.join(_os.getcwd(), "usage.json"))
     install_usage_meter()
 
     # ⚠️ 必须在任何 guard install() 之前。三个守卫都是替换
@@ -144,9 +151,22 @@ async def main() -> int:
     # 收工守卫：finish_scan 没有 flag 就拒绝。CTFARENA-013 只用了 260s/780s
     # 预算就收工，已注入成功却没去读 flag 文件——这是唯一能挡住它的手段。
     from ctf_strix.finish_guard import install as install_finish_guard
+    from ctf_strix.sweep_guard import SWEEP_HARD, SWEEP_WARN
 
     finisher = install_finish_guard()
     print("[guard] finish guard installed (refuses flagless finish_scan, max 3)")
+
+    # 单次调用内部的扫描守卫。`enum_guard` 按**调用**去重，对"把几万个候选
+    # 塞进一条 exec_command 的 Python 循环"完全无能为力——CTFARENA-050 实测
+    # 打了约 36,000 次路径变体，枚举守卫计数为 0，577 秒后失败。
+    # 这个模块 2026-10-31 就写好了判定逻辑，但一直没有 install()，等于没装。
+    from ctf_strix.sweep_guard import install as install_sweep_guard
+
+    sweeper = install_sweep_guard()
+    print(
+        f"[guard] sweep guard installed "
+        f"(warn>={SWEEP_WARN} distinct values in one call, hard>={SWEEP_HARD})"
+    )
 
     # 收工时自动提交。顺序很关键：**必须在 finish guard 之后安装**，
     # 因为两者都包 finish_scan.on_invoke_tool，后装的是外层——
@@ -188,7 +208,7 @@ async def main() -> int:
     # 白烧了 1170 秒。宁可启动时打一行 WARNING。
     from ctf_strix.guard_mount import verify_mount
 
-    wired = verify_mount(("_ctf_guarded", "_ctf_journey_guarded"))
+    wired = verify_mount(("_ctf_guarded", "_ctf_journey_guarded", "_ctf_sweep_guarded"))
     print(f"[guard] mount verified={wired} (exec_command reaches guards)")
 
     # Caido 工具必须无条件摘掉：本机没有 caido-cli，这 6 个调用必然报错。
@@ -225,32 +245,22 @@ async def main() -> int:
     except Exception as e:  # noqa: BLE001 — 增强能力失败不能让整题跑不动
         print(f"[aisec] registration failed: {type(e).__name__}: {e}")
 
-    # 结构化 HTTP 原语。装它的理由不是"多一个工具"，而是把
-    # "请求没到达"与"服务器拒绝"拆开：009 第一跑把两者都读成 000，
-    # 于是放弃了唯一可行的入口。
-    try:
-        from ctf_strix import http_probe as http_probe_mod
+    # Structured HTTP + route discovery.  Shared with the official entrypoint
+    # (ctf_strix.agent) so the harness and the submitted image cannot drift
+    # apart again.
+    from ctf_strix.capabilities import install_web_capabilities
 
-        added = http_probe_mod.register()
-        print(f"[http] registered {len(added)} tools: {', '.join(added) or '(already present)'}")
-    except Exception as e:  # noqa: BLE001 — 增强能力失败不能让整题跑不动
-        print(f"[http] registration failed: {type(e).__name__}: {e}")
-
-    # 发现层：从 bundle 提路由 + 对路径换方法。这两个动作是把 009 的
-    # "运气"变成"流程"的关键，装一次就一直在。
-    try:
-        from ctf_strix import discovery
-
-        added = discovery.register()
-        print(f"[discovery] registered {len(added)} tools: {', '.join(added) or '(already present)'}")
-    except Exception as e:  # noqa: BLE001
-        print(f"[discovery] registration failed: {type(e).__name__}: {e}")
+    web_tools, web_errors = install_web_capabilities()
+    for capability, names in web_tools.items():
+        print(f"[{capability}] registered {len(names)} tools: {', '.join(names) or '(already present)'}")
+    for message in web_errors:
+        print(f"[capability] registration failed: {message}")
 
     # 文件类题（rev/pwn/misc/crypto 的附件题）才装入口原语。
     #
     # 只在 target_kind == file 时注册，是因为它会往 system prompt 里多塞一段
     # schema；web 题每一轮都要为这段付 token，收益却是零。
-    if args.target_kind == "file":
+    if args.target_kind in ("file", "tcp"):
         try:
             from ctf_strix import file_triage
 
@@ -258,6 +268,18 @@ async def main() -> int:
             print(f"[file] registered {len(added)} tools: {', '.join(added) or '(already present)'}")
         except Exception as e:  # noqa: BLE001
             print(f"[file] registration failed: {type(e).__name__}: {e}")
+
+        # Same split as the official entrypoint: attachment primitives only on
+        # file challenges, socket primitives only on tcp ones.  Registering both
+        # would put ~2.5k chars of unused schema in front of the model on every
+        # call of the other kind.
+        try:
+            from ctf_strix import nonweb
+
+            added = nonweb.register(kind=args.target_kind)
+            print(f"[nonweb] registered {len(added)} tools: {', '.join(added) or '(already present)'}")
+        except Exception as e:  # noqa: BLE001
+            print(f"[nonweb] registration failed: {type(e).__name__}: {e}")
 
     # CTF 技能包：12 个方向索引，走 strix 自带的 load_skill。
     #
@@ -280,6 +302,22 @@ async def main() -> int:
             print("[skills] pack missing, routing hint NOT installed")
     except Exception as e:  # noqa: BLE001 — 技能装不上也要能把题跑完
         print(f"[skills] registration failed: {type(e).__name__}: {e}")
+
+    # ── 上下文管理（2026-11-01）────────────────────────────────────────────
+    # 与官方入口 ctf_strix.agent 共用同一实现，避免"评测跑的是新提示、
+    # 提交镜像跑的是旧提示"那种测量/实现分裂（capabilities.py 就是为此存在）。
+    try:
+        from ctf_strix import context as ctf_context
+        from ctf_strix import prompt as ctf_prompt
+
+        ctf_prompt.install()
+        capper = ctf_context.install()
+        print(
+            f"[ctx] prompt installed ({len(ctf_prompt.build({}))} chars); "
+            f"content cap={capper.cap_chars} chars/output, {capper.arg_cap} chars/args"
+        )
+    except Exception as e:  # noqa: BLE001 — 失败必须回落到原来的行为
+        print(f"[ctx] install failed: {type(e).__name__}: {e}")
 
     from strix.core.runner import run_strix_scan
 
@@ -435,6 +473,13 @@ async def main() -> int:
         f"[usage] calls={u['llm_calls']} in={u['input_tokens']} "
         f"out={u['output_tokens']} total={u['total_tokens']}"
     )
+    try:
+        from ctf_strix import context as ctf_context
+
+        print(f"[ctx] stats: {ctf_context.stats()}")
+    except Exception as e:  # noqa: BLE001
+        print(f"[ctx] stats unavailable: {type(e).__name__}: {e}")
+
     if deadline is not None:
         snap = deadline.snapshot()
         print(

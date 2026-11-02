@@ -146,7 +146,7 @@ def main() -> int:
         (
             "dry_run",
             {
-                "schema_version": 2,
+                "schema_version": 3,
                 "run_mode": "instance",
                 "challenge": {"id": "CHK-1", "name": "dry", "description": "noop"},
                 "scope": [url],
@@ -160,7 +160,7 @@ def main() -> int:
         (
             "no_scope",
             {
-                "schema_version": 2,
+                "schema_version": 3,
                 "run_mode": "instance",
                 "challenge": {"id": "CHK-2", "name": "noscope", "description": "x"},
                 "scope": [],
@@ -173,7 +173,7 @@ def main() -> int:
         (
             "declared_path",
             {
-                "schema_version": 2,
+                "schema_version": 3,
                 "run_mode": "qa",
                 "challenge": {"id": "CHK-3", "name": "custom", "description": "x"},
                 "scope": [],
@@ -187,7 +187,7 @@ def main() -> int:
         (
             "import_crash",
             {
-                "schema_version": 2,
+                "schema_version": 3,
                 "run_mode": "instance",
                 "challenge": {"id": "CHK-4", "name": "crash", "description": "x"},
                 "scope": [url],
@@ -216,8 +216,8 @@ def main() -> int:
                 extra.append(f"dry run 耗时 {elapsed:.1f}s > {DRY_RUN_EXPECT_S}s")
             if rollup and rollup.get("stop_reason") != "dry_run":
                 extra.append(f"stop_reason={rollup.get('stop_reason')!r} 应为 'dry_run'")
-        if rollup is not None and rollup.get("schema_version") != 2:
-            extra.append(f"schema_version={rollup.get('schema_version')!r} 应为 2")
+        if rollup is not None and rollup.get("schema_version") != 3:
+            extra.append(f"schema_version={rollup.get('schema_version')!r} 应为 3")
 
         ok = not blocking and not extra
         if not ok:

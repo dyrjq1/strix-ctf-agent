@@ -219,8 +219,32 @@ def register(register_fn=None) -> list[str]:
 
     from agents import function_tool
 
-    wrapped = [function_tool(timeout=120)(fn) for fn in TOOLS]
+    wrapped = [function_tool(timeout=120)(_as_async(fn)) for fn in TOOLS]
     fresh = [t for t in wrapped if getattr(t, "name", "") not in existing]
     if fresh:
         register_fn(*fresh)
     return [t.name for t in fresh]
+
+
+def _as_async(func):
+    """Run a blocking helper off the event loop, keeping its signature.
+
+    ⚠️ This is not cosmetic.  ``function_tool(timeout=...)`` rejects *sync*
+    handlers (``ValueError: timeout_seconds is only supported for async
+    @function_tool handlers``), and that error is raised *inside* ``register()``
+    where both entrypoints wrap it in ``try/except`` and print one line.  The
+    result: every attachment challenge ran without ``file_triage`` while the log
+    said only "registration failed".  Same silent-shape as the guard-mount bug.
+
+    ``functools.wraps`` is required because the SDK derives the JSON schema from
+    ``inspect.signature``, which follows ``__wrapped__``; without it the tool
+    would advertise zero parameters and the model could not call it at all.
+    """
+    import asyncio
+    import functools
+
+    @functools.wraps(func)
+    async def runner(*args, **kwargs):
+        return await asyncio.to_thread(func, *args, **kwargs)
+
+    return runner

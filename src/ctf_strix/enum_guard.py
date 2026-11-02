@@ -28,26 +28,15 @@ import re
 from collections import Counter
 from typing import TYPE_CHECKING, Any
 
+from ctf_strix.probe_surface import PROBE_TOOLS
+
 if TYPE_CHECKING:
     from agents import FunctionTool
 
 
-#: 计为"探测目标"的工具。其余（读本地文件、记账）不计入。
-#:
-#: ⚠️ 这份名单必须对着 strix 的真实工具面写。早先写的是
-#: ``("exec_command", "write_stdin", "browser_", "http_request")``——
-#: ``browser_*`` 和 ``http_request`` 在 strix 里**根本不存在**（核对
-#: ``factory._BASE_TOOLS`` 与 ``Shell`` capability 得到的实际名单是
-#: ``exec_command`` / ``write_stdin`` / ``repeat_request`` / ``apply_patch`` /
-#: ``view_image`` 等）。不存在的名字不会报错，只会让守卫永远不匹配，
-#: 属于最难查的一类失效。
-_PROBE_TOOLS = (
-    "exec_command", "write_stdin", "repeat_request",
-    "http_probe", "route_map", "method_sweep",
-)
-#: ``http_probe`` / ``route_map`` / ``method_sweep`` 是 P1/P2 新增的原语。
-#: 不加进这份名单，它们就绕过了
-#: 所有枚举计数——新工具最典型的失效方式不是报错，是"守卫根本不认识它"。
+#: 计为"探测目标"的工具。单一来源在 ``probe_surface``——四个守卫共用同一份
+#: 名单，避免出现"三个名字的副本永远匹配不到 http_probe"那类静默失效。
+_PROBE_TOOLS = PROBE_TOOLS
 
 #: 同一族连续 N 次拿到**完全相同**的响应就警告。计的是"第一次之后的重复次数"：
 #: 2 表示第 3 次同响应。两次可能只是抖动，三次已经能断定这条路没有新信息。
@@ -132,8 +121,58 @@ def _fingerprint(tool_name: str, args: str) -> str | None:
 #: 这不是浪费一次调用的问题——009/018 实测各花 4-6 次调用把 chunk 逐段 cat 出来，
 #: 而 route_map 一次就能给路径表。工具已经给出答案时，旧习惯仍会覆盖它。
 _BUNDLE_RE = re.compile(
-    r"(?:curl|wget)[^\n]*\.js\b|cat[^\n]*\.js\b|read_file[^\n]*\.js|head[^\n]*\.js\b"
+    r"(?:curl|wget)\s[^\n]*?\.js\b"
+    r"|\bcat\s+[^\n;|&>]*?\.js\b"
+    r"|\bread_file\b[^\n]*?\.js\b"
+    r"|\bhead\s[^\n;|&>]*?\.js\b"
 )
+
+#: ``cat >/tmp/x.py``、``cat <<'EOF'`` 这类是**写**文件，不是读 bundle。
+#: 实测（traces/094 第 16 步、traces/096 第 15 步）：脚本正文里出现 ``.js`` 字样
+#: 就会命中 _BUNDLE_RE，BUNDLE GUARD 把"写脚本"误判成"又在读前端产物"。
+_WRITE_REDIRECT_RE = re.compile(r"\b(?:cat|tee)\b[^\n]*?(?:>>?|<<)")
+
+#: head 里逐次变化的只有"耗时"和"字节数"。**不能**把 head 里的所有数字都归一化：
+#: 状态码就在 head 里（``[HTTP 403]`` / ``Process exited with code 1``），
+#: 一起洗掉的话 403 和 500 会变成同一个指纹 —— 那是把真实的状态变化当成重复，
+#: 比原来的漏报更危险（测试 test_different_status_codes_* 锁住这一点）。
+_HEAD_DURATION_RE = re.compile(r"\b\d+(?:\.\d+)?\s*(?:ms|s|seconds?|sec)\b", re.I)
+_HEAD_SIZE_RE = re.compile(r"\b\d+(?:\.\d+)?\s*(?:B|KB|MB|bytes?)\b", re.I)
+
+
+def _norm_head(head: str) -> str:
+    """归一化状态行里逐次变化的部分，保留状态码等语义数字。
+
+    Args:
+        head: 结果的第一行。
+
+    Returns:
+        归一化后的状态行。
+    """
+    out = _HEAD_DURATION_RE.sub("<t>", head)
+    out = _HEAD_SIZE_RE.sub("<n>", out)
+    return re.sub(r"\s+", " ", out).strip()
+
+
+def _is_bundle_read(args: str) -> bool:
+    """判断这次调用是不是在**读**前端 bundle，而不是在写脚本。
+
+    ``cat > /tmp/x.py <<'EOF'`` 和 ``cat <<'EOF'`` 都是写文件；脚本正文里随手
+    出现一个 ``.js`` 就让旧的 _BUNDLE_RE 命中，BUNDLE GUARD 于是对着"写脚本"
+    喊"别再看前端产物了"。两条真实轨迹（094 第 16 步、096 第 15 步）都是这样
+    假阳性的。先剥掉写重定向，再匹配读的模式。
+
+    Args:
+        args: 工具调用的原始参数串。
+
+    Returns:
+        是否是一次 bundle 读取。
+    """
+    if not args:
+        return False
+    stripped = _WRITE_REDIRECT_RE.sub(" ", args)
+    return bool(_BUNDLE_RE.search(stripped))
+
 
 _URL_RE = re.compile(r"https?://[^\s\"'<>|)}\]]+")
 
@@ -164,9 +203,28 @@ def _obs_signature(result: Any, args: str) -> str:
         if len(parts) == 2 and len(parts[1]) > 2:
             text = text.replace("/" + parts[1], "<path>")
     head, _, body = text.partition("\n")
+    # ⚠️ 必须先洗掉逐次随机的"传输层噪声"，否则同一个响应永远算新信息。
+    # 实测（traces/094.json）：16 次 exec_command 的响应指纹 16 个全不同，
+    # 逐个查下去发现差别只有 ``Chunk ID: 6b2fbc`` 和 ``Wall time: 2.5237``
+    # ——hash 就建在这两个随机串上。后果是 ENUMERATION GUARD 与 stall 判据
+    # 在这批题上一次都没触发（只有 BUNDLE GUARD 响了两声），7 道失败题全部
+    # 无干预地烧完预算。洗掉之后同一条轨迹的 16 个指纹收敛成 15 个，
+    # 真正重复的两步（22、23）才显形。
+    noise = (
+        (r"Chunk ID: \S+", "Chunk ID: <id>"),
+        (r"Wall time: [0-9.]+ ?(?:seconds|s)\b", "Wall time: <t>"),
+        (r"/tmp/sandbox-\d+-\d+", "/tmp/sandbox"),
+    )
+    for pattern, repl in noise:
+        text = re.sub(pattern, repl, text)
+    head, _, body = text.partition("\n")
+    # ⚠️ head 也必须归一化。���验（traces/094.json 第 5/6 步）：两次探测的响应体逐字相同，
+    # 只有状态行里的 ``0.11s`` vs ``0.10s`` 不同 —— 守卫因此判成"两个新观测"，
+    # 同一族永远凑不满 3 次，ENUMERATION GUARD 一次都没响。
+    head = _norm_head(head)
     body = re.sub(r"\d+", "#", body.lower())
     body = re.sub(r"\s+", " ", body).strip()
-    payload = head.strip() + "|" + body[:1500]
+    payload = head + "|" + body[:1500]
     return hashlib.sha1(payload.encode("utf-8", "replace")).hexdigest()[:12]
 
 
@@ -232,7 +290,7 @@ class EnumerationGuard:
             提示文本；无需提示时返回 None。
         """
         key, args = token
-        if _BUNDLE_RE.search(args or ""):
+        if _is_bundle_read(args):
             self.bundle_hits += 1
             if self.bundle_hits in (2, 4):
                 return (

@@ -59,6 +59,7 @@ SUITES = {
 }
 _LETTER = re.compile(r"\b([A-D])\b")
 _OPT = re.compile(r"(?:^|\s)([A-D])\)\s*")
+_FINAL = re.compile(r"FINAL\s*:\s*([A-D])\b")
 
 
 def parse_options(desc: str) -> tuple[str, list[tuple[str, str]]]:
@@ -85,7 +86,12 @@ def parse_options(desc: str) -> tuple[str, list[tuple[str, str]]]:
     return stem, opts
 
 
-def build_prompt(stem: str, opts: list[tuple[str, str]], order: list[int]) -> tuple[str, dict[str, str]]:
+def build_prompt(
+    stem: str,
+    opts: list[tuple[str, str]],
+    order: list[int],
+    style: str = "bare",
+) -> tuple[str, dict[str, str]]:
     """按给定顺序渲染选项，返回（提示, 展示字母 → 原始字母）。
 
     Args:
@@ -104,11 +110,24 @@ def build_prompt(stem: str, opts: list[tuple[str, str]], order: list[int]) -> tu
         orig, text = opts[idx]
         mapping[letter] = orig
         lines.append(f"{letter}) {text}")
-    prompt = (
-        "Answer this multiple-choice security question. Reply with ONLY the letter "
-        "(A, B, C or D) of the correct option — no explanation, no punctuation.\n\n"
-        f"Question: {stem}\n\n" + "\n".join(lines)
-    )
+    if style == "reason":
+        # 只在**重试错题**时用。强制"只回一个字母"会让推理模型没有草稿纸；
+        # 放开两三句推理再落一个 FINAL 行，是对同一道题换一种问法，
+        # 而不是把同样的采样再跑一遍（那只会得到同样的错）。
+        prompt = (
+            "You are a senior cybersecurity engineer taking a multiple-choice exam.\n"
+            "Think it through: name the option you believe is right, then check the "
+            "tempting alternative and say why it is worse. Keep it under 120 words.\n"
+            "End with a final line exactly of the form `FINAL: X` where X is one of "
+            "A, B, C, D.\n\n"
+            f"Question: {stem}\n\n" + "\n".join(lines)
+        )
+    else:
+        prompt = (
+            "Answer this multiple-choice security question. Reply with ONLY the letter "
+            "(A, B, C or D) of the correct option — no explanation, no punctuation.\n\n"
+            f"Question: {stem}\n\n" + "\n".join(lines)
+        )
     return prompt, mapping
 
 
@@ -163,14 +182,26 @@ def pick_letter(content: str, reasoning: str = "") -> str | None:
     Returns:
         大写字母；解析不到返回 None。
     """
-    m = _LETTER.search((content or "").upper())
+    body = (content or "").upper()
+    # 带推理的作答以 `FINAL: X` 收尾；取**最后一个**，避免"FINAL"之前的讨论被当成答案。
+    finals = _FINAL.findall(body)
+    if finals:
+        return finals[-1]
+    m = _LETTER.search(body)
     if m:
         return m.group(1)
     hits = _LETTER.findall((reasoning or "").upper())
     return hits[-1] if hits else None
 
 
-def vote(stem: str, opts: list[tuple[str, str]], k: int, temperature: float, seed: int) -> tuple[str | None, list[str]]:
+def vote(
+    stem: str,
+    opts: list[tuple[str, str]],
+    k: int,
+    temperature: float,
+    seed: int,
+    style: str = "bare",
+) -> tuple[str | None, list[str]]:
     """k 次采样，每次打乱选项，按原始字母投票。
 
     Args:
@@ -190,7 +221,7 @@ def vote(stem: str, opts: list[tuple[str, str]], k: int, temperature: float, see
         order = base_order[:]
         if i > 0:
             rng.shuffle(order)
-        prompt, mapping = build_prompt(stem, opts, order)
+        prompt, mapping = build_prompt(stem, opts, order, style=style)
         content, reasoning = ask_llm(prompt, temperature)
         letter = pick_letter(content, reasoning)
         if letter and letter in mapping:
@@ -214,6 +245,7 @@ def adaptive_vote(
     unanimous_need: int = 3,
     majority_need: int = 4,
     commit_split: bool = False,
+    style: str = "bare",
 ) -> tuple[str | None, list[str], str]:
     """自适应采样：一致就直接定，分歧再补票。
 
@@ -235,13 +267,13 @@ def adaptive_vote(
     Returns:
         ``(胜出字母或 None, 全部票, 裁决理由)``。
     """
-    choice, votes = vote(stem, opts, k, temperature, seed)
+    choice, votes = vote(stem, opts, k, temperature, seed, style=style)
     if not votes:
         return None, [], "no_votes"
     top = max(votes.count(v) for v in set(votes))
     if top >= unanimous_need and len(votes) >= k:
         return choice, votes, "unanimous"
-    more_choice, more_votes = vote(stem, opts, extra, temperature, seed + 7919)
+    more_choice, more_votes = vote(stem, opts, extra, temperature, seed + 7919, style=style)
     merged = votes + more_votes
     if not merged:
         return None, [], "no_votes"
@@ -352,6 +384,8 @@ def main(argv: list[str] | None = None) -> int:
                     help="5 票仍分裂时按多数票提交（默认弃权，等于放弃这题的分）")
     ap.add_argument("--retry-skipped", action="store_true",
                     help="只重做以前弃权、且还有提交机会的题")
+    ap.add_argument("--retry-wrong", action="store_true",
+                    help="只重做以前答错、且还有提交机会的题（自动改用带推理的问法）")
     ap.add_argument("--stop-after", type=int, default=25, help="至少交够这么多题后开始检查准确率")
     ap.add_argument("--stop-below", type=float, default=0.6, help="准确率低于此值就停（防域偏移）")
     ap.add_argument("--submit", action="store_true", help="真的提交（默认只算）")
@@ -383,6 +417,17 @@ def main(argv: list[str] | None = None) -> int:
         retry = {r["challenge"] for r in _load_rows(out)
                  if not r.get("submitted") and not r.get("locked")}
         todo = [c for c in items if c["id"] in retry]
+    if args.retry_wrong:
+        rows = _load_rows(out)
+        latest: dict[str, dict] = {}
+        for r in rows:
+            latest[r["challenge"]] = r
+        retry = {
+            cid for cid, r in latest.items()
+            if r.get("submitted") and not r.get("correct") and not r.get("locked")
+            and (r.get("attempts_remaining") or 0) > 0
+        }
+        todo = [c for c in items if c["id"] in retry]
     print(f"[qa] {args.suite}: {len(items)} 题，待做 {len(todo)}，已有结果 {len(done)}")
 
     for c in todo[: args.limit]:
@@ -395,9 +440,14 @@ def main(argv: list[str] | None = None) -> int:
                 stem, opts, args.k, args.k_extra, args.temperature,
                 seed=hash(c["id"]) & 0xFFFF, majority_need=args.extra_min,
                 commit_split=args.commit_split,
+                style="reason" if args.retry_wrong else "bare",
             )
         else:
-            choice, votes = vote(stem, opts, args.k, args.temperature, seed=hash(c["id"]) & 0xFFFF)
+            choice, votes = vote(
+                stem, opts, args.k, args.temperature,
+                seed=hash(c["id"]) & 0xFFFF,
+                style="reason" if args.retry_wrong else "bare",
+            )
             verdict = "manual"
         agree = max((votes.count(v) for v in set(votes)), default=0)
         rec = {

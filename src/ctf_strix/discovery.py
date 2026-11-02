@@ -34,6 +34,7 @@ tail -c 7000 NXz3x3fk.js
 from __future__ import annotations
 
 import re
+import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import Final
 from urllib.parse import urljoin, urlparse
@@ -309,15 +310,36 @@ async def method_sweep(
 
     def probe(pair: tuple[str, str]) -> dict[str, object] | None:
         url, method = pair
-        try:
-            r = requests.request(
-                method, url, timeout=_TIMEOUT, verify=False,
-                allow_redirects=False,
-                headers={"Content-Type": "application/json"} if method in ("POST", "PUT", "PATCH") else {},
-                data=b"{}" if method in ("POST", "PUT", "PATCH") else None,
-            )
-        except Exception as exc:  # noqa: BLE001
-            return {"method": method, "url": url, "status": 0, "note": type(exc).__name__}
+        wants_body = method in ("POST", "PUT", "PATCH")
+        headers = {"Connection": "close"}
+        if wants_body:
+            headers["Content-Type"] = "application/json"
+
+        # 为什么最多试三次、且最后一次不带 body：
+        # 靶机在参数校验失败时常常"不等请求体读完就回包并关连接"，
+        # 客户端还没发完 body 就收到 RST（Windows 10053），
+        # 连已经到达的 400 响应都会一起丢掉。实测 body 型请求约 5% 概率撞上，
+        # 而无 body 请求 0/300 失败。少一个 body 只影响"字段名"这一层信息，
+        # 丢掉整行却等于把"这个路径上有这个方法"删了——后者贵得多。
+        attempts: list[bytes | None] = [b"{}", b"{}", None] if wants_body else [None, None, None]
+        last: Exception | None = None
+        r = None
+        for index, body in enumerate(attempts):
+            try:
+                r = requests.request(
+                    method, url, timeout=_TIMEOUT, verify=False,
+                    allow_redirects=False, headers=headers, data=body,
+                )
+                break
+            except Exception as exc:  # noqa: BLE001
+                last = exc
+                if index + 1 < len(attempts):
+                    time.sleep(0.1 * (index + 1))
+        if r is None:
+            return {
+                "method": method, "url": url, "status": 0,
+                "note": f"{type(last).__name__} after {len(attempts)} tries",
+            }
         allow = r.headers.get("allow", "")
         text = (r.text or "").replace("\n", " ")[:160]
         return {

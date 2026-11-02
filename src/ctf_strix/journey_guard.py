@@ -31,14 +31,15 @@ import re
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
+from ctf_strix.probe_surface import PROBE_TOOLS
+
 if TYPE_CHECKING:
     from agents import FunctionTool
 
 
-#: 计为"与目标交互"的工具。其余（读本地文件、记账）不计入。
-#: 名单与 `enum_guard._PROBE_TOOLS` 保持一致，理由见那里的注释——
-#: `browser_*` / `http_request` 在 strix 里不存在，写了等于没写。
-_PROBE_TOOLS = ("exec_command", "write_stdin", "repeat_request")
+#: 计为"与目标交互"的工具。单一来源见 ``probe_surface``：此前这里是 3 个
+#: 名字的副本，``http_probe`` 等 4 个原语因此从不进入认证墙判定。
+_PROBE_TOOLS = PROBE_TOOLS
 
 #: 表示"这是认证端点"的线索，出现在调用参数里。
 _AUTH_HINT_RE = re.compile(
@@ -170,7 +171,7 @@ class JourneyGuard:
         Returns:
             需要追加的提示文本；不需要干预时返回 None。
         """
-        if not any(tool_name.startswith(p) for p in _PROBE_TOOLS):
+        if tool_name not in _PROBE_TOOLS:
             return None
 
         st = self.state

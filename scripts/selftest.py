@@ -429,7 +429,7 @@ def test_agent_entry() -> None:
     from ctf_strix import agent as entry
 
     section("CTFY 入口")
-    check("入口声明 schema_version=2", entry.BRIEF_SCHEMA_VERSION == 2, "")
+    check("入口声明 schema_version=3", entry.BRIEF_SCHEMA_VERSION == 3, "")
 
     # 入口源码必须装挂载钩子、且验证接线。这两条缺失过一次：
     # agent.py 装了三个守卫，却没有任何 install_mount_hook()，

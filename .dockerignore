@@ -30,3 +30,9 @@ js*
 .env
 .env.*
 !env.example
+
+# 参考材料目录（含 misc-bank 真 flag与 19MB 其他材料）：绝不进镜像
+reference/
+
+traces/
+backup/

@@ -129,6 +129,64 @@ def test_method_sweep_finds_undocumented_post(base_url):
     assert "字段名" in out, "拿到校验错误要直接提示按字段名构造 body"
 
 
+class _NoDrainHandler(BaseHTTPRequestHandler):
+    """靶机常见形状：不读请求体，直接回 400 并关连接。
+
+    客户端还没把 body 发完就收到 RST（Windows 10053），
+    连已经到达的 400 响应也会一起丢掉。实测 body 型请求约 5% 概率撞上，
+    无 body 请求 0/300 失败。探测层必须在最后降级为空 body 重试，
+    否则"这个路径上有这个方法"这一行证据会被静默删掉。
+    """
+
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, *args):
+        pass
+
+    def _send(self, code, body=b""):
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        try:
+            self.wfile.write(body)
+        except OSError:
+            pass
+
+    def do_POST(self):
+        self.close_connection = True
+        self._send(400, b'{"error":"code_b64 required"}')
+
+    def do_GET(self):
+        self._send(404, b"{}")
+
+    def do_PUT(self):
+        self._send(404, b"{}")
+
+    def do_PATCH(self):
+        self._send(404, b"{}")
+
+
+@pytest.fixture()
+def nodrain_url():
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), _NoDrainHandler)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        yield f"http://127.0.0.1:{srv.server_address[1]}"
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_method_sweep_survives_server_that_never_reads_body(nodrain_url):
+    # 连跑 12 次：单次有约 5% 概率碰不到 RST，跑多次才能稳定验证。
+    for _ in range(12):
+        out = run(method_sweep("/api/plugins/preview", base_url=nodrain_url, methods="POST"))
+        assert "400 POST" in out, out
+        assert "code_b64 required" in out, out
+        assert "ERR " not in out, out
+
+
 def test_method_sweep_omits_404_noise(base_url):
     out = run(method_sweep("/nope/does-not-exist", base_url=base_url))
     rows = [l for l in out.splitlines() if l[:3] in {"200", "302", "400", "401", "403",

@@ -1,4 +1,4 @@
-﻿# 运行期产物：不进版本库
+# 运行期产物：不进版本库
 .venv/
 __pycache__/
 *.pyc
@@ -18,3 +18,16 @@ logs/
 
 # 推送到运行机时写入的提交戳
 .codex-commit
+
+# reference materials (misc-bank holds real flags): never commit
+reference/
+
+# scratch scripts archived out of repo root
+archive/tmp-scratch-*/
+.probe/
+$null
+
+# 取证与快照：traces/ 含真实 flag 原文，backup/ 含未脱敏台账副本。
+# 进 git 历史就再也删不干净，赔率远高于收益。只留计数与脱敏结论。
+traces/
+backup/

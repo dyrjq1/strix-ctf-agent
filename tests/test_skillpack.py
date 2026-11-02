@@ -2,7 +2,9 @@
 
 三条不变的约定，任何一条破了都会让"技能在、但模型用不到"：
 
-1. 只注册 12 个索引 —— 整包注册会把 145 条塞进每个 agent 的 system prompt；
+1. 只注册**索引**（每个分类一个 ``<分类>/<分类>.md``）—— 整包注册会把 190 个文件
+   塞进每个 agent 的 system prompt；断言写成"索引数 == 目录数"而不是硬编码 12，
+   这样新增一个方向技能只需要加目录，不需要改测试；
 2. 索引正文里必须带子文件路径提示 —— 少这行，模型只能猜路径；
 3. 索引里 266 条相对链接必须全部有效 —— 链接断了，提示指向的就是空。
 """
@@ -20,10 +22,14 @@ from ctf_strix import skillpack
 _LINK = re.compile(r"\]\(([^)]+\.md)\)")
 
 
-def test_index_skills_returns_twelve() -> None:
-    """每个分类只有一个 ``<分类>/<分类>.md`` 索引。"""
+def test_index_skills_returns_one_per_category() -> None:
+    """每个分类只有一个 ``<分类>/<分类>.md`` 索引，数量跟着目录走。"""
     idx = skillpack.index_skills()
-    assert len(idx) == 12
+    categories = [p.name for p in skillpack.PACK_DIR.iterdir() if p.is_dir()]
+    assert len(idx) == len(categories), (
+        f"索引 {len(idx)} 个但目录 {len(categories)} 个：有分类缺 <分类>/<分类>.md"
+    )
+    assert len(idx) >= 12, "方向技能只增不减；少于 12 说明有索引被删了"
     assert [c for c, _, _ in idx] == sorted(c for c, _, _ in idx)
     for category, name, path in idx:
         assert category == name
@@ -51,10 +57,10 @@ def test_render_without_frontmatter_still_hints() -> None:
 
 
 def test_stage_writes_only_indexes(tmp_path: Path) -> None:
-    """注册目录里只能有 12 个文件；子文件不进注册目录。"""
+    """注册目录里只能有索引；子文件不进注册目录。"""
     reg = skillpack.stage(ref="/var/ctf/jail/skills")
     files = sorted(reg.rglob("*.md"))
-    assert len(files) == 12
+    assert len(files) == len(skillpack.index_skills())
     assert all(f.parent.name == f.stem for f in files), "布局必须是 <分类>/<分类>.md"
     body = (reg / "ctf-web" / "ctf-web.md").read_text(encoding="utf-8")
     assert "/var/ctf/jail/skills/ctf-web/" in body
@@ -64,7 +70,7 @@ def test_register_calls_strix_once() -> None:
     """注册一次就够了；重复调用会让 strix 的搜索目录里堆同一份副本。"""
     seen: list[Path] = []
     names = skillpack.register(register_fn=seen.append)
-    assert len(names) == 12
+    assert len(names) == len(skillpack.index_skills())
     assert len(seen) == 1
     assert all("/" in n and n.split("/")[0] == n.split("/")[1] for n in names)
 

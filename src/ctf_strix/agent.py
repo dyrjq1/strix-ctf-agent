@@ -137,12 +137,61 @@ def _is_cidr(entry: str) -> bool:
     return bool(re.fullmatch(r"[0-9a-fA-F:.]+/\d{1,3}", entry))
 
 
+def _target_endpoints(task: dict[str, Any]) -> list[dict[str, str]]:
+    """协议 v3 公布的靶面地址：``target_endpoints`` 与 ``CTFY_TARGET_URL``。
+
+    为什么要单独一支：v3 起 ``scope`` 只留给 engagement（主机名 + 网段），
+    jeopardy 题的靶址搬到 ``target_endpoints``，单一 web 端点还会重复成
+    ``CTFY_TARGET_URL``。只读 ``scope`` 的客户端在 v3 上会拿到空目标，
+    然后把这题记成"没有可扫描目标"——看着像题目坏了，其实是版本没跟上。
+
+    Returns:
+        ``[{"url": ..., "type": ..., "label": ...}]``；没有时返回空列表。
+    """
+    out: list[dict[str, str]] = []
+    seen: set[str] = set()
+
+    declared = task.get("target_endpoints")
+    if isinstance(declared, list):
+        for item in declared:
+            if isinstance(item, dict):
+                url = str(item.get("url") or "").strip()
+                kind = str(item.get("type") or "").strip().lower()
+                label = str(item.get("label") or "").strip()
+            elif isinstance(item, str):
+                url, kind, label = item.strip(), "", ""
+            else:
+                continue
+            if not url or url in seen:
+                continue
+            seen.add(url)
+            out.append({"url": url, "type": kind, "label": label})
+
+    # 平台在只有一个 web 端点时也会写这个变量。它和 target_endpoints 是
+    # 同一份事实的两种写法，去重而不是当成第二个目标。
+    env_url = str(os.environ.get("CTFY_TARGET_URL") or "").strip()
+    if env_url and env_url not in seen:
+        out.append({"url": env_url, "type": "http", "label": "env"})
+    return out
+
+
+def _is_web_endpoint(entry: dict[str, str]) -> bool:
+    """这条端点是不是 HTTP 面。"""
+    if entry.get("type") in {"http", "https"}:
+        return True
+    return entry.get("url", "").startswith(("http://", "https://"))
+
+
 def _targets_from(task: dict[str, Any]) -> list[str]:
     """从 task.json 解析出可当 web 目标打的 URL。
 
-    两种形态差别很大，不能混：
+    三种形态差别很大，不能混：
 
-    - **instance**：``scope`` 里是起好的实例 URL（``https://xxx.node2.ctfy.run:443``）。
+    - **instance（v3）**：靶址在 ``target_endpoints``，单一 web 端点还会同时出现在
+      ``CTFY_TARGET_URL``；``scope`` 在这类题里是空的。
+    - **instance（v2 及更早）**：``scope`` 里是起好的实例 URL
+      （``https://xxx.node2.ctfy.run:443``）。仍要认，旧的 dry-run 样本与本地
+      task.json 都是这个形状。
     - **engagement**：``scope`` 里是**主机名和网段**（``edge.meridian.test``、
       ``10.20.0.0/16``），靶场已经起来了，``target_instance`` 非空就说明平台先起好了。
       网段交给 agent 自己用 nmap 摸，别硬拼成 URL——``https://10.20.0.0/16`` 是个
@@ -158,6 +207,10 @@ def _targets_from(task: dict[str, Any]) -> list[str]:
     raw = _raw_scope(task)
 
     urls = [entry for entry in raw if entry.startswith(("http://", "https://"))]
+    # v3：jeopardy 的靶址在 target_endpoints / CTFY_TARGET_URL，不在 scope。
+    for endpoint in _target_endpoints(task):
+        if _is_web_endpoint(endpoint) and endpoint["url"] not in urls:
+            urls.append(endpoint["url"])
     if urls:
         return urls
 
@@ -172,7 +225,7 @@ def _targets_from(task: dict[str, Any]) -> list[str]:
 def _target_specs(task: dict[str, Any]) -> list[dict[str, Any]]:
     """把 scope 翻译成 strix 的 ``scan_config["targets"]``。
 
-    除了 web URL，还保留两类语义：
+    除了 web URL（scope 与 ``target_endpoints`` 两个来源），还保留两类语义：
 
     - **CIDR** 作为 ``ip_address`` 目标进 scope，让 agent 知道整段都在授权范围内，
       而不是从 prompt 里那串 ``10.20.0.0/16`` 里猜。
@@ -188,6 +241,15 @@ def _target_specs(task: dict[str, Any]) -> list[dict[str, Any]]:
         {"type": "web_application", "details": {"target_url": url}} for url in urls
     ]
     seen = {url for url in urls}
+
+    # v3 的非 HTTP 端点（``type: tcp`` 等）不在 scope 里，只在
+    # ``target_endpoints``。丢掉它们，TCP 题就只剩一个空目标列表。
+    for endpoint in _target_endpoints(task):
+        url = endpoint["url"]
+        if not url or url in seen or _is_web_endpoint(endpoint):
+            continue
+        specs.append({"type": "ip_address", "details": {"target_ip": url}})
+        seen.add(url)
     # 已经作为 web 目标出现过的主机名不要再按 ip_address 加一遍：同一个主机
     # 在 prompt 里出现两次会让 agent 以为是两台机器，多花轮次去区分。
     covered_hosts = {_host_of(url) for url in urls}
@@ -279,6 +341,10 @@ def _challenge_kind(task: dict[str, Any], work: Path | None = None) -> str:
         return "checker"
 
     raw = _raw_scope(task)
+    # v3 的端点类型是明说的，不用猜；scope 为空时它是唯一线索。
+    endpoint_types = {e.get("type") for e in _target_endpoints(task)}
+    if endpoint_types & {"tcp", "udp", "ssh"} and not endpoint_types & {"http", "https"}:
+        return "tcp"
     if raw and all("://" not in entry and not _is_cidr(entry) for entry in raw):
         if any(re.fullmatch(r"[^/\s]+:\d{1,5}", entry) for entry in raw):
             return "tcp"
@@ -326,7 +392,11 @@ def _extract_flag(blob: str, own_host: str | None = None) -> str | None:
     except Exception:  # noqa: BLE001 — 抽取器不可用时不能拖垮整条链路
         # 降级：至少剔除 FLAG{...} 这种模板占位符。
         found = [f for f in FLAG_PATTERN.findall(blob) if set(f.split("{", 1)[1][:-1]) != {"."}]
-        return found[-1] if found else None
+        # Take the FIRST, not the last: the docstring above says the last one is
+        # exactly the wrong choice (stale recon notes from another challenge,
+        # or a decoy in the same output).  Mechanical fix of a comment/code
+        # contradiction found by the 2026-11-02 external review.
+        return found[0] if found else None
 
 
 def _write_result(path: Path, payload: dict[str, Any]) -> None:
@@ -420,6 +490,31 @@ def _turn_budget(task: dict[str, Any]) -> int:
         return 500
 
 
+def _attempt_count() -> int:
+    """How many sequential attempts to allow (1-3).
+
+    Three is the platform's agent-concurrency ceiling; sequential attempts
+    stay within it.  Default 1 keeps the old behavior unless explicitly
+    enabled, because a second attempt roughly doubles wall-clock demand.
+    """
+    try:
+        value = int(str(os.environ.get("CTF_ATTEMPTS", "1")).strip())
+    except (TypeError, ValueError):
+        return 1
+    return max(1, min(value, 3))
+
+
+def _attempt_turns(total: int, attempts: int, split: float) -> list[int]:
+    """Split a turn budget across attempts, giving the first one `split`."""
+    if attempts <= 1:
+        return [total]
+    first = max(1, int(round(total * split)))
+    first = min(first, total - (attempts - 1))
+    rest = total - first
+    base, extra = divmod(rest, attempts - 1)
+    return [first] + [base + (1 if i < extra else 0) for i in range(attempts - 1)]
+
+
 def _local_attachments(work: Path) -> list[dict[str, str]]:
     """把工作目录里的附件读成 strix 的 ``extra_files``。
 
@@ -490,10 +585,12 @@ def _local_attachments(work: Path) -> list[dict[str, str]]:
     return out
 
 
-#: 与 ctfy 0.7.0 的 ``core/agent_brief.BRIEF_SCHEMA_VERSION`` 对齐。
+#: CTFY-0001 v3 的 ``schema_version``（规范版本号 == wire schema 版本）。
 #: ⚠️ 必须写进 result.json：`inspect_probe` 会因为缺它而报 `no_schema_version`
 #: （advisory，不 blocking，但白送的告警没有理由留着）。
-BRIEF_SCHEMA_VERSION = 2
+#: 2026-10-30 修订把协议从 2 提到 3（平台替你起靶、scope 只留 engagement），
+#: 写 2 等于自报一个不认识 ``target_endpoints`` 的旧客户端。
+BRIEF_SCHEMA_VERSION = 3
 
 
 def main() -> int:
@@ -544,11 +641,15 @@ def main() -> int:
             scope = _raw_scope(task)
             if not specs and not (kind == "engagement" and scope) and kind != "file":
                 # 写清楚是"模式不匹配"，不是"agent 傻了"。
-                # instance 模式下 scope 为空意味着要自己 POST /instances 起靶机，
-                # 本镜像还没做这一步——照实说，别伪装成扫过了。
+                #
+                # v3 起靶机由平台负责（``target_instance``），客户端调
+                # ``POST /api/v1/instances`` 会被 403。所以这里不再有
+                # "自己起靶机"这一步可选；目标为空只能是 task.json 没给地址。
                 error = (
                     f"无可扫描目标：run_mode={task.get('run_mode')} "
-                    f"scope={task.get('scope')} target_instance={task.get('target_instance')}"
+                    f"scope={task.get('scope')} "
+                    f"target_endpoints={task.get('target_endpoints')} "
+                    f"target_instance={task.get('target_instance')}"
                 )
                 stop_reason = "no_target"
             elif kind == "file" and not specs and not attachments:
@@ -571,6 +672,11 @@ def main() -> int:
                     attachments=attachments,
                     publisher=publisher,
                 )
+                if diag.pop("no_attempt_ran", False):
+                    # 每个 attempt 都抛异常：这不是"跑了没解出"，是"根本没跑"。
+                    # 两者在成功率统计里必须分开，否则根因分析全被污染。
+                    error = error or "所有 attempt 都未能启动运行时"
+                    stop_reason = "error"
 
     except BaseException as exc:  # noqa: BLE001 — 任何异常都必须转成 result.json
         error = f"{type(exc).__name__}: {exc}"
@@ -683,6 +789,15 @@ def _writeup(
     report = (diag or {}).get("report")
     if report:
         lines.append(f"report_delivery: {json.dumps(report, ensure_ascii=False)}")
+    evidence = (diag or {}).get("evidence")
+    if evidence:
+        # Visible after the fact: a dropped claim is a modelling problem worth
+        # reading, not noise to swallow.
+        lines.append(f"evidence: {json.dumps(evidence, ensure_ascii=False)}")
+    if (diag or {}).get("guard_mount") == "failed":
+        # Missing guards are not "nothing fired today": the wiring is broken and
+        # every later conclusion about guard behaviour is void. Log loudly.
+        lines.append("guard_mount: FAILED (guards inert -- see stderr/logs)")
     if error:
         lines.append(f"error: {error}")
     return "\n".join(lines)
@@ -718,6 +833,10 @@ def _run_agent(
 
     install_backend()
 
+    # 本函数末尾要返回的诊断字典（与 `main` 里的 `diag` 同名但不同作用域）。
+    # 守卫接线失败就写进这里，随 `out.update(diag)` 进 result.json。
+    diag: dict[str, Any] = {}
+
     # ⚠️ 挂载钩子必须最先装。三个守卫都是替换 factory._with_bounded_result 来
     # 挂 on_invoke_tool 的，但 exec_command / write_stdin 走 Shell capability 的
     # _configure_shell_tools，**绕过**那个函数。不装钩子，守卫只覆盖
@@ -738,6 +857,17 @@ def _run_agent(
 
     install_journey_guard()
 
+    # 单次调用内部的扫描守卫。``enum_guard`` 按**调用**去重，对"把几万个候选
+    # 塞进一条 exec_command 的 Python 循环"完全无能为力——CTFARENA-050 实测
+    # 打了约 36,000 次路径变体，枚举守卫计数为 0，577 秒后失败。
+    #
+    # 2026-11-02 外部审查发现：这个守卫只在 scripts/run_strix_ctf.py 里装过，
+    # **正赛入口 agent.py 从来没装**。也就是说评测里它有、交付镜像里它没有，
+    # 和 v2 原语漏装（capabilities.py 模块文档记的同一类事故）是一个形态。
+    from ctf_strix.sweep_guard import install as install_sweep_guard
+
+    install_sweep_guard()
+
     # 收工守卫：没有 flag 的 finish_scan 会被拒绝。engagement 没有 flag，
     # checker 题也没有 flag——这两类必须让路，否则会误拦每一次正常收工。
     from ctf_strix.finish_guard import install as install_finish_guard
@@ -747,17 +877,54 @@ def _run_agent(
     # 装完立刻验证接线。正赛里没有第二次机会，接线失败必须当场知道。
     from ctf_strix.guard_mount import verify_mount
 
-    wired = verify_mount(("_ctf_guarded", "_ctf_journey_guarded"))
+    wired = verify_mount(
+        ("_ctf_guarded", "_ctf_journey_guarded", "_ctf_sweep_guarded")
+    )
     print(f"[ctfy] guard mount verified={wired}", flush=True)
+    if not wired:
+        # 不抛异常：没挂上守卫仍然能把题跑完，只是少了三层纠偏。但这件事必须
+        # 出现在 result.json 里，否则"守卫全废"和"今天没触发"在数据上同形。
+        diag["guard_mount"] = "failed"
 
     from ctf_strix.tool_trim import install_ctf_toolset
 
-    # 只摘 Caido（本机没有 caido-cli，那 6 个工具调用必然报错），保留记账工具。
-    # engagement 的交付物就是报告，记账/报告工具更不能裁。
-    install_ctf_toolset(drop_bookkeeping=False)
+    # Caido tools always go (no caido-cli in the image).  Bookkeeping tools
+    # (notes / coverage / threat model / reports) stay only for engagement,
+    # whose deliverable is the report.  For web/file/tcp they are 17 schemas
+    # that cost tokens every turn and tempt the model to write prose instead
+    # of reading the answer.  The eval harness already trimmed them; keeping
+    # them here made the submitted tool surface differ from the measured one.
+    install_ctf_toolset(drop_bookkeeping=kind != "engagement")
+    # workdir 兼容：见 tool_trim.install_workdir_shim 的实测说明。
+    from ctf_strix.tool_trim import install_workdir_shim
+
+    install_workdir_shim()
+
+    # Capability parity with scripts/run_strix_ctf.py.  The v2 primitives were
+    # validated there but were never registered here, so the submitted image
+    # silently ran the pre-v2 tool surface.  Both entrypoints now share one
+    # installer; failures are printed instead of swallowed.
+    from ctf_strix.capabilities import install_soft_deadline
+    from ctf_strix.capabilities import install_web_capabilities
+
+    installed, cap_errors = install_web_capabilities()
+    print(
+        f"[ctfy] web capabilities: "
+        f"http_probe={len(installed.get('http_probe', []))} "
+        f"discovery={len(installed.get('discovery', []))}",
+        flush=True,
+    )
+    for message in cap_errors:
+        print(f"[ctfy] capability failed: {message}", flush=True)
+
+    # Soft deadline is opt-in: the platform does not publish a per-challenge
+    # wall clock, so inventing one would cut hard challenges short.
+    soft_seconds = float(os.environ.get("CTFY_SOFT_DEADLINE", "0") or 0)
+    if install_soft_deadline(soft_seconds, _turn_budget(task)) is not None:
+        print(f"[ctfy] soft deadline {soft_seconds:.0f}s installed", flush=True)
 
     # 附件题（rev/pwn/misc/crypto）才装文件入口原语；web 题不为它付 schema token。
-    if kind == "file":
+    if kind in ("file", "tcp"):
         try:
             from ctf_strix import file_triage
 
@@ -765,6 +932,19 @@ def _run_agent(
             print(f"[file] registered {len(added)} tools: {', '.join(added) or '(already present)'}", flush=True)
         except Exception as exc:  # noqa: BLE001
             print(f"[file] registration failed: {type(exc).__name__}: {exc}", flush=True)
+
+        # Non-web primitives (decode chain / safe unpack / hex view / raw TCP /
+        # batched TCP / ELF peek).  Split by kind: an attachment challenge must
+        # not pay for socket schemas and a remote-service challenge must not pay
+        # for archive ones.  Kept separate from file_triage on purpose --
+        # file_triage answers "what is this?", these answer "what does it say?".
+        try:
+            from ctf_strix import nonweb
+
+            added = nonweb.register(kind=kind)
+            print(f"[nonweb] registered {len(added)} tools: {', '.join(added) or '(already present)'}", flush=True)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[nonweb] registration failed: {type(exc).__name__}: {exc}", flush=True)
 
     # token 计量：result.json 的 input_tokens / output_tokens 必须是真实值。
     # 计量失败不影响解题，只退化成 0。
@@ -805,6 +985,28 @@ def _run_agent(
     except Exception as exc:  # noqa: BLE001 — 增强能力失败不能让整题跑不动
         print(f"[ctfy] aisec registration failed: {type(exc).__name__}: {exc}", flush=True)
 
+    # ── 上下文管理（2026-11-01）────────────────────────────────────────────
+    # 两处改动都挂在框架已有的接缝上，vendor 不动：
+    #   1) prompt.install()  替换 103,541 字符的通用渗透提示（实测 22,813 token）
+    #   2) context.install_history_elision()  每次 LLM 请求前裁剪旧工具输出
+    #
+    # 依据：043/047 两道 hard 题都在 40 轮用尽时失败，input 2.24M token，
+    # 且 strix 自带的 maybe_compact 阈值 180k 在单轮峰值 54k 下永不触发。
+    # 详见 src/ctf_strix/context.py 与 src/ctf_strix/prompt.py 的模块注释。
+    try:
+        from ctf_strix import context as ctf_context
+        from ctf_strix import prompt as ctf_prompt
+
+        ctf_prompt.install()
+        capper = ctf_context.install()
+        print(
+            f"[ctx] prompt installed ({len(ctf_prompt.build({}))} chars); "
+            f"content cap={capper.cap_chars} chars/output, {capper.arg_cap} chars/args",
+            flush=True,
+        )
+    except Exception as exc:  # noqa: BLE001 — 上下文改造失败必须回落到原行为
+        print(f"[ctx] install failed: {type(exc).__name__}: {exc}", flush=True)
+
     from strix.core.runner import run_strix_scan
 
     goal = _read_goal(kind)
@@ -831,9 +1033,23 @@ def _run_agent(
 
     captured: list[str] = []
     activity: list[str] = []
+    # Every flag has to be seen in a tool output from *this* run before it is
+    # submitted; a flag the model only wrote down is a guess.  078 produced one
+    # (``3cada892...``) and it was one parameter away from being submitted via
+    # ``finish_scan``.  See docs/11 section 4.15.
+    from ctf_strix.evidence import EvidenceLedger
+
+    ledger = EvidenceLedger()
     tool_outputs = 0
     root_tool_calls = 0
     root_agent: str | None = None
+    attempt_pairs: list[tuple[str, str]] = []
+    attempt_outputs: list[str] = []
+    pending_calls: dict[str, tuple[str, str]] = {}
+    pending_seq: list[tuple[str, str]] = []
+    # Flags the model wrote into a tool call's arguments.  Kept until a tool
+    # output proves the same string was actually read.
+    arg_claims: list[str] = []
     own_host = _host_of(_targets_from(task)[0]) if _targets_from(task) else ""
     save_threads: list[threading.Thread] = []
 
@@ -894,10 +1110,31 @@ def _run_agent(
         if item_type == "tool_call_item":
             if agent_id == root_agent:
                 root_tool_calls += 1
-            if engagement:
                 raw = getattr(item, "raw_item", None)
                 name = str(getattr(raw, "name", "?") or "?")
-                args = str(getattr(raw, "arguments", "") or "")[:300]
+                args_full = str(getattr(raw, "arguments", "") or "")
+                args = args_full[:300]
+                # finish_scan carries the agent's final answer in its
+                # arguments, not in a tool output.  Scanning outputs only was
+                # losing challenges where the agent read the flag correctly
+                # but reported it through the lifecycle call (082: both A/B
+                # arms had the flag in finish_scan and neither was submitted).
+                if not engagement and qid not in answers:
+                    found = _extract_flag(args_full, own_host)
+                    if found:
+                        # Record, do not submit yet: the same string must show
+                        # up in a tool output before it counts as retrieved.
+                        arg_claims.append(found)
+                call_id = str(
+                    getattr(item, "call_id", "")
+                    or getattr(raw, "call_id", "")
+                    or ""
+                )
+                if call_id:
+                    pending_calls[call_id] = (name, args)
+                else:
+                    pending_seq.append((name, args))
+            if engagement:
                 activity.append(f"`{name}` {args}")
                 if len(activity) > _CAPTURE_LIMIT:
                     del activity[:100]
@@ -910,6 +1147,27 @@ def _run_agent(
         captured.append(text)
         if len(captured) > _CAPTURE_LIMIT:
             del captured[:100]
+        raw = getattr(item, "raw_item", None)
+        call_id = str(
+            getattr(item, "call_id", "")
+            or (raw.get("call_id") if isinstance(raw, dict) else "")
+            or ""
+        )
+        pair = pending_calls.pop(call_id, None) if call_id else None
+        if pair is None and pending_seq:
+            pair = pending_seq.pop(0)
+        if pair is None and pending_calls:
+            # Some providers omit call_id on the output item.  With a single
+            # in-flight call, pair it directly; with several, take the oldest.
+            oldest = next(iter(pending_calls))
+            pair = pending_calls.pop(oldest)
+        if pair is None and attempt_pairs and len(attempt_outputs) < len(attempt_pairs):
+            # Last resort: the previous output was never paired.  Reuse its
+            # call in order rather than dropping the output from the digest.
+            pair = attempt_pairs[len(attempt_outputs)]
+        if pair is not None:
+            attempt_pairs.append(pair)
+            attempt_outputs.append(text)
         tool_outputs += 1
 
         if engagement:
@@ -922,6 +1180,18 @@ def _run_agent(
                 if not publisher.authored:
                     _publish(force=False, background=True)
             return
+
+        # Every flag-shaped string in this output is now *retrieved* evidence.
+        ledger.observe_output(text)
+        if arg_claims and qid not in answers:
+            for claim in list(arg_claims):
+                if ledger.supports(claim):
+                    answers[qid] = claim
+                    print(
+                        f"[ctfy] flag captured from tool args: {claim}",
+                        flush=True,
+                    )
+                    break
 
         # ⚠️ 必须逐条输出单独判定，不能等最后拼起来一起判。拼接后
         # 本题靶机与别题 flag 的距离信息会被淹没，证据判定退化成瞎猜。
@@ -972,24 +1242,103 @@ def _run_agent(
         _publish(force=True, background=False)
 
     result: Any = None
+    turns_total = 0
+    # 有多少个 attempt 真的跑起来了（run_strix_scan 正常返回）。
+    # 全部失败时上层必须把 stop_reason 从 "completed" 改成 "error"。
+    runs_ok = 0
+    attempts = 1 if engagement else _attempt_count()
+    scan_id = f"ctfy-{int(time.time())}"
+    try:
+        split = float(os.environ.get("CTF_ATTEMPT_SPLIT", "0.6") or 0.6)
+    except ValueError:
+        split = 0.6
+    budgets = _attempt_turns(max_turns, attempts, min(max(split, 0.2), 0.9))
 
     async def _go() -> None:
-        nonlocal result
-        try:
-            result = await run_strix_scan(
-                scan_config=scan_config,
-                scan_id=f"ctfy-{int(time.time())}",
-                image="unused-local",
-                local_sources=[],
-                extra_files=attachment_files or None,
-                max_turns=max_turns,
-                cleanup_on_exit=True,
-                event_sink=sink,
+        nonlocal result, turns_total, root_agent, runs_ok
+        for index, budget in enumerate(budgets):
+            if not engagement and qid in answers:
+                break
+            # Each attempt gets a new strix agent id.  Without resetting this,
+            # the sink keeps comparing against attempt 1 and undercounts every
+            # later attempt as zero calls.
+            root_agent = None
+            # A call without an output at the end of an attempt must not pair
+            # with the next attempt's first output.
+            pending_calls.clear()
+            pending_seq.clear()
+            call_start = len(attempt_pairs)
+            output_start = len(attempt_outputs)
+            calls_before = root_tool_calls
+            config = dict(scan_config)
+            if index > 0:
+                from ctf_strix.attempt_digest import build_digest
+
+                digest = build_digest(
+                    attempt_pairs[:call_start],
+                    attempt_outputs[:output_start],
+                )
+                if not digest:
+                    print("[ctfy] retry skipped: empty digest", flush=True)
+                    break
+                # Resume the same scan: strix restores the sandbox session and
+                # the SDK history, then injects this as a new user message.
+                # A fresh scan_id would lose /tmp scripts and login state.
+                config["resume_instruction"] = (
+                    "## Previous attempt (failed)\n\n"
+                    + digest
+                    + f"\n\nThis is attempt {index + 1} of {len(budgets)}. "
+                    "Do not repeat the calls listed above. Change the mechanism, "
+                    "not the parameter values. Start from an untried method or an "
+                    "untried class of path, and read the real answer once you have "
+                    "execution, file read, or DB read."
+                )
+                print(
+                    f"[ctfy] retry with digest: {len(digest)} chars "
+                    f"from {call_start} calls",
+                    flush=True,
+                )
+                if os.environ.get("CTF_DIGEST_DEBUG", "").strip().lower() in ("1", "true", "yes"):
+                    print(digest, flush=True)
+            print(
+                f"[ctfy] attempt {index + 1}/{len(budgets)} turns={budget}",
+                flush=True,
             )
-        except Exception as exc:  # noqa: BLE001 — turn 用尽属于正常终止
-            print(f"[ctfy] scan ended: {type(exc).__name__}: {exc}", flush=True)
+            try:
+                result = await run_strix_scan(
+                    scan_config=config,
+                    scan_id=scan_id,
+                    image="unused-local",
+                    local_sources=[],
+                    extra_files=(attachment_files or None) if index == 0 else None,
+                    max_turns=budget,
+                    # Keep the sandbox alive between attempts; the final
+                    # attempt is responsible for tearing it down.
+                    cleanup_on_exit=index == len(budgets) - 1,
+                    event_sink=sink,
+                )
+            except Exception as exc:  # noqa: BLE001 — turn 用尽属于正常终止
+                print(f"[ctfy] scan ended: {type(exc).__name__}: {exc}", flush=True)
+                turns_total += max(root_tool_calls - calls_before, 0)
+                continue
+            runs_ok += 1
+            used = _requests_of(result)
+            turns_total += used if used > 0 else max(root_tool_calls - calls_before, 0)
 
     asyncio.run(_go())
+
+    # ``finish_scan`` is usually the last call, so no further tool output will
+    # arrive to promote a claim recorded in its arguments.  Settle here as well,
+    # otherwise a correct answer reported at the end would be dropped.
+    if not engagement and qid not in answers:
+        for claim in arg_claims:
+            if ledger.supports(claim):
+                answers[qid] = claim
+                print(
+                    f"[ctfy] flag captured from tool args: {claim}",
+                    flush=True,
+                )
+                break
 
     # 兜底：sink 里若因竞态没抓住，这里逐条重扫一遍。
     # ⚠️ 不要对 "\n".join(captured) 整体判定——拼接后本题靶机的出现位置被
@@ -1002,6 +1351,14 @@ def _run_agent(
                 print(f"[ctfy] flag captured on rescan: {flag}", flush=True)
                 break
 
+    # A flag the model wrote but never read is a guess.  Keep it visible in the
+    # diagnostics instead of submitting it.  Run this *after* the rescan: a
+    # rescan hit is itself proof the string was printed by a tool.
+    for claim in arg_claims:
+        if not ledger.supports(claim) and answers.get(qid) != claim:
+            ledger.reject(claim)
+            print(f"[ctfy] flag rejected (no tool output): {claim}", flush=True)
+
     # 最终保存必须在这里再走一次：agent 可能根本没调 finish_scan（被轮次上限
     # 或墙钟打断），那样上面的钩子从未触发，整轮发现会全部丢失。
     if engagement and publisher is not None:
@@ -1009,10 +1366,25 @@ def _run_agent(
             thread.join(timeout=25)
         _publish(force=True, background=False)
 
-    turns = _requests_of(result)
+
+    turns = turns_total
     if turns <= 0:
         turns = root_tool_calls
-    return turns, {"report": publisher.snapshot()} if publisher is not None else {}
+    out: dict[str, Any] = {}
+    if publisher is not None:
+        out["report"] = publisher.snapshot()
+    if ledger.observed or ledger.unsupported:
+        out["evidence"] = ledger.summary()
+    out.update(diag)
+    if attempts > 0 and runs_ok == 0 and not answers:
+        # 一次都没跑起来，而且也没拿到答案。上层据此把 stop_reason 写成
+        # "error"，否则"运行时压根没启动"会以 turns=0 + stop_reason=completed
+        # 混进失败率里。
+        #
+        # `and not answers` 是防御：将来若有人在进循环前就填好了 answers，
+        # 那不是"没跑起来"，不该被标成 error。
+        out["no_attempt_ran"] = True
+    return turns, out
 
 
 def _requests_of(result: Any) -> int:

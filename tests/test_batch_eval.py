@@ -15,7 +15,13 @@ import pytest
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "scripts"))
 
-from batch_eval import _archive_run, _fresh_box, _new_run_id, _proxy_blackhole  # noqa: E402
+from batch_eval import (  # noqa: E402
+    _answer_values,
+    _archive_run,
+    _fresh_box,
+    _new_run_id,
+    _proxy_blackhole,
+)
 
 
 @pytest.fixture()
@@ -128,3 +134,239 @@ def test_proxy_blackhole_accepts_host_port_target(monkeypatch):
     env = _proxy_blackhole("10.0.0.5:31337")
 
     assert "10.0.0.5" in env["NO_PROXY"].split(",")
+
+
+def test_answer_values_stops_before_markdown_emphasis() -> None:
+    """049 的两个真实 flag 都被粗体包住；旧解析把 ``**`` 拼进了答案。"""
+    text = (
+        "**ANSWER[foothold]=FLAG{1111aaaa2222bbbb3333cccc4444dddd}**\n\n"
+        "**ANSWER[deploy]=FLAG{5555eeee6666ffff7777aaaa8888bbbb}**\n\n"
+        "The target is Gitea."
+    )
+
+    assert _answer_values(text) == {
+        "foothold": "FLAG{1111aaaa2222bbbb3333cccc4444dddd}",
+        "deploy": "FLAG{5555eeee6666ffff7777aaaa8888bbbb}",
+    }
+
+
+def test_answer_values_accepts_backticks_and_trailing_punctuation() -> None:
+    text = "ANSWER[user]=`FLAG{abc}`\nANSWER[token]=deadbeef.\n"
+
+    assert _answer_values(text) == {
+        "user": "FLAG{abc}",
+        "token": "deadbeef",
+    }
+
+def test_deadline_args_put_soft_deadline_at_75_percent() -> None:
+    """墙钟杀会连带丢掉 usage；软截止必须早于它，且用同一个硬上限措辞。"""
+    from batch_eval import _deadline_args
+
+    assert _deadline_args(600) == [
+        "--soft-deadline", "450", "--wall-deadline", "600",
+    ]
+    assert _deadline_args(0) == ["--soft-deadline", "1", "--wall-deadline", "1"]
+
+
+def test_run_agent_passes_deadline_args_to_child(monkeypatch, workdir: Path) -> None:
+    """参数没传下去就等于没装——这条盯住接线本身。"""
+    import batch_eval
+
+    captured: dict = {}
+
+    class _Proc:
+        returncode = 0
+
+        def wait(self, timeout=None):  # noqa: ANN001, ARG002
+            return 0
+
+    def fake_popen(argv, **kwargs):  # noqa: ANN001, ANN003
+        captured["argv"] = list(argv)
+        captured["kwargs"] = kwargs
+        return _Proc()
+
+    monkeypatch.setattr(batch_eval, "_fresh_box", lambda n: (workdir, workdir / "run.log"))
+    monkeypatch.setattr(batch_eval.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(batch_eval, "_private_tmp_available", lambda: False)
+    monkeypatch.setattr(batch_eval, "_archive_run", lambda *a, **k: workdir)
+    monkeypatch.setattr(batch_eval, "_answer_values", lambda text: {})
+
+    batch_eval.run_agent(
+        "https://example.test/", turns=30, timeout_s=600, name="t-acct",
+        archive_dir=None, model="openai/GLM-5.3-EV",
+    )
+
+    argv = captured["argv"]
+    assert "--soft-deadline" in argv
+    assert argv[argv.index("--soft-deadline") + 1] == "450"
+    assert argv[argv.index("--wall-deadline") + 1] == "600"
+
+
+def test_suite_for_uses_static_table_without_network(monkeypatch):
+    """快路径不许发请求：批测里每题都要路由，多一次 HTTP 就是多一次抖动源。"""
+    import batch_eval
+
+    called = {"n": 0}
+
+    def boom(*a, **k):  # noqa: ANN002, ANN003
+        called["n"] += 1
+        return {}
+
+    monkeypatch.setattr(batch_eval, "_fetch_suite_map", boom)
+    batch_eval._SUITE_CACHE.clear()
+
+    assert batch_eval.suite_for("CTFARENA-009") == "4394a10aa5d24f97a1ec3301ca718a45"
+    assert called["n"] == 0
+
+
+def test_suite_for_falls_back_to_platform_suites(monkeypatch):
+    """XBOW 这种静态表里没有的套件，必须靠 /api/v1/suites 兜底，而不是整题崩掉。
+
+    2026-11-01 校准批实测：XBOW-052 / XBOW-007 两题以 KeyError 秒退，
+    结果表上看是"failed"，其实是根本没跑。
+    """
+    import batch_eval
+
+    monkeypatch.setattr(
+        batch_eval,
+        "_fetch_suite_map",
+        lambda token="": {"XBOW": "e236cf74b397436d94577142e5cdb528"},
+    )
+    batch_eval._SUITE_CACHE.clear()
+
+    assert batch_eval.suite_for("XBOW-052") == "e236cf74b397436d94577142e5cdb528"
+    # 解析结果要缓存，后面 100 多题不再重复问平台。
+    assert batch_eval._SUITE_CACHE == {"XBOW": "e236cf74b397436d94577142e5cdb528"}
+    batch_eval._SUITE_CACHE.clear()
+
+
+def test_suite_for_prefers_longest_prefix(monkeypatch):
+    """`AGENT-DEFENSE-001` 不能被假想的 `AGENT` 前缀抢走。"""
+    import batch_eval
+
+    monkeypatch.setattr(
+        batch_eval,
+        "_fetch_suite_map",
+        lambda token="": {"AGENT": "aaa", "AGENT-DEFENSE": "d4917609895644e1bcf92b3c9b3bc70f"},
+    )
+    batch_eval._SUITE_CACHE.clear()
+
+    assert batch_eval.suite_for("AGENT-DEFENSE-001") == "d4917609895644e1bcf92b3c9b3bc70f"
+    batch_eval._SUITE_CACHE.clear()
+
+
+def test_suite_for_raises_with_known_list_when_unresolvable(monkeypatch):
+    """真解析不出来要出声，并且报错里带已知前缀——否则排查只能靠猜。"""
+    import batch_eval
+
+    monkeypatch.setattr(batch_eval, "_fetch_suite_map", lambda token="": {})
+    batch_eval._SUITE_CACHE.clear()
+
+    with pytest.raises(KeyError) as exc:
+        batch_eval.suite_for("NOSUCHSUITE-001")
+
+    assert "NOSUCHSUITE-001" in str(exc.value)
+    assert "CTFARENA" in str(exc.value)
+
+
+def test_title_prefixes_normalises_title() -> None:
+    from batch_eval import _title_prefixes
+
+    assert _title_prefixes("XBOW") == ["XBOW"]
+    assert _title_prefixes(" agent-defense ") == ["AGENT-DEFENSE"]
+    assert _title_prefixes("") == []
+
+
+def test_tcp_service_is_not_treated_as_a_webpage() -> None:
+    """端口 1337 的原始服务不能被拼成 http://host:1337/。
+
+    旧版 `_public_url()` 无条件拼 http://，于是 SAMPLE-014 / CYBENCH 这类
+    TCP 题被当成网页交给 agent，它用 curl 打必然失败，然后在"是不是 TLS /
+    是不是路径错"上耗完预算。实测走桥一条命令就能拿到 flag。
+    """
+    from batch_eval import is_tcp_service
+
+    assert is_tcp_service({"service_type": "tcp", "port": 1337}) is True
+    assert is_tcp_service({"service_type": "tcp", "port": 443}) is True
+    assert is_tcp_service({"port": 1337}) is True
+    assert is_tcp_service({"service_type": "https", "port": 443}) is False
+    assert is_tcp_service({"service_type": "http", "port": 8080}) is False
+    assert is_tcp_service({"port": 8000}) is False
+
+
+def test_probe_tcp_uses_a_real_socket(monkeypatch) -> None:
+    """TCP 题的连通性必须用 socket 测，不能用 HTTP 探测。
+
+    HTTP 探测读到 `CTFy TCP test service` 这种 banner 会解析失败，判成
+    "不可达"，然后触发换实例——把好好的题换掉。
+    """
+    import socket as _socket
+
+    import batch_eval
+
+    class _Fake:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def settimeout(self, _):
+            return None
+
+        def recv(self, _):
+            return b"CTFy TCP test service\n> "
+
+    monkeypatch.setattr(_socket, "create_connection", lambda addr, timeout: _Fake())
+
+    ok, detail = batch_eval._probe_tcp("127.0.0.1:41345")
+
+    assert ok is True
+    assert "tcp open" in detail
+    assert "CTFy" in detail
+
+
+def test_probe_tcp_reports_failure_without_raising(monkeypatch) -> None:
+    import socket as _socket
+
+    import batch_eval
+
+    def boom(addr, timeout):  # noqa: ANN001, ARG001
+        raise ConnectionRefusedError("nope")
+
+    monkeypatch.setattr(_socket, "create_connection", boom)
+
+    ok, detail = batch_eval._probe_tcp("127.0.0.1:9", attempts=1)
+
+    assert ok is False
+    assert "ConnectionRefusedError" in detail
+
+
+def test_run_agent_passes_target_kind(monkeypatch, workdir: Path) -> None:
+    """题型没传下去 = 桥建了但子进程仍按 web 打，等于没建。"""
+    import batch_eval
+
+    captured: dict = {}
+
+    class _Proc:
+        returncode = 0
+
+        def wait(self, timeout=None):  # noqa: ANN001, ARG002
+            return 0
+
+    def fake_popen(argv, **kwargs):  # noqa: ANN001, ANN003
+        captured["argv"] = list(argv)
+        return _Proc()
+
+    monkeypatch.setattr(batch_eval, "_fresh_box", lambda n: (workdir, workdir / "run.log"))
+    monkeypatch.setattr(batch_eval.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(batch_eval, "_private_tmp_available", lambda: False)
+    monkeypatch.setattr(batch_eval, "_archive_run", lambda *a, **k: workdir)
+
+    batch_eval.run_agent(
+        "127.0.0.1:41345", turns=20, timeout_s=600, name="t-tcp",
+        target_kind="tcp",
+    )
+
+    argv = captured["argv"]
+    assert argv[argv.index("--target-kind") + 1] == "tcp"

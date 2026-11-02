@@ -42,10 +42,21 @@ timeout 4 bash -c "exec 3<>/dev/tcp/HOST/PORT; head -c 300 <&3" || echo "[无 ba
 
 | banner 特征 | 方向 |
 |---|---|
-| `HTTP/1.` | `ctf-web/ctf-web`；若页面像 AI 工具（Gradio / 聊天框 / 工作流画布）→ `ctf-ai-infra/ctf-ai-infra` |
+| `HTTP/1.` | 见下方"HTTP 题三分法" |
 | `SSH-` | 通常是跳板，找凭据（`ctf-forensics` 或 `ctf-misc`） |
 | 自定义提示语（"Enter your name:"） | `ctf-pwn/ctf-pwn`，先要二进制附件 |
 | 返回一堆 JSON / 版本号 | `ctf-ai-infra/ctf-ai-infra` |
+
+### HTTP 题三分法（先选对索引，比扫目录重要）
+
+| 页面像什么 | 先加载 | 为什么 |
+|---|---|---|
+| 普通业务站：表单、列表、登录、API 文档 | `ctf-web/ctf-web` | 经典 web 漏洞面 |
+| 有 **install / build / publish / deploy / update / sync** 按钮或接口，或依赖里有包名、版本、registry | `ctf-supply-chain/ctf-supply-chain` | 答案是依赖图，不是路由表 |
+| 有 **chat / assistant / agent / plugin / skill / bot / moderation** | `ctf-agentic-ai/ctf-agentic-ai` | 答案是 agent 的一个决策，不是一条路由 |
+
+判据只有一句：**看这题"做什么"而不是"长什么样"**。
+这三个方向的前 3 次调用完全不同，选错索引等于用错工具。
 
 **HTTP 题再补一步**——看技术栈，别急着扫：
 

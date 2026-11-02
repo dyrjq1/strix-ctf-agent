@@ -156,18 +156,32 @@ class DeadlineGuard:
         return None
 
     def snapshot(self) -> dict[str, Any]:
-        """给记录用的摘要。"""
+        """给记录用的摘要。
+
+        ⚠️ 这里**不能**调用 ``should_kill()``：它在内部会再次获取
+        ``self._lock``，而 ``threading.Lock`` 不可重入，结果是收尾阶段永久
+        挂起。实测 2026-10-31 的 074/GLM 臂：agent 在 218.9s 就打完
+        ``[usage]``，随后卡在 ``[deadline]`` 这一行直到 600s 被墙钟 SIGKILL
+        ——每道解出的题白等近 400 秒。
+
+        所以先取锁算状态，出锁后再做判定。
+        """
         with self._lock:
             st = self._state_locked()
-            return {
+            answer_at_s = (
+                round(self._answer_seen_at - self._start, 1)
+                if self._answer_seen_at
+                else None
+            )
+            payload = {
                 "elapsed": round(st["elapsed"], 1),
                 "tool_calls": st["tool_calls"],
                 "soft_hit": self._soft_injected,
-                "answer_at_s": round(self._answer_seen_at - self._start, 1)
-                if self._answer_seen_at else None,
+                "answer_at_s": answer_at_s,
                 "answer": self._answer,
-                "killed_for": self.should_kill(),
             }
+        payload["killed_for"] = self.should_kill()
+        return payload
 
     # ------------------------------------------------------------ 观察
     def observe(self, text: str) -> str | None:

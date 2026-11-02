@@ -17,6 +17,27 @@ TLS、是不是端口错。SAMPLE-004 两轮共烧掉 3.2M token，全部浪费�
 ``AllowedIPs`` 的路由；域名解析显式走 profile 里的 DNS 服务器，
 不碰全局配置。
 
+## 提权
+
+建接口/加路由要 root。这里**不读密码、不存密码**：``_run`` 在非 root 时
+自动把命令前置成 ``sudo -n``，依赖管理员预先装好的 sudoers 白名单
+（只放行 ``ip`` / ``wg`` / ``wg-quick`` / ``dig`` / ``ctfvpn-wg``，见
+``scripts/install_vpn_sudoers.sh``）。拿不到免密就**立刻失败**并报错，
+而不是挂在交互式密码提示上——批测是无人值守的，挂住等于整批卡死。
+
+## 为什么 setconf 走 ctfvpn-wg 而不是临时文件
+
+Ubuntu 自带的 ``/etc/apparmor.d/wg`` 只允许 ``wg`` 读
+``/etc/wireguard/{,**}``，**且不给 dac_override**。于是
+``wg setconf <if> /tmp/x.wg`` 即使在 root 下也是 ``fopen: Permission
+denied``——``dmesg`` 里能看到 ``apparmor="DENIED" profile="wg"``。实测
+踩过：隧道永远起不来，错误看起来像普通权限问题，实际是 AppArmor 的
+路径白名单。
+
+``ctfvpn-wg`` 是个二十行的 root 包装：把 stdin 写成
+``/etc/wireguard/<if>.conf``（profile 明确放行），``wg setconf`` 完立刻
+删除。私钥不在磁盘留存，也不必放宽 AppArmor 策略。
+
 ## 生命周期
 
 一个进程同时只持有一条隧道（平台也只有一个实例配额）。名字带 pid，
@@ -28,6 +49,7 @@ from __future__ import annotations
 import configparser
 import logging
 import os
+import shutil
 import subprocess
 import tempfile
 from pathlib import Path
@@ -35,7 +57,37 @@ from pathlib import Path
 logger = logging.getLogger(__name__)
 
 
+#: 需要 root 才能改网络栈的子命令。只放行这四个，sudoers 白名单与之对齐。
+_PRIVILEGED = {"ip", "wg", "wg-quick", "dig", "ctfvpn-wg"}
+
+
+def _needs_root(argv: list[str]) -> bool:
+    """这条命令是否要 root。
+
+    Args:
+        argv: 待执行的命令。
+
+    Returns:
+        True 表示非 root 时要走 ``sudo -n``。
+    """
+    return bool(argv) and Path(argv[0]).name in _PRIVILEGED
+
+
 def _run(argv: list[str], *, timeout: float = 15.0) -> subprocess.CompletedProcess[str]:
+    """执行一条系统命令；非 root 时对特权命令自动加 ``sudo -n``。
+
+    ``sudo -n`` 而非 ``sudo -S``：批测无人值守，等密码提示等于挂死。
+    拿不到免密就以非零码返回，由调用方按"隧道起不来"处理。
+
+    Args:
+        argv: 命令与参数。
+        timeout: 秒。
+
+    Returns:
+        ``subprocess.CompletedProcess``。
+    """
+    if os.geteuid() != 0 and _needs_root(argv):
+        argv = ["sudo", "-n", *argv]
     return subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
 
 
@@ -111,8 +163,8 @@ class VpnTunnel:
         """建接口、配地址、加路由。
 
         Returns:
-            是否成功。失败时只记日志——题目仍可跑，只是会像以前一样连不上，
-            调用方据此把"环境不可达"和"agent 没解出"分开记。
+            是否成功。失败时只记日志——调用方据此把"环境不可达"和
+            "agent 没解出"分开记。
         """
         cfg = (
             "[Interface]\n"
@@ -123,31 +175,75 @@ class VpnTunnel:
             f"AllowedIPs = {self.allowed}\n"
             "PersistentKeepalive = 25\n"
         )
+        # 幂等清理：上一次崩掉留下的同名接口必须先拆，否则下面
+        # ``ip link add`` 会直接 "File exists"。
+        _run(["ip", "link", "del", self.iface])
+        proc = _run(["ip", "link", "add", self.iface, "type", "wireguard"])
+        if proc.returncode != 0:
+            logger.warning("vpn add failed: %s", (proc.stderr or proc.stdout).strip())
+            return False
+        if not self._setconf(cfg):
+            _run(["ip", "link", "del", self.iface])
+            return False
+        for argv in (
+            ["ip", "-4", "addr", "add", self.address, "dev", self.iface],
+            ["ip", "link", "set", "mtu", "1420", "up", "dev", self.iface],
+            ["ip", "-4", "route", "add", self.allowed, "dev", self.iface],
+        ):
+            proc = _run(argv)
+            if proc.returncode != 0:
+                # 同网段的路由可能被上一条隧道留着（RTNETLINK answers:
+                # File exists），那不是失败：路已经通了。
+                if "File exists" in (proc.stderr or ""):
+                    continue
+                logger.warning(
+                    "vpn step failed: %s: %s", argv, (proc.stderr or proc.stdout).strip()
+                )
+                _run(["ip", "link", "del", self.iface])
+                return False
+        self.up_ok = True
+        return True
+
+    def _setconf(self, cfg: str) -> bool:
+        """把配置喂给 wg。
+
+        优先走 ``ctfvpn-wg``（写 /etc/wireguard 后 setconf 再删），绕开
+        AppArmor 对 ``wg`` 的路径白名单。机器上没装这个包装时退回临时
+        文件——那在 AppArmor enforce 的机器上会失败，但至少错误来自真实
+        调用，而不是我们凭空拒绝。
+
+        Args:
+            cfg: wg-quick 风格的 ``[Interface]/[Peer]`` 文本。
+
+        Returns:
+            是否成功。
+        """
+        wrapper = shutil.which("ctfvpn-wg") or "/usr/local/sbin/ctfvpn-wg"
+        if Path(wrapper).exists():
+            argv = [wrapper, self.iface]
+            if os.geteuid() != 0:
+                argv = ["sudo", "-n", *argv]
+            proc = subprocess.run(
+                argv, input=cfg, capture_output=True, text=True, timeout=20
+            )
+            if proc.returncode == 0:
+                return True
+            logger.warning(
+                "vpn setconf failed via %s: %s",
+                wrapper, (proc.stderr or proc.stdout).strip(),
+            )
+            return False
+
         fd, path = tempfile.mkstemp(suffix=".wg")
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as fh:
                 fh.write(cfg)
             os.chmod(path, 0o600)
-            steps = [
-                ["ip", "link", "del", self.iface],
-                ["ip", "link", "add", self.iface, "type", "wireguard"],
-                ["wg", "setconf", self.iface, path],
-                ["ip", "-4", "addr", "add", self.address, "dev", self.iface],
-                ["ip", "link", "set", "mtu", "1420", "up", "dev", self.iface],
-                ["ip", "-4", "route", "add", self.allowed, "dev", self.iface],
-            ]
-            for i, argv in enumerate(steps):
-                proc = _run(argv)
-                # 第一步是幂等清理，失败无关紧要；其余失败就是真失败。
-                if proc.returncode != 0 and i > 0:
-                    # 同网段的路由可能被上一条隧道留着（RTNETLINK answers:
-                    # File exists），那不是失败：路已经通了。
-                    if "File exists" in proc.stderr:
-                        continue
-                    logger.warning("vpn step failed: %s: %s", argv, proc.stderr.strip())
-                    return False
-            self.up_ok = True
-            return True
+            proc = _run(["wg", "setconf", self.iface, path])
+            if proc.returncode == 0:
+                return True
+            logger.warning("vpn setconf failed: %s", (proc.stderr or proc.stdout).strip())
+            return False
         finally:
             Path(path).unlink(missing_ok=True)
 

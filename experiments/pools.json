@@ -1,0 +1,302 @@
+{
+  "_说明": "CTFARENA 评测池切分。改这个文件等于换尺子，必须重新记台账。",
+  "version": 2,
+  "seed": "ctfarena-split-v1",
+  "rule": "对未跑过且不在官方封存集(20道)里的题，按 solves_count 分桶(hardest<=5/hard6-10/mid11-20/easy21+)，桶内按 sha256(seed+id) 升序，取前 k 入诊断池，其余入储备池。",
+  "burned": [
+    "CTFARENA-000",
+    "CTFARENA-001",
+    "CTFARENA-002",
+    "CTFARENA-003",
+    "CTFARENA-004",
+    "CTFARENA-006",
+    "CTFARENA-007",
+    "CTFARENA-009",
+    "CTFARENA-010",
+    "CTFARENA-011",
+    "CTFARENA-012",
+    "CTFARENA-013",
+    "CTFARENA-014",
+    "CTFARENA-015",
+    "CTFARENA-016",
+    "CTFARENA-017",
+    "CTFARENA-018",
+    "CTFARENA-019",
+    "CTFARENA-020",
+    "CTFARENA-021",
+    "CTFARENA-022",
+    "CTFARENA-023",
+    "CTFARENA-025",
+    "CTFARENA-026",
+    "CTFARENA-027",
+    "CTFARENA-028",
+    "CTFARENA-029",
+    "CTFARENA-030",
+    "CTFARENA-031",
+    "CTFARENA-032",
+    "CTFARENA-035",
+    "CTFARENA-036",
+    "CTFARENA-037",
+    "CTFARENA-038",
+    "CTFARENA-039",
+    "CTFARENA-040",
+    "CTFARENA-041",
+    "CTFARENA-042",
+    "CTFARENA-043",
+    "CTFARENA-044",
+    "CTFARENA-045",
+    "CTFARENA-046",
+    "CTFARENA-047",
+    "CTFARENA-049",
+    "CTFARENA-050",
+    "CTFARENA-051",
+    "CTFARENA-052",
+    "CTFARENA-053",
+    "CTFARENA-054",
+    "CTFARENA-055",
+    "CTFARENA-057",
+    "CTFARENA-059",
+    "CTFARENA-061",
+    "CTFARENA-064",
+    "CTFARENA-065",
+    "CTFARENA-067",
+    "CTFARENA-072",
+    "CTFARENA-073",
+    "CTFARENA-074",
+    "CTFARENA-078",
+    "CTFARENA-079",
+    "CTFARENA-080",
+    "CTFARENA-081",
+    "CTFARENA-082",
+    "CTFARENA-083",
+    "CTFARENA-084",
+    "CTFARENA-086",
+    "CTFARENA-087",
+    "CTFARENA-094",
+    "CTFARENA-095",
+    "CTFARENA-096",
+    "CTFARENA-098",
+    "CTFARENA-102",
+    "CTFARENA-103",
+    "CTFARENA-106",
+    "CTFARENA-107",
+    "CTFARENA-112",
+    "CTFARENA-113",
+    "CTFARENA-114"
+  ],
+  "burned_note": "已跑 78 题 = 45 历史 + 20 诊断批(2026-11-01) + 13 道本队已提交但漏记的(002/013/015/016/035/053/054/074/078/082/083/084/095，用 /api/v1/submissions 核对)。永久退出验证用途，只能当历史基线。",
+  "sealed_excluded": [
+    "CTFARENA-024",
+    "CTFARENA-034",
+    "CTFARENA-048",
+    "CTFARENA-069",
+    "CTFARENA-097",
+    "CVE-2017-9841",
+    "CYBENCH-003",
+    "CYBENCH-007",
+    "CYBENCH-036",
+    "SQLILABS-004",
+    "SQLILABS-008",
+    "SQLILABS-033",
+    "SQLILABS-063",
+    "SQLILABS-066",
+    "UPLOADLABS-002",
+    "UPLOADLABS-008",
+    "XBOW-004",
+    "XBOW-020",
+    "XBOW-076",
+    "XBOW-095"
+  ],
+  "sealed_note": "官方封存集，见 docs/22 §5.3。定稿前只跑一次，跑完不改代码。",
+  "diagnostic": [
+    {
+      "id": "CTFARENA-033",
+      "difficulty": "hard",
+      "solves_count": 3,
+      "bucket": "hardest"
+    },
+    {
+      "id": "CTFARENA-071",
+      "difficulty": "medium",
+      "solves_count": 4,
+      "bucket": "hardest"
+    },
+    {
+      "id": "CTFARENA-075",
+      "difficulty": "medium",
+      "solves_count": 3,
+      "bucket": "hardest"
+    },
+    {
+      "id": "CTFARENA-070",
+      "difficulty": "medium",
+      "solves_count": 4,
+      "bucket": "hardest"
+    },
+    {
+      "id": "CTFARENA-005",
+      "difficulty": "hard",
+      "solves_count": 0,
+      "bucket": "hardest"
+    },
+    {
+      "id": "CTFARENA-062",
+      "difficulty": "hard",
+      "solves_count": 7,
+      "bucket": "hard"
+    },
+    {
+      "id": "CTFARENA-068",
+      "difficulty": "medium",
+      "solves_count": 10,
+      "bucket": "hard"
+    },
+    {
+      "id": "CTFARENA-109",
+      "difficulty": "hard",
+      "solves_count": 9,
+      "bucket": "hard"
+    },
+    {
+      "id": "CTFARENA-099",
+      "difficulty": "hard",
+      "solves_count": 7,
+      "bucket": "hard"
+    },
+    {
+      "id": "CTFARENA-056",
+      "difficulty": "hard",
+      "solves_count": 10,
+      "bucket": "hard"
+    },
+    {
+      "id": "CTFARENA-088",
+      "difficulty": "hard",
+      "solves_count": 8,
+      "bucket": "hard"
+    },
+    {
+      "id": "CTFARENA-060",
+      "difficulty": "hard",
+      "solves_count": 10,
+      "bucket": "hard"
+    },
+    {
+      "id": "CTFARENA-066",
+      "difficulty": "medium",
+      "solves_count": 10,
+      "bucket": "hard"
+    },
+    {
+      "id": "CTFARENA-076",
+      "difficulty": "hard",
+      "solves_count": 11,
+      "bucket": "mid"
+    },
+    {
+      "id": "CTFARENA-104",
+      "difficulty": "medium",
+      "solves_count": 12,
+      "bucket": "mid"
+    },
+    {
+      "id": "CTFARENA-101",
+      "difficulty": "medium",
+      "solves_count": 11,
+      "bucket": "mid"
+    },
+    {
+      "id": "CTFARENA-089",
+      "difficulty": "medium",
+      "solves_count": 11,
+      "bucket": "mid"
+    },
+    {
+      "id": "CTFARENA-108",
+      "difficulty": "medium",
+      "solves_count": 12,
+      "bucket": "mid"
+    },
+    {
+      "id": "CTFARENA-111",
+      "difficulty": "medium",
+      "solves_count": 11,
+      "bucket": "mid"
+    }
+  ],
+  "reserve": [
+    {
+      "id": "CTFARENA-008",
+      "difficulty": "hard",
+      "solves_count": 0,
+      "bucket": "hardest"
+    },
+    {
+      "id": "CTFARENA-058",
+      "difficulty": "hard",
+      "solves_count": 9,
+      "bucket": "hard"
+    },
+    {
+      "id": "CTFARENA-063",
+      "difficulty": "hard",
+      "solves_count": 8,
+      "bucket": "hard"
+    },
+    {
+      "id": "CTFARENA-077",
+      "difficulty": "hard",
+      "solves_count": 5,
+      "bucket": "hardest"
+    },
+    {
+      "id": "CTFARENA-085",
+      "difficulty": "hard",
+      "solves_count": 8,
+      "bucket": "hard"
+    },
+    {
+      "id": "CTFARENA-090",
+      "difficulty": "medium",
+      "solves_count": 11,
+      "bucket": "mid"
+    },
+    {
+      "id": "CTFARENA-091",
+      "difficulty": "hard",
+      "solves_count": 6,
+      "bucket": "hard"
+    },
+    {
+      "id": "CTFARENA-092",
+      "difficulty": "hard",
+      "solves_count": 8,
+      "bucket": "hard"
+    },
+    {
+      "id": "CTFARENA-093",
+      "difficulty": "hard",
+      "solves_count": 8,
+      "bucket": "hard"
+    },
+    {
+      "id": "CTFARENA-100",
+      "difficulty": "hard",
+      "solves_count": 8,
+      "bucket": "hard"
+    },
+    {
+      "id": "CTFARENA-105",
+      "difficulty": "medium",
+      "solves_count": 11,
+      "bucket": "mid"
+    },
+    {
+      "id": "CTFARENA-110",
+      "difficulty": "medium",
+      "solves_count": 11,
+      "bucket": "mid"
+    }
+  ],
+  "diagnostic_note": "batch2 2026-11-01: 19 challenges validating enum_guard noise fix + three knowledge changes. Burned after run."
+}
