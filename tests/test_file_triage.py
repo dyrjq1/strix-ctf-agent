@@ -76,5 +76,10 @@ def test_elf_suggests_static_analysis_not_execution(tmp_path: Path, monkeypatch)
     monkeypatch.setattr(ft.shutil, "which", lambda name: None)
     out = ft.file_triage(str(target))
     assert "family: elf" in out
-    assert "checksec" in out
+    # Every hint must be runnable in this image.  ``checksec`` and ``r2`` are
+    # not installed (docker/Dockerfile), so suggesting them sent the model at a
+    # missing binary on its first call -- docs/27 C2.
+    assert "checksec" not in out
+    assert "r2" not in out
+    assert "readelf" in out
     assert "别一上来跑它" in out

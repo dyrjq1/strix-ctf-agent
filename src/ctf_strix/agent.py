@@ -803,6 +803,195 @@ def _writeup(
     return "\n".join(lines)
 
 
+def _registered_names() -> frozenset[str]:
+    """Return the tool names really present in the scan-agent registry.
+
+    Returns:
+        The registered names, or an empty set when the registry is not
+        importable (unit tests and the dry-run path do not need it).
+    """
+
+    try:
+        from strix.agents import factory
+
+        return frozenset(getattr(tool, "name", "") for tool in factory.registered_agent_tools())
+    except Exception:  # noqa: BLE001
+        return frozenset()
+
+
+def _measured_groups(kind: str) -> list[str]:
+    """Return the catalogue groups whose tools are really in the registry.
+
+    The installer used to report the groups it *tried* to install, so a partial
+    failure left the prompt promising a tool that was not there -- the same
+    class of drift this whole change removes.  Reading the registry closes it:
+    only a name that can actually be called is described.
+
+    Args:
+        kind: challenge kind, used to ignore tools not offered to this kind.
+
+    Returns:
+        Group names in prompt order, ``base`` excluded (it is always present).
+    """
+
+    from ctf_strix import catalogue
+
+    try:
+        from strix.agents import factory
+
+        present = {getattr(tool, "name", "") for tool in factory.registered_agent_tools()}
+    except Exception:  # noqa: BLE001 — no registry means nothing to promise
+        return []
+
+    found = {
+        info.group
+        for info in catalogue.for_kind(kind)
+        if info.group != "base" and info.name in present
+    }
+    return [group for group in ("web", "file", "tcp", "aisec") if group in found]
+
+
+def install_toolset(task: dict[str, Any], kind: str) -> tuple[str, list[str]]:
+    """Register every capability this challenge kind is entitled to.
+
+    Args:
+        task: parsed task.json; AI-security gating reads its metadata.
+        kind: challenge kind from _challenge_kind.
+
+    Returns:
+        (skill routing hint, installer groups that registered).  The groups
+        are what prompt.activate describes, which is how registration and
+        the Tools section stay in step.
+    """
+
+    from ctf_strix.capabilities import install_soft_deadline
+    from ctf_strix.capabilities import install_web_capabilities
+    from ctf_strix.capabilities import wants_aisec
+
+    # Only kinds with a live web surface pay for the HTTP primitives.  A file or
+    # tcp challenge used to register all four unconditionally: 3,829 chars of
+    # schema (~843 tokens) on every call, for tools whose target does not exist.
+    if kind in ("web", "checker", "engagement"):
+        installed, cap_errors = install_web_capabilities()
+        print(
+            f"[ctfy] web capabilities: "
+            f"http_probe={len(installed.get('http_probe', []))} "
+            f"discovery={len(installed.get('discovery', []))} "
+            f"variants={len(installed.get('variants', []))}",
+            flush=True,
+        )
+        for message in cap_errors:
+            print(f"[ctfy] capability failed: {message}", flush=True)
+    else:
+        print(f"[ctfy] web capabilities skipped (kind={kind})", flush=True)
+
+    # Soft deadline is opt-in: the platform does not publish a per-challenge
+    # wall clock, so inventing one would cut hard challenges short.
+    soft_seconds = float(os.environ.get("CTFY_SOFT_DEADLINE", "0") or 0)
+    if install_soft_deadline(soft_seconds, _turn_budget(task)) is not None:
+        print(f"[ctfy] soft deadline {soft_seconds:.0f}s installed", flush=True)
+
+    # 附件题（rev/pwn/misc/crypto）才装文件入口原语；web 题不为它付 schema token。
+    if kind in ("file", "tcp"):
+        try:
+            from ctf_strix import file_triage
+
+            added = file_triage.register()
+            print(f"[file] registered {len(added)} tools: {', '.join(added) or '(already present)'}", flush=True)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[file] registration failed: {type(exc).__name__}: {exc}", flush=True)
+
+        # Non-web primitives (decode chain / safe unpack / hex view / raw TCP /
+        # batched TCP / ELF peek).  Split by kind: an attachment challenge must
+        # not pay for socket schemas and a remote-service challenge must not pay
+        # for archive ones.  Kept separate from file_triage on purpose --
+        # file_triage answers "what is this?", these answer "what does it say?".
+        try:
+            from ctf_strix import nonweb
+
+            added = nonweb.register(kind=kind)
+            print(f"[nonweb] registered {len(added)} tools: {', '.join(added) or '(already present)'}", flush=True)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[nonweb] registration failed: {type(exc).__name__}: {exc}", flush=True)
+
+    # token 计量：result.json 的 input_tokens / output_tokens 必须是真实值。
+    # 计量失败不影响解题，只退化成 0。
+    try:
+        from ctf_strix.usage_meter import install as install_usage_meter
+
+        install_usage_meter()
+    except Exception as exc:  # noqa: BLE001
+        print(f"[ctfy] usage meter unavailable: {type(exc).__name__}: {exc}", flush=True)
+
+    # 技能包：12 个方向索引，走 strix 自带的 load_skill。只注册索引、不注册
+    # 整包——整包 145 条进 system prompt，其中 133 条是没有 frontmatter 的参考
+    # 子文件，对模型零信息量。
+    hint = ""
+    try:
+        from ctf_strix import skillpack
+
+        names = skillpack.register()
+        if names:
+            hint = skillpack.prompt_hint(names)
+            print(f"[ctfy] skills registered={len(names)} ref={skillpack.ref_root()}", flush=True)
+        else:
+            print("[ctfy] skills pack missing, routing hint not installed", flush=True)
+    except Exception as exc:  # noqa: BLE001 — 技能装不上也要能把题跑完
+        print(f"[ctfy] skills registration failed: {type(exc).__name__}: {exc}", flush=True)
+
+    # AI 安全能力（指纹 + CVE 匹配）：走官方 register_agent_tools，不改 vendor。
+    # 规则库缺失时不注册——挂一个必然报错的工具只会浪费轮次。
+    # 2026-11-02: this used to register whenever the rule data was on disk, while
+    # the eval harness defaulted CTF_AISEC=0.  The submitted image therefore had
+    # three schemas the measured one never had -- the same drift as the web
+    # primitives and sweep_guard before it.  One rule now lives in
+    # capabilities.wants_aisec and both entrypoints call it.
+    aisec_on, aisec_reason = wants_aisec(kind, task)
+    try:
+        from ctf_strix.aisec import aig_probe
+        from ctf_strix.aisec import tools as aisec_tools
+
+        if not aisec_on:
+            print(f"[ctfy] aisec off ({aisec_reason})", flush=True)
+        elif not aig_probe.data_dir():
+            print(f"[ctfy] aisec wanted but rules missing ({aisec_reason})", flush=True)
+        else:
+            registered = aisec_tools.register()
+            print(f"[ctfy] aisec tools={len(registered)} ({aisec_reason})", flush=True)
+    except Exception as exc:  # noqa: BLE001 — 增强能力失败不能让整题跑不动
+        print(f"[ctfy] aisec registration failed: {type(exc).__name__}: {exc}", flush=True)
+
+    # ── 上下文管理（2026-11-01）────────────────────────────────────────────
+    # 两处改动都挂在框架已有的接缝上，vendor 不动：
+    #   1) prompt.install()  替换 103,541 字符的通用渗透提示（实测 22,813 token）
+    #   2) context.install_history_elision()  每次 LLM 请求前裁剪旧工具输出
+    #
+    # 依据：043/047 两道 hard 题都在 40 轮用尽时失败，input 2.24M token，
+    # 且 strix 自带的 maybe_compact 阈值 180k 在单轮峰值 54k 下永不触发。
+    # 详见 src/ctf_strix/context.py 与 src/ctf_strix/prompt.py 的模块注释。
+    groups = ["base"]
+    try:
+        from ctf_strix import context as ctf_context
+        from ctf_strix import prompt as ctf_prompt
+
+        # Tell the prompt which kind is running *before* the first render, so
+        # the Tools section describes what was actually registered: a file
+        # challenge is not told about route_map, and is told about decode_blob.
+        groups = ["base", *_measured_groups(kind)]
+        ctf_prompt.activate(kind, tuple(groups), _registered_names())
+        ctf_prompt.install()
+        capper = ctf_context.install()
+        print(
+            f"[ctx] prompt installed kind={kind} groups={','.join(groups)} "
+            f"({len(ctf_prompt.build({}))} chars); "
+            f"content cap={capper.cap_chars} chars/output, {capper.arg_cap} chars/args",
+            flush=True,
+        )
+    except Exception as exc:  # noqa: BLE001 — 上下文改造失败必须回落到原行为
+        print(f"[ctx] install failed: {type(exc).__name__}: {exc}", flush=True)
+    return hint, groups
+
+
 def _run_agent(
     task: dict[str, Any],
     answers: dict[str, str],
@@ -904,108 +1093,9 @@ def _run_agent(
     # validated there but were never registered here, so the submitted image
     # silently ran the pre-v2 tool surface.  Both entrypoints now share one
     # installer; failures are printed instead of swallowed.
-    from ctf_strix.capabilities import install_soft_deadline
-    from ctf_strix.capabilities import install_web_capabilities
-
-    installed, cap_errors = install_web_capabilities()
-    print(
-        f"[ctfy] web capabilities: "
-        f"http_probe={len(installed.get('http_probe', []))} "
-        f"discovery={len(installed.get('discovery', []))}",
-        flush=True,
-    )
-    for message in cap_errors:
-        print(f"[ctfy] capability failed: {message}", flush=True)
-
-    # Soft deadline is opt-in: the platform does not publish a per-challenge
-    # wall clock, so inventing one would cut hard challenges short.
-    soft_seconds = float(os.environ.get("CTFY_SOFT_DEADLINE", "0") or 0)
-    if install_soft_deadline(soft_seconds, _turn_budget(task)) is not None:
-        print(f"[ctfy] soft deadline {soft_seconds:.0f}s installed", flush=True)
-
-    # 附件题（rev/pwn/misc/crypto）才装文件入口原语；web 题不为它付 schema token。
-    if kind in ("file", "tcp"):
-        try:
-            from ctf_strix import file_triage
-
-            added = file_triage.register()
-            print(f"[file] registered {len(added)} tools: {', '.join(added) or '(already present)'}", flush=True)
-        except Exception as exc:  # noqa: BLE001
-            print(f"[file] registration failed: {type(exc).__name__}: {exc}", flush=True)
-
-        # Non-web primitives (decode chain / safe unpack / hex view / raw TCP /
-        # batched TCP / ELF peek).  Split by kind: an attachment challenge must
-        # not pay for socket schemas and a remote-service challenge must not pay
-        # for archive ones.  Kept separate from file_triage on purpose --
-        # file_triage answers "what is this?", these answer "what does it say?".
-        try:
-            from ctf_strix import nonweb
-
-            added = nonweb.register(kind=kind)
-            print(f"[nonweb] registered {len(added)} tools: {', '.join(added) or '(already present)'}", flush=True)
-        except Exception as exc:  # noqa: BLE001
-            print(f"[nonweb] registration failed: {type(exc).__name__}: {exc}", flush=True)
-
-    # token 计量：result.json 的 input_tokens / output_tokens 必须是真实值。
-    # 计量失败不影响解题，只退化成 0。
-    try:
-        from ctf_strix.usage_meter import install as install_usage_meter
-
-        install_usage_meter()
-    except Exception as exc:  # noqa: BLE001
-        print(f"[ctfy] usage meter unavailable: {type(exc).__name__}: {exc}", flush=True)
-
-    # 技能包：12 个方向索引，走 strix 自带的 load_skill。只注册索引、不注册
-    # 整包——整包 145 条进 system prompt，其中 133 条是没有 frontmatter 的参考
-    # 子文件，对模型零信息量。
-    hint = ""
-    try:
-        from ctf_strix import skillpack
-
-        names = skillpack.register()
-        if names:
-            hint = skillpack.prompt_hint(names)
-            print(f"[ctfy] skills registered={len(names)} ref={skillpack.ref_root()}", flush=True)
-        else:
-            print("[ctfy] skills pack missing, routing hint not installed", flush=True)
-    except Exception as exc:  # noqa: BLE001 — 技能装不上也要能把题跑完
-        print(f"[ctfy] skills registration failed: {type(exc).__name__}: {exc}", flush=True)
-
-    # AI 安全能力（指纹 + CVE 匹配）：走官方 register_agent_tools，不改 vendor。
-    # 规则库缺失时不注册——挂一个必然报错的工具只会浪费轮次。
-    try:
-        from ctf_strix.aisec import aig_probe
-        from ctf_strix.aisec import tools as aisec_tools
-
-        if aig_probe.data_dir():
-            registered = aisec_tools.register()
-            print(f"[ctfy] aisec tools={len(registered)}", flush=True)
-        else:
-            print("[ctfy] aisec rules missing, tools not registered", flush=True)
-    except Exception as exc:  # noqa: BLE001 — 增强能力失败不能让整题跑不动
-        print(f"[ctfy] aisec registration failed: {type(exc).__name__}: {exc}", flush=True)
-
-    # ── 上下文管理（2026-11-01）────────────────────────────────────────────
-    # 两处改动都挂在框架已有的接缝上，vendor 不动：
-    #   1) prompt.install()  替换 103,541 字符的通用渗透提示（实测 22,813 token）
-    #   2) context.install_history_elision()  每次 LLM 请求前裁剪旧工具输出
-    #
-    # 依据：043/047 两道 hard 题都在 40 轮用尽时失败，input 2.24M token，
-    # 且 strix 自带的 maybe_compact 阈值 180k 在单轮峰值 54k 下永不触发。
-    # 详见 src/ctf_strix/context.py 与 src/ctf_strix/prompt.py 的模块注释。
-    try:
-        from ctf_strix import context as ctf_context
-        from ctf_strix import prompt as ctf_prompt
-
-        ctf_prompt.install()
-        capper = ctf_context.install()
-        print(
-            f"[ctx] prompt installed ({len(ctf_prompt.build({}))} chars); "
-            f"content cap={capper.cap_chars} chars/output, {capper.arg_cap} chars/args",
-            flush=True,
-        )
-    except Exception as exc:  # noqa: BLE001 — 上下文改造失败必须回落到原行为
-        print(f"[ctx] install failed: {type(exc).__name__}: {exc}", flush=True)
+    # One place assembles the tool surface, so what is registered and what
+    # the prompt describes cannot drift apart (docs/27 C3/C4).
+    hint, groups = install_toolset(task, kind)
 
     from strix.core.runner import run_strix_scan
 

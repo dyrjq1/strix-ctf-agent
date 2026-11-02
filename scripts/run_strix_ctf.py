@@ -37,6 +37,16 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--turns", type=int, default=12, help="Max agent turns (cost cap)")
     p.add_argument("--name", default=None, help="Scan id; defaults to a timestamp")
     p.add_argument(
+        "--tags",
+        nargs="*",
+        default=None,
+        help=(
+            "Challenge tags as published by the platform. Used only to decide whether "
+            "the AI-security tools are worth their schema; never used as a hint about "
+            "how to solve the challenge."
+        ),
+    )
+    p.add_argument(
         "--instruction",
         default="",
         help="Extra instruction appended to strix's root task",
@@ -229,19 +239,28 @@ async def main() -> int:
         from ctf_strix.aisec import aig_probe
         from ctf_strix.aisec import tools as aisec_tools
 
-        # 默认不注册。理由：旧总账里 "aisec 收益验证" 一栏的结论是
-        # "本批全是传统 CTF 题，AI 组件指纹没用上"；而这 3 个工具 schema
-        # 会常驻每次调用的 prompt。CTF 里 20 次调用 × ~500 token 不值。
-        # 需要时 CTF_AISEC=1 打开。
-        enabled = os.environ.get("CTF_AISEC", "").strip() in ("1", "true", "yes")
+        # One rule for both entrypoints (capabilities.wants_aisec): CTF_AISEC
+        # overrides, otherwise the challenge's own metadata decides.  Before
+        # this, the harness defaulted off and the submitted image defaulted on,
+        # so the measured tool surface was not the delivered one.
+        from ctf_strix.capabilities import wants_aisec
+
+        # This script receives the challenge description as text (--instruction),
+        # not as task.json, so the metadata the official entrypoint reads is
+        # reconstructed here from what the caller did pass.
+        aisec_task = {
+            "challenge": {"description": args.instruction or ""},
+            "tags": [t for t in (args.tags or [])],
+        }
+        enabled, reason = wants_aisec(args.target_kind, aisec_task)
         if enabled and aig_probe.data_dir():
             registered = aisec_tools.register()
-            print(f"[aisec] registered {len(registered)} tools: {', '.join(registered)}")
+            print(f"[aisec] registered {len(registered)} tools: {', '.join(registered)} ({reason})")
             print(f"[aisec] rules={aig_probe.data_dir()} allow={os.environ.get('CTF_AISEC_ALLOW', '(none)')}")
         elif enabled:
-            print("[aisec] rules missing, AI-security tools NOT registered")
+            print(f"[aisec] wanted ({reason}) but rules missing, tools NOT registered")
         else:
-            print("[aisec] disabled by default (set CTF_AISEC=1 to enable)")
+            print(f"[aisec] off ({reason})")
     except Exception as e:  # noqa: BLE001 — 增强能力失败不能让整题跑不动
         print(f"[aisec] registration failed: {type(e).__name__}: {e}")
 
@@ -250,11 +269,20 @@ async def main() -> int:
     # apart again.
     from ctf_strix.capabilities import install_web_capabilities
 
-    web_tools, web_errors = install_web_capabilities()
-    for capability, names in web_tools.items():
-        print(f"[{capability}] registered {len(names)} tools: {', '.join(names) or '(already present)'}")
-    for message in web_errors:
-        print(f"[capability] registration failed: {message}")
+    # Same gate as the official entrypoint: HTTP primitives only where there is
+    # an HTTP surface.  Keeping the harness unconditional would re-create the
+    # very drift this change removes -- a run measured with four extra schemas
+    # is not the run the platform will make.
+    groups: list[str] = ["base"]
+    if args.target_kind in ("web", "checker", "engagement"):
+        web_tools, web_errors = install_web_capabilities()
+        groups.append("web")
+        for capability, names in web_tools.items():
+            print(f"[{capability}] registered {len(names)} tools: {', '.join(names) or '(already present)'}")
+        for message in web_errors:
+            print(f"[capability] registration failed: {message}")
+    else:
+        print(f"[web] skipped (kind={args.target_kind})")
 
     # 文件类题（rev/pwn/misc/crypto 的附件题）才装入口原语。
     #
@@ -265,6 +293,7 @@ async def main() -> int:
             from ctf_strix import file_triage
 
             added = file_triage.register()
+            groups.append("file")
             print(f"[file] registered {len(added)} tools: {', '.join(added) or '(already present)'}")
         except Exception as e:  # noqa: BLE001
             print(f"[file] registration failed: {type(e).__name__}: {e}")
@@ -277,6 +306,7 @@ async def main() -> int:
             from ctf_strix import nonweb
 
             added = nonweb.register(kind=args.target_kind)
+            groups.append("tcp" if args.target_kind == "tcp" else "file")
             print(f"[nonweb] registered {len(added)} tools: {', '.join(added) or '(already present)'}")
         except Exception as e:  # noqa: BLE001
             print(f"[nonweb] registration failed: {type(e).__name__}: {e}")
@@ -310,10 +340,12 @@ async def main() -> int:
         from ctf_strix import context as ctf_context
         from ctf_strix import prompt as ctf_prompt
 
+        ctf_prompt.activate(args.target_kind, tuple(groups))
         ctf_prompt.install()
         capper = ctf_context.install()
         print(
-            f"[ctx] prompt installed ({len(ctf_prompt.build({}))} chars); "
+            f"[ctx] prompt installed kind={args.target_kind} groups={','.join(groups)} "
+            f"({len(ctf_prompt.build({}))} chars); "
             f"content cap={capper.cap_chars} chars/output, {capper.arg_cap} chars/args"
         )
     except Exception as e:  # noqa: BLE001 — 失败必须回落到原来的行为

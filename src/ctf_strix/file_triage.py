@@ -98,20 +98,43 @@ def _family(magic: str, path: Path) -> str:
     return "unknown"
 
 
-#: family → 下一步命令。这句话是工具的主要价值，别删。
+#: family → 下一步。这句话是工具的主要价值，别删。
+#:
+#: ⚠️ 每一条都必须能在**本镜像里直接跑通**。旧版本给的是
+#: ``checksec`` / ``r2`` / ``binwalk`` / ``zsteg`` / ``exiftool`` / ``tshark``——这六个
+#: 在 ``docker/Dockerfile`` 里一个都没装。模型第一次调用就拿到一条
+#: 跑不通的命令，这是 Misc 题的第一个致命断点（docs/27 C2）。
+#:
+#: 现在的写法分两类：
+#:   * 镜像里有的工具（file / strings / xxd / unzip / binutils）——直接给命令；
+#:   * 镜像里没有的能力（图片隐写/pcap 重组/binwalk 扫描）——
+#:     给**用 python 手写**的具体入口，而不是一个不存在的命令。
+#: 这也是本项目的一贯结论：把"我没有这个能力"伪装成"我该往这走"，
+#: 比不给建议更糟。
 _NEXT: Final = {
-    "elf": "checksec --file={p} 2>/dev/null || r2 -q -c 'iI;izz~flag' {p}; 静态优先，别一上来跑它",
-    "pe": "r2 -q -c 'iI;iS' {p}  或 objdump -x {p} | head -60",
-    "macho": "r2 -q -c 'iI' {p}",
-    "zip": "binwalk -eM {p} 或 unzip -l {p}（先看清单再解，避免炸开一堆文件）",
-    "gzip": "file {p} && gunzip -c {p} | head -c 4000 | xxd | head -40",
-    "png": "zsteg -a {p} 2>/dev/null || exiftool {p} && binwalk {p}",
-    "jpeg": "exiftool {p} && binwalk {p}",
-    "pdf": "binwalk {p} && strings -n 8 {p} | head -40",
-    "pcap": "tshark -r {p} 2>/dev/null | head -40 || tcpdump -nn -r {p} | head -40",
-    "pyc": "python3 -c \"import sys;print(open(sys.argv[1],'rb').read(4).hex())\" {p}  # 先看 magic 再选反编译版本",
-    "text": "cat {p} | head -80",
-    "unknown": "xxd {p} | head -20 然后 binwalk {p}",
+    "elf": (
+        "readelf -h {p} && readelf -lW {p} | head -30；然后 elfpeek('{p}', what='all') 拿保护/符号/gadget。"
+        "静态优先，别一上来跑它。"
+    ),
+    "pe": "objdump -x {p} | head -60；镜像没有 r2，PE 的分析用 objdump + strings 手工推。",
+    "macho": "objdump -x {p} | head -40；镜像没有 r2。",
+    "zip": "unzip -l {p}（先看清单再解，避免炸开一堆文件）；解包用 unpack_archive('{p}')，它会进嵌套层。",
+    "gzip": "gunzip -c {p} | head -c 4000 | xxd | head -40；或 unpack_archive('{p}') 直接进嵌套。",
+    "png": (
+        "图像隐写要自己写（本镜像没装图像工具）："
+        "`python3 -c \"import zlib,struct;d=open('{p}','rb').read();print(len(d),d[:32].hex())\"` 先看块结构，"
+        "再抽 IDAT 解压看像素/alpha 低位。"
+    ),
+    "jpeg": "strings -n 8 {p} | head -40 看元数据可读段；结构用 xxd 手工读。",
+    "pdf": "strings -n 8 {p} | head -60；再 xxd {p} | head -40 看对象结构。",
+    "pcap": (
+        "本镜像没装抓包工具，用 python 手写："
+        "`python3 -c \"import struct;d=open('{p}','rb').read();print(d[:24].hex())\"` 先认魔数，"
+        "再按 帧头/传输层 分解 —— 常见题目只需把 payload 拼回来。"
+    ),
+    "pyc": "xxd {p} | head -4 先看 magic（对应 Python 版本），再决定用哪个反编译器。",
+    "text": "cat {p} | head -80；若是密文串，先 decode_blob('…') 而不是自己写解码器。",
+    "unknown": "xxd {p} | head -20 看前 320 字节的魔数；仍然认不出就 strings -n 6 {p} | head -40。",
 }
 
 _FLAG_RE: Final = re.compile(r"(?:FLAG|CTF|flag|ctfy)\{[^}\s]{4,80}\}")

@@ -68,27 +68,9 @@ that scores is the answer string, graded exactly. There is no report to write.
 - Failures that mean "stop diagnosing, change course": `curl` exit 000,
   `Connection refused` on 127.0.0.1, proxy errors.
 
-## Tools
+{tools}
 
-- `http_probe` — one structured HTTP exchange (status, headers, body, timing).
-- `route_map` — crawl the site and list API paths plus unverified `?` candidates
-  derived from the page's own vocabulary.
-- `method_sweep` — send a method across many paths in one call.
-- `path_variants` — retry a path under case/encoding/prefix variants.
-- `exec_command` — shell. Use it for Python scripts, loops over many payloads,
-  file reads after you get execution.
-- `load_skill` — load one discipline index. The list at the end of this prompt
-  says when each one applies; load at most one, then `read_file` its subfiles.
-- `think` — reasoning scratchpad. It does not touch the target.
-
-## How to spend turns
-
-1. Probe the root once, map routes once. Do not re-fetch a page you already have.
-2. If the app has accounts or login, register and log in **before** attacking.
-   Access-control bugs live behind a session you have not created yet. Two
-   accounts beat any wordlist.
-3. Attack the specific thing you found. Name the mechanism before you send:
-   "id param is trusted server-side, swap it for another user's id".
+{turns}
 
 ## The failure mode that costs the most
 
@@ -108,6 +90,96 @@ Call `finish_scan` only when the answer string is in front of you, quoted
 verbatim (case and braces matter). Before calling it, answer honestly: do I have
 execution/file/DB read, and did I actually read the secret — or only a schema?
 """
+
+#: ``How to spend turns`` differs by challenge kind.  A file challenge has no
+#: root page to probe and no accounts to register; telling it to do both burns
+#: two turns before it opens the attachment.  The web text is the original one,
+#: unchanged, so the measured web behaviour does not move.
+_TURNS_WEB = """\
+## How to spend turns
+
+1. Probe the root once, map routes once. Do not re-fetch a page you already have.
+2. If the app has accounts or login, register and log in **before** attacking.
+   Access-control bugs live behind a session you have not created yet. Two
+   accounts beat any wordlist.
+3. Attack the specific thing you found. Name the mechanism before you send:
+   "id param is trusted server-side, swap it for another user's id".
+"""
+
+_TURNS_FILE = """\
+## How to spend turns
+
+1. `file_triage` the attachment once. Do not run `file` and `strings` by hand
+   first: the triage answer already contains both, plus the family guess.
+2. Follow the family. An archive goes through `unpack_archive` (it walks nested
+   ones); an image or a pcap is a data-carving problem, not an HTTP one; a
+   binary goes through `elfpeek` and stays static until you have a reason to run
+   it.
+3. When the trail is a string rather than a file, `decode_blob` before writing
+   your own decoder — it reports which layer was which.
+4. Name the mechanism before each step: "the flag is in the PNG IDAT after the
+   LSB plane", "the second gzip member holds the key".
+"""
+
+_TURNS_TCP = """\
+## How to spend turns
+
+1. `file_triage` the attachment first when there is one, then `tcp` once to read
+   the banner. The banner usually names the binary and its protections.
+2. `elfpeek` the binary before connecting again: checksec-style results, symbols
+   and gadgets come from the file, not from the service.
+3. Probe with `tcp_batch`, not a hand-written loop. One call, many payloads,
+   one line per response — that is how an offset is found.
+4. Name the crash before you weaponise it: which input, which offset, which
+   register or return address it overwrites.
+"""
+
+_TURNS: dict[str, str] = {
+    "web": _TURNS_WEB,
+    "checker": _TURNS_WEB,
+    "engagement": _TURNS_WEB,
+    "file": _TURNS_FILE,
+    "tcp": _TURNS_TCP,
+}
+
+#: Challenge kind and the installer groups that actually registered.  Set by
+#: :func:`activate` from the entrypoint, before the first prompt is rendered.
+#: ``None`` means "not told yet": the renderer then offers every row for
+#: ``web``, which is the pre-2026-11-02 behaviour and keeps unit tests working.
+_ACTIVE_KIND: str = "web"
+_ACTIVE_GROUPS: tuple[str, ...] | None = None
+_ACTIVE_NAMES: frozenset[str] | None = None
+
+
+def activate(
+    kind: str,
+    groups: tuple[str, ...] | None = None,
+    names: frozenset[str] | set[str] | None = None,
+) -> None:
+    """Tell the prompt which challenge kind is running and what was installed.
+
+    Why this is a module-level switch rather than a render argument: strix's
+    ``render_system_prompt`` signature is fixed and is rebound at import time in
+    three modules.  Passing the kind through it would mean changing vendor code,
+    and vendor stays untouched.
+
+    Args:
+        kind: ``web`` / ``file`` / ``tcp`` / ``checker`` / ``engagement``.
+        groups: installer groups that registered successfully.  ``None`` keeps
+            every group, which is only correct when nothing was asked to skip.
+        names: tool names measured in the registry.  ``None`` means "trust the
+            groups", which is right for unit tests and wrong for a live run --
+            see ``catalogue.for_kind``.
+    """
+    global _ACTIVE_KIND, _ACTIVE_GROUPS, _ACTIVE_NAMES
+    _ACTIVE_KIND = kind or "web"
+    _ACTIVE_GROUPS = groups
+    _ACTIVE_NAMES = names
+
+
+def active() -> tuple[str, tuple[str, ...] | None]:
+    """Return ``(kind, groups)`` currently in effect; used by tests and logs."""
+    return _ACTIVE_KIND, _ACTIVE_GROUPS
 
 
 def _targets_block(ctx: dict[str, Any] | None) -> str:
@@ -230,6 +302,32 @@ def _skills_block() -> str:
     )
 
 
+def _render_core(
+    kind: str,
+    groups: tuple[str, ...] | None,
+    names: frozenset[str] | set[str] | None = None,
+) -> str:
+    """Fill the Tools and How-to-spend-turns sections for one challenge kind.
+
+    Both come from the single catalogue (``ctf_strix.catalogue``) and from the
+    per-kind turn plan, so a tool that is registered but undescribed -- or
+    described but not registered -- is impossible by construction.
+
+    Args:
+        kind: challenge kind from ``agent._challenge_kind``.
+        groups: installer groups that actually registered.
+        names: tool names measured in the registry; ``None`` trusts the groups.
+
+    Returns:
+        The core prompt text, ready to concatenate.
+    """
+    from ctf_strix import catalogue
+
+    tools = catalogue.prompt_block(kind, groups, names)
+    turns = _TURNS.get(kind, _TURNS_WEB)
+    return _CORE.format(tools=tools, turns=turns).strip()
+
+
 def build(system_prompt_context: dict[str, Any] | None = None) -> str:
     """拼出 CTF 系统提示。
 
@@ -251,7 +349,8 @@ def build(system_prompt_context: dict[str, Any] | None = None) -> str:
     if OVERRIDE.is_file():
         return OVERRIDE.read_text(encoding="utf-8")
 
-    parts = [_CORE.strip(), _targets_block(system_prompt_context), _skills_block()]
+    core = _render_core(_ACTIVE_KIND, _ACTIVE_GROUPS, _ACTIVE_NAMES)
+    parts = [core, _targets_block(system_prompt_context), _skills_block()]
     return "\n\n".join(part for part in parts if part) + "\n"
 
 

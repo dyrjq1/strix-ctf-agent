@@ -31,3 +31,6 @@ $null
 # 进 git 历史就再也删不干净，赔率远高于收益。只留计数与脱敏结论。
 traces/
 backup/
+
+# pytest TMP sandboxes (fresh dir per run to dodge Windows permission residue)
+ctfwork/

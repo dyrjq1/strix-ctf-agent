@@ -17,6 +17,7 @@ this challenge".
 
 from __future__ import annotations
 
+import os
 from typing import Callable
 
 
@@ -35,6 +36,84 @@ def _install(
     except Exception as exc:  # noqa: BLE001 - one capability must not kill the run
         installed[name] = []
         errors.append(f"{name}: {type(exc).__name__}: {exc}")
+
+
+#: Kinds where the HTTP primitives are worth their schema.  A ``file`` or
+#: ``tcp`` challenge has no route table to probe: buying ``route_map`` there is
+#: dead weight in every request's prompt, and it also invites the model to look
+#: for a web surface that does not exist.
+WEB_KINDS: tuple[str, ...] = ("web", "checker", "engagement")
+
+#: Tokens in the task's own metadata that mark a challenge as AI-facing.  This
+#: is used only to *offer* the AI-security tools; a hit is not a claim that the
+#: challenge is one.  Kept deliberately narrow: every token here has been seen
+#: on a real CTFY challenge page.
+_AISEC_HINTS: tuple[str, ...] = (
+    "agentic_ai",
+    "ai_security",
+    "ai-security",
+    "llm",
+    "prompt_injection",
+    "prompt-injection",
+    "rag",
+    "mcp",
+    "asi01",
+    "asi02",
+    "asi03",
+    "asi04",
+    "asi05",
+    "asi06",
+    "asi07",
+    "asi08",
+    "asi09",
+    "asi10",
+)
+
+
+def wants_aisec(kind: str, task: dict | None = None) -> tuple[bool, str]:
+    """Decide whether to register the three AI-security tools.
+
+    Args:
+        kind: challenge kind from ``agent._challenge_kind``.
+        task: the parsed ``task.json``; ``None`` means "no metadata available".
+
+    Returns:
+        ``(enabled, reason)``.  The reason is printed once at start-up, so a run
+        where the tools were off is distinguishable from a run where they were
+        on and not needed -- the two look identical in a transcript otherwise.
+
+    Notes:
+        ``CTF_AISEC=1`` forces them on and ``CTF_AISEC=0`` forces them off for
+        both entrypoints.  Without either, they follow the challenge metadata:
+        an AI-facing target gets them, everything else does not.
+    """
+    forced = os.environ.get("CTF_AISEC", "").strip().lower()
+    if forced in ("0", "false", "no"):
+        return False, "CTF_AISEC=0"
+    if forced in ("1", "true", "yes"):
+        return True, "CTF_AISEC=1"
+    if kind not in WEB_KINDS:
+        return False, f"kind={kind} has no web surface"
+    if not task:
+        return False, "no task metadata"
+    blob = " ".join(_metadata_tokens(task)).lower()
+    hits = [hint for hint in _AISEC_HINTS if hint in blob]
+    if hits:
+        return True, "task metadata mentions " + ", ".join(sorted(set(hits))[:3])
+    return False, "task metadata has no AI-security signal"
+
+
+def _metadata_tokens(task: dict) -> list[str]:
+    """Flatten the task's tags/labels/name/description into searchable tokens."""
+    tokens: list[str] = []
+    challenge = task.get("challenge") or {}
+    if isinstance(challenge, dict):
+        tokens.append(str(challenge.get("name") or ""))
+        tokens.append(str(challenge.get("description") or ""))
+        tokens.extend(str(t) for t in (challenge.get("tags") or []))
+    tokens.extend(str(t) for t in (task.get("tags") or []))
+    tokens.extend(str(t) for t in (task.get("labels") or []))
+    return [t for t in tokens if t]
 
 
 def install_web_capabilities(

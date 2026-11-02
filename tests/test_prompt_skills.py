@@ -82,13 +82,25 @@ def test_index_carries_a_when_to_use_hint(block):
 
 
 def test_prompt_does_not_duplicate_the_skill_list():
-    """``_CORE`` must not name directions; it points at the index instead."""
+    """No hard-coded direction list anywhere in the rendered prompt.
+
+    ``_CORE`` is a template now (Tools and turns are filled per kind), so the
+    assertion has to run on rendered output: a hard-coded list added to the
+    template would still be a second source of truth.
+    """
     from ctf_strix import prompt
 
-    core = prompt._CORE
+    text = prompt.build({})
+    # Everything from "## Skill indexes" on is the generated index; nothing
+    # before it may name a direction, and nothing after it may name one twice.
+    head, _, index = text.partition("## Skill indexes")
     for name in ("ctf-web", "ctf-ai-ml", "ctf-triage"):
-        assert name not in core, f"_CORE still hard-codes {name}"
-    assert "load_skill" in core
+        assert name not in head, f"{name} is hard-coded above the index"
+        # Each index line is ``- `ctf-x/ctf-x` -- when to use it``, so the
+        # category name legitimately appears twice *on that one line*.
+        entries = [ln for ln in index.splitlines() if ln.startswith("- `")]
+        assert sum(name in ln for ln in entries) <= 1, f"{name} is listed twice"
+    assert "load_skill" in text
 
 
 def test_prompt_stays_small(block):
