@@ -18,6 +18,7 @@ this challenge".
 from __future__ import annotations
 
 import os
+import re
 from typing import Callable
 
 
@@ -55,6 +56,10 @@ _AISEC_HINTS: tuple[str, ...] = (
     "llm",
     "prompt_injection",
     "prompt-injection",
+    "prompt_injection_indirect",
+    "prompt_injection_bypass",
+    "agent_defense",
+    "agent_task",
     "rag",
     "mcp",
     "asi01",
@@ -68,6 +73,10 @@ _AISEC_HINTS: tuple[str, ...] = (
     "asi09",
     "asi10",
 )
+
+#: Tags that begin with an AI-security hint but mean something else.  Subtracted
+#: before the hint is tested, so ``llm_reasoning`` does not turn on ``llm``.
+_AISEC_LOOKALIKES: tuple[str, ...] = ("llm_reasoning",)
 
 
 def wants_aisec(kind: str, task: dict | None = None) -> tuple[bool, str]:
@@ -97,10 +106,42 @@ def wants_aisec(kind: str, task: dict | None = None) -> tuple[bool, str]:
     if not task:
         return False, "no task metadata"
     blob = " ".join(_metadata_tokens(task)).lower()
-    hits = [hint for hint in _AISEC_HINTS if hint in blob]
+    hits = [hint for hint in _AISEC_HINTS if _hint_matches(hint, blob)]
     if hits:
         return True, "task metadata mentions " + ", ".join(sorted(set(hits))[:3])
     return False, "task metadata has no AI-security signal"
+
+
+def _hint_matches(hint: str, blob: str) -> bool:
+    """Return whether ``hint`` occurs in ``blob`` as a whole token.
+
+    Substring matching is wrong here, and the failure was measured on the
+    platform's own catalog: ``rag`` matched ``storage``, so a plain storage
+    administration challenge (``C2O-ALIST-001``) was handed the three AI
+    security tools plus their schema on every request.  Underscores and
+    hyphens are part of a token, so ``ai_security`` and ``ai-security`` still
+    match themselves but ``aisecurity`` does not accidentally match either.
+
+    Args:
+        hint: one entry from :data:`_AISEC_HINTS`.
+        blob: lower-cased challenge metadata.
+
+    Returns:
+        ``True`` only when the hint stands on its own.
+    """
+
+    pattern = r"(?<![a-z0-9])" + re.escape(hint) + r"(?![a-z0-9])"
+    if re.search(pattern, blob) is None:
+        return False
+    # A hint can stand alone as a token and still belong to a longer tag that
+    # means something else.  ``llm_reasoning`` is CTFARENA's OSINT reasoning
+    # tag (measured on CTFARENA-037: a payroll kiosk, no model anywhere);
+    # matching the bare ``llm`` inside it bought three useless schemas on
+    # every request.  Subtract known look-alikes, then test the hint again.
+    for lookalike in _AISEC_LOOKALIKES:
+        if lookalike.startswith(hint + "_") or lookalike.startswith(hint + "-"):
+            blob = blob.replace(lookalike, " ")
+    return re.search(pattern, blob) is not None
 
 
 def _metadata_tokens(task: dict) -> list[str]:

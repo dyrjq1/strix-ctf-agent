@@ -154,3 +154,30 @@ def test_next_commands_only_use_binaries_the_image_installs():
     for family, hint in file_triage._NEXT.items():
         for name in banned:
             assert name not in hint, f"_NEXT[{family}] still suggests missing {name}"
+
+@pytest.mark.parametrize(
+    "metadata,expected,why",
+    [
+        ({"description": "create a storage you are operating here"}, False, "rag inside storage"),
+        ({"tags": ["benchmark_c2o", "api_operation"]}, False, "no AI signal at all"),
+        ({"tags": ["osint", "llm_reasoning"]}, False, "llm_reasoning is an OSINT tag"),
+        ({"description": "a chat bot backed by an llm"}, True, "real llm"),
+        ({"tags": ["rag"]}, True, "rag on its own"),
+        ({"tags": ["storage", "rag"]}, True, "rag alongside a word containing it"),
+        ({"tags": ["agent_defense"]}, True, "agent_defense"),
+        ({"tags": ["agent_task"]}, True, "agent_task"),
+        ({"tags": ["owasp_2026_asi01"]}, True, "asi01"),
+    ],
+)
+def test_aisec_hint_requires_a_whole_token(monkeypatch, metadata, expected, why):
+    """Substring matching turned three schemas on for a plain storage challenge.
+
+    Measured on the platform catalog: ``rag`` matched ``sto-rag-e`` (C2O-ALIST),
+    and ``llm`` matched the OSINT tag ``llm_reasoning`` (CTFARENA-037, a payroll
+    kiosk with no model anywhere).  A hint has to stand on its own.
+    """
+    from ctf_strix import capabilities
+
+    monkeypatch.delenv("CTF_AISEC", raising=False)
+    enabled, _ = capabilities.wants_aisec("web", {"challenge": metadata})
+    assert enabled is expected, why
