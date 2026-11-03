@@ -79,8 +79,12 @@ cd "$WORK" 2>/dev/null || cd /
 # 卡在不可中断的系统调用里时信号救不了它。这里再加一层 coreutils timeout：
 # agent 被杀后走到下面的兜底写手，result.json 仍然在——被外部强杀而没有
 # result 文件是平台侧的 blocking 判据。CTFY_WALL_FUSE=0 可关闭。
-if [ "${CTFY_WALL_FUSE:-7200}" -gt 0 ] 2>/dev/null; then
-  timeout -s KILL "${CTFY_WALL_FUSE}" python3 /app/src/ctf_strix/agent.py
+# ⚠️ 默认值必须先落到 shell 变量再用两处：`:-` 只在引用点生效，`if` 里给了
+# 默认、`then` 里裸引用 "${CTFY_WALL_FUSE}"，在 set -u + 未注入时就是
+# unbound variable 崩溃（CI 实测，和当年 OUT 那次同类）。
+WALL_FUSE="${CTFY_WALL_FUSE:-7200}"
+if [ "$WALL_FUSE" -gt 0 ] 2>/dev/null; then
+  timeout -s KILL "$WALL_FUSE" python3 /app/src/ctf_strix/agent.py
 else
   python3 /app/src/ctf_strix/agent.py
 fi
