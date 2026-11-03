@@ -38,14 +38,21 @@ WORKDIR /app
 
 # 依赖先装，源码后拷——改代码不会让依赖层失效，重建只要几秒。
 COPY requirements.lock /app/requirements.lock
+COPY docker/a_tier_closure.txt /app/docker/a_tier_closure.txt
+COPY docker/check_toolchain.sh /app/docker/check_toolchain.sh
+RUN chmod +x /app/docker/check_toolchain.sh
 # --no-deps：requirements.lock 是环境快照，里面有 fastmcp/mcp 的版本死结，
 # 任何解析器都会拒绝（详见交付说明 §4）。照单装才是忠实复现。
+# 装完立刻自检：pip check 看元数据，check_toolchain.sh 再逐个 import 并做
+# 一次真实调用。lock 少一个传递依赖时是构建失败，而不是比赛里第一次
+# from Crypto / from PIL 才失败。
 RUN set -eux; \
     if [ -n "$PIP_INDEX_URL" ]; then \
         pip install --no-deps -r /app/requirements.lock -i "$PIP_INDEX_URL"; \
     else \
         pip install --no-deps -r /app/requirements.lock; \
-    fi
+    fi; \
+    bash /app/docker/check_toolchain.sh
 
 # 源码：vendor 里是未改动的 strix 1.7.0，src 里是 ctf_strix 改造层。
 COPY vendor/src /app/vendor/src

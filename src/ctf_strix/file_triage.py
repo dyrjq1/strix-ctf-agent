@@ -107,8 +107,8 @@ def _family(magic: str, path: Path) -> str:
 #:
 #: 现在的写法分两类：
 #:   * 镜像里有的工具（file / strings / xxd / unzip / binutils / python3）——直接给命令；
-#:   * 镜像里没有的能力（图片隐写/pcap 重组/专用反编译器）——
-#:     给**用 python3 手写**的具体入口，而不是一个不存在的命令。
+#:   * 镜像里没有 CLI 的能力（图片隐写/pcap 重组/专用反编译器）——优先用
+#:     lock 里已有的 Python 库（Pillow）或 python3 手写入口，绝不给不存在的命令。
 #: 模型拿到 ``next:`` 就按 1→2→3 执行，不必先加载技能再决定方向；
 #: 末尾的 ``深读`` 只是需要更多手法时的索引，不是第一步。
 _NEXT: Final = {
@@ -143,14 +143,14 @@ _NEXT: Final = {
         "深读: ctf-misc/encodings。"
     ),
     "png": (
-        "1) `hexpeek('{p}', length=64)` 认签名/IHDR；\n"
-        "2) `python3 -c \"import zlib;d=open('{p}','rb').read();print(zlib.decompressobj().decompress(d[d.find(b'IDAT')+4:])[:64])\"` 抽 IDAT；多块时先拼再解；\n"
-        "3) `python3 -c \"d=open('{p}','rb').read();print(d[8:33].hex())\"` 看宽高/位深，再查 alpha 低位与 tEXt。\n"
+        "1) `hexpeek('{p}', length=64)` 认签名/IHDR；`python3 -c \"from PIL import Image;im=Image.open('{p}');print(im.size,im.mode,im.info)\"`；\n"
+        "2) 像素/位平面用 Pillow，别手解 zlib：`python3 -c \"from PIL import Image;im=Image.open('{p}').convert('RGB');print(list(im.getdata())[:8])\"`\n"
+        "3) 仍无头绪再 `python3 -c \"d=open('{p}','rb').read();print(d[8:33].hex())\"` 看宽高/位深，查 alpha 低位与 tEXt。\n"
         "深读: ctf-forensics/stego-image。"
     ),
     "jpeg": (
-        "1) `hexpeek('{p}', length=64)` 看 SOI/APP 段；\n"
-        "2) `strings -n 8 {p} | head -40` 找 EXIF/注释/URL；\n"
+        "1) `hexpeek('{p}', length=64)` 看 SOI/APP 段；`python3 -c \"from PIL import Image;im=Image.open('{p}');print(im.size,im.mode)\"`\n"
+        "2) `strings -n 8 {p} | head -40` 找 EXIF/注释/URL；像素用 Pillow：`python3 -c \"from PIL import Image;im=Image.open('{p}');print(list(im.getdata())[:8])\"`\n"
         "3) `python3 -c \"d=open('{p}','rb').read();i=d.rfind(b'\\xff\\xd9');print(len(d),i,d[i+2:i+66])\"` 看 EOI 后附加数据。\n"
         "深读: ctf-forensics/stego-image。"
     ),

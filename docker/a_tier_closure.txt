@@ -1,0 +1,44 @@
+# A-tier complete dependency closure (roots + pwntools transitive deps).
+# Measured with `pip download --no-deps -r requirements.lock`; the image
+# build compares this against requirements.lock for missing pins/drift.
+# `pip` is intentionally absent: it is the base image installer and
+# pwntools only requires pip>=6.0.8.
+pycryptodome==4.3.0
+pycryptodomex==3.24.1
+z3-solver==4.15.4.0
+pillow==12.2.0
+pwntools==4.15.0
+paramiko==5.1.0
+mako==1.4.3
+pyelftools==0.33
+capstone==5.0.9
+ropgadget==7.7
+pyserial==3.5
+requests==2.34.2
+pygments==2.21.0
+pysocks==1.7.1
+python-dateutil==2.9.0.post0
+packaging==26.3
+psutil==7.2.2
+intervaltree==3.2.1
+sortedcontainers==2.4.0
+unicorn==2.1.2
+six==1.17.0
+rpyc==6.0.2
+plumbum==2.0.2
+colored-traceback==0.4.2
+unix-ar==0.2.1
+zstandard==0.25.0
+markupsafe==3.0.4
+bcrypt==5.0.0
+cryptography==50.0.2
+cffi==2.1.1
+invoke==3.0.3
+pynacl==1.6.2
+charset-normalizer==3.5.2
+idna==3.20
+urllib3==2.8.0
+certifi==2026.10.23
+pycparser==3.12
+colorama==0.4.6
+typing-extensions==4.16.0
