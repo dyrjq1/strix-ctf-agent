@@ -22,20 +22,26 @@
 |---|---|
 | 项目根 | `C:\Users\rjq\Downloads\strix-ctf-agent` |
 | Python | `.venv\Scripts\python.exe`（系统 python 缺 `agents` 模块，**必须**用 venv） |
-| 全量测试 | **480 passed**（P18 后 454；I 接线修复 +7；H P19a +19；J 落地后预计再加） |
-| Git | HEAD `2078a78`，工作区积压 P16–P19a 未提交改动；**分层 commit 已获批准**，J 验收后执行（代码/文档两个提交） |
+| 全量测试 | **497 passed, 3 skipped**（2026-11-03 墙钟接线后；3 skipped 为 SIGALRM 专项，POSIX 才跑） |
+| Git | 分层 commit 已执行（HEAD `c86a3d0`）；本地与 GitHub main 因 Contents-API 上传 SHA 分叉（内容一致），待 git 端点可用时 fetch/reset 对齐。**墙钟修复未提交**（auto 模式拦 commit，待用户批准） |
 | 留出集 | `experiments/pools.json` SHA256 `55da418b…678` **未变**（本轮没跑题） |
-| 台账 | `docs/11-实验台账.md`，最新条目 §4.55 = P19a（§4.54 = harness 接入修复） |
-| 备份 | `backup/p19a-20261103/`、`backup/pi-20261103/`、`backup/p18-20261102/`、`backup/p17-20261102/` |
+| 台账 | `docs/11-实验台账.md`，最新条目 §4.58 = 容器路径墙钟接线 |
+| 备份 | `backup/wallclock-fix-20261103/`、`backup/p19k-20261103/`、`backup/p19a-20261103/`、`backup/pi-20261103/`、`backup/p18-20261102/`、`backup/p17-20261102/` |
 | 平台成绩 | CTFARENA 已测 48 题解出 40（83.3%），全库 40/115（34.8%） |
+| 镜像 | `ghcr.io/dyrjq1/strix-ctf-agent:v1` 已构建（GitHub→Actions→ghcr，run 41614099921，公开可拉）。平台已注册为 agent "strix-ctf-agent" v1（wzm26 + 任启骐两账号）。部署验证赛首跑 822s / 0-2 题（归档需 owner 浏览器下载） |
+| 平台账号 | 当前用 **wzm26**（user f8dd465d…，token 在用户本地）；主账号任启骐的旧 pf_ token 已失效 |
 
-### 本轮（P18 → P19a）进度
-- ✅ 第 1 项 流量记忆：`traffic.py`（`traffic_list` / `traffic_view`），已注册、已测试。
-- ✅ 第 2 项 假设类别计数：`enum_guard` CAPEC-1000 九类机制分类 + 汇总行可观测。
-- ✅ 第 3 项 CVE 路由（P19a）：离线 web CVE 索引（KEV+CPE 区间，79 产品族 / 10,678 条）+ `web_cve_lookup` 工具，台账 §4.55，**迁移验证待规则后验证批**。
-- ✅ 第 4 项 triage 决策表内联（P18-4）。
-- ✅ 额外：harness 接入错杀修复（I，台账 §4.54）——052 端到端已解；镜像工具面审计（L，`docs/30`）；strix 差距盘点（G，`docs/29`）。
-- ⏳ J：read_file 幽灵契约修复（在跑）。
+### 2026-11-03 平台实测情报（详见 memory/deploy-verification-findings）
+- **部署验证赛** = "Deploy verification e39f96d54 (temp)"（`b702278527c048ffa0f68b6e7337547f`，2 题：SAMPLE-004 crypto padding-oracle/TCP + CTFARENA-108 web），play_open，供验证镜像部署。
+- **正式赛程大改**（手册 11-02 更新）：初选赛 11-15 10:00–20:00（UTC+8）；正式赛 11-21/11-22 每日 10:00–20:00。Agent Track 注册 282 队 > 150 上限 → 11-14 入围测试大概率举行。`internet_policy` 已改 **deny**（人类也断网）。**智能体赛道出题方向仅限在线交互类**；正式赛设 authoring_windows（11-21 三个 2h 窗口）→ **agent 出题能力是空白**（平台 MCP 有 get_authoring_template / upload_authored_challenge 全套工具）。
+- 「时间限制没生效」根因：部署验证走 entrypoint→agent.py，此前无任何墙钟。修复 = 台账 §4.58，**待提交 + 构建 v2 才在平台生效**。
+
+### 本轮（P18 → P19k）进度
+- ✅ P18 四项（流量记忆 / 机制计数 / triage 决策表）+ P19a CVE 路由 + P19j read_file 契约 + P19k 假设纪律块（均已提交）。
+- ✅ 镜像 v1 推送全链路打通（GitHub PAT → Actions → ghcr；CI 内含全量 pytest + 双 conformance 自检；顺手修了 entrypoint fallback 的 `OUT` unbound 与 CI 挂载属主问题）。
+- ✅ 墙钟接线（§4.58，未提交）：agent.py SIGALRM 看门狗 + entrypoint timeout 保险丝 + 11 条测试。
+- ⏳ A 档工具（pycryptodome/z3/Pillow/pwntools 闭包）：Codex 在跑。
+- ⏳ skip-4 重跑（CYBENCH-011/001、XBOW-007/052）：Codex 在 VM 跑。
 
 ---
 
@@ -64,16 +70,19 @@
 | 项 | 值 |
 |---|---|
 | suite id | `c0d8b4e3dd3b42c095d63d7dfa66431f` |
-| 时间 | 2026-11-15T02:00Z → 11-22T12:00Z（报名 11-13 截止） |
+| 时间 | **2026-11-03 手册改版**：初选赛 11-15 10:00–20:00（UTC+8，即 02:00–12:00Z）；正式赛 11-21/11-22 每日 10:00–20:00；不再是 7 天连续。报名 11-13 20:00（UTC+8）截止 |
+| 入围测试 | 注册 282 队 > 150 上限 → **11-14 入围测试大概率举行**（手册原文：「如报名超过限制，则视情况决定是否在 11 月 14 日增加进行入围测试」） |
 | 题量 | `challenges_withheld=true`，赛前不下发 |
-| 范围 | `challenge_scope=catalog` → **六类都可能进卷**：web / pwn / reverse / crypto / misc / AI |
-| 运行 | 指定 VPS（4C/8G/100G/x64），赛前上传一次，重启后自主执行 |
+| 范围 | `challenge_scope=catalog`；**智能体赛道出题方向仅限在线交互类**（web/pwn/AI 安全）——crypto/rev/misc 离线附件类在出题侧被排除，解题侧卷面待初选赛实证 |
+| 运行 | 镜像经平台注册（已注册 v1）；正式赛设 authoring_windows（11-21 10–12/14–16/18–20 UTC+8 三个 2h 窗口）→ **agent 需出题能力，当前空白** |
 | 交付 | 按 CTFY-0001：读 `task.json`，写 `result.json` |
 | 并发 | 平台实例配额 1；QA#26 的「≤3」是**上限许可**，不是能力保证 |
 | 计分 | QA#29 动态积分：0/1 解 = 1000 分，随解题队伍数下降；无血分；早解有优势 |
+| 断网 | `internet_policy=deny` + `agent_internet=deny`（2026-11-03 起**人类选手也断网**，此前为 allow） |
 
 **结论**：练习赛的「全 web、7/48/60、单实例、不交镜像」**不能外推到正式赛**。
-正式赛是「六类初赛 + 动态积分 + 前 30 名出题 + VPS 自主运行」。
+正式赛是「初选赛 10h 窗口 + 动态积分 + 正式赛内出题窗口 + 镜像注册运行」。
+初选赛若挂，11-21 的正式赛进不去——**11-15 前的稳定性优先于一切能力扩展**。
 
 ### 3.3 已核实的几个坑
 - **没有每题 40 步的平台限制**。40 只是我们自己的预算；运行时必须读 `task.json.max_turns`。
@@ -388,14 +397,16 @@ curl -sS https://ctfy.tsinghua.edu.cn/api/v1/mcp/ \
 
 ## 16. 当前待办与不做清单
 
-待办（P19a 后，按顺序）：
+待办（2026-11-03 更新，按优先级）：
 
-1. J：read_file 幽灵契约修复（在跑）——提示/技能索引里指向未注册工具的指引改写为 exec_command/view_image。
-2. K：反证/闭合 + 换机制提示块（600–1,500 字符）。外部依据：arXiv 2605.21497，识别层是首要瓶颈、编排不抬天花板。
-3. 分层 commit（已批准）：J 验收后执行，代码/文档两提交。
-4. 规则 11-07 后的验证批：P18+P19a+J+K 一起在未参与改动的题上测迁移（含 4 道未测 agentic_ai）；experiments/pools.json 不能动。
-5. 镜像 A 档工具（L 审计 `docs/30`）：pycryptodome/z3/Pillow 优先，pwntools 传递依赖必须完整闭包进 lock；装完 `_NEXT` 白名单与断言同步。
-6. 历史 skip 4 题（CYBENCH-011/001、XBOW-007/052）用修好的接入判据重跑归因。
+1. **墙钟修复提交 + 镜像 v2**（等用户批准 commit）：agent.py/entrypoint.sh/测试/台账在工作区；push → workflow_dispatch(tag=v2) → 部署验证赛复跑验证 822s 问题是否收敛。
+2. **部署验证赛 0/2 归因**：run 归档只有 owner 能在浏览器下载（平台页面 → 该 run → download archive），拿到 stdout+workdir 才能定位是没进题、方向错还是别的。
+3. **agent 出题能力（新空白）**：正式赛 authoring_windows 要求 agent 出在线交互类题；平台 MCP 有 get_authoring_template/upload_authored_challenge 全套。11-15 初选赛前不投入，初选赛稳进后是最高优先级。
+4. **初选赛前稳定性**（11-15 10:00–20:00 UTC+8，10h 窗口）：镜像注册链路、串行轮转、墙钟、result.json 落盘——全部要在此窗口前实测一遍。可能的 11-14 入围测试同理。
+5. 规则后的验证批：P18+P19a+J+K+墙钟接线一起在未参与改动的题上测迁移（含 4 道未测 agentic_ai）；experiments/pools.json 不能动。
+6. ⏳ 镜像 A 档工具（Codex 在跑）：pycryptodome/z3/Pillow，pwntools 闭包；`_NEXT` 白名单同步。
+7. ⏳ 历史 skip 4 题（Codex 在 VM 跑）：CYBENCH-011/001、XBOW-007/052 接入归因。
+8. 对齐本地/远程 git 分叉（fetch/reset）；提醒用户改 GitHub 密码（与 VM sudo 同密码）。
 
 已判定不做：
 

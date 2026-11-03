@@ -22,6 +22,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import signal
 import sys
 import threading
 import time
@@ -576,6 +577,71 @@ def _turn_budget(task: dict[str, Any]) -> int:
         return 500
 
 
+class WallclockExceeded(BaseException):
+    """Run 的墙钟预算耗尽。
+
+    故意继承 ``BaseException``：strix 与本模块内部到处是 ``except Exception``，
+    普通异常会被吞成一条工具错误然后继续跑；alarm 只响一次，被吞掉就没有
+    第二次机会。必须像 ``KeyboardInterrupt`` 一样直达 ``main`` 的收尾，
+    让 finally 把 result.json 写出来。
+    """
+
+
+#: 容器路径的墙钟分层（秒），与 ``scripts/batch_eval.py`` 的难度分层同源
+#: （easy=1x / medium=1.5x / hard=2.3x，基准 600s）。task.json 不下发墙钟
+#: （协议只有 ``max_turns``），评测 harness 的进程组 SIGKILL 也只存在于内部
+#: 跑批：正式赛/部署验证走本入口，此前没有任何墙钟，一次挂死的 run 既烧
+#: 比赛窗口又写不出 result.json（``no_result_file`` 是 blocking 判据）。
+#: 难度未知取 hard 档：成功题 p90=253s、失败题 max=815s，1380s 已是实测
+#: 失败上限的 1.7 倍，再紧只会误伤还在推进的题。
+_WALL_TIERS: dict[str, int] = {"easy": 600, "medium": 900, "hard": 1380}
+
+
+def _wall_budget(task: dict[str, Any]) -> int:
+    """解析容器路径的墙钟预算（秒）；0 表示关闭。
+
+    优先级：``CTFY_WALL_DEADLINE`` 环境变量（运维显式控制，非法值视为关）
+    > task.json 难度分层 > hard 档默认。
+    """
+    raw = os.environ.get("CTFY_WALL_DEADLINE")
+    if raw is not None:
+        try:
+            return max(int(str(raw).strip()), 0)
+        except (TypeError, ValueError):
+            return 0
+    difficulty = str((task.get("challenge") or {}).get("difficulty") or "").strip().lower()
+    return _WALL_TIERS.get(difficulty, _WALL_TIERS["hard"])
+
+
+def _install_hard_deadline(wall_seconds: int) -> bool:
+    """装 SIGALRM 看门狗；平台不支持时（Windows 本地）返回 False。
+
+    到点在主线程抛 :class:`WallclockExceeded`，由 ``main`` 的收尾写出
+    ``stop_reason="wallclock"`` 的 result.json。被平台外部强杀是没有这个
+    待遇的——这正是看门狗存在的理由。
+    """
+    if wall_seconds <= 0:
+        return False
+
+    def _fire(signum: int, frame: Any) -> None:  # noqa: ARG001
+        raise WallclockExceeded(f"wall budget {wall_seconds}s spent")
+
+    try:
+        signal.signal(signal.SIGALRM, _fire)
+        signal.alarm(wall_seconds)
+    except (AttributeError, ValueError, OSError):
+        return False
+    return True
+
+
+def _cancel_hard_deadline() -> None:
+    """撤销看门狗，避免 alarm 在写 result.json 的途中响起。"""
+    try:
+        signal.alarm(0)
+    except (AttributeError, ValueError, OSError):
+        pass
+
+
 def _attempt_count() -> int:
     """How many sequential attempts to allow (1-3).
 
@@ -699,6 +765,14 @@ def main() -> int:
         print(f"[ctfy] env bridged: {env_applied}", flush=True)
 
     started = time.time()
+    # 墙钟兜底（接线修复，背景见 _WALL_TIERS）：此前时间限制只在评测
+    # harness 里生效，本入口没有。软截止同步设为墙钟的 75%（与 harness
+    # ``_deadline_args`` 同口径）；已显式设置的 CTFY_SOFT_DEADLINE 不覆盖。
+    wall_budget = _wall_budget(task)
+    if wall_budget > 0:
+        os.environ.setdefault("CTFY_SOFT_DEADLINE", str(max(int(wall_budget * 0.75), 1)))
+        if _install_hard_deadline(wall_budget):
+            print(f"[ctfy] wall budget {wall_budget}s installed", flush=True)
     answers: dict[str, str] = {}
     error: str | None = None
     stop_reason = "completed"
@@ -770,12 +844,20 @@ def main() -> int:
                     error = error or "所有 attempt 都未能启动运行时"
                     stop_reason = "error"
 
+    except WallclockExceeded as exc:
+        # 墙钟到点不是崩溃：已抽到的答案照常进 result.json，归档口径
+        # 用 stop_reason 区分开，避免污染"error"的根因分析。
+        error = str(exc)
+        stop_reason = "wallclock"
+        print(f"[ctfy] {exc}", flush=True)
     except BaseException as exc:  # noqa: BLE001 — 任何异常都必须转成 result.json
         error = f"{type(exc).__name__}: {exc}"
         stop_reason = "error"
         traceback.print_exc()
 
     finally:
+        # 先撤看门狗：alarm 在收尾途中响起会把 result.json 也一起带走。
+        _cancel_hard_deadline()
         # 运行时半路崩掉时，_run_agent 的收尾保存不会执行。这里补一手：只要
         # agent 真的写过报告，就把最后一版再保存一次——报告是唯一交付物，
         # "写好了但没发出去"与"没写"在评分上完全等价。

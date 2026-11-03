@@ -75,7 +75,15 @@ cd "$WORK" 2>/dev/null || cd /
 # 用模块文件路径而不是 -m：-m 要求包可导入，而 PYTHONPATH 一旦被平台覆盖
 # （它会给容器注入自己的 env），-m 会在 import 阶段就崩，连"我崩了"都写不出来。
 # 直接执行文件只需要文件在，那是镜像自己的保证。
-python3 /app/src/ctf_strix/agent.py
+# 外层保险丝：agent.py 里已有 SIGALRM 看门狗（_install_hard_deadline），但进程
+# 卡在不可中断的系统调用里时信号救不了它。这里再加一层 coreutils timeout：
+# agent 被杀后走到下面的兜底写手，result.json 仍然在——被外部强杀而没有
+# result 文件是平台侧的 blocking 判据。CTFY_WALL_FUSE=0 可关闭。
+if [ "${CTFY_WALL_FUSE:-7200}" -gt 0 ] 2>/dev/null; then
+  timeout -s KILL "${CTFY_WALL_FUSE}" python3 /app/src/ctf_strix/agent.py
+else
+  python3 /app/src/ctf_strix/agent.py
+fi
 rc=$?
 
 # 主流程承诺自己写文件，但崩溃/被 kill 时可能没兑现。这里补最后一手。
