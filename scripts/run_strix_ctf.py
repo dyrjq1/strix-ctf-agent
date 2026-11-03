@@ -113,6 +113,31 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
+def _guard_summary(guard: object, journey_state: object, finisher: object, reached: int) -> str:
+    """Render the one-line guard summary, including mechanism-class counts.
+
+    Mechanism counts are observational: they say which CAPEC classes the run
+    actually exercised.  Without them the only way to recover that breakdown was
+    to replay the transcript offline, so a run that stayed inside one class
+    looked the same as one that never reached the guard at all.
+
+    The suffix goes last on purpose: existing log parsers anchor on
+    ``finish: refused=N`` and must keep matching.
+    """
+    counts = guard.mechanism_counts()
+    mechanisms = ",".join(
+        f"{name}={count}" for name, count in sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))
+    ) or "(none)"
+    return (
+        f"[guard] reach={reached} (calls into guards) | enum keys={len(guard.counts)} "
+        f"| journey: wall={journey_state.wall_hit} authed={journey_state.authed} "
+        f"created={journey_state.created} payloads={journey_state.payloads} "
+        f"prompts={journey_state.prompts} "
+        f"| finish: refused={finisher.refusals} allowed={finisher.allowed} "
+        f"| mechanisms: {mechanisms}"
+    )
+
+
 async def main() -> int:
     args = parse_args()
 
@@ -497,12 +522,7 @@ async def main() -> int:
     # 光看计数器还不够，必须能看出**守卫到底有没有被调用过**。
     js = journey.state
     reached = guard.observe_calls + js.observe_calls
-    print(
-        f"[guard] reach={reached} (calls into guards) | enum keys={len(guard.counts)} "
-        f"| journey: wall={js.wall_hit} authed={js.authed} created={js.created} "
-        f"payloads={js.payloads} prompts={js.prompts} "
-        f"| finish: refused={finisher.refusals} allowed={finisher.allowed}"
-    )
+    print(_guard_summary(guard, js, finisher, reached))
     if reached == 0:
         print(
             "[guard] WARNING: no guard was ever invoked. The mount hook is not "

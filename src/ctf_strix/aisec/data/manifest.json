@@ -1,0 +1,21 @@
+{
+  "catalogVersion": "2026.10.30",
+  "fetched_at": "2026-11-03T03:22:11+00:00",
+  "kev_released": "2026-10-30T17:02:45.3665Z",
+  "built_at": "2026-11-03T05:08:16+00:00",
+  "sha256": "49f788419bea55b5528f9c7e01b42ff41fd88cf51dbcc3efab4f54b7ba64a3c5",
+  "bytes": 3093204,
+  "gzip_bytes": 123828,
+  "product_families": 79,
+  "target_families": 115,
+  "entries": 10678,
+  "kev_marked": 223,
+  "nvd_feeds": 25,
+  "update_rule_changes": 1535,
+  "update_rule_additions": 0,
+  "update_affected_cves": 1458,
+  "source": {
+    "kev": "https://www.cisa.gov/known-exploited-vulnerabilities-catalog",
+    "nvd": "https://nvd.nist.gov/feeds/json/cve/2.0/"
+  }
+}

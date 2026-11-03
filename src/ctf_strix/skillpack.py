@@ -86,6 +86,16 @@ def ref_root() -> str:
     return str(PACK_DIR)
 
 
+#: Categories that must never be offered or registered.
+#:
+#: ``ctf-similar-search`` 整篇建立在 ``pip install tavily`` + ``api.tavily.com``
+#: 之上，而运行期禁止出网、镜像也没有这个包。它出现在索引里只有一种效果：
+#: 模型点名加载它，读到一份自己完全执行不了的方法论，然后浪费一轮。
+#:
+#: 这里排除而不是删目录：目录留着以便本地查询，注册面与提示面必须干净。
+_EXCLUDED: frozenset[str] = frozenset({"ctf-similar-search"})
+
+
 def index_skills(pack: Path | None = None) -> list[tuple[str, str, Path]]:
     """列出所有**索引**技能。
 
@@ -103,6 +113,8 @@ def index_skills(pack: Path | None = None) -> list[tuple[str, str, Path]]:
     if not root.is_dir():
         return out
     for category in sorted(p for p in root.iterdir() if p.is_dir()):
+        if category.name in _EXCLUDED:
+            continue
         # 只认 <分类>/<分类>.md。SKILL.md / README.md 一律跳过：前者是重复索引，
         # 后者是包说明，两者进 prompt 都只是噪音。
         candidate = category / f"{category.name}.md"
@@ -122,9 +134,8 @@ def _hint(ref: str, category: str) -> str:
         markdown 片段，末尾带两个换行，保证与正文之间有分隔。
     """
     return (
-        f"> 子文件目录：`{ref}/{category}/`。索引里 `[x.md](x.md)` 形式的引用，"
-        f"用 `read_file` 读 `{ref}/{category}/x.md`；**子文件不是技能**，"
-        f"不要用 `load_skill` 加载。一次只加载一个方向索引。\n\n"
+        f"> 子文件目录：`{ref}/{category}/`；`[x.md](x.md)`=`{ref}/{category}/x.md`；"
+        f"`exec_command` cat/sed -n、图片 `view_image`；非技能，勿 `load_skill`；一次一个方向索引。\n\n"
     )
 
 
@@ -224,6 +235,7 @@ def prompt_hint(names: list[str] | None = None, ref: str | None = None) -> str:
         "【CTF 技能库】可用方向：" + joined + "\n"
         "拿到题先 load_skill([\"ctf-triage/ctf-triage\"]) 定型，再只加载对应方向的**一个**索引"
         "（不要同时加载两个以上，单个索引 1k-10k token）。\n"
-        "索引里 [x.md](x.md) 是子文件，用 read_file 读 " + root + "/<分类>/x.md；"
-        "子文件不是技能，不要用 load_skill 加载。"
+        "非技能子文件：文本 exec_command(cat/sed -n)，图片 view_image；"
+        + root
+        + "/<分类>/x.md；勿 load_skill。"
     )

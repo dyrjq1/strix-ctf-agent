@@ -93,8 +93,11 @@ execution/file/DB read, and did I actually read the secret — or only a schema?
 
 #: ``How to spend turns`` differs by challenge kind.  A file challenge has no
 #: root page to probe and no accounts to register; telling it to do both burns
-#: two turns before it opens the attachment.  The web text is the original one,
-#: unchanged, so the measured web behaviour does not move.
+#: two turns before it opens the attachment.  The file text points at the
+#: per-family ``next:`` table inside ``file_triage``: the model should run
+#: that table instead of loading a skill just to decide the direction.
+#: The web text is the original one, unchanged, so the measured web
+#: behaviour does not move.
 _TURNS_WEB = """\
 ## How to spend turns
 
@@ -111,12 +114,13 @@ _TURNS_FILE = """\
 
 1. `file_triage` the attachment once. Do not run `file` and `strings` by hand
    first: the triage answer already contains both, plus the family guess.
-2. Follow the family. An archive goes through `unpack_archive` (it walks nested
-   ones); an image or a pcap is a data-carving problem, not an HTTP one; a
-   binary goes through `elfpeek` and stays static until you have a reason to run
-   it.
+2. Run its `next:` table in order (1 then 2 then 3). The table is per family and
+   every command is installed in this image; a deep-read skill line is a last
+   resort, not the first step. Do not substitute a command from another family.
 3. When the trail is a string rather than a file, `decode_blob` before writing
-   your own decoder — it reports which layer was which.
+   your own decoder — it reports which layer was which. An archive goes through
+   `unpack_archive`; a binary stays static in `elfpeek` until you have a reason
+   to run it.
 4. Name the mechanism before each step: "the flag is in the PNG IDAT after the
    LSB plane", "the second gzip member holds the key".
 """
@@ -296,8 +300,8 @@ def _skills_block() -> str:
         return ""
     return (
         "## Skill indexes\n\n"
-        "Load at most one. Each line says **when** to load it; `read_file` its\n"
-        "subfiles (they are not skills, do not `load_skill` them).\n\n"
+        "Load at most one. Each line says **when**; subfiles: `exec_command`\n"
+        "(`cat`/`sed -n`), images `view_image`; not `load_skill`.\n\n"
         + "\n".join(lines)
     )
 

@@ -125,15 +125,23 @@ def test_turn_plan_follows_the_kind():
 
 
 def test_prompt_stays_inside_the_web_budget():
-    """The web prompt must not grow: it is the measured configuration."""
-    from ctf_strix import prompt
+    """The delivered web prompt must not grow: it is the measured configuration.
 
+    Measured with the skill index present, because that is what the container
+    sends.  The index is process-global state, so it is registered explicitly
+    here rather than inherited from whichever test ran first -- otherwise the
+    same code measures 3.5k or 5.5k depending on collection order, and the
+    guard silently stops guarding.
+    """
+    from ctf_strix import prompt, skillpack
+
+    skillpack.register()
     prompt.activate("web", ("base", "web", "aisec"))
     size = len(prompt.build({}))
-    # Was 4,690 chars before the Tools section became generated; the generated
-    # block adds the AI-security tools when they are on, so allow that headroom
-    # and no more.
-    assert size < 5200, f"web prompt grew to {size} chars"
+    # 5,005 before traffic memory (two tool lines, ~500 chars of prompt text);
+    # 5,505 after.  Headroom is 100 chars so an unrelated one-line addition does
+    # not need a threshold edit, but a tool section cannot slip in unnoticed.
+    assert size < 5600, f"web prompt grew to {size} chars"
 
 
 def test_activate_defaults_to_web_so_unit_tests_keep_working():
@@ -160,3 +168,18 @@ def test_name_filter_never_drops_vendor_base_tools():
     empty = catalogue.registered_names("web", None, frozenset())
     assert {"exec_command", "load_skill", "think"} <= empty
     assert "http_probe" not in empty
+
+
+def test_load_skill_line_points_at_registered_readers():
+    """The Tools section is the other place a model learns how to open a subfile.
+
+    ``read_file`` is not in the vendor registry; ``exec_command`` and
+    ``view_image`` are.  Naming the ghost tool here is the same contract bug as
+    naming it in the skill index.
+    """
+    from ctf_strix import catalogue
+
+    line = catalogue.describe("load_skill")
+    assert "read_file" not in line
+    assert "exec_command" in line
+    assert "view_image" in line

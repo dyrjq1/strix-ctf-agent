@@ -109,3 +109,68 @@ def test_prompt_stays_small(block):
 
     size = len(prompt.build({}))
     assert size < 6000, f"system prompt grew to {size} chars"
+
+
+def test_file_turn_plan_runs_the_triage_table_before_loading_a_skill() -> None:
+    """The file branch must point at the tool's own table, not at a skill.
+
+    The decision table ships inside ``file_triage``'s return value; telling the
+    model to load a discipline index first adds a round trip that carries no
+    information about the file it is already holding.
+    """
+    from ctf_strix import prompt
+
+    text = prompt._TURNS_FILE
+    assert "`next:`" in text
+    assert "1 then 2 then 3" in text
+    assert "last resort" in " ".join(text.split())
+    assert "load_skill" not in text
+
+
+def test_skill_index_teaches_registered_read_channels_only() -> None:
+    """The index must not name a tool the registry never installs.
+
+    ``read_file`` was never registered: Shell exposes ``exec_command`` and
+    Filesystem exposes ``view_image``/``apply_patch``.  A model that follows
+    the index toward ``read_file`` spends a turn on a tool that does not exist.
+    """
+    from ctf_strix import prompt
+
+    text = prompt._skills_block()
+    if not text:
+        pytest.skip("skill pack not staged in this environment")
+    assert "read_file" not in text
+    assert "exec_command" in text
+    assert "view_image" in text
+    assert "`cat`" in text or "cat" in text
+
+
+def test_skill_index_sends_images_to_view_image_not_the_shell() -> None:
+    """Pixels go through ``view_image``; ``cat`` would print bytes, not a picture."""
+    from ctf_strix import prompt
+
+    text = prompt._skills_block()
+    if not text:
+        pytest.skip("skill pack not staged in this environment")
+    sentence = " ".join(text.split("\n\n", 2)[1].split())
+    assert "subfiles: `exec_command`" in sentence
+    assert "images `view_image`" in sentence
+    assert "images `exec_command`" not in sentence
+
+
+def test_skill_index_names_both_read_channels_in_one_sentence() -> None:
+    """A text-only sentence leaves the image case to guesswork.
+
+    The index is the only place the model learns how to open a subfile, so the
+    two registered channels must be in the same instruction: text via
+    ``exec_command`` (``cat``/``sed -n``), images via ``view_image``.
+    """
+    from ctf_strix import prompt
+
+    text = prompt._skills_block()
+    if not text:
+        pytest.skip("skill pack not staged in this environment")
+    sentence = " ".join(text.split("\n\n", 2)[1].split())
+    assert "exec_command" in sentence
+    assert "view_image" in sentence
+    assert "load_skill" in sentence

@@ -108,6 +108,8 @@ def test_every_registered_tool_is_described_in_the_catalogue():
         registered.add(fn.__name__)
     for fn in aisec_tools.TOOLS:
         registered.add(fn.__name__)
+    for fn in aisec_tools.WEB_CVE_TOOLS:
+        registered.add(fn.__name__)
 
     missing = registered - declared
     assert not missing, f"registered but never described: {sorted(missing)}"
@@ -122,9 +124,12 @@ def test_catalogue_does_not_promise_tools_nobody_registers():
     registered = {fn.__name__ for fn in file_triage.TOOLS}
     registered |= {fn.__name__ for fn in (*nonweb.FILE_TOOLS, *nonweb.TCP_TOOLS)}
     registered |= {fn.__name__ for fn in aisec_tools.TOOLS}
+    registered |= {fn.__name__ for fn in aisec_tools.WEB_CVE_TOOLS}
     # The web primitives' public names differ from their function names in one
     # case (``method_sweep`` is built by the discovery module's register()).
     registered |= {"http_probe", "route_map", "method_sweep", "path_variants"}
+    # Traffic memory: two read-only primitives that replay the ledger.
+    registered |= {"traffic_list", "traffic_view"}
     # The base four are vendor tools; they are asserted separately below.
     base = {"exec_command", "load_skill", "think"}
 

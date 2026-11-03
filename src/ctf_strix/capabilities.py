@@ -161,6 +161,8 @@ def install_web_capabilities(
     http_register: RegisterFn | None = None,
     discovery_register: RegisterFn | None = None,
     variants_register: RegisterFn | None = None,
+    traffic_register: RegisterFn | None = None,
+    web_cve_register: RegisterFn | None = None,
 ) -> tuple[dict[str, list[str]], list[str]]:
     """Install the structured HTTP and route-discovery primitives.
 
@@ -168,6 +170,9 @@ def install_web_capabilities(
         http_register: Test seam; defaults to ``ctf_strix.http_probe.register``.
         discovery_register: Test seam; defaults to ``ctf_strix.discovery.register``.
         variants_register: Test seam; defaults to ``ctf_strix.variants.register``.
+        traffic_register: Test seam; defaults to ``ctf_strix.traffic.register``.
+        web_cve_register: Test seam; defaults to
+            ``ctf_strix.aisec.tools.register_web_cve``.
 
     Returns:
         ``(installed, errors)``.  ``installed`` maps capability name to the
@@ -180,12 +185,24 @@ def install_web_capabilities(
         from ctf_strix.discovery import register as discovery_register
     if variants_register is None:
         from ctf_strix.variants import register as variants_register
+    if traffic_register is None:
+        from ctf_strix.traffic import register as traffic_register
+    if web_cve_register is None:
+        from ctf_strix.aisec.tools import register_web_cve as web_cve_register
 
     installed: dict[str, list[str]] = {}
     errors: list[str] = []
     _install("http_probe", http_register, installed, errors)
     _install("discovery", discovery_register, installed, errors)
     _install("variants", variants_register, installed, errors)
+    # Traffic memory is read-only and depends on http_probe having recorded
+    # something, but it is registered separately: a failure to install the
+    # ledger must not take the probe down with it.
+    _install("traffic", traffic_register, installed, errors)
+    # The offline CVE index is data, not an AI-security feature: a plain
+    # Apache/WordPress box gets it too.  It is installed separately so a
+    # missing snapshot cannot take the HTTP primitives down with it.
+    _install("web_cve", web_cve_register, installed, errors)
     return installed, errors
 
 

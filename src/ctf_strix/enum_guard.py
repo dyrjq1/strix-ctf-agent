@@ -26,7 +26,7 @@ from __future__ import annotations
 import hashlib
 import re
 from collections import Counter
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Final
 
 from ctf_strix.probe_surface import PROBE_TOOLS
 
@@ -46,6 +46,12 @@ _HARD_REPEATS = 4
 #: 跨族连续零新信息的警告阈值，以及之后每隔多少次重复提醒。
 _STALL_AFTER = 6
 _STALL_REPEAT = 4
+#: How many probes may pass without discovering a *new mechanism class* before
+#: naming the untried classes.  Same cap as ``_STALL_AFTER`` on purpose: this is
+#: another way of saying "six calls, no new ground", so it should not be a new
+#: budget.  Only the *class* is new here, not the threshold.
+_CLASS_STREAK_AFTER = _STALL_AFTER
+_CLASS_STREAK_REPEAT = _STALL_REPEAT
 
 #: 从命令里提取"被探测的路径族"。抽不出来就不计——宁可漏抓，不可误伤。
 _PATH_RE = re.compile(r"[A-Za-z0-9_\-./]*(?:api|admin|flag|config|debug|static|assets)[A-Za-z0-9_\-./]*")
@@ -54,6 +60,158 @@ _HOST_RE = re.compile(r"https?://([A-Za-z0-9.\-]+)")
 _BRUTE_MARK_RE = re.compile(
     r"\bFUZZ\b|\bffuf\b|\bdirsearch\b|\bgobuster\b|\bferoxbuster\b|\bwfuzz\b|\bnuclei\b"
 )
+
+
+#: CAPEC-1000 "Mechanisms of Attack" categories, in the vocabulary of a CTF.
+#:
+#: Why a taxonomy at all: the per-family counter above answers "did I send the
+#: same request twice", but the costlier failure is *six different requests that
+#: are the same hypothesis*.  CTFARENA-043 enumerated 52 names, then probed
+#: ``/api/notes`` variants, ``?id=`` variants and ``/admin`` -- all of it inside
+#: one mechanism (information collection), so every fingerprint was new, every
+#: counter reset, and no guard said "you have not left this room".
+#:
+#: The nine categories are not invented here: they are the top level of MITRE
+#: CAPEC view 1000 (https://capec.mitre.org/data/definitions/1000.html,
+#: retrieved 2026-11-03), which groups attack patterns by mechanism rather than
+#: by goal.  Mapping them onto request syntax is ours; the partition is theirs.
+_MECHANISM_RULES: Final[tuple[tuple[str, str, str], ...]] = (
+    # Order matters: first match wins, so narrow markers (``/admin``) come
+    # before broad collectors (``.js``), and spoofing headers come before the
+    # information-collection rule that would otherwise swallow them.
+    (
+        "225",
+        "access-control",
+        r"/admin\b|\brole\b|is_admin|\bjwt\b|authorization\s*:"
+        r"|x-forwarded-for|x-forwarded-host|x-original-url|\bsession\b\s*=|\bcsrf\b",
+    ),
+    (
+        "210",
+        "abuse-functionality",
+        r"\bupload\b|\bexport\b|\bimport\b|\bpreview\b|\brender\b"
+        r"|\bwebhook\b|\bredirect\b|\bproxy\b|\bfetch\b|\bdownload\b"
+        r'|(?:url|uri|target|dest)\s*[=:]\s*(?:\x27|")?(?:https?:|//)',
+    ),
+    (
+        "255",
+        "data-structures",
+        r"__proto__|\bconstructor\b|\bprototype\b|\bpickle\b|\byaml\b|!!"
+        r"|\bdeserial|O:\d+:|\bunserialize\b|\bjson\s*parse",
+    ),
+    (
+        "152",
+        "injection",
+        r"union\s+select|\bor\s+1\s*=\s*1|\bsleep\s*\(|<script|javascript:"
+        r"|\{\{|\$\{|%\{|\beval\s*\(|os\.system|\bcat\s+/etc/"
+        r"|\|\s*(?:id|whoami|ls)\b|;\s*(?:id|whoami|ls)\b",
+    ),
+    (
+        "262",
+        "system-resources",
+        r"/proc/|/dev/|\.\./|%2e%2e|file://|/etc/(?:passwd|shadow)|symlink"
+        r"|\bchmod\b|\bchown\b|/flag|/root/|/tmp/",
+    ),
+    (
+        "156",
+        "deception",
+        r"\b(?:origin|referer|host)\\?[\"\x27]?\s*:|%00|%0d%0a|\\r\\n"
+        r"|@[a-z0-9.-]+\.[a-z]{2,}|xn--|\bunicode\b|\bhomograph",
+    ),
+    (
+        "172",
+        "timing-state",
+        r"\brace\b|\bsleep\b|\btoctou\b|\breplay\b|\bcoupon\b|\bnonce\b"
+        r"|\btimestamp\b|\bretry\b|\bconcurren",
+    ),
+    (
+        "223",
+        "probabilistic",
+        r"\bfuzz\b|\bbrute|\bwordlist\b|\bdictionary\b|FUZZ|\bguess\b"
+        r"|\brandom\b|\bpin\b|\botp\b",
+    ),
+    (
+        "118",
+        "information-collection",
+        r"robots\.txt|sitemap|/\.git|\.env\b|swagger|openapi|\.well-known"
+        r"|favicon|/static/|/bundle|\.js\b|\benumerat|\blisting\b",
+    ),
+)
+
+#: Compiled once; ``.search`` on the raw argument blob.
+_MECHANISM_RES: Final = tuple(
+    (cid, name, re.compile(pattern, re.I)) for cid, name, pattern in _MECHANISM_RULES
+)
+
+#: Human-facing class names, in CAPEC order.  Used to tell the model which
+#: classes it has *not* tried -- the actionable half of the hint.
+MECHANISM_NAMES: Final[tuple[str, ...]] = (
+    "access-control",
+    "abuse-functionality",
+    "data-structures",
+    "injection",
+    "system-resources",
+    "deception",
+    "timing-state",
+    "probabilistic",
+    "information-collection",
+)
+
+
+#: The rule table and the public order must describe the same set.  A class
+#: missing from one side would silently vanish from the "untried" hint.
+assert {name for _cid, name, _re in _MECHANISM_RES} == set(MECHANISM_NAMES)
+
+
+#: A URL's "family" is everything but the last path segment, with the query
+#: dropped.  ``/api/notes/note_a`` and ``/api/notes/note_b`` are one family.
+_FAMILY_RE: Final = re.compile(r"https?://[^\s\"'<>]+")
+
+
+def _path_family(args: str) -> str | None:
+    """Return the request's path family, or ``None`` when there is no URL.
+
+    Enumeration has no syntax marker: ``/api/notes/note_ab12`` and
+    ``/api/notes/note_cd34`` are the same request with a different leaf.  The
+    only way to see that is to compare the *shape* of consecutive URLs, which
+    is what this helper extracts.
+
+    Args:
+        args: the raw tool-argument blob.
+
+    Returns:
+        ``scheme://host/dir/dir`` with the last segment and query removed.
+    """
+    match = _FAMILY_RE.search(args or "")
+    if match is None:
+        return None
+    url = match.group(0).split("?", 1)[0].split("#", 1)[0].rstrip("/")
+    tail = url.split("://", 1)[-1]
+    if "/" not in tail:
+        return url
+    _host, path = tail.split("/", 1)
+    if "/" not in path:
+        return url.rsplit("/", 1)[0]
+    return url.rsplit("/", 1)[0]
+
+
+def _mechanism_of(args: str) -> str | None:
+    """Classify one probe into a CAPEC mechanism class.
+
+    Args:
+        args: the raw tool-argument blob.
+
+    Returns:
+        A class name, or ``None`` when the request carries no mechanism marker
+        (a plain ``GET /``, an ``ls``, a file read).  ``None`` is deliberate:
+        guessing a class for an unclassifiable call would make the counter fire
+        on ordinary work.
+    """
+    if not args:
+        return None
+    for _cid, name, pattern in _MECHANISM_RES:
+        if pattern.search(args):
+            return name
+    return None
 
 
 def _host_of(args: str) -> str | None:
@@ -263,8 +421,26 @@ class EnumerationGuard:
         self._global: set[tuple[str | None, str]] = set()
         self.stall: int = 0
         self.stall_hits: int = 0
+        #: Probes per CAPEC mechanism class, for the "same hypothesis" hint.
+        self.mechanisms: Counter[str] = Counter()
+        #: Probes sent since the last *new* class was discovered.
+        self.class_streak: int = 0
+        self.class_hits: int = 0
+        #: How many distinct leaves each path family has been asked for.
+        self.leaves: dict[str, set[str]] = {}
         #: 读 bundle 原文的次数（含 curl/wget/cat .js）。
         self.bundle_hits: int = 0
+
+    def mechanism_counts(self) -> dict[str, int]:
+        """Return a read-only snapshot of the per-CAPEC-class probe counts.
+
+        The live ``Counter`` is mutated by :meth:`finish`; handing it out would
+        let logging code (or a test) alter the guard's state while measuring it.
+
+        Returns:
+            Class name → number of classified probes so far.
+        """
+        return dict(self.mechanisms)
 
     def begin(self, tool_name: str, args: str) -> tuple[str | None, str]:
         """调用前登记。
@@ -314,6 +490,33 @@ class EnumerationGuard:
             seen.add(sig)
             self.counts[key] = 0
 
+        # ---- mechanism-class coverage -------------------------------------
+        # ``key`` exists only for a call that reached the target, so this never
+        # counts a local ``ls`` or a file read.  A request with no mechanism
+        # marker is skipped rather than assigned a class: an invented class is
+        # worse than a missing one.
+        mechanism = _mechanism_of(args)
+        if mechanism is None:
+            # No syntax marker: enumeration is a *shape*, not a payload.  The
+            # same path family asked for a second distinct leaf is the 043
+            # behaviour -- many new names, one hypothesis.  One leaf alone is
+            # ordinary navigation and is left unclassified.
+            family = _path_family(args)
+            if family is not None:
+                leaf = args.rsplit("/", 1)[-1]
+                leaves = self.leaves.setdefault(family, set())
+                leaves.add(leaf)
+                if len(leaves) >= 2:
+                    mechanism = "information-collection"
+        class_hint = None
+        if mechanism is not None:
+            if mechanism not in self.mechanisms:
+                self.class_streak = 0
+            else:
+                self.class_streak += 1
+            self.mechanisms[mechanism] += 1
+            class_hint = self._class_hint(mechanism)
+
         n = self.counts[key]
         family = key.split("|")[-1]
         if n >= _HARD_REPEATS and (n - _HARD_REPEATS) % 3 == 0:
@@ -332,7 +535,48 @@ class EnumerationGuard:
                 "(mechanism + exact request + expected response) that differs in "
                 "structure from everything you already sent, then send that."
             )
+        # The class hint is *less* urgent than "identical response, stop": a
+        # blind extraction can legitimately repeat one mechanism, but it cannot
+        # legitimately repeat one identical response.  So the hard signals go
+        # first and this one only fills the gap they leave.
+        if class_hint:
+            return class_hint
         return self._stall_hint()
+
+    def _class_hint(self, mechanism: str) -> str | None:
+        """Name the untried mechanism classes once a class run gets long.
+
+        This is the anti-"direction lock" hint.  It is deliberately about
+        *mechanism*, not about payload: every probe inside one CAPEC class can
+        look new (a different name, a different parameter) while the hypothesis
+        never changes, so the fingerprint counters above stay quiet.  It does
+        not block -- a blind extraction legitimately sends many probes of one
+        kind -- it asks the model to say what it is extracting and, if it cannot
+        name one, lists the classes it has not touched.
+
+        Args:
+            mechanism: the class of the probe that just returned.
+
+        Returns:
+            The hint text, or ``None`` while the class run is still short or on
+            a non-repeat cadence.
+        """
+        streak = self.class_streak
+        if streak < _CLASS_STREAK_AFTER:
+            return None
+        if (streak - _CLASS_STREAK_AFTER) % _CLASS_STREAK_REPEAT:
+            return None
+        self.class_hits += 1
+        untried = [name for name in MECHANISM_NAMES if name not in self.mechanisms]
+        untried_text = ", ".join(untried) if untried else "(none left)"
+        return (
+            f"\n\n[MECHANISM GUARD] {streak} probes in a row stayed inside "
+            f"'{mechanism}' and no new attack class was found. "
+            "If you cannot name the exact value this run is extracting, the "
+            "mechanism is wrong: parameter count is not a hypothesis. "
+            f"Untried classes: {untried_text}. "
+            "Pick the one the evidence you already have points at."
+        )
 
     def _stall_hint(self) -> str | None:
         if self.stall < _STALL_AFTER:

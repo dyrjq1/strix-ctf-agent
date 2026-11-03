@@ -133,9 +133,12 @@ def test_connection_refused_is_phase_connect_not_000():
     port = s.getsockname()[1]
     s.close()
     out = call(url=f"http://127.0.0.1:{port}/", timeout_s=3)
-    assert out.startswith("[NO RESPONSE]")
-    assert "phase=CONNECT" in out
-    assert "000" not in out.splitlines()[0]
+    first = out.splitlines()[0]
+    assert first.startswith("[NO RESPONSE]")
+    assert "phase=CONNECT" in first
+    # 断言状态位不是 000，而不是对整行做子串匹配：随机端口号本身可能含
+    # "000"（如 :31000），按子串查会把正确实现判红。旧写法在 CI 上偶发。
+    assert "[HTTP 000]" not in out
 
 
 def test_invalid_url_is_classified():

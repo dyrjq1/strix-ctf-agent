@@ -11,7 +11,11 @@ from ctf_strix.agent import (
     _attempt_count,
     _attempt_turns,
     _challenge_kind,
+    _needs_value,
     _question_id,
+    _question_ids,
+    _record_answer,
+    _round_note,
     _scope_note,
     _target_endpoints,
     _target_specs,
@@ -83,6 +87,140 @@ def test_instance_empty_scope_yields_nothing() -> None:
     """instance 模式 scope 为空 = 要自己起靶机，本层解析不出目标，如实返回空。"""
     task: dict[str, Any] = {"run_mode": "instance", "scope": [], "questions": []}
     assert _targets_from(task) == []
+
+
+def test_question_ids_lists_every_visible_question() -> None:
+    """Multiple visible questions each need their own key in ``answers``.
+
+    Ledger 4.9: CTFARENA-001 kept ``my_fully_solved=false`` after a correct
+    flag because only ``questions[0]`` was ever written.
+    """
+    task = {
+        "questions": [
+            {"id": "flag", "prompt": "the secret"},
+            {"id": "xhr_token", "prompt": "the token"},
+            {"id": "flag", "prompt": "duplicate must not repeat"},
+        ]
+    }
+    assert _question_ids(task) == ["flag", "xhr_token"]
+    assert _question_id(task) == "flag"
+
+
+def test_record_answer_writes_every_visible_id() -> None:
+    """One recovered value lands under every visible id, primary first."""
+    answers: dict[str, str] = {}
+    derived: set[str] = set()
+    written = _record_answer(
+        answers, ["flag", "xhr_token"], "CTFY{x}", "flag", derived=derived
+    )
+    assert written == ["flag", "xhr_token"]
+    assert answers == {"flag": "CTFY{x}", "xhr_token": "CTFY{x}"}
+    # Only the primary is evidence; the sibling is a guess.
+    assert derived == {"xhr_token"}
+
+
+def test_a_real_answer_replaces_an_earlier_guess() -> None:
+    """Mirroring must not make the guess look like a known answer.
+
+    Without the ``derived`` bookkeeping, the flag mirrored onto ``xhr_token``
+    would block the real token found later in the same run -- strictly worse
+    than never mirroring.
+    """
+    answers: dict[str, str] = {}
+    derived: set[str] = set()
+    _record_answer(answers, ["flag", "xhr_token"], "CTFY{flag}", "flag", derived=derived)
+    _record_answer(answers, ["flag", "xhr_token"], "tok-real", "xhr_token", derived=derived)
+
+    assert answers == {"flag": "CTFY{flag}", "xhr_token": "tok-real"}
+    assert derived == set()
+
+
+def test_a_second_finding_is_attributed_to_the_open_question() -> None:
+    """The first hit must not mask the second one.
+
+    With ``flag`` answered for real, a later finding is not "another flag" --
+    the primary is closed, so the value belongs to the sibling id that is still
+    only holding a mirror.
+    """
+    answers: dict[str, str] = {}
+    derived: set[str] = set()
+    _record_answer(answers, ["flag", "xhr_token"], "CTFY{first}", "flag", derived=derived)
+    assert derived == {"xhr_token"}
+
+    written = _record_answer(
+        answers, ["flag", "xhr_token"], "tok-real", "flag", derived=derived
+    )
+    assert written[0] == "xhr_token"
+    assert answers == {"flag": "CTFY{first}", "xhr_token": "tok-real"}
+    assert derived == set()
+
+
+def test_nothing_is_written_once_every_id_has_evidence() -> None:
+    """A third finding must not clobber two real answers."""
+    answers = {"flag": "CTFY{first}", "xhr_token": "tok-real"}
+    derived: set[str] = set()
+    assert _record_answer(answers, ["flag", "xhr_token"], "CTFY{third}", "flag",
+                          derived=derived) == []
+    assert answers == {"flag": "CTFY{first}", "xhr_token": "tok-real"}
+
+
+def test_needs_value_treats_a_mirror_as_open() -> None:
+    """A guessed key must keep the question open for real evidence."""
+    answers = {"flag": "CTFY{x}", "xhr_token": "CTFY{x}"}
+    derived = {"xhr_token"}
+    assert _needs_value(answers, ["flag", "xhr_token"], derived) is True
+    assert _needs_value(answers, ["flag"], derived) is False
+
+
+def test_a_later_guess_does_not_overwrite_an_earlier_real_answer() -> None:
+    """A guess on ``flag`` must not overwrite a real ``xhr_token``."""
+    answers = {"xhr_token": "tok-real"}
+    derived: set[str] = set()
+    _record_answer(answers, ["flag", "xhr_token"], "CTFY{guess}", "flag", derived=derived)
+    assert answers["xhr_token"] == "tok-real"
+    assert answers["flag"] == "CTFY{guess}"
+
+
+def test_round_note_is_empty_without_a_readme(tmp_path: Path) -> None:
+    """No briefing file at all (local run): nothing to point at."""
+    assert _round_note(tmp_path) == ""
+
+
+def test_first_round_briefing_is_pointed_at_but_not_quoted(tmp_path: Path) -> None:
+    """``README.md`` exists from round one -- it is task.json as prose.
+
+    Calling that "not the first round" would be a false statement about the
+    platform's own file, so the first-round form only tells the model to read
+    it.
+    """
+    (tmp_path / "README.md").write_text(
+        "# Challenge\n\nRecover the flag from the target.\n", encoding="utf-8"
+    )
+    note = _round_note(tmp_path)
+    assert "Read the platform briefing first" in note
+    assert "not the first round" not in note
+    assert "Recover the flag" not in note
+
+
+def test_later_round_briefing_is_quoted_with_its_verdicts(tmp_path: Path) -> None:
+    """From round two the briefing is the only record of what was already tried."""
+    (tmp_path / "README.md").write_text(
+        "# Round 2\n\nflag: wrong\nxhr_token: correct\n", encoding="utf-8"
+    )
+    note = _round_note(tmp_path)
+    assert "not" in note and "first round" in note
+    assert "newly unlocked" in note
+    assert "xhr_token: correct" in note
+
+
+def test_verdict_without_a_round_number_still_counts_as_later(tmp_path: Path) -> None:
+    """The protocol's wording is the marker, not a specific header format."""
+    (tmp_path / "README.md").write_text(
+        "Questions\n- flag: not answered\n", encoding="utf-8"
+    )
+    note = _round_note(tmp_path)
+    assert "first round" in note
+    assert "not answered" in note
 
 
 def test_question_id_falls_back() -> None:

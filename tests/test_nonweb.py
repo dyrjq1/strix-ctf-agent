@@ -272,12 +272,126 @@ def test_elfpeek_info_names_mitigations_and_next_step(tmp_path: Path) -> None:
     assert "next:" in out
 
 
-def test_elfpeek_gadgets_finds_patterns_without_capstone(tmp_path: Path) -> None:
+def test_elfpeek_gadgets_finds_patterns(tmp_path: Path) -> None:
+    """Gadget search must work whether or not a decoder is installed."""
     target = tmp_path / "tiny.elf"
     target.write_bytes(_tiny_elf())
     out = nonweb.elfpeek(str(target), view="gadgets")
     assert "pop rdi; ret" in out
     assert "/bin/sh" in out
+
+
+def test_gadgets_fall_back_to_byte_patterns_without_a_decoder(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The delivery image may ship without capstone; the fixed patterns must hold."""
+    monkeypatch.setattr(nonweb, "_capstone", lambda _elf: None)
+    target = tmp_path / "tiny.elf"
+    target.write_bytes(_tiny_elf())
+    out = nonweb.elfpeek(str(target), view="gadgets")
+    assert "pop rdi; ret" in out
+    assert "/bin/sh" in out
+
+
+def _elf_with_symtab() -> bytes:
+    """A linked ELF with .symtab/.strtab, so symbol lookup has something to read.
+
+    Hand-built on purpose: it pins the two header fields that are easy to
+    confuse (``sh_name`` vs ``sh_link``, and ``st_info`` type vs binding)
+    without depending on whatever toolchain happens to be installed.
+    """
+    import struct
+
+    size = 0x800
+    data = bytearray(size)
+    code_off = 0x100
+    code = bytes([
+        0x55,                                # push rbp
+        0x48, 0x89, 0xe5,                    # mov rbp, rsp
+        0x8b, 0x45, 0xfc,                    # mov eax, [rbp-4]
+        0x83, 0xc0, 0x01,                    # add eax, 1
+        0x89, 0x45, 0xfc,                    # mov [rbp-4], eax
+        0x5d,                                # pop rbp
+        0xc3,                                # ret
+    ])
+    main_off = code_off + len(code)
+    main_code = bytes([0x55, 0x48, 0x89, 0xe5, 0x5d, 0xc3])
+    data[code_off:code_off + len(code)] = code
+    data[main_off:main_off + len(main_code)] = main_code
+
+    base = 0x400000
+    data[0:4] = b"\x7fELF"; data[4] = 2; data[5] = 1; data[6] = 1
+    struct.pack_into("<H", data, 16, 2)      # ET_EXEC
+    struct.pack_into("<H", data, 18, 62)     # x86-64
+    struct.pack_into("<I", data, 20, 1)
+    struct.pack_into("<Q", data, 24, base + code_off)
+    struct.pack_into("<Q", data, 32, 64)     # e_phoff
+    struct.pack_into("<Q", data, 40, 0x400)  # e_shoff
+    struct.pack_into("<H", data, 52, 64)
+    struct.pack_into("<H", data, 54, 56)
+    struct.pack_into("<H", data, 56, 1)
+    struct.pack_into("<H", data, 58, 64)
+    struct.pack_into("<H", data, 60, 5)
+    struct.pack_into("<H", data, 62, 4)      # .shstrtab is section 4
+    struct.pack_into("<II", data, 64, 1, 5)
+    struct.pack_into("<QQQQ", data, 72, 0, base, base, size)
+
+    shstr = b"\x00.text\x00.symtab\x00.strtab\x00.shstrtab\x00"
+    data[0x200:0x200 + len(shstr)] = shstr        # .text=1 .symtab=7 .strtab=15
+    strtab = b"\x00check\x00main\x00"
+    data[0x240:0x240 + len(strtab)] = strtab      # check=1 main=7
+    sym_off = 0x280
+    struct.pack_into("<IBBHQQ", data, sym_off, 0, 0, 0, 0, 0, 0)
+    # st_info = (GLOBAL << 4) | FUNC
+    struct.pack_into("<IBBHQQ", data, sym_off + 24, 1, 0x12, 0, 1, base + code_off, len(code))
+    struct.pack_into("<IBBHQQ", data, sym_off + 48, 7, 0x12, 0, 1, base + main_off, len(main_code))
+
+    def _sh(name, typ, flags, addr, off, sz, link=0, info=0, align=1, entsize=0):
+        return struct.pack("<IIQQQQIIQQ", name, typ, flags, addr, off, sz,
+                           link, info, align, entsize)
+
+    data[0x400:0x440] = _sh(0, 0, 0, 0, 0, 0)
+    data[0x440:0x480] = _sh(1, 1, 6, base + code_off, code_off, 0x100)
+    data[0x480:0x4C0] = _sh(7, 2, 0, 0, sym_off, 72, 3, 1, 8, 24)
+    data[0x4C0:0x500] = _sh(15, 3, 0, 0, 0x240, len(strtab))
+    data[0x500:0x540] = _sh(23, 3, 0, 0, 0x200, len(shstr))
+    return bytes(data)
+
+
+def test_symbol_table_is_read_from_the_linked_string_table(tmp_path: Path) -> None:
+    """``sh_link`` names the string table; ``sh_name`` is only a name offset.
+
+    Reading ``sh_name`` as a section index made every symbol lookup return
+    nothing, so ``elfpeek view=symbols`` claimed "stripped" for binaries that
+    had a full symbol table, and ``elffind symbol=`` never resolved anything.
+    """
+    target = tmp_path / "sym.elf"
+    target.write_bytes(_elf_with_symtab())
+    out = nonweb.elfpeek(str(target), view="symbols")
+    assert "check" in out and "main" in out, out
+    assert "stripped" not in out, out
+
+
+def test_symbol_type_is_the_low_nibble_of_st_info(tmp_path: Path) -> None:
+    """``st_info`` packs type low and binding high; FUNC must not read OBJECT."""
+    target = tmp_path / "sym.elf"
+    target.write_bytes(_elf_with_symtab())
+    out = nonweb.elfpeek(str(target), view="symbols")
+    assert "FUNC" in out, out
+    assert "OBJECT" not in out, out
+
+
+def test_disasm_by_symbol_returns_the_whole_function(tmp_path: Path) -> None:
+    """One call must give one function, not an arbitrary byte window."""
+    target = tmp_path / "sym.elf"
+    target.write_bytes(_elf_with_symtab())
+    out = nonweb.elfpeek(str(target), view="disasm", symbol="check")
+    assert "symbol check" in out, out
+    if "no disassembler" in out:
+        return
+    # Every instruction of check(), ending at its ret -- and nothing from main.
+    assert "push" in out and "ret" in out, out
+    assert "main" not in out.replace("symbol check", ""), out
 
 
 def test_elffind_reports_offsets(tmp_path: Path) -> None:
@@ -304,10 +418,15 @@ def test_elfpeek_unknown_view_lists_choices(tmp_path: Path) -> None:
 
 
 def test_elfpeek_schema_does_not_carry_lookup_parameters(tmp_path: Path) -> None:
-    """`symbol`/`search` serve one view; the other six must not pay for them.
+    """Lookup parameters belong to the view that uses them.
 
     Measured: the combined schema was 1,576 chars -- larger than the whole
     ``file_triage`` tool.  Splitting keeps the per-call surface honest.
+
+    ``symbol`` is the one exception and it is deliberate: ``disasm`` without it
+    can only read "128 bytes from some offset", which is not how a check
+    function gets read.  ``search`` stays on ``elffind`` because resolving a
+    byte string to an address is a different question from reading code.
     """
     seen: list = []
 
@@ -318,9 +437,47 @@ def test_elfpeek_schema_does_not_carry_lookup_parameters(tmp_path: Path) -> None
     schemas = {
         tool.name: set(tool.params_json_schema["properties"]) for tool in seen
     }
-    assert "symbol" not in schemas["elfpeek"]
+    assert "symbol" in schemas["elfpeek"]
+    assert "search" not in schemas["elfpeek"]
     assert "utf16" not in schemas["elfpeek"]
     assert {"symbol", "search"} <= schemas["elffind"]
+
+
+def test_disasm_reports_where_it_stopped(tmp_path: Path) -> None:
+    """A truncated disassembly must say so and name the resume offset.
+
+    Silently ending at the row cap reads like "the function ends here"; that
+    is how a run concludes the wrong thing about a long check function.
+    """
+    target = tmp_path / "tiny.elf"
+    target.write_bytes(_tiny_elf())
+    if nonweb._capstone(nonweb._Elf(target.read_bytes())) is None:
+        # Truncation can only be reported by a real decoder. The image installs
+        # capstone; this branch is a developer box without it.
+        return
+    out = nonweb.elfpeek(str(target), view="disasm", offset=0x100, length=256, limit=3)
+    assert "truncated" in out, out
+    assert "continue with offset=" in out, out
+
+
+def test_disasm_by_symbol_names_the_symbol(tmp_path: Path) -> None:
+    """``symbol=`` resolves through the symbol table instead of guessing."""
+    target = tmp_path / "tiny.elf"
+    target.write_bytes(_tiny_elf())
+    out = nonweb.elfpeek(str(target), view="disasm", symbol="not_a_symbol_here")
+    assert "no function symbol" in out, out
+
+
+def test_disasm_without_a_decoder_names_a_working_command(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """No decoder must degrade to bytes plus a command the image really has."""
+    monkeypatch.setattr(nonweb, "_capstone", lambda _elf: None)
+    target = tmp_path / "tiny.elf"
+    target.write_bytes(_tiny_elf())
+    out = nonweb.elfpeek(str(target), view="disasm", offset=0, length=16)
+    assert "[elfpeek]" in out
+    assert "objdump -d" in out, out
 
 
 # --------------------------------------------------------------------------
@@ -360,6 +517,33 @@ def test_network_tools_are_not_probe_tools() -> None:
     assert not (probe_surface.NETWORK_TOOLS & probe_surface.PROBE_TOOLS)
     for name in probe_surface.NETWORK_TOOLS:
         assert not probe_surface.is_probe_tool(name)
+
+def test_unpack_names_7z_instead_of_calling_it_unknown(tmp_path: Path) -> None:
+    """A 7z that cannot be read must not look like a corrupt file.
+
+    "detected unknown, nothing extracted" invites a retry of the same tool.
+    The magic bytes are conclusive, so say what it is and that this image has
+    no reader -- that is the observation that changes the next action.
+    """
+    archive = tmp_path / "a.7z"
+    archive.write_bytes(b"7z\xbc\xaf\x27\x1c" + b"\x00" * 300)
+    out = nonweb.unpack_archive(str(archive), out_dir=str(tmp_path / "out"))
+    assert "detected 7z" in out, out
+    assert "no 7z reader" in out, out
+    assert "offset 0x0" in out, out
+    assert "unknown" not in out, out
+
+
+def test_unpack_finds_a_rar_signature_behind_an_sfx_stub(tmp_path: Path) -> None:
+    """RAR self-extracting stubs put up to 64KB before the signature."""
+    archive = tmp_path / "sfx.rar"
+    archive.write_bytes(b"MZ" + b"\x00" * 4096 + b"Rar!\x1a\x07\x00" + b"\x00" * 128)
+    out = nonweb.unpack_archive(str(archive), out_dir=str(tmp_path / "out"))
+    assert "detected rar" in out, out
+    assert "no rar reader" in out, out
+    # The message must not pretend the file *is* a bare RAR: it is an SFX stub.
+    assert "offset 0x1002" in out, out
+
 
 def test_unpack_archive_handles_data_appended_after_eocd(tmp_path: Path) -> None:
     """A real misc attachment: 143KB of appended data after the ZIP EOCD.

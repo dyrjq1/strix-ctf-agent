@@ -104,7 +104,9 @@ def test_correct_answer_stops_trying_more_candidates() -> None:
     calls = {"n": 0}
 
     def fake_post(path: str, body: dict[str, Any]) -> dict[str, Any]:
-        sent.append(body)
+        # 预检不记账，所以只统计真正写进 /submissions 的那条。
+        if path.endswith("/submissions"):
+            sent.append(body)
         calls["n"] += 1
         # q1 的第一个候选就中；q2 全部判错
         return {"correct": body["question_id"] == "q1"}
@@ -160,3 +162,96 @@ def test_verdict_json_serialisable() -> None:
     sub, _ = _mk([{"id": "q1", "mode": "dynamic"}])
     verdict = sub.submit("FLAG{abc}")
     json.dumps(verdict)  # 不抛异常即可
+
+
+def _mk_oracle(questions, truth: dict[str, str]):
+    """A submitter whose verify-answer endpoint knows the answers."""
+    sub = AutoSubmitter("https://example.invalid", "inst-1", "tok")
+    posted: list[dict[str, Any]] = []
+    verified: list[dict[str, Any]] = []
+
+    sub._questions = lambda: questions  # type: ignore[method-assign]
+
+    def fake_post(path: str, body: dict[str, Any]) -> dict[str, Any]:
+        if path.endswith("/verify-answer"):
+            verified.append(body)
+            return {
+                "correct": truth.get(body["question_id"]) == body["answer"],
+                "question_id": body["question_id"],
+            }
+        posted.append(body)
+        return {"correct": truth.get(body["question_id"]) == body["answer"]}
+
+    sub._post = fake_post  # type: ignore[method-assign]
+    return sub, posted, verified
+
+
+def test_verify_is_used_before_spending_a_submission() -> None:
+    """Wrong candidates must not consume the per-question attempt cap.
+
+    The platform's openapi says verify-answer runs the same grader while
+    writing no submission record. Six wrong candidates against a cap of
+    three is a real loss; the probe makes the wrong ones free.
+    """
+    sub, posted, verified = _mk_oracle(
+        [{"id": "flag", "mode": "dynamic", "attempts_remaining": 3}],
+        {"flag": "FLAG{right}"},
+    )
+    verdict = sub.submit("FLAG{wrong} FLAG{right}")
+    assert len(verified) == 2, verified
+    assert [b["answer"] for b in posted] == ["FLAG{right}"], posted
+    assert verdict["correct"] == ["flag=FLAG{right}"]
+
+
+def test_seeded_mode_is_submitted() -> None:
+    """``seeded`` answers go through /submissions like dynamic ones."""
+    sub, posted, _ = _mk_oracle(
+        [{"id": "storage_remark", "mode": "seeded"}],
+        {"storage_remark": "s3cr3t"},
+    )
+    verdict = sub.submit("answer: s3cr3t")
+    assert [b["question_id"] for b in posted] == ["storage_remark"]
+    assert verdict["correct"] == ["storage_remark=s3cr3t"], verdict
+
+
+def test_exhausted_question_is_skipped_not_hammered() -> None:
+    """``attempts_remaining=0`` means the platform will reject: say so."""
+    sub, posted, verified = _mk_oracle(
+        [{"id": "flag", "mode": "dynamic", "attempts_remaining": 0}],
+        {"flag": "FLAG{right}"},
+    )
+    verdict = sub.submit("FLAG{right}")
+    assert posted == [] and verified == []
+    assert verdict["skipped"] and "attempts_remaining=0" in verdict["skipped"][0]
+
+
+def test_verify_unavailable_falls_back_to_submitting() -> None:
+    """An older platform without verify-answer must still score."""
+    sub = AutoSubmitter("https://example.invalid", "inst-1", "tok")
+    posted: list[dict[str, Any]] = []
+    sub._questions = lambda: [{"id": "flag", "mode": "dynamic"}]  # type: ignore[method-assign]
+
+    def fake_post(path: str, body: dict[str, Any]) -> dict[str, Any]:
+        if path.endswith("/verify-answer"):
+            return {"error": "HTTP 404"}
+        posted.append(body)
+        return {"correct": body["answer"] == "FLAG{right}"}
+
+    sub._post = fake_post  # type: ignore[method-assign]
+    verdict = sub.submit("FLAG{wrong} FLAG{right}")
+    assert [b["answer"] for b in posted] == ["FLAG{wrong}", "FLAG{right}"]
+    assert verdict["correct"] == ["flag=FLAG{right}"]
+
+
+def test_labelled_answer_is_extracted_for_non_flag_shapes() -> None:
+    """A seeded answer is often not flag-shaped; the label is the only signal."""
+    cands = AutoSubmitter.candidates(
+        "some noise 6420f7ff74fc44616ecf891691049580\nfinal answer: `s3cr3t-value`"
+    )
+    assert cands[0] == "s3cr3t-value", cands
+
+
+def test_bare_prose_is_still_not_a_candidate() -> None:
+    """Scraping free text would submit sentences; only labels and shapes count."""
+    cands = AutoSubmitter.candidates("I looked around and the page said nothing useful.")
+    assert cands == [], cands

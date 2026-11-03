@@ -28,6 +28,7 @@ RUN set -eux; \
     apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates curl wget git jq \
         file xxd binutils unzip zip \
+        gdb strace ltrace \
         netcat-openbsd iproute2 dnsutils \
         vim-tiny less procps \
         libssl-dev libffi-dev \

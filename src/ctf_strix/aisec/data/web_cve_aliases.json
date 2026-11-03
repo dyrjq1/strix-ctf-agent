@@ -1,0 +1,271 @@
+{
+  "version": 1,
+  "note": "Banner name -> vendor:product keys. Keys absent from the index are ignored at load time; a hand-written row wins over a derived bare product name.",
+  "aliases": {
+    "nginx": [
+      "f5:nginx"
+    ],
+    "openresty": [
+      "openresty:openresty"
+    ],
+    "apache httpd": [
+      "apache:http_server"
+    ],
+    "apache http server": [
+      "apache:http_server"
+    ],
+    "httpd": [
+      "apache:http_server"
+    ],
+    "apache tomcat": [
+      "apache:tomcat"
+    ],
+    "tomcat": [
+      "apache:tomcat"
+    ],
+    "apache log4j": [
+      "apache:log4j"
+    ],
+    "log4j": [
+      "apache:log4j"
+    ],
+    "log4j2": [
+      "apache:log4j"
+    ],
+    "apache struts": [
+      "apache:struts"
+    ],
+    "struts": [
+      "apache:struts"
+    ],
+    "struts2": [
+      "apache:struts"
+    ],
+    "weblogic": [
+      "oracle:weblogic_server"
+    ],
+    "oracle weblogic": [
+      "oracle:weblogic_server"
+    ],
+    "oracle http server": [
+      "oracle:http_server"
+    ],
+    "node.js": [
+      "nodejs:node.js"
+    ],
+    "nodejs": [
+      "nodejs:node.js"
+    ],
+    "node": [
+      "nodejs:node.js"
+    ],
+    "d-link dir": [
+      "dlink:dir",
+      "d-link:dir"
+    ],
+    "dlink dir": [
+      "dlink:dir",
+      "d-link:dir"
+    ],
+    "spring": [
+      "vmware:spring_framework"
+    ],
+    "spring framework": [
+      "vmware:spring_framework"
+    ],
+    "spring boot": [
+      "spring:spring_boot"
+    ],
+    "spring cloud gateway": [
+      "vmware:spring_cloud_gateway"
+    ],
+    "spring cloud config": [
+      "vmware:spring_cloud_config"
+    ],
+    "confluence": [
+      "atlassian:confluence"
+    ],
+    "jira": [
+      "atlassian:jira"
+    ],
+    "jenkins": [
+      "jenkins:jenkins"
+    ],
+    "gitlab": [
+      "gitlab:gitlab"
+    ],
+    "gitea": [
+      "gitea:gitea"
+    ],
+    "grafana": [
+      "grafana:grafana"
+    ],
+    "elasticsearch": [
+      "elastic:elasticsearch"
+    ],
+    "kibana": [
+      "elastic:kibana"
+    ],
+    "logstash": [
+      "elastic:logstash"
+    ],
+    "mongodb": [
+      "mongodb:mongodb"
+    ],
+    "redis": [
+      "redis:redis"
+    ],
+    "wordpress": [
+      "wordpress:wordpress"
+    ],
+    "drupal": [
+      "drupal:drupal"
+    ],
+    "joomla": [
+      "joomla:joomla"
+    ],
+    "magento": [
+      "magento:magento"
+    ],
+    "typo3": [
+      "typo3:typo3"
+    ],
+    "laravel": [
+      "laravel:laravel"
+    ],
+    "thinkphp": [
+      "thinkphp:thinkphp"
+    ],
+    "symfony": [
+      "symfony:symfony"
+    ],
+    "codeigniter": [
+      "codeigniter:codeigniter"
+    ],
+    "cakephp": [
+      "cakephp:cakephp"
+    ],
+    "php": [
+      "php:php"
+    ],
+    "phpmyadmin": [
+      "php:phpmyadmin"
+    ],
+    "exchange": [
+      "microsoft:exchange_server"
+    ],
+    "microsoft exchange": [
+      "microsoft:exchange_server"
+    ],
+    "sharepoint": [
+      "microsoft:sharepoint_server"
+    ],
+    "iis": [
+      "microsoft:iis"
+    ],
+    "asp.net": [
+      "microsoft:asp.net"
+    ],
+    "netscaler": [
+      "citrix:netscaler"
+    ],
+    "citrix adc": [
+      "citrix:adc"
+    ],
+    "fortios": [
+      "fortinet:fortios"
+    ],
+    "fortiproxy": [
+      "fortinet:fortiproxy"
+    ],
+    "fortimanager": [
+      "fortinet:fortimanager"
+    ],
+    "connect secure": [
+      "ivanti:connect_secure"
+    ],
+    "pulse connect secure": [
+      "pulse_secure:pulse_connect_secure"
+    ],
+    "websphere": [
+      "ibm:websphere_application_server"
+    ],
+    "websphere liberty": [
+      "ibm:websphere_liberty"
+    ],
+    "lotus domino": [
+      "ibm:lotus_domino"
+    ],
+    "moveit": [
+      "progress:moveit_transfer"
+    ],
+    "moveit transfer": [
+      "progress:moveit_transfer"
+    ],
+    "whatsup gold": [
+      "progress:whatsup_gold"
+    ],
+    "sonicos": [
+      "sonicwall:sonicos"
+    ],
+    "cpanel": [
+      "cpanel:cpanel"
+    ],
+    "plesk": [
+      "plesk:plesk"
+    ],
+    "webmin": [
+      "webmin:webmin"
+    ],
+    "adminer": [
+      "adminer:adminer"
+    ],
+    "jboss": [
+      "red_hat:jboss_enterprise_application_platform"
+    ],
+    "node.js:node.js": [
+      "nodejs:node.js"
+    ],
+    "nginx:nginx": [
+      "f5:nginx"
+    ],
+    "dlink:dir": [
+      "dlink:dir",
+      "d-link:dir"
+    ],
+    "d-link:dir": [
+      "dlink:dir",
+      "d-link:dir"
+    ],
+    "spring:spring_framework": [
+      "vmware:spring_framework"
+    ],
+    "pivotal:spring_framework": [
+      "vmware:spring_framework"
+    ],
+    "rails:rails": [
+      "rubyonrails:rails"
+    ],
+    "rubyonrails:rails": [
+      "rubyonrails:rails"
+    ],
+    "confluence:confluence": [
+      "atlassian:confluence"
+    ],
+    "jira:jira": [
+      "atlassian:jira"
+    ],
+    "bitbucket:bitbucket": [
+      "atlassian:bitbucket"
+    ],
+    "apache:struts2": [
+      "apache:struts"
+    ],
+    "zoho:manageengine": [
+      "zohocorp:manageengine"
+    ],
+    "zohocorp:manageengine": [
+      "zoho:manageengine"
+    ]
+  }
+}

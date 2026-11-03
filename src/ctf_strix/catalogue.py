@@ -74,8 +74,8 @@ CATALOGUE: Final[tuple[ToolInfo, ...]] = (
     ),
     ToolInfo(
         "load_skill",
-        "load one discipline index. The index at the end of this prompt says "
-        "when each applies; load at most one, then `read_file` its subfiles",
+        "load at most one discipline index; its line at the end says when; "
+        "subfiles: `exec_command` (cat/sed -n), images `view_image`",
         ALL_KINDS,
         "base",
     ),
@@ -115,6 +115,26 @@ CATALOGUE: Final[tuple[ToolInfo, ...]] = (
         WEB_KINDS,
         "web",
     ),
+    ToolInfo(
+        "traffic_list",
+        "list this run exchanges plus ids the target returned that nobody "
+        "fetched yet; read-only, no network",
+        WEB_KINDS,
+        "web",
+    ),
+    ToolInfo(
+        "traffic_view",
+        "re-read one stored exchange, paginated by offset, without re-sending "
+        "it; read-only",
+        WEB_KINDS,
+        "web",
+    ),
+    ToolInfo(
+        "web_cve_lookup",
+        "offline CVE index for web products; KEV entries first",
+        WEB_KINDS,
+        "web",
+    ),
     # -- attachment --------------------------------------------------------
     ToolInfo(
         "file_triage",
@@ -146,8 +166,9 @@ CATALOGUE: Final[tuple[ToolInfo, ...]] = (
     ),
     ToolInfo(
         "elfpeek",
-        "inspect an ELF: info, sections, symbols, strings, gadgets, disasm. "
-        "Static first -- do not run an unknown binary",
+        "inspect an ELF: info/sections/symbols/strings/gadgets/disasm. Static "
+        "first, never run an unknown binary; disasm symbol='name' reads one "
+        "whole function",
         FILE_KINDS | TCP_KINDS,
         "file",
     ),

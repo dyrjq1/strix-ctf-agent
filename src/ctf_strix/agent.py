@@ -295,11 +295,41 @@ def _scope_note(task: dict[str, Any]) -> str:
     )
 
 
-def _question_id(task: dict[str, Any]) -> str:
-    """取本次要回答的 question id。
+def _question_ids(task: dict[str, Any]) -> list[str]:
+    """List every question id that is visible in this round.
 
-    ``answers`` 是个 map，key 必须**和题目声明的 id 对上**——写死 ``"flag"``
-    只在题目恰好把 id 命名为 flag 时成立。平台按 id 逐条匹配，key 不对等于没交。
+    ``answers`` is a map keyed by question id: the platform matches each key
+    against its own record, so an id that is missing from the map is a
+    question that was never answered -- even when the flag was found.  A
+    challenge whose ``questions`` lists two visible ids used to collect one
+    key and score one question (ledger 4.9: CTFARENA-001 kept
+    ``my_fully_solved=false`` after a correct flag).
+
+    Gated questions are not listed here: the protocol says their prompt does
+    not exist yet, so they cannot be in ``task.json`` either.
+
+    Args:
+        task: parsed task.json.
+
+    Returns:
+        Declared ids in declaration order; ``["flag"]`` when the task has no
+        questions (engagement / awd).
+    """
+    out: list[str] = []
+    for question in task.get("questions") or []:
+        if isinstance(question, dict):
+            declared = question.get("id")
+            if declared and str(declared) not in out:
+                out.append(str(declared))
+    return out or ["flag"]
+
+
+def _question_id(task: dict[str, Any]) -> str:
+    """取本次要回答的 question id（第一个）。
+
+    Kept as the narrow accessor for callers that need one id (the ledger key,
+    the prompt line).  Written answers must go through :func:`_question_ids`
+    so every visible question gets its own key.
 
     Args:
         task: 已解析的 task.json。
@@ -307,12 +337,68 @@ def _question_id(task: dict[str, Any]) -> str:
     Returns:
         第一个 question 的 id；没有 questions（engagement / awd）时退回 ``"flag"``。
     """
-    questions = task.get("questions") or []
-    if questions and isinstance(questions[0], dict):
-        declared = questions[0].get("id")
-        if declared:
-            return str(declared)
-    return "flag"
+    return _question_ids(task)[0]
+
+
+#: Wording the platform uses in the per-round briefing (protocol §3.3) for the
+#: verdicts of the previous round.  Presence of any of these means the README
+#: carries state we would otherwise re-derive from scratch.
+_ROUND_VERDICTS = ("correct", "wrong", "not answered", "newly unlocked")
+_ROUND_NUMBER = re.compile(r"\bround\s+(\d+)\b", re.IGNORECASE)
+
+
+def _round_note(work: Path) -> str:
+    """Point the model at the platform briefing, and quote it when it has state.
+
+    ``README.md`` exists from the **first** round -- it is ``task.json``
+    rendered as prose -- so its presence alone says nothing about rounds.  What
+    matters is whether it carries a verdict list: the protocol states that from
+    round two it names the round and gives each question of the last round
+    ``correct`` / ``wrong`` / ``not answered`` / ``newly unlocked``, and that
+    ``/ctfy/work`` survives between rounds.  Without reading that, a restart
+    re-derives everything and repeats paths already known to be wrong.
+
+    Args:
+        work: the CTFY work directory.
+
+    Returns:
+        An instruction block; on the first round it is one line (read the file),
+        on later rounds it also quotes the briefing, capped.
+    """
+    readme = work / "README.md"
+    head = (
+        "## Read the platform briefing first\n\n"
+        "`README.md` in your working directory is the platform's own briefing; "
+        "it is generated from the same contract as `task.json`. Read it before "
+        "the first tool call."
+    )
+    if not readme.is_file():
+        return ""
+    try:
+        body = readme.read_text(encoding="utf-8", errors="replace").strip()
+    except OSError:
+        return head
+    if not body:
+        return head
+
+    match = _ROUND_NUMBER.search(body)
+    later = bool(match and int(match.group(1)) > 1) or any(
+        word in body.lower() for word in _ROUND_VERDICTS
+    )
+    if not later:
+        return head
+
+    if len(body) > 1800:
+        body = body[:1800] + "\n...(truncated; read the file for the rest)"
+    return (
+        head
+        + "\n\nThis is **not** the first round: the briefing below names the round "
+        "and gives each question of the last round a verdict. Do not repeat a "
+        "path recorded as **wrong**, continue from the ones marked **newly "
+        "unlocked**, and note that whatever you left in the working directory "
+        "is still there.\n\n"
+        f"```\n{body}\n```"
+    )
 
 
 def _challenge_kind(task: dict[str, Any], work: Path | None = None) -> str:
@@ -617,7 +703,11 @@ def main() -> int:
     error: str | None = None
     stop_reason = "completed"
     turns_used = 0
-    qid = _question_id(task)
+    all_qids = _question_ids(task)
+    qid = all_qids[0]
+    # Ids whose value came from mirroring a sibling answer rather than from the
+    # target. Kept here so a real answer found later can replace the guess.
+    mirrored: set[str] = set()
     kind = _challenge_kind(task, work)
     diag: dict[str, Any] = {}
     # 附件只读一次：main 要用它判断"附件题是不是空的"，_run_agent 要把它注入
@@ -671,6 +761,8 @@ def main() -> int:
                     kind=kind,
                     attachments=attachments,
                     publisher=publisher,
+                    qids=all_qids,
+                    derived=mirrored,
                 )
                 if diag.pop("no_attempt_ran", False):
                     # 每个 attempt 都抛异常：这不是"跑了没解出"，是"根本没跑"。
@@ -851,6 +943,40 @@ def _measured_groups(kind: str) -> list[str]:
     return [group for group in ("web", "file", "tcp", "aisec") if group in found]
 
 
+def _autosubmit_target(task: dict[str, Any]) -> tuple[str, str, str] | None:
+    """Resolve ``(platform, instance, token)`` for in-run submissions.
+
+    The protocol guarantees all three on a scored run: ``CTFY_PLATFORM_URL`` and
+    ``CTFY_TOKEN`` in the environment, ``target_instance`` in ``task.json``
+    (mirrored as ``CTFY_EVAL_TARGET_INSTANCE``).  A dry run has none of them,
+    which is why this returns ``None`` instead of guessing -- submitting to an
+    empty URL would show up in the log as a network error that looks like the
+    platform's fault.
+
+    Returns:
+        The three values, or ``None`` when this run has no instance to submit
+        against (dry run, qa item, or a local smoke test).
+    """
+    try:
+        from ctf_strix.engagement import platform_of
+    except Exception:  # noqa: BLE001 -- a broken report module must not stop scoring
+        return None
+    platform = platform_of(task)
+    instance = str(
+        os.environ.get("CTFY_EVAL_TARGET_INSTANCE")
+        or task.get("target_instance")
+        or ""
+    ).strip()
+    token = (
+        os.environ.get("CTFY_TOKEN")
+        or os.environ.get("CTF_PLATFORM_TOKEN")
+        or str(task.get("token") or "")
+    ).strip()
+    if not (platform and instance and token):
+        return None
+    return platform, instance, token
+
+
 def install_toolset(task: dict[str, Any], kind: str) -> tuple[str, list[str]]:
     """Register every capability this challenge kind is entitled to.
 
@@ -992,6 +1118,82 @@ def install_toolset(task: dict[str, Any], kind: str) -> tuple[str, list[str]]:
     return hint, groups
 
 
+def _needs_value(answers: dict[str, str], qids: list[str], derived: set[str]) -> bool:
+    """True when at least one visible id still lacks evidence of its own.
+
+    A key that exists is not the same as a question that is answered: mirroring
+    writes guesses, and a guess must keep the question open so later evidence
+    can replace it.
+
+    Args:
+        answers: the answer map.
+        qids: every visible question id.
+        derived: ids whose value is a mirror rather than evidence.
+
+    Returns:
+        Whether any visible id is absent or only guessed.
+    """
+    return any(key not in answers or key in derived for key in qids)
+
+
+def _record_answer(
+    answers: dict[str, str],
+    qids: list[str],
+    value: str,
+    primary: str,
+    *,
+    derived: set[str],
+) -> list[str]:
+    """Record a recovered value, and mirror it onto the ids still unanswered.
+
+    ``answers`` is a map keyed by question id, and the platform submits each key
+    it finds: an id that is absent scores zero even when the string is right.
+    A challenge whose ``questions`` lists two visible ids therefore used to
+    score one of them (ledger 4.9: CTFARENA-001 kept ``my_fully_solved=false``
+    after a correct flag).  Gated ids are never here -- their prompt does not
+    exist until an earlier one is answered.
+
+    Two rules keep the mirror honest, and both were learned the hard way:
+
+    * A mirrored value is a **guess**, tracked in ``derived``.  Without that,
+      the guess itself looks like a known answer and the real answer for the
+      second id -- found later in the same run -- is dropped as "already
+      answered".  That is strictly worse than never mirroring.
+    * A later finding is evidence for a *different* id when the primary is
+      already evidence-backed.  Attributing everything to the primary would
+      let the first hit mask the second.
+
+    Args:
+        answers: the out-parameter map.
+        qids: every visible question id, in declaration order.
+        value: the recovered answer.
+        primary: the id this value was derived for; preferred when it is open.
+        derived: ids whose current value is a mirror, not evidence.  Mutated.
+
+    Returns:
+        The ids written, attribution target first; empty when every visible id
+        already holds evidence.
+    """
+    target = primary if primary not in answers or primary in derived else None
+    if target is None:
+        target = next((key for key in qids if key in derived), None)
+    if target is None:
+        return []
+
+    answers[target] = value
+    derived.discard(target)
+    written = [target]
+    for key in qids:
+        if key == target:
+            continue
+        if key in answers and key not in derived:
+            continue  # real answer for that question: never overwrite it
+        answers[key] = value
+        derived.add(key)
+        written.append(key)
+    return written
+
+
 def _run_agent(
     task: dict[str, Any],
     answers: dict[str, str],
@@ -1000,13 +1202,18 @@ def _run_agent(
     kind: str = "web",
     attachments: list[dict[str, str]] | None = None,
     publisher: Any = None,
+    qids: list[str] | None = None,
+    derived: set[str] | None = None,
 ) -> tuple[int, dict[str, Any]]:
     """调用 strix 打这一道题。
 
     Args:
         task: 已解析的 task.json，用于取题目描述与 turn 预算。
         answers: 出参。拿到 flag 时写入 ``answers[qid]``。
-        qid: 题目的 question id，决定 ``answers`` 的 key。
+        qid: 主 question id（日志与提示用）。
+        qids: 本轮**全部可见**的 question id；缺省时退化为 ``[qid]``。
+        derived: 记录哪些 ``answers`` 值是"镜像猜测"而不是实证；由 main 持有，
+            使后到的真实答案仍能覆盖它。
         kind: 题型，由 :func:`_challenge_kind` 给出。
         attachments: 已读入的附件（``extra_files`` 形状）。附件题由 main 读好
             传进来，避免同一批文件被搬两遍。
@@ -1063,6 +1270,32 @@ def _run_agent(
 
     install_finish_guard(require_flag=kind not in {"engagement", "checker"})
 
+    # 边跑边交。``answers`` 是收工时一次性交给平台的，而协议 §3 明说：跑完
+    # 才交就拿不到即时判定，gated 题也永远解锁不了。评测入口
+    # ``scripts/run_strix_ctf.py`` 早就有 --autosubmit，**正赛入口从来没装过**
+    # ——这是第三次"评测有、交付没有"（前两次：sweep_guard、v2 原语），所以
+    # 装配结果同时写进 diag，并做成测试钉住。
+    #
+    # engagement 的交付物是报告，checker 没有 flag，两类都不许挂。
+    if kind not in {"engagement", "checker"}:
+        submitted_to = _autosubmit_target(task)
+        if submitted_to is None:
+            print("[ctfy] autosubmit off (no platform/instance/token)", flush=True)
+            diag["autosubmit"] = "off"
+        else:
+            try:
+                from ctf_strix.autosubmit import install as install_autosubmit
+
+                install_autosubmit(*submitted_to)
+                print(f"[ctfy] autosubmit on (instance {submitted_to[1][:8]}...)", flush=True)
+                diag["autosubmit"] = "on"
+            except Exception as exc:  # noqa: BLE001 -- 提交失败不能阻止跑题
+                print(
+                    f"[ctfy] autosubmit registration failed: {type(exc).__name__}: {exc}",
+                    flush=True,
+                )
+                diag["autosubmit"] = "failed"
+
     # 装完立刻验证接线。正赛里没有第二次机会，接线失败必须当场知道。
     from ctf_strix.guard_mount import verify_mount
 
@@ -1096,6 +1329,11 @@ def _run_agent(
     # One place assembles the tool surface, so what is registered and what
     # the prompt describes cannot drift apart (docs/27 C3/C4).
     hint, groups = install_toolset(task, kind)
+
+    # Every visible question id, resolved once per run.  ``qid`` stays the
+    # primary (prompt + log line); ``all_qids`` is what answers are keyed by.
+    all_qids = qids or [qid]
+    mirrors: set[str] = derived if derived is not None else set()
 
     from strix.core.runner import run_strix_scan
 
@@ -1273,10 +1511,11 @@ def _run_agent(
 
         # Every flag-shaped string in this output is now *retrieved* evidence.
         ledger.observe_output(text)
-        if arg_claims and qid not in answers:
+        if arg_claims:
             for claim in list(arg_claims):
-                if ledger.supports(claim):
-                    answers[qid] = claim
+                if ledger.supports(claim) and _record_answer(
+                    answers, all_qids, claim, qid, derived=mirrors
+                ):
                     print(
                         f"[ctfy] flag captured from tool args: {claim}",
                         flush=True,
@@ -1286,14 +1525,29 @@ def _run_agent(
         # ⚠️ 必须逐条输出单独判定，不能等最后拼起来一起判。拼接后
         # 本题靶机与别题 flag 的距离信息会被淹没，证据判定退化成瞎猜。
         flag = _extract_flag(text, own_host)
-        if flag and qid not in answers:
-            answers[qid] = flag
+        if flag and _record_answer(answers, all_qids, flag, qid, derived=mirrors):
             print(f"[ctfy] flag captured: {flag}", flush=True)
 
     scope_note = _scope_note(task)
     parts = [goal, scope_note]
     if hint:
         parts.append(hint)
+
+    # A later round leaves a README that names the round and scores the last
+    # one.  Injecting it is the difference between continuing and restarting.
+    round_note = _round_note(_work_dir())
+    if round_note:
+        parts.append(round_note)
+
+    if len(all_qids) > 1:
+        listing = "\n".join(f"- {item}" for item in all_qids)
+        parts.append(
+            "## Questions visible this round\n\n"
+            f"The platform scores each id separately:\n\n{listing}\n\n"
+            "Put the recovered value in `answers` under **every** id it could "
+            "answer, not only the first. An id that is missing scores zero even "
+            "when the string is right."
+        )
     if attachment_files:
         # strix 只把 ``workspace_files`` 渲染进 task，``extra_files`` 是静默注入的。
         # 不说一声，agent 会不知道这些文件从哪来、甚至以为工作目录是空的。
@@ -1420,10 +1674,15 @@ def _run_agent(
     # ``finish_scan`` is usually the last call, so no further tool output will
     # arrive to promote a claim recorded in its arguments.  Settle here as well,
     # otherwise a correct answer reported at the end would be dropped.
-    if not engagement and qid not in answers:
+    #
+    # "Still missing" means every visible id without evidence, not just the
+    # primary one: mirroring fills the keys, so absence alone would say
+    # "done" while the second question only holds a guess.
+    if not engagement and _needs_value(answers, all_qids, mirrors):
         for claim in arg_claims:
-            if ledger.supports(claim):
-                answers[qid] = claim
+            if ledger.supports(claim) and _record_answer(
+                answers, all_qids, claim, qid, derived=mirrors
+            ):
                 print(
                     f"[ctfy] flag captured from tool args: {claim}",
                     flush=True,
@@ -1433,11 +1692,10 @@ def _run_agent(
     # 兜底：sink 里若因竞态没抓住，这里逐条重扫一遍。
     # ⚠️ 不要对 "\n".join(captured) 整体判定——拼接后本题靶机的出现位置被
     # 稀释到几千字符之外，证据判定会退化成"取最后一个"，正是踩过的坑。
-    if not engagement and qid not in answers:
+    if not engagement and _needs_value(answers, all_qids, mirrors):
         for text in captured:
             flag = _extract_flag(text, own_host)
-            if flag:
-                answers[qid] = flag
+            if flag and _record_answer(answers, all_qids, flag, qid, derived=mirrors):
                 print(f"[ctfy] flag captured on rescan: {flag}", flush=True)
                 break
 

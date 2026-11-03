@@ -57,12 +57,20 @@ def test_file_challenge_registers_attachment_tools_but_no_http(registry):
     for web_tool in ("http_probe", "route_map", "method_sweep", "path_variants"):
         assert web_tool not in names, f"file challenge registered {web_tool}"
         assert f"`{web_tool}`" not in text, f"file challenge is told about {web_tool}"
+    assert "web_cve_lookup" not in names
+    assert "`web_cve_lookup`" not in text
     assert "`decode_blob`" in text
 
 
 def test_web_challenge_registers_http_and_not_attachment_tools(registry):
     names, groups, text = registry("web", {"challenge": {"description": "a login page"}})
     assert {"http_probe", "route_map", "method_sweep", "path_variants"} <= names
+    assert "web_cve_lookup" in names
+    assert "`web_cve_lookup`" in text
+    # Traffic memory travels with the HTTP surface: it is the only way to read
+    # back an exchange after its body scrolled out of the context.
+    assert {"traffic_list", "traffic_view"} <= names
+    assert "`traffic_list`" in text
     for file_tool in ("file_triage", "decode_blob", "unpack_archive"):
         assert file_tool not in names
         assert f"`{file_tool}`" not in text
@@ -72,6 +80,7 @@ def test_tcp_challenge_registers_socket_tools(registry):
     names, groups, text = registry("tcp")
     assert {"tcp", "tcp_batch"} <= names
     assert "http_probe" not in names
+    assert "web_cve_lookup" not in names
 
 
 def test_aisec_is_not_registered_on_a_plain_web_task(registry, monkeypatch):

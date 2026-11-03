@@ -40,6 +40,14 @@ _CAND_PATTERNS: tuple[re.Pattern[str], ...] = (
     # 前缀与 `flag_extract.FLAG_RE` 保持一致：CTFY 的交付示例就是 `ctfy{...}`，
     # 少一个前缀等于把合法答案排除在候选之外。
     re.compile(r"(?:FLAG|flag|CTF|ctf|CTFY|ctfy)\{[^}\s]{2,}\}"),
+    # 显式标注的答案。``seeded`` 题的答案常在实例创建时下发，形状任意
+    # （不是 FLAG{...}，也不一定是 hex），只靠前两条正则永远抽不到。
+    # 这条只认模型自己写的 ``answer: xxx`` / ``flag=xxx``，不猜自由文本；
+    # 噪声由 verify-answer 预检兜住——判错的候选不会消耗提交次数。
+    re.compile(
+        r"""(?im)^[\s>*`-]*(?:final\s+)?(?:answer|flag)\s*[:=]\s*[`'"]?"""
+        r"""([^\s`'"]{6,200})"""
+    ),
     re.compile(r"\b[0-9a-fA-F]{32}\b"),
     re.compile(r"\b[0-9a-fA-F]{40,64}\b"),
 )
@@ -95,6 +103,33 @@ class AutoSubmitter:
         except Exception as e:  # noqa: BLE001 — 提交失败不能让收工本身失败
             return {"error": f"{type(e).__name__}: {e}"}
 
+    def _verify(self, qid: str, answer: str) -> dict[str, Any]:
+        """Ask the oracle-mode grader without spending a submission attempt.
+
+        ``POST /api/v1/instances/{id}/verify-answer`` is documented in the
+        platform openapi as "same grader as /submissions but writes no
+        submission record", and it does not consume ``attempts_remaining``.
+        A single finish can otherwise spend six candidates x N questions from
+        a per-question cap, so probing here first keeps the cap for answers
+        that are worth recording.
+
+        Args:
+            qid: question id.
+            answer: the candidate string.
+
+        Returns:
+            ``{"correct": bool, "question_id": str}``, or ``{}`` when the
+            endpoint is unavailable -- callers then fall back to the old
+            submit-everything behaviour.
+        """
+        body = self._post(
+            f"/api/v1/instances/{self.instance}/verify-answer",
+            {"question_id": qid, "answer": answer},
+        )
+        if "error" in body or "correct" not in body:
+            return {}
+        return body
+
     def _questions(self) -> list[dict[str, Any]]:
         """拉当前实例的 question 列表。
 
@@ -135,8 +170,10 @@ class AutoSubmitter:
         out: list[str] = []
         for pat in _CAND_PATTERNS:
             for m in pat.finditer(text or ""):
-                v = m.group(0)
-                if v not in out:
+                # 带捕获组的模式只取组内容（标签本身不是答案）。
+                v = m.group(1) if pat.groups else m.group(0)
+                v = v.rstrip(".,;:)]")
+                if v and v not in out:
                     out.append(v)
         return out[:_MAX_CANDIDATES]
 
@@ -166,9 +203,12 @@ class AutoSubmitter:
         #   answered_correctly=true 时提交 deadbeef... → correct:false
         #   answered_correctly=true 时提交真 slug     → correct:true
         # 也就是说这个标记**不拦提交**，拿它当闸门纯属自伤。
+        # ``seeded`` 是第三种会走 /submissions 的模式：答案在实例创建时下发
+        # （sample_chals 的 C2O-ALIST-002 就是它）。旧白名单只认 dynamic/static，
+        # 这类题会被判成"只有非 flag 类 question"，答案是静默丢掉的。
         pending = [
             q for q in questions
-            if q.get("mode") in ("dynamic", "static")
+            if q.get("mode") in ("dynamic", "static", "seeded")
         ]
         if not pending:
             # 区分两种"没得投"：拿不到列表（错误）vs 只有 checker 题（正常）。
@@ -182,10 +222,24 @@ class AutoSubmitter:
 
         tried: list[dict[str, Any]] = []
         correct: list[str] = []
+        skipped: list[str] = []
         with self._lock:
             for q in pending:
                 qid = q["id"]
+                # ``attempts_remaining`` 是平台按 question 记账的剩余次数。为 0
+                # 时继续打只会拿到拒绝，白白在日志里制造"我试过了"的假象。
+                left = q.get("attempts_remaining")
+                if isinstance(left, int) and left <= 0:
+                    skipped.append(f"{qid}: attempts_remaining=0")
+                    continue
                 for ans in cands:
+                    # 先问不记账的判分器。它正确 → 只写一条提交记录；
+                    # 它不可用（旧平台 / 网络抖动）→ 退回直接提交。
+                    probe = self._verify(qid, ans)
+                    if probe and not probe.get("correct"):
+                        tried.append({"qid": qid, "answer": ans, "correct": False,
+                                      "verified": True})
+                        continue
                     self.attempts += 1
                     res = self._post(
                         "/api/v1/submissions",
@@ -201,9 +255,16 @@ class AutoSubmitter:
                     if res.get("correct"):
                         correct.append(f"{qid}={ans}")
                         break  # 这个 question 已经有了正确答案，换下一个 question
+                    if isinstance(left, int):
+                        left -= 1
+                        if left <= 0:
+                            skipped.append(f"{qid}: attempts_remaining exhausted")
+                            break
         self.answers_tried.extend(tried)
         self.correct.extend(correct)
-        verdict = {"tried": tried, "correct": correct}
+        verdict: dict[str, Any] = {"tried": tried, "correct": correct}
+        if skipped:
+            verdict["skipped"] = skipped
         self._persist(verdict)
         return verdict
 

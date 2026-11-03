@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import os
 import sys
 import types
 from pathlib import Path
@@ -280,3 +281,74 @@ def test_guards_stay_opt_in_for_smoke_level_task_parsing() -> None:
 
     task = {"run_mode": "instance", "scope": ["https://box.example:443"]}
     assert agent_mod._targets_from(task) == ["https://box.example:443"]
+
+
+# --------------------------------------------------------------------------
+# the shipped entrypoint must submit during the run, not only at the end
+# --------------------------------------------------------------------------
+
+
+def test_agent_module_resolves_the_submission_target() -> None:
+    """All three parts come from documented places; a dry run has none."""
+    import ctf_strix.agent as agent_mod
+
+    env = {
+        "CTFY_PLATFORM_URL": "https://ctfy.example",
+        "CTFY_TOKEN": "tok",
+        "CTFY_EVAL_TARGET_INSTANCE": "inst-env",
+    }
+    task = {"target_instance": "inst-task"}
+    old = {k: os.environ.get(k) for k in env}
+    os.environ.update(env)
+    try:
+        got = agent_mod._autosubmit_target(task)
+        assert got == ("https://ctfy.example", "inst-env", "tok"), got
+        # task.json is the fallback when the env var is absent.
+        del os.environ["CTFY_EVAL_TARGET_INSTANCE"]
+        assert agent_mod._autosubmit_target(task) == (
+            "https://ctfy.example", "inst-task", "tok"
+        )
+    finally:
+        for key, value in old.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+    for key in ("CTFY_PLATFORM_URL", "CTFY_TOKEN", "CTFY_EVAL_TARGET_INSTANCE"):
+        os.environ.pop(key, None)
+    assert agent_mod._autosubmit_target({}) is None
+
+
+def test_shipped_entrypoint_installs_autosubmit() -> None:
+    """The eval harness had --autosubmit; the delivered image never did.
+
+    Same shape as the sweep_guard and v2-primitive incidents: measured under
+    one configuration, shipped under another.  The check is structural on
+    purpose -- importing the whole runner needs a sandbox this box lacks.
+    """
+    from collections import Counter
+
+    tree = _agent_tree()
+    fn = _func(tree, "_run_agent")
+    called = _called_names(fn)
+    assert "install_autosubmit" in called or "install" in called, called
+    imports = [
+        n for n in ast.walk(fn)
+        if isinstance(n, ast.ImportFrom) and (n.module or "").endswith("autosubmit")
+    ]
+    assert imports, "agent.py must import the autosubmit installer"
+
+    # It must be reachable on the scored path only: engagement's deliverable is
+    # a report and checker questions have no flag.
+    src = ast.get_source_segment(AGENT.read_text(encoding="utf-8"), fn) or ""
+    assert "engagement" in src and "checker" in src
+
+
+def test_autosubmit_failure_is_visible_in_diagnostics() -> None:
+    """A silently failed registration is the bug being prevented."""
+    src = AGENT.read_text(encoding="utf-8")
+    assert 'diag["autosubmit"]' in src
+    # One assignment for each outcome, so "off" cannot be mistaken for "on".
+    for value in ('"on"', '"off"', '"failed"'):
+        assert value in src

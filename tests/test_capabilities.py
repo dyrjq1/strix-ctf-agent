@@ -21,6 +21,8 @@ def test_installs_all_capabilities():
         http_register=lambda: ["http_probe"],
         discovery_register=lambda: ["route_map", "method_sweep"],
         variants_register=lambda: ["path_variants"],
+        traffic_register=lambda: ["list_requests", "view_request"],
+        web_cve_register=lambda: ["web_cve_lookup"],
     )
 
     assert errors == []
@@ -28,6 +30,8 @@ def test_installs_all_capabilities():
         "http_probe": ["http_probe"],
         "discovery": ["route_map", "method_sweep"],
         "variants": ["path_variants"],
+        "traffic": ["list_requests", "view_request"],
+        "web_cve": ["web_cve_lookup"],
     }
 
 
@@ -39,11 +43,15 @@ def test_one_failure_does_not_skip_the_other():
         http_register=boom,
         discovery_register=lambda: ["route_map"],
         variants_register=lambda: ["path_variants"],
+        traffic_register=lambda: ["list_requests", "view_request"],
+        web_cve_register=lambda: ["web_cve_lookup"],
     )
 
     assert installed["http_probe"] == []
     assert installed["discovery"] == ["route_map"]
     assert installed["variants"] == ["path_variants"]
+    assert installed["traffic"] == ["list_requests", "view_request"]
+    assert installed["web_cve"] == ["web_cve_lookup"]
     assert len(errors) == 1
     assert "registry closed" in errors[0]
 

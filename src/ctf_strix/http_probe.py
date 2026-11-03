@@ -42,6 +42,8 @@ import json
 import time
 from typing import Final
 
+from ctf_strix import traffic
+
 import requests
 import urllib3
 
@@ -233,6 +235,9 @@ async def http_probe(
     if not isinstance(headers, dict):
         return "[http_probe] headers_json 必须是 JSON 对象（花括号），不能是数组或字符串。"
 
+    # Reserve the traffic id *before* sending: a refused connection also gets a
+    # record, which is what stops the same dead end from being retried.
+    request_id = traffic.ledger().next_id()
     started = time.time()
     try:
         resp = requests.request(
@@ -249,8 +254,18 @@ async def http_probe(
         root = _root_cause(exc)
         elapsed = time.time() - started
         hint = _PHASE_HINT.get(phase, _PHASE_HINT["UNKNOWN"])
+        traffic.record(
+            request_id=request_id,
+            method=method,
+            url=url,
+            req_headers=headers,
+            req_body=body if isinstance(body, str) else "",
+            phase=phase,
+            elapsed=elapsed,
+            note=f"{type(root).__name__}: {root}"[:300],
+        )
         return (
-            f"[NO RESPONSE] {method} {url} | {elapsed:.2f}s | phase={phase}\n"
+            f"[NO RESPONSE] {method} {url} | {elapsed:.2f}s | phase={phase} | id={request_id}\n"
             f"detail: {type(root).__name__}: {root}"[:400] + "\n"
             f"hint: {hint}\n"
             "next: 这是**请求没到达服务器**，不是服务器拒绝了它。"
@@ -263,7 +278,25 @@ async def http_probe(
     size = len(raw)
     ctype = resp.headers.get("content-type", "?")
 
-    head = f"[HTTP {resp.status_code}] {method} {url} | {elapsed:.2f}s | {size}B | {ctype}"
+    # The full body is kept in the ledger even when the text below is clipped,
+    # so `view_request` can re-read it without re-sending the request.
+    traffic.record(
+        request_id=request_id,
+        method=method,
+        url=url,
+        req_headers=headers,
+        req_body=body if isinstance(body, str) else "",
+        status=resp.status_code,
+        resp_headers=dict(resp.headers),
+        resp_body=text,
+        size=size,
+        elapsed=elapsed,
+    )
+
+    head = (
+        f"[HTTP {resp.status_code}] {method} {url} | {elapsed:.2f}s | "
+        f"{size}B | {ctype} | id={request_id}"
+    )
     lines = [head]
     hdrs = _format_headers(resp.headers)
     if hdrs:

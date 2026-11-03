@@ -34,3 +34,6 @@ backup/
 
 # pytest TMP sandboxes (fresh dir per run to dodge Windows permission residue)
 ctfwork/
+
+# traffic ledger runtime output (rebuilt on every run)
+.ctf_traffic.jsonl

@@ -1,0 +1,17 @@
+Offline web-CVE index -- data sources and attribution
+=====================================================
+
+CISA Known Exploited Vulnerabilities (KEV)
+  Source: https://www.cisa.gov/known-exploited-vulnerabilities-catalog
+  License: CC0 1.0 (https://creativecommons.org/publicdomain/zero/1.0/)
+  This build only copies the CVE identifier and its exploited-in-the-wild
+  flag; the catalogue text is not redistributed.
+
+NVD CVE feeds, CPE match data
+  Source: https://nvd.nist.gov/feeds/json/cve/2.0/
+  NIST states that information presented on NIST sites is public information
+  and may be distributed or copied, and requests an appropriate byline or
+  source credit.  This file is that credit.
+
+The index contains derived version expressions only.  It is a build-time
+snapshot and is never refreshed over the network by the agent.

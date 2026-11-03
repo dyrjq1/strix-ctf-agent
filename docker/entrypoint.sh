@@ -41,11 +41,14 @@ write_fallback() {
   [ -f "$RESULT_ABS" ] && return 0
   mkdir -p "$(dirname "$RESULT_ABS")" 2>/dev/null || true
   REASON="$reason" OUT="$RESULT_ABS" python3 - <<'PY' 2>/dev/null || \
-    printf '{"schema_version":2,"answers":{},"turns":0,"input_tokens":0,"output_tokens":0,"stop_reason":"error","writeup":"entrypoint fallback: %s"}\n' \
+    printf '{"schema_version":3,"answers":{},"turns":0,"input_tokens":0,"output_tokens":0,"stop_reason":"error","writeup":"entrypoint fallback: %s"}\n' \
       "${reason//\"/}" > "$OUT"
 import json, os
 json.dump({
-    "schema_version": 2,
+    # 必须和 agent.py 的 BRIEF_SCHEMA_VERSION 一致。旧值 2 只在"主流程
+    # 写完 result 之前就崩了"时可见，于是同一批 run 里两个版本号并存，
+    # 复盘时看不出哪个是协议版本、哪个是兜底脚本的遗留。
+    "schema_version": 3,
     # 规范字段是 input_tokens / output_tokens；`tokens` 是自造字段，
     # 平台不读，写进去只会让 result.json 看起来像另一个协议。
     "answers": {}, "turns": 0, "input_tokens": 0, "output_tokens": 0,

@@ -25,7 +25,11 @@ _LINK = re.compile(r"\]\(([^)]+\.md)\)")
 def test_index_skills_returns_one_per_category() -> None:
     """每个分类只有一个 ``<分类>/<分类>.md`` 索引，数量跟着目录走。"""
     idx = skillpack.index_skills()
-    categories = [p.name for p in skillpack.PACK_DIR.iterdir() if p.is_dir()]
+    # Excluded categories still exist on disk but must not be offered.
+    categories = [
+        p.name for p in skillpack.PACK_DIR.iterdir()
+        if p.is_dir() and p.name not in skillpack._EXCLUDED
+    ]
     assert len(idx) == len(categories), (
         f"索引 {len(idx)} 个但目录 {len(categories)} 个：有分类缺 <分类>/<分类>.md"
     )
@@ -66,6 +70,22 @@ def test_stage_writes_only_indexes(tmp_path: Path) -> None:
     assert "/var/ctf/jail/skills/ctf-web/" in body
 
 
+def test_similar_search_is_not_staged_or_registered() -> None:
+    """A category that needs pip + api.tavily.com cannot be offered.
+
+    The run is offline and the image has no Tavily client, so loading it
+    costs a turn and teaches nothing runnable.  The upstream index is still
+    filtered in ``prompt.py``; this is the second gate, on the registry.
+    """
+    names = [name for name, _n, _p in skillpack.index_skills()]
+    assert "ctf-similar-search" not in names
+
+    seen: list = []
+    registered = skillpack.register(register_fn=seen.append)
+    assert "ctf-similar-search/ctf-similar-search" not in registered
+    assert all("similar-search" not in item for item in registered)
+
+
 def test_register_calls_strix_once() -> None:
     """注册一次就够了；重复调用会让 strix 的搜索目录里堆同一份副本。"""
     seen: list[Path] = []
@@ -90,7 +110,24 @@ def test_prompt_hint_has_routing_and_path() -> None:
     assert "ctf-triage/ctf-triage" in hint
     assert "一个" in hint
     assert "/var/ctf/jail/skills/<分类>/x.md" in hint
-    assert "不要用 load_skill 加载" in hint
+    assert "勿 load_skill" in hint
+    assert "read_file" not in hint
+    assert "exec_command" in hint
+    assert "view_image" in hint
+
+
+def test_index_hint_sends_text_and_images_to_registered_channels() -> None:
+    """The staged index hint is the model's only map from link to file.
+
+    Text must go through ``exec_command`` and images through ``view_image``;
+    naming an unregistered reader sends the model at a tool that is not there.
+    """
+    hint = skillpack._hint("/var/ctf/jail/skills", "ctf-x")
+    assert "read_file" not in hint
+    assert "`exec_command`" in hint
+    assert "cat/sed -n" in hint
+    assert "`view_image`" in hint
+    assert "load_skill" in hint
 
 
 def test_prompt_hint_empty_when_no_skills() -> None:

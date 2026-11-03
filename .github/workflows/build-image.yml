@@ -53,6 +53,20 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
+      - name: 单元测试
+        # 构建成功只证明镜像能起来；真正的接线错误（守卫没挂、工具没注册、
+        # 提示里写着镜像没有的命令）只有测试能看见。放在 conformance 之前。
+        #
+        # tests/ 被 .dockerignore 排除（不进交付镜像），所以这里把它 bind-mount
+        # 进容器：依赖用镜像里装好的那一份，代码用本次 checkout 的同一份，
+        # 两者正是"交付物"和"测的东西"应当一致的关系。
+        run: |
+          set -eux
+          docker run --rm -v "$PWD:/repo:ro" -w /repo \
+            -e PYTHONPATH=/app/src:/app/vendor/src \
+            "${{ env.IMAGE }}:${{ inputs.tag || '1.0.0' }}" \
+            python3 -m pytest /repo/tests -q -p no:cacheprovider
+
       # 平台的两条 blocking 判据（did_not_start / no_result_file）在 CI 里先过一遍。
       # 构建成功 ≠ conformance 通过，这一步才是真正的门。
       - name: conformance 自检（无 task.json）
@@ -76,7 +90,10 @@ jobs:
           docker run --rm -w /ctfy/work -e CTFY_WORK_DIR=/ctfy/work \
             -v /tmp/w2:/ctfy/work "${{ env.IMAGE }}:${{ inputs.tag || '1.0.0' }}"
           test -s /tmp/w2/out/result.json
-          python3 -c "import json;d=json.load(open('/tmp/w2/out/result.json'));assert d.get('schema_version')==2;print(d.get('stop_reason'))"
+          # The schema version follows the protocol, not this file.  Pinning
+          # 2 here made the build fail the day the agent started writing 3 --
+          # a conformance check that rejects the correct answer.
+          python3 -c "import json;d=json.load(open('/tmp/w2/out/result.json'));assert d.get('schema_version')>=2;print(d.get('schema_version'), d.get('stop_reason'))"
 
       - name: 摘要
         run: |

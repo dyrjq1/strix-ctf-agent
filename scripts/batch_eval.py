@@ -353,7 +353,12 @@ class Client:
                         # ——CYBENCH 的 TCP 题全是这个形态，一抛就等于整类放弃。
                         # 原样把 service 交给调用方，由它起隧道、解析、建桥。
                         if is_private_service(svc):
-                            if str(svc.get("access") or "").lower() in _VPN_ACCESS:
+                            # service 级 access 不是唯一证据：实例级 /vpn-config
+                            # 非空同样说明隧道可用（052 的 access=null，profile 有 277B）。
+                            if (
+                                str(svc.get("access") or "").lower() in _VPN_ACCESS
+                                or self.vpn_config(iid).strip()
+                            ):
                                 return svc
                             continue
                         if is_tcp_service(svc):
@@ -951,7 +956,8 @@ def _attach(
 
     Returns:
         ``(bridge, tunnel, target, kind, real_host, access)``。
-        ``kind`` 是 ``tcp``（本函数只处理 TCP 类服务）。
+        ``kind`` 默认是 ``tcp``；隧道接入且 ``service_type=http`` 时是 ``web``，
+        ``target`` 也相应变成 ``http://127.0.0.1:PORT/``。
 
     Raises:
         TunnelRequiredError: 声明了 vpn 但 stage/parse/up 任一环节失败。
@@ -981,6 +987,14 @@ def _attach(
         host = real
 
     bridge = TcpBridge(host, int(svc["port"]), access=access).start()
+    # A bridged HTTP service is still HTTP from the agent's point of view.  The
+    # bridge only removes the network/tunnel tax; it must not change the tool
+    # surface, or the run loses http_probe/route_map exactly when it needs them.
+    # Only ``service_type=http`` maps to web: an https target is carried by TLS
+    # inside the pipe for some access modes, so its local endpoint is not
+    # necessarily plaintext HTTP.
+    if tunnel is not None and str(svc.get("service_type") or "").lower() == "http":
+        return bridge, tunnel, f"http://{bridge.local_url}/", "web", host, access
     return bridge, tunnel, bridge.local_url, "tcp", host, access
 
 

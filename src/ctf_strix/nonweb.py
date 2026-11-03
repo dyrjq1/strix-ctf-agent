@@ -66,6 +66,10 @@ _BLOB_MAX_CHARS: Final = 256 * 1024
 #: chasing its own tail.
 _BLOB_MAX_LAYERS: Final = 8
 
+#: Formats ``_sniff`` can name but cannot read.  Used only to turn "nothing
+#: extracted" into an actionable message; extraction is never attempted.
+_NAMES_ONLY: Final = frozenset({"7z", "rar"})
+
 #: Extraction budget, shared across recursion depth.  Without sharing, five
 #: levels of "64MB each" is 320MB on a 3GB VM -- the bomb wins by arithmetic.
 _UNPACK_MAX_BYTES: Final = 64 * 1024 * 1024
@@ -488,8 +492,11 @@ def decode_blob(text: str = "", max_layers: int = 5) -> str:
 def _sniff(path: Path) -> str:
     """Identify an archive by magic bytes; extension is not evidence."""
     try:
+        # 64 KB, not 512 B: a RAR self-extracting stub legally precedes the
+        # signature by up to that much, and reading less makes such a file
+        # indistinguishable from an unknown blob.
         with path.open("rb") as handle:
-            head = handle.read(512)
+            head = handle.read(64 * 1024)
     except OSError:
         return ""
     if head.startswith(b"PK\x03\x04") or head.startswith(b"PK\x05\x06"):
@@ -502,6 +509,17 @@ def _sniff(path: Path) -> str:
         return "xz"
     if len(head) >= 262 and head[257:262] == b"ustar":
         return "tar"
+    # 7z and RAR are *named* but deliberately not extracted: Python's stdlib
+    # has no reader for either and this image ships no 7z/rar binary.  Naming
+    # them matters because "detected unknown, nothing extracted" reads exactly
+    # like a corrupt file -- the model then retries unpack_archive instead of
+    # changing method.  A RAR self-extracting stub can precede the signature by
+    # up to 64 KB (rarlab technote), so search that window rather than byte 0.
+    window = head[: 64 * 1024]
+    if window.find(b"\x37\x7a\xbc\xaf\x27\x1c") >= 0:
+        return "7z"
+    if window.find(b"Rar!\x1a\x07") >= 0:
+        return "rar"
     return ""
 
 
@@ -668,6 +686,23 @@ def _unique_dir(base: Path) -> Path:
     return base.parent / f"{base.name}-{index}"
 
 
+def _signature_offset(path: Path, kind: str) -> int:
+    """Where the named-only signature actually starts (0 when it is the header).
+
+    Reporting the offset keeps the message honest for polyglots: a PNG with an
+    embedded 7z is not "a 7z file", but "a 7z signature at 0x1234" is true and
+    tells the model to carve from there.
+    """
+    pattern = b"\x37\x7a\xbc\xaf\x27\x1c" if kind == "7z" else b"Rar!\x1a\x07"
+    try:
+        with path.open("rb") as handle:
+            head = handle.read(64 * 1024)
+    except OSError:
+        return 0
+    found = head.find(pattern)
+    return found if found >= 0 else 0
+
+
 def unpack_archive(path: str = "", max_depth: int = 3, out_dir: str = "extracted") -> str:
     """Extract an archive safely, then keep going into nested archives.
 
@@ -704,6 +739,10 @@ def unpack_archive(path: str = "", max_depth: int = 3, out_dir: str = "extracted
         if kind is None:
             kind = _sniff(item)
         if not kind or depth > depth_cap:
+            return
+        if kind in _NAMES_ONLY:
+            # Recognized but unreadable here.  Stop before _from_stream, which
+            # would otherwise raise KeyError on the opener table.
             return
         sub = root if depth == 1 else root / f"_d{depth}"
         sink = _Sink(sub, budget)
@@ -746,6 +785,18 @@ def unpack_archive(path: str = "", max_depth: int = 3, out_dir: str = "extracted
             "file_triage/hexpeek; a wrong extension is common and the magic "
             "bytes are the authority."
         )
+        if kind in _NAMES_ONLY:
+            where = _signature_offset(source, kind)
+            at = "this IS that archive" if where == 0 else "the archive starts there"
+            body.append(
+                f"matched a {kind} signature at offset 0x{where:x} -- {at}, and this "
+                f"image ships no {kind} reader. Do not retry unpack_archive; it will "
+                "return the same line. Next: carve from that offset and read the "
+                "container by hand (hexpeek + the struct module), or check whether "
+                "the statement/strings already leaks the content. If it is encrypted, "
+                "the password has to come from the challenge -- brute force here is a "
+                "different, much more expensive problem."
+            )
     else:
         body.append(
             "next: run file_triage on the largest extracted file; for text "
@@ -1149,6 +1200,32 @@ class _Elf:
             rows.append((name, sh_type, flags, addr, sh_offset, size))
         return rows
 
+    def _section_rows_linked(self) -> list[tuple[int, int, int, int, int, int, int]]:
+        """Section rows including ``sh_link``: the index of the string table.
+
+        ``sh_name`` is an *offset into the section-name string table*, not a
+        section index.  Reading it as an index is why every symbol lookup used
+        to come back empty on a normal linked binary: ``sh_name`` is usually in
+        the hundreds, so ``sh_name >= len(rows)`` skipped every symbol table.
+        """
+        rows = []
+        for index in range(min(self.e_shnum, 1024)):
+            offset = self.e_shoff + index * self.e_shentsize
+            if offset + self.e_shentsize > len(self.data):
+                break
+            if self.is64:
+                (name, sh_type, flags, addr, sh_offset, size,
+                 link) = struct.unpack_from(
+                    self.endian + "IIQQQQI", self.data, offset
+                )
+            else:
+                (name, sh_type, flags, addr, sh_offset, size,
+                 link) = struct.unpack_from(
+                    self.endian + "IIIIIII", self.data, offset
+                )
+            rows.append((name, sh_type, flags, addr, sh_offset, size, link))
+        return rows
+
     def sections(self) -> list[tuple[str, int, int, int]]:
         rows = self._section_rows()
         if not rows:
@@ -1167,14 +1244,27 @@ class _Elf:
         return out
 
     def symbols(self) -> list[tuple[str, int, int]]:
-        rows = self._section_rows()
+        """Return ``(name, value, type)`` for every .symtab/.dynsym entry.
+
+        Two header fields are easy to swap, and both were wrong here:
+
+        * the string table is the symbol section's ``sh_link``; ``sh_name`` is
+          only that section's own name offset;
+        * ``st_info`` packs *type* in the low nibble and *binding* in the high
+          one, so ``info >> 4`` reports GLOBAL as a type and turns every FUNC
+          into OBJECT.
+
+        Neither bug was visible with the old fixture: it had no section header
+        table at all, so this path never ran.
+        """
+        rows = self._section_rows_linked()
         out: list[tuple[str, int, int]] = []
-        for name, sh_type, _flags, _addr, offset, size in rows:
+        for _name, sh_type, _flags, _addr, offset, size, link in rows:
             if sh_type not in (2, 11):  # SHT_SYMTAB / SHT_DYNSYM
                 continue
-            if name >= len(rows):
+            if not 0 <= link < len(rows):
                 continue
-            string_offset = rows[name][4]
+            string_offset = rows[link][4]
             entry_size = 24 if self.is64 else 16
             for position in range(offset, min(offset + size, len(self.data)), entry_size):
                 if position + entry_size > len(self.data):
@@ -1189,10 +1279,13 @@ class _Elf:
                     )
                 if not str_name:
                     continue
-                end = self.data.find(b"\0", string_offset + str_name)
-                stop = end if end > 0 else string_offset + str_name + 64
-                label = self.data[string_offset + str_name : stop].decode("latin-1", "replace")
-                out.append((label, value, info >> 4))
+                base = string_offset + str_name
+                if base >= len(self.data):
+                    continue
+                end_byte = self.data.find(b"\0", base)
+                stop = end_byte if end_byte > 0 else base + 64
+                label = self.data[base:stop].decode("latin-1", "replace")
+                out.append((label, value, info & 0xF))
         return out
 
     def strings(self, min_len: int = 4, limit: int = 80, utf16: bool = False) -> list[str]:
@@ -1283,6 +1376,10 @@ def _capstone(elf: "_Elf"):
 def _gadget_offsets(elf: "_Elf", filt: str, limit: int) -> list[str]:
     """Fixed-pattern scan: answers "where is pop rdi", not "list every gadget"."""
     wanted = [token.strip().lower() for token in (filt or "").split("|") if token.strip()]
+    # ``binsh`` names the /bin/sh constant, not a gadget: filtering on it would
+    # drop every "pop rdi" row the caller also asked for, and the decoder path
+    # already treats it as a constant instead of a needle.
+    wanted = [token for token in wanted if token not in ("binsh", "/bin/sh")]
     rows: list[str] = []
     for label, pattern in _GADGET_PATTERNS.items():
         if wanted and not any(token in label for token in wanted):
@@ -1307,7 +1404,12 @@ def _gadgets_capstone(elf: "_Elf", filt: str, limit: int) -> list[str]:
     if engine is None or elf.e_machine not in (3, 62):
         return []
     tokens = [token.strip().lower() for token in (filt or "").split("|") if token.strip()]
-    needles = [token for token in tokens if token != "binsh"] or ["rdi", "rsi", "rdx", "syscall"]
+    # ``/bin/sh`` is a constant, not an instruction: the decoder path can never
+    # produce it, so keeping it in ``needles`` made the same binary report
+    # "pop rdi found" without a decoder and "not found" with one.  It is always
+    # listed below, from the byte scan, whatever the filter says.
+    wanted = [token for token in tokens if token not in ("binsh", "/bin/sh")]
+    needles = wanted or ["rdi", "rsi", "rdx", "syscall"]
     deadline = time.monotonic() + 4.0
     rows: list[str] = []
     counts = {token: 0 for token in needles}
@@ -1331,7 +1433,9 @@ def _gadgets_capstone(elf: "_Elf", filt: str, limit: int) -> list[str]:
                     continue
                 if chain[-1].mnemonic != "ret":
                     continue
-                text = " ; ".join(
+                # Same separator as the fixed-pattern path, so "pop rdi; ret"
+                # matches what the model was told to grep for.
+                text = "; ".join(
                     item.mnemonic + (" " + item.op_str if item.op_str else "") for item in chain
                 )
                 for token in needles:
@@ -1347,14 +1451,16 @@ def _gadgets_capstone(elf: "_Elf", filt: str, limit: int) -> list[str]:
     for token in needles:
         if counts[token] == 0:
             rows.append(f"{('pop ' + token) if token in ('rdi', 'rsi', 'rdx', 'rax') else token:<60} not found")
-    if "binsh" in tokens:
-        position = elf.data.find(b"/bin/sh\x00")
-        vaddr = elf.off_to_vaddr(position) if position >= 0 else None
+    # Always answer the one question a ROP chain asks first, whether or not a
+    # decoder is installed.
+    position = elf.data.find(b"/bin/sh\x00")
+    if position >= 0:
+        vaddr = elf.off_to_vaddr(position)
         rows.append(
-            "/bin/sh"
-            + (f"  file 0x{position:x}" + (f"  vaddr 0x{vaddr:x}" if vaddr is not None else "")
-               if position >= 0 else "  not found")
+            "/bin/sh  file 0x%x%s" % (position, f"  vaddr 0x{vaddr:x}" if vaddr is not None else "")
         )
+    else:
+        rows.append("/bin/sh  not found")
     return rows[: max(limit, 8)]
 
 
@@ -1451,6 +1557,7 @@ def elfpeek(
     offset: int = 0,
     length: int = 128,
     filt: str = "",
+    symbol: str = "",
 ) -> str:
     """Inspect an ELF binary: info, sections, symbols, strings, gadgets, disasm.
 
@@ -1462,16 +1569,18 @@ def elfpeek(
         offset: File start byte for the disasm view.
         length: Byte window for the disasm view.
         filt: Gadget filter, '|'-separated (rdi|syscall|binsh ...).
+        symbol: Disasm only -- start at this symbol and stop at the next one.
 
     Returns:
         A compact table plus a ``next:`` line; when tooling is missing it says
         what to do instead of raising.
 
     Note:
-        Address-to-offset lookups live in ``elffind`` rather than here.  Two
-        parameters used only by one of seven views would otherwise be paid for
-        by every call of every other view -- this is the same argument that
-        keeps socket schemas off attachment challenges.
+        Address-to-offset lookups live in ``elffind`` rather than here.  Every
+        parameter used by only one view would otherwise be paid for by every
+        call of every other view -- the same argument that keeps socket
+        schemas off attachment challenges.  ``symbol`` is the deliberate
+        exception: ``disasm`` without it cannot read a function at all.
     """
     target = Path(path).expanduser()
     if not target.is_file():
@@ -1566,24 +1675,66 @@ def elfpeek(
     if name == "disasm":
         start = _to_int(offset, 0, 0, max(0, len(data) - 1))
         span = _to_int(length, 128, 16, 4096)
+        row_cap = _to_int(limit, 120, 1, 600)
+
+        # ``symbol=`` answers the question people actually ask: "show me
+        # check()".  Without it a call can only say "128 bytes from some
+        # offset", which is not how a function gets read -- and the row cap
+        # then silently ends mid-function, which reads like "the function ends
+        # here".  Resolve first, then bound the window by the *next* symbol.
+        symbols = elf.symbols()
+        wanted = (symbol or "").strip()
+        header = ""
+        if wanted:
+            starts = sorted(
+                (value, label) for label, value, kind in symbols
+                if label == wanted and value and kind in (0, 2, 10)
+            )
+            if not starts:
+                names = [label for label, value, _kind in symbols if value and label]
+                hint = ", ".join(names[:12]) or "(symbol table is empty)"
+                return (
+                    f"[elfpeek] no function symbol {wanted!r} in this ELF. "
+                    f"Known: {hint}\n"
+                    "next: view='symbols' for the full table, or elffind search= "
+                    "for a byte string, or disasm with a raw offset."
+                )
+            base, label = starts[0]
+            following = [value for value, other in
+                         ((v, l) for l, v, _k in symbols if v and l != label)
+                         if value > base]
+            stop_vaddr = min(following) if following else base + span
+            start = elf.vaddr_to_off(base)
+            if start is None:
+                return f"[elfpeek] symbol {label!r} is at 0x{base:x}, outside every PT_LOAD"
+            span = max(1, min(stop_vaddr - base, 0x4000))
+            header = f"symbol {label} at vaddr 0x{base:x}, {span} B (bounded by the next symbol)"
+
+        chunk = data[start : start + span]
+        vaddr = elf.off_to_vaddr(start)
         engine = _capstone(elf)
         if engine is None:
-            chunk = data[start : start + span]
-            vaddr = elf.off_to_vaddr(start)
             return _clip(
-                "[elfpeek] capstone is not installed, so this is a byte view. "
-                "Read it as hex, or infer from symbols/strings.\n"
-                f"file offset 0x{start:x}, {len(chunk)} B, vaddr "
-                f"{hex(vaddr) if vaddr is not None else '?'}:\n{chunk[:256].hex()}"
+                "[elfpeek] no disassembler available (capstone missing), so this is "
+                "a byte view. Run the instruction decoder the image does have:\n"
+                f"  objdump -d -M intel --start-address=0x{(vaddr or start):x} "
+                f"--stop-address=0x{((vaddr or start) + len(chunk)):x} <file>\n"
+                + (header + "\n" if header else "")
+                + f"file offset 0x{start:x}, {len(chunk)} B, vaddr "
+                + (f"0x{vaddr:x}" if vaddr is not None else "?")
+                + f":\n{chunk[:256].hex()}"
             )
-        vaddr = elf.off_to_vaddr(start) or start
+
+        vaddr = vaddr if vaddr is not None else start
         rows = [
-            f"[elfpeek] disasm file offset 0x{start:x}, {span} B, vaddr 0x{vaddr:x}"
+            f"[elfpeek] disasm "
+            + (header if header else f"file offset 0x{start:x}, {span} B")
+            + f", vaddr 0x{vaddr:x}"
             + (" (PIE: add runtime base)" if elf.security()["PIE"] else "")
         ]
-        symbols = elf.symbols()
         emitted = 0
-        for instruction in engine.disasm(data[start : start + span], vaddr):
+        stopped_at = None
+        for instruction in engine.disasm(chunk, vaddr):
             nearest = ""
             best = None
             for label, value, _kind in symbols:
@@ -1596,10 +1747,21 @@ def elfpeek(
                 f"{instruction.mnemonic:<8}{instruction.op_str}{nearest}"
             )
             emitted += 1
-            if emitted >= 120:
+            if emitted >= row_cap:
+                stopped_at = instruction.address + instruction.size
                 break
         if emitted == 0:
             rows.append("(0 decodable instructions: offset lands in data; check sections)")
+        elif stopped_at is not None and stopped_at < vaddr + len(chunk):
+            # Say where to resume.  Ending at the cap without a word is read as
+            # "function ends here", and that is how a run concludes the wrong
+            # thing about a long check function.
+            resume = elf.vaddr_to_off(stopped_at)
+            rows.append(
+                f"... truncated at {emitted} instructions; continue with "
+                f"offset=0x{(resume if resume is not None else stopped_at):x} "
+                f"or raise limit (max 600)"
+            )
         return _clip("\n".join(rows))
 
     return (

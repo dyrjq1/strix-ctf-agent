@@ -32,6 +32,7 @@ from typing import Any, Final
 
 from ctf_strix.aisec import aig_probe
 from ctf_strix.aisec.aig_probe import BlockedTarget, UrlGuard
+from ctf_strix.aisec import web_cve
 
 #: 常见 AI 组件端口。探测失败时直接给出来，避免 agent 反复猜端口浪费轮次。
 COMMON_PORTS: Final[tuple[int, ...]] = (
@@ -239,6 +240,82 @@ async def ai_quick_scan(target: str) -> str:
 
 #: strix / openai-agents 注册用
 TOOLS: Final = (ai_fingerprint, ai_cve_lookup, ai_quick_scan)
+
+
+async def web_cve_lookup(component: str, version: str = "", top_k: int = 8) -> str:
+    """Look a web product and version up in the offline CVE index.
+
+    Args:
+        component: banner name or vendor:product, e.g. nginx, tomcat, wordpress
+        version: version from the banner; empty lists exploited-in-the-wild
+            candidates only, because without a version no rule can be judged
+        top_k: maximum rows, default 8
+
+    Returns:
+        Matching CVEs, each with its version rule; KEV-marked rows come first.
+    """
+    try:
+        if web_cve.data_paths()[0] is None:
+            return "[web_cve_lookup] 索引缺失：缺少 web_cve_index.json，本次不查询。"
+        hits = await _run(web_cve.lookup, component, version or None, top_k, timeout=30)
+    except Exception as e:  # noqa: BLE001 — 查询失败不能打断整题
+        return f"[web_cve_lookup] 查询失败：{type(e).__name__}: {e}"
+    if not hits:
+        scope = "无版本时只列在野利用条目" if not (version or "").strip() else "已按版本求值"
+        return (
+            f"[web_cve_lookup] {component or '(空)'} {version or '(无版本)'} 未命中（{scope}）。\n"
+            "若产品名与版本都没把握，先看响应头的 Server / X-Powered-By；"
+            "也可能是自研或逻辑漏洞，直接读接口。"
+        )
+    label = (version or "").strip()
+    head = f"[web_cve_lookup] {component} {label or '(无版本，仅候选)'} 命中 {len(hits)} 条："
+    lines = [head]
+    for hit in hits:
+        mark = " [KEV 在野利用]" if hit.get("kev") else ""
+        lines.append(
+            f"- {hit.get('cve') or 'N/A'} [{hit.get('severity') or '?'}]{mark} "
+            f"{(hit.get('product') or '')}"
+        )
+        rule = hit.get("rule") or "无版本约束"
+        lines.append(f"  约束: {rule[:180]}")
+    if not label:
+        lines.append("注意：无版本，仅候选；取到版本后再查一次才会收紧。")
+    lines.append("下一步：挑与题目功能吻合的一条，按 CPE 区间核对自己的版本，再实际验证。")
+    return _trim(lines)
+
+
+#: Web-product CVE tool. Registered for web kinds only, independent of the
+#: AI-security gate: a plain Apache or WordPress box has no AI metadata.
+WEB_CVE_TOOLS: Final = (web_cve_lookup,)
+
+
+def register_web_cve(register_fn: Any | None = None) -> list[str]:
+    """Register ``web_cve_lookup`` through the official extension point.
+
+    Args:
+        register_fn: injection point, defaults to ``factory.register_agent_tools``.
+
+    Returns:
+        Names newly registered (empty when already present).
+    """
+    if register_fn is None:
+        from strix.agents import factory
+
+        register_fn = factory.register_agent_tools
+        try:
+            existing = {getattr(tool, "name", "") for tool in factory.registered_agent_tools()}
+        except Exception:  # noqa: BLE001 — older runtime without the query API
+            existing = set()
+    else:
+        existing = set()
+
+    from agents import function_tool
+
+    wrapped = [function_tool(timeout=60)(fn) for fn in WEB_CVE_TOOLS]
+    pending = [tool for tool in wrapped if tool.name not in existing]
+    if pending:
+        register_fn(*pending)
+    return [w.name for w in wrapped]
 
 
 # ---------------------------------------------------------------- strix 接入
