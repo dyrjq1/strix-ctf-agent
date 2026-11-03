@@ -42,7 +42,7 @@ write_fallback() {
   mkdir -p "$(dirname "$RESULT_ABS")" 2>/dev/null || true
   REASON="$reason" OUT="$RESULT_ABS" python3 - <<'PY' 2>/dev/null || \
     printf '{"schema_version":3,"answers":{},"turns":0,"input_tokens":0,"output_tokens":0,"stop_reason":"error","writeup":"entrypoint fallback: %s"}\n' \
-      "${reason//\"/}" > "$OUT"
+      "${reason//\"/}" > "$RESULT_ABS"
 import json, os
 json.dump({
     # 必须和 agent.py 的 BRIEF_SCHEMA_VERSION 一致。旧值 2 只在"主流程
