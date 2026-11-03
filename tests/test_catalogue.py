@@ -139,9 +139,10 @@ def test_prompt_stays_inside_the_web_budget():
     prompt.activate("web", ("base", "web", "aisec"))
     size = len(prompt.build({}))
     # 5,005 before traffic memory (two tool lines, ~500 chars of prompt text);
-    # 5,505 after.  Headroom is 100 chars so an unrelated one-line addition does
-    # not need a threshold edit, but a tool section cannot slip in unnoticed.
-    assert size < 5600, f"web prompt grew to {size} chars"
+    # 5,505 after; 6,558 after the shared hypothesis block (+1,030).  Headroom
+    # is 72 chars so an unrelated one-line addition does not need a threshold
+    # edit, but a tool section cannot slip in unnoticed.
+    assert size < 6630, f"web prompt grew to {size} chars"
 
 
 def test_activate_defaults_to_web_so_unit_tests_keep_working():

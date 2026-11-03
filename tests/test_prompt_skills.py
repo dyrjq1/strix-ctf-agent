@@ -108,7 +108,57 @@ def test_prompt_stays_small(block):
     from ctf_strix import prompt
 
     size = len(prompt.build({}))
-    assert size < 6000, f"system prompt grew to {size} chars"
+    # 5,186 before hypothesis discipline; 6,216 after (+1,030 exactly).
+    # Headroom from the old threshold is preserved, so a one-line edit fits but
+    # an unmeasured section does not.
+    assert size < 7030, f"system prompt grew to {size} chars"
+
+
+_KINDS = ("web", "file", "tcp")
+
+
+def _build_by_kind() -> dict[str, str]:
+    """Render one prompt per challenge kind, then restore module state."""
+    from ctf_strix import prompt
+
+    before = prompt.active()
+    texts: dict[str, str] = {}
+    try:
+        for kind in _KINDS:
+            prompt.activate(kind, ("base", kind))
+            texts[kind] = prompt.build({})
+    finally:
+        prompt.activate(*before)
+    return texts
+
+
+def test_hypothesis_block_requires_falsification_in_every_kind() -> None:
+    """Every kind must ask for at least one action that could disprove the bet."""
+    texts = _build_by_kind()
+    for kind, text in texts.items():
+        assert "Try to falsify it" in text, f"{kind} prompt lacks falsification"
+
+
+def test_hypothesis_block_requires_explicit_closure_in_every_kind() -> None:
+    """Repeated same-shape failure must close the hypothesis, not extend it."""
+    texts = _build_by_kind()
+    for kind, text in texts.items():
+        assert "Close it explicitly" in text, f"{kind} prompt lacks closure"
+
+
+def test_hypothesis_block_requires_a_mechanism_switch_in_every_kind() -> None:
+    """After closure the next step must move to a different mechanism."""
+    texts = _build_by_kind()
+    for kind, text in texts.items():
+        assert "Change mechanism" in text, f"{kind} prompt lacks a switch"
+
+
+def test_hypothesis_block_is_within_its_character_budget() -> None:
+    """The shared block is paid on every request; 600-1,500 chars is the deal."""
+    from ctf_strix import prompt
+
+    size = len(prompt._HYPOTHESIS)
+    assert 600 <= size <= 1500, f"hypothesis block is {size} chars"
 
 
 def test_file_turn_plan_runs_the_triage_table_before_loading_a_skill() -> None:

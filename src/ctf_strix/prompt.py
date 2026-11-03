@@ -53,6 +53,29 @@ logger = logging.getLogger(__name__)
 #: 覆盖文件（存在则用它，缺省用内置版本）。改提示不必改代码。
 OVERRIDE = Path(__file__).resolve().parents[2] / "config" / "prompt_ctf.md"
 
+#: One discipline shared by every challenge kind: falsify, close, switch.
+_HYPOTHESIS = """\
+## Hypothesis discipline
+
+Before each step, state the mechanism you are betting on in one line: what
+causes the wrong result, and what single check should expose it.
+
+- **Try to falsify it.** At least one action in the next step must be designed
+  to prove the hypothesis false, not to confirm it: rerun the same input under
+  a changed premise, or alter one variable that should be irrelevant and see
+  whether the output still matches the prediction.
+- **Close it explicitly.** After N consecutive failures on the same hypothesis
+  (pick N small and fixed before the series), or when fresh parameters keep
+  failing in the same shape, declare it closed and write one line saying why.
+  A closed hypothesis stays closed in later turns; reopen it only with new
+  evidence.
+- **Change mechanism.** After closure, the next step must test a different
+  exploitation mechanism or attack surface. Do not scale the closed one with
+  more names of the same kind or a larger input set -- that is the same
+  mechanism, not a new attempt.
+
+"""
+
 _CORE = """\
 You are the solver for one CTF challenge on the CTFY platform. The only thing
 that scores is the answer string, graded exactly. There is no report to write.
@@ -72,7 +95,7 @@ that scores is the answer string, graded exactly. There is no report to write.
 
 {turns}
 
-## The failure mode that costs the most
+{hypothesis}## The failure mode that costs the most
 
 **Enumerating one more name is not progress.** When a family of requests returns
 the same response twice, the mechanism is wrong, not the payload. Change the
@@ -329,7 +352,7 @@ def _render_core(
 
     tools = catalogue.prompt_block(kind, groups, names)
     turns = _TURNS.get(kind, _TURNS_WEB)
-    return _CORE.format(tools=tools, turns=turns).strip()
+    return _CORE.format(tools=tools, turns=turns, hypothesis=_HYPOTHESIS).strip()
 
 
 def build(system_prompt_context: dict[str, Any] | None = None) -> str:
