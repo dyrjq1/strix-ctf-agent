@@ -1,12 +1,14 @@
 name: build-image
 
-# 涓轰粈涔堝湪 CI 閲屾瀯寤猴細鏈湴锛堝浗鍐呯綉缁滐級鍒?deb.debian.org 鍜?pypi.org 閮芥槸鍑犲垎閽熻捣姝ワ紝
-# 涓€娆?build 鍗佸嚑鍒嗛挓杩樺彲鑳借秴鏃讹紱GitHub runner 鍦ㄥ澶栵紝瀹樻柟婧愬弽鑰屾渶蹇€?# 鏋勫缓瀹岀洿鎺ユ帹 ghcr.io锛屽钩鍙伴偅杈瑰～鐨勫氨鏄繖涓湴鍧€銆?
+# 为什么在 CI 里构建：本地（国内网络）到 deb.debian.org 和 pypi.org 都是几分钟起步，
+# 一次 build 十几分钟还可能超时；GitHub runner 在境外，官方源反而最快。
+# 构建完直接推 ghcr.io，平台那边填的就是这个地址。
+
 on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "闀滃儚 tag"
+        description: "镜像 tag"
         required: false
         default: "1.0.0"
   push:
@@ -21,26 +23,29 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      packages: write        # 鎺?ghcr 蹇呴渶
+      packages: write        # 推 ghcr 必需
 
     steps:
       - uses: actions/checkout@v4
 
       - uses: docker/setup-buildx-action@v3
 
-      - name: 鐧诲綍 ghcr
+      - name: 登录 ghcr
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: 鏋勫缓骞舵帹閫侊紙鍙嚭 amd64锛?        id: build
+      - name: 构建并推送（只出 amd64）
+        id: build
         uses: docker/build-push-action@v6
         with:
           context: .
           file: docker/Dockerfile
-          # 骞冲彴 worker 鏄?amd64锛涗笉鎸囧畾 platforms 鏃?buildx 榛樿灏辨槸瀹夸富鏋舵瀯锛?          # 杩欓噷鏄惧紡鍐欐锛岄伩鍏嶄互鍚?runner 鎹㈡垚 arm 鏃堕潤榛樹骇鍑烘媺涓嶅姩鐨勯暅鍍忋€?          platforms: linux/amd64
+          # 平台 worker 是 amd64；不指定 platforms 时 buildx 默认就是宿主架构，
+          # 这里显式写死，避免以后 runner 换成 arm 时静默产出拉不动的镜像。
+          platforms: linux/amd64
           push: true
           tags: |
             ${{ env.IMAGE }}:${{ inputs.tag || '1.0.0' }}
@@ -48,12 +53,21 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      - name: 鍗曞厓娴嬭瘯
-        # 鏋勫缓鎴愬姛鍙瘉鏄庨暅鍍忚兘璧锋潵锛涚湡姝ｇ殑鎺ョ嚎閿欒锛堝畧鍗病鎸傘€佸伐鍏锋病娉ㄥ唽銆?        # 鎻愮ず閲屽啓鐫€闀滃儚娌℃湁鐨勫懡浠わ級鍙湁娴嬭瘯鑳界湅瑙併€傛斁鍦?conformance 涔嬪墠銆?        #
-        # tests/ 琚?.dockerignore 鎺掗櫎锛堜笉杩涗氦浠橀暅鍍忥級锛屾墍浠ヨ繖閲屾妸瀹?bind-mount
-        # 杩涘鍣細渚濊禆鐢ㄩ暅鍍忛噷瑁呭ソ鐨勯偅涓€浠斤紝浠ｇ爜鐢ㄦ湰娆?checkout 鐨勫悓涓€浠斤紝
-        # 涓よ€呮鏄?浜や粯鐗?鍜?娴嬬殑涓滆タ"搴斿綋涓€鑷寸殑鍏崇郴銆?        #
-        # 鈿狅笍 蹇呴』 --entrypoint python3锛氶暅鍍忕殑 ENTRYPOINT 鏄?ctfy-entrypoint锛?        # 瀹冩寜濂戠害蹇界暐 CMD 鍙傛暟銆佹案杩滆窇 agent.py銆備笉鍔犺鐩栨椂杩欎竴姝ユ墽琛岀殑鏄?        # "鏃?task.json 鈫?鍐?result.json 鈫?exit 0"锛宲ytest 涓€鏉℃病璺戝嵈鏄剧ず缁库€斺€?        # v1 鐨?闀滃儚鍐呮祴璇曢€氳繃"灏辨槸杩欎釜鍋囦俊鍙凤紙2026-11-03 瀹炴祴鍙戠幇锛夈€?        # 鍙傛暟閲屼篃涓嶈兘鍐嶅甫寮€澶寸殑 python3锛堝畠浼氬彉鎴?pytest 鐨勭涓€涓弬鏁帮級銆?        # 鏈熬 grep 淇濊瘉杈撳嚭閲岀湡鏈?pytest 鎽樿琛岋紝闃叉鍐嶆绌鸿皟缁裤€?        run: |
+      - name: 单元测试
+        # 构建成功只证明镜像能起来；真正的接线错误（守卫没挂、工具没注册、
+        # 提示里写着镜像没有的命令）只有测试能看见。放在 conformance 之前。
+        #
+        # tests/ 被 .dockerignore 排除（不进交付镜像），所以这里把它 bind-mount
+        # 进容器：依赖用镜像里装好的那一份，代码用本次 checkout 的同一份，
+        # 两者正是"交付物"和"测的东西"应当一致的关系。
+        #
+        # ⚠️ 必须 --entrypoint python3：镜像的 ENTRYPOINT 是 ctfy-entrypoint，
+        # 它按契约忽略 CMD 参数、永远跑 agent.py。不加覆盖时这一步执行的是
+        # "无 task.json → 写 result.json → exit 0"，pytest 一条没跑却显示绿——
+        # v1 的"镜像内测试通过"就是这个假信号（2026-11-03 实测发现）。
+        # 参数里也不能再带开头的 python3（它会变成 pytest 的第一个参数）。
+        # 末尾 grep 保证输出里真有 pytest 摘要行，防止再次空调绿。
+        run: |
           set -euxo pipefail
           docker run --rm --entrypoint python3 -v "$PWD:/repo:ro" -w /repo \
             -e PYTHONPATH=/app/src:/app/vendor/src \
@@ -62,26 +76,35 @@ jobs:
             | tee /tmp/pytest_in_image.out
           grep -E "[0-9]+ passed" /tmp/pytest_in_image.out
 
-      # 骞冲彴鐨勪袱鏉?blocking 鍒ゆ嵁锛坉id_not_start / no_result_file锛夊湪 CI 閲屽厛杩囦竴閬嶃€?      # 鏋勫缓鎴愬姛 鈮?conformance 閫氳繃锛岃繖涓€姝ユ墠鏄湡姝ｇ殑闂ㄣ€?      - name: conformance 鑷锛堟棤 task.json锛?        run: |
+      # 平台的两条 blocking 判据（did_not_start / no_result_file）在 CI 里先过一遍。
+      # 构建成功 ≠ conformance 通过，这一步才是真正的门。
+      - name: conformance 自检（无 task.json）
+        run: |
           set -eux
           mkdir -p /tmp/w1 && rm -rf /tmp/w1/*
-          # 闀滃儚鍐呮槸闈?root锛圲ID 1000锛夛紱runner 寤虹殑鐩綍灞炰簬 UID 1001锛?          # 涓嶆敼灞炰富鐨勮瘽瀹瑰櫒鍐欎笉杩涙寕杞界洰褰曪紝conformance 娴嬬殑鏄潈闄愪笉鏄绾︺€?          sudo chown -R 1000:1000 /tmp/w1
+          # 镜像内是非 root（UID 1000）；runner 建的目录属于 UID 1001，
+          # 不改属主的话容器写不进挂载目录，conformance 测的是权限不是契约。
+          sudo chown -R 1000:1000 /tmp/w1
           docker run --rm -w /ctfy/work -e CTFY_WORK_DIR=/ctfy/work \
             -v /tmp/w1:/ctfy/work "${{ env.IMAGE }}:${{ inputs.tag || '1.0.0' }}"
           test -s /tmp/w1/result.json
           python3 -c "import json;d=json.load(open('/tmp/w1/result.json'));print(d)"
 
-      - name: conformance 鑷锛坉ry_run + 鑷畾涔?result 璺緞锛?        run: |
+      - name: conformance 自检（dry_run + 自定义 result 路径）
+        run: |
           set -eux
           mkdir -p /tmp/w2/out && rm -rf /tmp/w2/out/*
-          # 姝ゅ涓嶈 chown锛歮kdir 鍚庣洰褰曞睘 runner(1001)锛屽厛 chown 缁欏鍣?UID
-          # 浼氳涓嬮潰鐨?heredoc 鍐?task.json 鐩存帴 Permission denied锛坴2 鏋勫缓
-          # 5 杩炵孩鐨勬牴鍥狅級銆俢hown 鍙湪鍐欏畬 task.json 涔嬪悗鍋氫竴娆°€?          cat > /tmp/w2/task.json <<'JSON'
+          # 此处不许 chown：mkdir 后目录属 runner(1001)，先 chown 给容器 UID
+          # 会让下面的 heredoc 写 task.json 直接 Permission denied（v2 构建
+          # 5 连红的根因）。chown 只在写完 task.json 之后做一次。
+          cat > /tmp/w2/task.json <<'JSON'
           {"schema_version": 2, "dry_run": true, "run_mode": "instance",
            "challenge": {"name": "smoke"}, "scope": [],
            "result": {"path": "out/result.json"}}
           JSON
-          # chown 蹇呴』鍦ㄥ啓瀹?task.json 涔嬪悗锛歳unner 鐢ㄦ埛锛?001锛夊啓涓嶈繘宸蹭氦缁?          # 瀹瑰櫒 UID 1000 鐨勭洰褰曪紝瀹瑰櫒鍐欎笉杩涘睘浜?runner 鐨勭洰褰曗€斺€斾袱浠朵簨鍙兘杩欎釜椤哄簭銆?          sudo chown -R 1000:1000 /tmp/w2
+          # chown 必须在写完 task.json 之后：runner 用户（1001）写不进已交给
+          # 容器 UID 1000 的目录，容器写不进属于 runner 的目录——两件事只能这个顺序。
+          sudo chown -R 1000:1000 /tmp/w2
           docker run --rm -w /ctfy/work -e CTFY_WORK_DIR=/ctfy/work \
             -v /tmp/w2:/ctfy/work "${{ env.IMAGE }}:${{ inputs.tag || '1.0.0' }}"
           test -s /tmp/w2/out/result.json
@@ -90,15 +113,15 @@ jobs:
           # a conformance check that rejects the correct answer.
           python3 -c "import json;d=json.load(open('/tmp/w2/out/result.json'));assert d.get('schema_version')>=2;print(d.get('schema_version'), d.get('stop_reason'))"
 
-      - name: 鎽樿
+      - name: 摘要
         run: |
           {
-            echo "### 闀滃儚宸叉帹閫?
+            echo "### 镜像已推送"
             echo ""
             echo '```'
             echo "${{ env.IMAGE }}:${{ inputs.tag || '1.0.0' }}"
             echo "digest: ${{ steps.build.outputs.digest }}"
             echo '```'
             echo ""
-            echo "鎻愪氦鍒?CTFY 鏃跺～涓婇潰閭ｈ鍦板潃銆?
+            echo "提交到 CTFY 时填上面那行地址。"
           } >> "$GITHUB_STEP_SUMMARY"
