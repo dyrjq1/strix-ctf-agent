@@ -60,12 +60,21 @@ jobs:
         # tests/ 被 .dockerignore 排除（不进交付镜像），所以这里把它 bind-mount
         # 进容器：依赖用镜像里装好的那一份，代码用本次 checkout 的同一份，
         # 两者正是"交付物"和"测的东西"应当一致的关系。
+        #
+        # ⚠️ 必须 --entrypoint python3：镜像的 ENTRYPOINT 是 ctfy-entrypoint，
+        # 它按契约忽略 CMD 参数、永远跑 agent.py。不加覆盖时这一步执行的是
+        # "无 task.json → 写 result.json → exit 0"，pytest 一条没跑却显示绿——
+        # v1 的"镜像内测试通过"就是这个假信号（2026-11-03 实测发现）。
+        # 参数里也不能再带开头的 python3（它会变成 pytest 的第一个参数）。
+        # 末尾 grep 保证输出里真有 pytest 摘要行，防止再次空调绿。
         run: |
-          set -eux
-          docker run --rm -v "$PWD:/repo:ro" -w /repo \
+          set -euxo pipefail
+          docker run --rm --entrypoint python3 -v "$PWD:/repo:ro" -w /repo \
             -e PYTHONPATH=/app/src:/app/vendor/src \
             "${{ env.IMAGE }}:${{ inputs.tag || '1.0.0' }}" \
-            python3 -m pytest /repo/tests -q -p no:cacheprovider
+            -m pytest /repo/tests -q -p no:cacheprovider \
+            | tee /tmp/pytest_in_image.out
+          grep -E "[0-9]+ passed" /tmp/pytest_in_image.out
 
       # 平台的两条 blocking 判据（did_not_start / no_result_file）在 CI 里先过一遍。
       # 构建成功 ≠ conformance 通过，这一步才是真正的门。
