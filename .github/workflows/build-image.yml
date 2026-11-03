@@ -85,6 +85,7 @@ jobs:
         run: |
           set -eux
           mkdir -p /tmp/w2/out && rm -rf /tmp/w2/out/*
+          sudo chown -R 1000:1000 /tmp/w2
           cat > /tmp/w2/task.json <<'JSON'
           {"schema_version": 2, "dry_run": true, "run_mode": "instance",
            "challenge": {"name": "smoke"}, "scope": [],
