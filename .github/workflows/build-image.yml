@@ -85,12 +85,14 @@ jobs:
         run: |
           set -eux
           mkdir -p /tmp/w2/out && rm -rf /tmp/w2/out/*
-          sudo chown -R 1000:1000 /tmp/w2
           cat > /tmp/w2/task.json <<'JSON'
           {"schema_version": 2, "dry_run": true, "run_mode": "instance",
            "challenge": {"name": "smoke"}, "scope": [],
            "result": {"path": "out/result.json"}}
           JSON
+          # chown 必须在写完 task.json 之后：runner 用户（1001）写不进已交给
+          # 容器 UID 1000 的目录，容器写不进属于 runner 的目录——两件事只能这个顺序。
+          sudo chown -R 1000:1000 /tmp/w2
           docker run --rm -w /ctfy/work -e CTFY_WORK_DIR=/ctfy/work \
             -v /tmp/w2:/ctfy/work "${{ env.IMAGE }}:${{ inputs.tag || '1.0.0' }}"
           test -s /tmp/w2/out/result.json
