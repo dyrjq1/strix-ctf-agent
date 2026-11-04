@@ -82,19 +82,21 @@ that scores is the answer string, graded exactly. There is no report to write.
 
 ## Environment (verified facts, not guesses)
 
-- This is a small Linux container. There is **no** nmap, sqlmap, ffuf, gobuster,
-  nuclei, subfinder, Caido proxy, browser sidecar, or Docker. Do not plan around
-  them; write the request in Python (`requests`, `http.client`, `socket`) or use
-  `curl`.
-- There is **no internet**. Package installs, `git clone`, CVE lookups and search
-  engines all fail. Only the challenge target is reachable.
-- Failures that mean "stop diagnosing, change course": `curl` exit 000,
-  `Connection refused` on 127.0.0.1, proxy errors.
+- No nmap/sqlmap/ffuf/nuclei/Caido/Docker; HTTP via `requests` or `curl`.
+- `python3` has: `requests` `Crypto` `Cryptodome` `z3` `PIL` `pwn` `numpy`
+  `sympy` `gmpy2` `scipy` `matplotlib` `pefile` `yara` `segno` `dnslib`
+  `capstone` `unicorn` `paramiko` `rpyc` `plumbum`.
+- No internet: anything else **cannot be installed**; don't try.
+- Evidence: results must be **printed by a script**, not reasoned.
+- >30s: not inline (partial output). `nohup python3 x.py > log 2>&1 &`, poll
+  `cat log` or `write_stdin`.
+- Stop on `curl` 000, `Connection refused`, proxy errors.
 
 {tools}
 
 {turns}
 
+{race}
 {hypothesis}## The failure mode that costs the most
 
 **Enumerating one more name is not progress.** When a family of requests returns
@@ -168,6 +170,45 @@ _TURNS: dict[str, str] = {
     "file": _TURNS_FILE,
     "tcp": _TURNS_TCP,
 }
+
+#: The only situation in which splitting the work pays for itself: after recon,
+#: two mutually exclusive directions remain and both can be checked from the
+#: evidence already collected.  Everything else is faster single-threaded.
+_RACE = """\
+## Parallel hypothesis race (opt-in)
+
+The agent-graph tools are present for this run. They are not a general
+invitation to delegate: the default is still to solve the challenge yourself.
+
+- **Spawn only after recon, and only with two directions.** Before spawning,
+  list the candidate directions in `think`. Spawn only when that list contains
+  at least two directions that (a) are mutually exclusive -- confirming one
+  rules the other out -- and (b) can each be checked with the evidence you
+  already have. Then spawn **one** child per direction, at most **two**
+  children for the whole run.
+- **Do not spawn** when a direction is already ahead on evidence, when the
+  challenge is small enough to finish in a few calls, when the candidates are
+  variations of one mechanism, or when you cannot name what would falsify a
+  direction. In those cases keep working yourself; `finish_scan` is closer
+  than `create_agent`.
+- **One child, one direction.** Every `create_agent` brief must contain:
+  1. the single hypothesis and the exact check that would falsify it;
+  2. the facts already established (paths, credentials/session state, files,
+     commands that already failed);
+  3. what is out of bounds: no other direction, no re-running known-failed
+     probes, no spawning more agents, no `finish_scan` (that is the root's
+     call).
+  A child must report the answer it retrieved, or the evidence that closed its
+  direction, and call `agent_finish`. Children do not report prose-only.
+- **Race end.** The first retrieved answer wins. When a child retrieves a flag,
+  stop sending work: the run ends with that answer. Do not spawn a replacement
+  or restart the search. If the root retrieves it, call `finish_scan` once and
+  carry the exact string.
+- **Budget is shared.** Children run on the same turn, wall-clock and memory
+  budget as you; two children does not mean two budgets. Keep briefs short and
+  avoid duplicate reconnaissance.
+
+"""
 
 #: Challenge kind and the installer groups that actually registered.  Set by
 #: :func:`activate` from the entrypoint, before the first prompt is rendered.
@@ -333,6 +374,8 @@ def _render_core(
     kind: str,
     groups: tuple[str, ...] | None,
     names: frozenset[str] | set[str] | None = None,
+    *,
+    is_root: bool = True,
 ) -> str:
     """Fill the Tools and How-to-spend-turns sections for one challenge kind.
 
@@ -349,13 +392,28 @@ def _render_core(
         The core prompt text, ready to concatenate.
     """
     from ctf_strix import catalogue
+    from ctf_strix.tool_trim import subagents_allowed
 
     tools = catalogue.prompt_block(kind, groups, names)
     turns = _TURNS.get(kind, _TURNS_WEB)
-    return _CORE.format(tools=tools, turns=turns, hypothesis=_HYPOTHESIS).strip()
+    # `names` only carries the extra tools registered through
+    # `register_agent_tools`; `create_agent` lives in the vendor base tuple,
+    # so testing membership here would silently hide the protocol.
+    #
+    # Children render this same prompt.  Only the root may spawn, so a child
+    # that received this section would be told to do something its runtime
+    # guard refuses -- and on a long run it would burn turns trying.
+    race = _RACE if (is_root and subagents_allowed()) else ""
+    return _CORE.format(
+        tools=tools, turns=turns, hypothesis=_HYPOTHESIS, race=race
+    ).strip()
 
 
-def build(system_prompt_context: dict[str, Any] | None = None) -> str:
+def build(
+    system_prompt_context: dict[str, Any] | None = None,
+    *,
+    is_root: bool = True,
+) -> str:
     """拼出 CTF 系统提示。
 
     Args:
@@ -376,7 +434,9 @@ def build(system_prompt_context: dict[str, Any] | None = None) -> str:
     if OVERRIDE.is_file():
         return OVERRIDE.read_text(encoding="utf-8")
 
-    core = _render_core(_ACTIVE_KIND, _ACTIVE_GROUPS, _ACTIVE_NAMES)
+    core = _render_core(
+        _ACTIVE_KIND, _ACTIVE_GROUPS, _ACTIVE_NAMES, is_root=is_root
+    )
     parts = [core, _targets_block(system_prompt_context), _skills_block()]
     return "\n\n".join(part for part in parts if part) + "\n"
 
@@ -413,7 +473,7 @@ def install() -> bool:
         system_prompt_context: dict[str, Any] | None = None,
         include_scope: bool = True,
     ) -> str:  # noqa: ARG001 - 签名必须与 strix 原函数一致
-        return build(system_prompt_context)
+        return build(system_prompt_context, is_root=is_root)
 
     prompt_mod.render_system_prompt = render  # type: ignore[assignment]
     factory.render_system_prompt = render  # type: ignore[assignment]

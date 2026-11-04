@@ -65,10 +65,19 @@ _TIMEOUT = 45
 class AutoSubmitter:
     """在 ``finish_scan`` 里把答案交给平台，并把裁决贴回 summary。"""
 
-    def __init__(self, platform: str, instance: str, token: str) -> None:
+    def __init__(
+        self,
+        platform: str,
+        instance: str,
+        token: str,
+        success: Any = None,
+    ) -> None:
         self.platform = platform.rstrip("/")
         self.instance = instance
         self.token = token
+        # Optional structured-success ledger.  Only direct JSON verdicts from
+        # calls this object made are ever reported to it.
+        self.success = success
         self.attempts = 0
         self.correct: list[str] = []
         self.answers_tried: list[dict[str, Any]] = []
@@ -128,7 +137,42 @@ class AutoSubmitter:
         )
         if "error" in body or "correct" not in body:
             return {}
+        if self.success is not None:
+            self.success.observe_structured(
+                body, source="platform_verify", answer=answer
+            )
         return body
+
+    def probe_checkers(self) -> bool:
+        """Ask the platform's sidecar checker whether this instance is solved.
+
+        Only ``mode == "checker"`` questions are probed.  The verdict must be
+        the direct JSON body of our own ``POST /check``; a checker's page
+        saying "passed" is not this.  This is the recovery path's last chance
+        to notice a solve before the run is restarted.
+
+        Returns:
+            True when a direct checker response says ``passed: true``.
+        """
+        questions = self._questions()
+        for q in questions:
+            if q.get("mode") != "checker":
+                continue
+            qid = q.get("id")
+            if not qid:
+                continue
+            body = self._post(
+                f"/api/v1/instances/{self.instance}/check",
+                {"question_id": qid},
+            )
+            if "error" in body:
+                self.last_error = str(body["error"])
+                continue
+            if body.get("passed") is True:
+                if self.success is not None:
+                    self.success.observe_structured(body, source="checker")
+                return True
+        return False
 
     def _questions(self) -> list[dict[str, Any]]:
         """拉当前实例的 question 列表。
@@ -253,6 +297,10 @@ class AutoSubmitter:
                         k: res.get(k) for k in ("correct", "solve_rank", "detail", "error")
                     }})
                     if res.get("correct"):
+                        if self.success is not None:
+                            self.success.observe_structured(
+                                res, source="platform_submit", answer=ans
+                            )
                         correct.append(f"{qid}={ans}")
                         break  # 这个 question 已经有了正确答案，换下一个 question
                     if isinstance(left, int):
@@ -314,7 +362,13 @@ class AutoSubmitter:
         return summary + "\n".join(lines)
 
 
-def install(platform: str, instance: str, token: str, max_refusals: int = 0) -> AutoSubmitter:
+def install(
+    platform: str,
+    instance: str,
+    token: str,
+    max_refusals: int = 0,
+    success: Any = None,
+) -> AutoSubmitter:
     """挂到 ``finish_scan`` 上：允许收工前先提交，答错则拒绝。
 
     与另外几个守卫同一手法——包 ``factory._with_bounded_result``，不动 vendor。
@@ -332,7 +386,7 @@ def install(platform: str, instance: str, token: str, max_refusals: int = 0) -> 
     """
     from strix.agents import factory
 
-    sub = AutoSubmitter(platform, instance, token)
+    sub = AutoSubmitter(platform, instance, token, success=success)
     original = factory._with_bounded_result
     refusal_budget = {"left": max_refusals}
 

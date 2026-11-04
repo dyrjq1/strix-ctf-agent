@@ -92,6 +92,22 @@ _AGENT_GRAPH: Final[frozenset[str]] = frozenset(
     }
 )
 
+
+def subagents_allowed() -> bool:
+    """Return whether the opt-in parallel-agent path was requested.
+
+    Kept in one place so the toolset, the prompt, the runtime guard and the
+    tests cannot disagree about what "on" means.
+    """
+    import os
+
+    return os.environ.get("CTF_ALLOW_SUBAGENTS", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
 #: 依赖 MCP server 的工具。
 #:
 #: 容器里没有任何 MCP server：``docker/`` 下没有 ``.strix/mcp-servers.json``，
@@ -218,10 +234,8 @@ def install_ctf_toolset(
     """
     from strix.agents import factory
 
-    import os
-
     if drop_agent_graph is None:
-        drop_agent_graph = os.environ.get("CTF_ALLOW_SUBAGENTS", "").strip() not in ("1", "true", "yes")
+        drop_agent_graph = not subagents_allowed()
 
     global _ORIGINAL_BASE_TOOLS
     if not _ORIGINAL_BASE_TOOLS:
@@ -230,7 +244,11 @@ def install_ctf_toolset(
     keep: list = []
     dropped: list[str] = []
     stubbed: list[str] = []
-    for tool in factory._BASE_TOOLS:  # noqa: SLF001 — 这是唯一可用的注入点
+    # Always start from the snapshot: trimming replaces ``_BASE_TOOLS`` in
+    # place, so iterating the live tuple would make the result depend on
+    # whether an earlier call ran.  Concretely, a process that trimmed with the
+    # switch off and later enabled sub-agents would silently keep them out.
+    for tool in _ORIGINAL_BASE_TOOLS:
         if drop_bookkeeping and tool.name in _BOOKKEEPING:
             dropped.append(tool.name)
             continue
@@ -261,6 +279,19 @@ def install_ctf_toolset(
 
     factory._BASE_TOOLS = tuple(keep)  # noqa: SLF001
     _CTF_STUBBED_TOOLS[:] = stubbed
+
+    if not drop_agent_graph:
+        # Tool surface and hard ceiling must ship together.  The official
+        # entrypoint installs this guard itself, but the eval harness only
+        # calls this function -- exposing ``create_agent`` there without the
+        # two-child limit would put the exact memory risk this ceiling exists
+        # for on the A/B path.  Idempotent and non-fatal.
+        try:
+            from ctf_strix import parallel
+
+            parallel.install()
+        except Exception:  # noqa: BLE001 - the tool surface must still install
+            pass
     return dropped
 
 

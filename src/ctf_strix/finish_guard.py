@@ -70,7 +70,7 @@ _REFUSAL = {
 class FinishGuard:
     """拦下"没有 flag 的收工"。"""
 
-    def __init__(self, *, require_flag: bool = True) -> None:
+    def __init__(self, *, require_flag: bool = True, success: Any = None) -> None:
         """Args:
             require_flag: 是否要求 summary 里有 flag。engagement（报告交付）
                 与 checker（副作用交付）题没有 flag，必须传 False，否则每一次
@@ -79,6 +79,9 @@ class FinishGuard:
         self.refusals = 0
         self.allowed = 0
         self.require_flag = require_flag
+        # A structured success ledger, when the caller wires one in.  The guard
+        # only reports a flag it already validated; it never inspects prose.
+        self.success = success
 
     def check(self, raw_input: str) -> dict[str, Any] | None:
         """判断这次 finish_scan 是否该被拒。
@@ -93,7 +96,10 @@ class FinishGuard:
             self.allowed += 1
             return None
         found = [m.group(0) for m in _FLAG_RE.finditer(raw_input or "")]
-        if any(_PLACEHOLDER.match(flag) is None for flag in found):
+        accepted = [flag for flag in found if _PLACEHOLDER.match(flag) is None]
+        if accepted:
+            if self.success is not None:
+                self.success.observe_answer(accepted[0], source="finish_guard")
             self.allowed += 1
             return None
         if self.refusals >= _MAX_REFUSALS:
@@ -104,7 +110,7 @@ class FinishGuard:
         return dict(_REFUSAL)
 
 
-def install(*, require_flag: bool = True) -> FinishGuard:
+def install(*, require_flag: bool = True, success: Any = None) -> FinishGuard:
     """包装工具入口，给 finish_scan 装上收工守卫。
 
     与另外两个守卫用同一手法（改 ``on_invoke_tool``，不动 vendor 代码）。
@@ -115,7 +121,7 @@ def install(*, require_flag: bool = True) -> FinishGuard:
     """
     from strix.agents import factory
 
-    guard = FinishGuard(require_flag=require_flag)
+    guard = FinishGuard(require_flag=require_flag, success=success)
     original = factory._with_bounded_result
 
     def patched(tool: "FunctionTool") -> "FunctionTool":

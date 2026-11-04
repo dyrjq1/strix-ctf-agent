@@ -1,0 +1,518 @@
+"""Opt-in parallel hypothesis racing for CTF runs.
+
+The vendored runner already supports child agents, but its default prompt tells
+the root to delegate everything.  Measured runs spent 22% of their calls on
+coordination, so the CTF toolset removes the agent-graph tools by default.
+
+This module adds a narrow, CTF-specific protocol instead of restoring that
+behaviour:
+
+* the root may spawn at most two children for the whole run;
+* children may not spawn grandchildren;
+* a flag seen in a child's tool output is a race win: the root is woken and
+  every other child is stopped;
+* a root ``finish_scan`` that carries a proven flag stops live children before
+  the vendored tool's "no active agents" check can reject it.
+
+All of this is installed by wrapping ``factory._with_bounded_result``, the same
+seam the other CTF guards use.  Vendor files stay untouched.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import re
+import threading
+from typing import Any
+
+logger = logging.getLogger(__name__)
+
+#: Hard ceiling from the run constraints: container memory is the limiting
+#: resource and a single runaway agent has already produced exit 137.  This is
+#: deliberately a constant, not an environment-tunable budget.
+MAX_SUBAGENTS = 2
+
+_FLAG_RE = re.compile(r"(?:FLAG|flag|CTF|ctf|CTFY|ctfy)\{[^}\s]{2,}\}")
+_PLACEHOLDER = re.compile(
+    r"^(?:FLAG|flag|CTF|ctf|CTFY|ctfy)\{(?:\.{2,}|x{2,}|X{2,}|<[^>]*>|\{[^}]*\})$"
+)
+
+_LOCK = threading.Lock()
+_INSTALLED = False
+#: Strong references to race-stop tasks.  ``asyncio`` keeps only a weak
+#: reference to a task, so a short-lived stop could be garbage-collected
+#: before it wakes the root or stops a sibling.
+_STOP_TASKS: set[asyncio.Task[Any]] = set()
+_ORIGINAL: Any = None
+_SPAWNED = 0
+_ANNOUNCED = False
+_RACE_STOPPED = False
+_SUCCESS: Any = None
+_EVIDENCE: Any = None
+_COORDINATOR: Any = None
+_ROOT_ID: str | None = None
+
+
+def enabled() -> bool:
+    """Return whether the caller asked for the opt-in sub-agent path.
+
+    Delegates to :func:`ctf_strix.tool_trim.subagents_allowed` so the tool
+    surface, the prompt, the runtime guard and the tests cannot disagree about
+    what "on" means (``1`` / ``true`` / ``yes`` / ``on``).
+    """
+    from ctf_strix.tool_trim import subagents_allowed
+
+    return subagents_allowed()
+
+
+def configure(
+    *,
+    success: Any = None,
+    evidence: Any = None,
+    coordinator: Any = None,
+) -> None:
+    """Bind per-run state used by the guards.
+
+    Args:
+        success: the run's ``SuccessLedger``.
+        evidence: the run's ``EvidenceLedger``; a finish argument only counts
+            when the same string was already seen in a tool output.
+        coordinator: the attempt's ``AgentCoordinator``.  It lets the sink stop
+            children and wake the root without waiting for the next turn.
+    """
+    global _SUCCESS, _EVIDENCE, _COORDINATOR
+    _SUCCESS = success
+    _EVIDENCE = evidence
+    _COORDINATOR = coordinator
+
+
+def reset_run() -> None:
+    """Reset per-run counters.  The guard patch itself stays installed."""
+    global _SPAWNED, _ANNOUNCED, _RACE_STOPPED, _COORDINATOR, _ROOT_ID
+    global _SUCCESS, _EVIDENCE
+    with _LOCK:
+        _SPAWNED = 0
+        _ANNOUNCED = False
+        _RACE_STOPPED = False
+        _ROOT_ID = None
+        # A later run gets fresh bindings.  Keeping the previous coordinator or
+        # ledger would let a race stop address agents from a closed session, or
+        # report a success that belongs to a finished attempt.
+        _COORDINATOR = None
+        _SUCCESS = None
+        _EVIDENCE = None
+
+
+def bind_attempt(coordinator: Any) -> None:
+    """Point the guard at a new attempt's coordinator.
+
+    Each ``run_strix_scan`` attempt owns a separate ``AgentCoordinator``.  The
+    spawn count and the announced flag are per run and must survive, but the
+    previous attempt's root id and graph are closed; keeping them would make
+    ``root_id`` label the new root as a child.
+    """
+    global _COORDINATOR, _ROOT_ID
+    with _LOCK:
+        _COORDINATOR = coordinator
+        _ROOT_ID = None
+
+
+def root_id() -> str | None:
+    """Return the run's root agent id, or ``None`` when it is not known yet.
+
+    The coordinator graph is authoritative: on a resumed run the vendored
+    runner respawns children before the root's first event, so "first agent id
+    seen by the sink" is not a safe definition of the root.  ``_ROOT_ID`` is
+    only a fallback recorded from a race win or a test binding.
+    """
+    coordinator = _COORDINATOR
+    if coordinator is not None:
+        try:
+            for aid, parent in coordinator.parent_of.items():
+                if parent is None:
+                    return aid
+        except Exception:  # noqa: BLE001 - fall through to the recorded id
+            pass
+    return _ROOT_ID
+
+
+def bind_root(agent_id: str) -> None:
+    """Remember a root id when the coordinator graph is not available."""
+    global _ROOT_ID
+    if _ROOT_ID is None and agent_id:
+        _ROOT_ID = agent_id
+
+
+def is_root(agent_id: str) -> bool:
+    """Whether `agent_id` is the root of the current run.
+
+    The sink raises `SolvedStop` to unwind the run, but a child task is not
+    caught by the vendored runner (it only handles budget errors), so a child
+    raising it would surface as an unhandled task exception.  Only the root is
+    allowed to stop the whole process; a child just sees its stop request.
+    """
+    rid = root_id()
+    if rid is None:
+        return True
+    return agent_id == rid
+
+
+def stats() -> dict[str, Any]:
+    """Compact state for ``result.json`` diagnostics."""
+    with _LOCK:
+        return {
+            "enabled": enabled(),
+            "max_subagents": MAX_SUBAGENTS,
+            "spawned": _SPAWNED,
+            "race_announced": _ANNOUNCED,
+            "race_stopped": _RACE_STOPPED,
+        }
+
+
+def usage_summary(
+    *,
+    root_turns: int,
+    before: dict[str, int] | None,
+    after: dict[str, int] | None,
+) -> dict[str, int]:
+    """Aggregate root and child LLM usage for one parallel run.
+
+    ``usage_meter`` is process-wide and already counts every agent, so child
+    calls are the run delta minus the root's own request count.  The result is
+    only accounting: it does not feed back into any budget.
+    """
+    before = before or {}
+    after = after or {}
+    total = max(int(after.get("llm_calls", 0)) - int(before.get("llm_calls", 0)), 0)
+    input_tokens = max(
+        int(after.get("input_tokens", 0)) - int(before.get("input_tokens", 0)), 0
+    )
+    output_tokens = max(
+        int(after.get("output_tokens", 0)) - int(before.get("output_tokens", 0)), 0
+    )
+    child = max(total - max(int(root_turns), 0), 0)
+    return {
+        "root_turns": max(int(root_turns), 0),
+        "child_llm_calls": child,
+        "total_llm_calls": total,
+        # A vendor run result can report more requests than the meter observed
+        # (e.g. an aborted attempt).  Never publish a total below the root's
+        # own count; that would make a parallel run look cheaper than its
+        # parent.
+        "turns": max(total, max(int(root_turns), 0)),
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+    }
+
+
+def note_success(agent_id: str, flag: str, *, root_id: str | None = None) -> None:
+    """Announce a race win and stop the other agents.
+
+    Called from the synchronous event sink.  The actual coordinator work is
+    scheduled on the running loop; the sink can then return and let the runner
+    deliver the next event, where ``success.solved`` raises ``SolvedStop``.
+    """
+    global _ANNOUNCED, _ROOT_ID
+    if not flag:
+        return
+    if root_id is not None and _ROOT_ID is None:
+        _ROOT_ID = root_id
+    # Record the win in the run's structured ledger before scheduling any
+    # coordinator work.  `SolvedStop` is driven by `success.solved`; without
+    # this the root could receive the message and still finish as completed.
+    if _SUCCESS is not None:
+        _SUCCESS.observe_answer(flag, source="flag_extract")
+    with _LOCK:
+        if _ANNOUNCED:
+            return
+        _ANNOUNCED = True
+    coordinator = _COORDINATOR
+    if coordinator is None:
+        return
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        logger.warning("parallel race: no running loop to stop agents")
+        return
+    task = loop.create_task(
+        _stop_for_race(coordinator, root_id=root_id, winner_id=agent_id, flag=flag),
+        name="ctf-parallel-stop",
+    )
+    _STOP_TASKS.add(task)
+    task.add_done_callback(_STOP_TASKS.discard)
+
+
+async def _stop_for_race(
+    coordinator: Any,
+    *,
+    root_id: str | None,
+    winner_id: str,
+    flag: str,
+) -> None:
+    global _RACE_STOPPED
+    try:
+        if root_id is None:
+            root_id = next(
+                (aid for aid, parent in coordinator.parent_of.items() if parent is None),
+                None,
+            )
+        if root_id is not None and winner_id != root_id:
+            await coordinator.send(
+                root_id,
+                {
+                    "from": winner_id,
+                    "type": "success",
+                    "priority": "high",
+                    "content": (
+                        "A parallel sub-agent retrieved the answer. Stop all work now; "
+                        "do not wait, do not spawn another agent, and do not restart the "
+                        f"search. The answer seen in tool output was: {flag}"
+                    ),
+                },
+                interrupt=True,
+            )
+        active = await coordinator.active_agents_except(root_id or "")
+        for info in active:
+            await coordinator.request_stop(info["agent_id"])
+        _RACE_STOPPED = True
+        logger.info(
+            "parallel race: winner=%s stopped=%d root=%s",
+            winner_id,
+            len(active),
+            root_id or "-",
+        )
+    except Exception:  # noqa: BLE001 - a race stop must never crash the run
+        logger.exception("parallel race: stopping agents failed")
+
+
+def install() -> bool:
+    """Install the guard on ``factory._with_bounded_result``.
+
+    Idempotent for the process.  Per-run state is replaced by
+    :func:`configure` and :func:`reset_run`.
+    """
+    global _INSTALLED, _ORIGINAL
+    if _INSTALLED:
+        return True
+    try:
+        from strix.agents import factory
+    except Exception:  # noqa: BLE001 - vendor unavailable in some unit tests
+        return False
+
+    _ORIGINAL = factory._with_bounded_result
+
+    def patched(tool: Any) -> Any:
+        return wrap_tool(_ORIGINAL(tool))
+
+    factory._with_bounded_result = patched
+    _INSTALLED = True
+    return True
+
+
+def uninstall() -> None:
+    """Restore the previous mount function (tests and rollback)."""
+    global _INSTALLED, _ORIGINAL
+    if not _INSTALLED:
+        return
+    try:
+        from strix.agents import factory
+
+        if _ORIGINAL is not None:
+            factory._with_bounded_result = _ORIGINAL
+    finally:
+        _INSTALLED = False
+        _ORIGINAL = None
+
+
+def wrap_tool(tool: Any) -> Any:
+    """Apply the parallel protocol to one built tool."""
+    name = getattr(tool, "name", "")
+    if name == "create_agent":
+        return _wrap_create_agent(tool)
+    if name == "agent_finish":
+        return _wrap_agent_finish(tool)
+    if name == "finish_scan":
+        return _wrap_finish_scan(tool)
+    return tool
+
+
+def _wrap_create_agent(tool: Any) -> Any:
+    if getattr(tool, "_ctf_parallel_create", False):
+        return tool
+    inner = tool.on_invoke_tool
+
+    async def invoke(ctx: Any, raw_input: str) -> Any:
+        context = _context(ctx)
+        if context.get("coordinator") is not None:
+            _bind_coordinator(context["coordinator"])
+        if context.get("parent_id") is not None:
+            return _json(
+                {
+                    "success": False,
+                    "error": (
+                        "REFUSED: nested sub-agents are disabled in CTF mode. "
+                        "Do your assigned direction yourself and report back."
+                    ),
+                }
+            )
+        with _LOCK:
+            global _SPAWNED
+            if _SPAWNED >= MAX_SUBAGENTS:
+                return _json(
+                    {
+                        "success": False,
+                        "error": (
+                            f"REFUSED: this run allows at most {MAX_SUBAGENTS} sub-agents. "
+                            "Work with the agents already running, or stop one and continue "
+                            "yourself."
+                        ),
+                        "subagent_limit": MAX_SUBAGENTS,
+                        "spawned": _SPAWNED,
+                    }
+                )
+            _SPAWNED += 1
+        try:
+            result = await inner(ctx, raw_input)
+        except BaseException:
+            _rollback_spawn()
+            raise
+        if not _succeeded(result):
+            _rollback_spawn()
+        return result
+
+    tool.on_invoke_tool = invoke
+    tool._ctf_parallel_create = True  # type: ignore[attr-defined]
+    return tool
+
+
+def _rollback_spawn() -> None:
+    global _SPAWNED
+    with _LOCK:
+        _SPAWNED = max(0, _SPAWNED - 1)
+
+
+def _wrap_agent_finish(tool: Any) -> Any:
+    if getattr(tool, "_ctf_parallel_finish", False):
+        return tool
+    inner = tool.on_invoke_tool
+
+    async def invoke(ctx: Any, raw_input: str) -> Any:
+        context = _context(ctx)
+        # The coordinator is only reachable from the running agent context.
+        # Binding it here (once, per tool call) is what lets a child's success
+        # stop its siblings without waiting for the root's next turn.
+        if context.get("coordinator") is not None:
+            _bind_coordinator(context["coordinator"])
+        _observe_lifecycle_claim(ctx, raw_input, source="agent_finish")
+        return await inner(ctx, raw_input)
+
+    tool.on_invoke_tool = invoke
+    tool._ctf_parallel_finish = True  # type: ignore[attr-defined]
+    return tool
+
+
+def _wrap_finish_scan(tool: Any) -> Any:
+    if getattr(tool, "_ctf_parallel_scan", False):
+        return tool
+    inner = tool.on_invoke_tool
+
+    async def invoke(ctx: Any, raw_input: str) -> Any:
+        context = _context(ctx)
+        if context.get("coordinator") is not None:
+            _bind_coordinator(context["coordinator"])
+        if _should_stop_children(raw_input):
+            await _stop_children(ctx)
+        return await inner(ctx, raw_input)
+
+    tool.on_invoke_tool = invoke
+    tool._ctf_parallel_scan = True  # type: ignore[attr-defined]
+    return tool
+
+
+def _observe_lifecycle_claim(ctx: Any, raw_input: str, *, source: str) -> None:
+    context = _context(ctx)
+    agent_id = str(context.get("agent_id") or "")
+    for flag in _flags(raw_input):
+        if _EVIDENCE is not None and not _EVIDENCE.supports(flag):
+            continue
+        if _SUCCESS is not None:
+            _SUCCESS.observe_answer(flag, source=source)
+        note_success(agent_id, flag)
+        return
+
+
+def _should_stop_children(raw_input: str) -> bool:
+    if _SUCCESS is not None and getattr(_SUCCESS, "solved", False):
+        return True
+    flags = _flags(raw_input)
+    if not flags:
+        return False
+    if _EVIDENCE is None:
+        return True
+    return any(_EVIDENCE.supports(flag) for flag in flags)
+
+
+async def _stop_children(ctx: Any) -> None:
+    global _RACE_STOPPED
+    coordinator = _context(ctx).get("coordinator") or _COORDINATOR
+    if coordinator is None:
+        return
+    root_id = _context(ctx).get("agent_id")
+    try:
+        active = await coordinator.active_agents_except(str(root_id or ""))
+        for info in active:
+            await coordinator.request_stop(info["agent_id"])
+        if active:
+            _RACE_STOPPED = True
+            logger.info("parallel: stopped %d child agent(s) before finish_scan", len(active))
+    except Exception:  # noqa: BLE001 - finish must still be attempted
+        logger.exception("parallel: stopping children before finish_scan failed")
+
+
+def _context(ctx: Any) -> dict[str, Any]:
+    value = getattr(ctx, "context", None)
+    return value if isinstance(value, dict) else {}
+
+
+def _bind_coordinator(coordinator: Any) -> None:
+    global _COORDINATOR, _ROOT_ID
+    _COORDINATOR = coordinator
+    if _ROOT_ID is None:
+        try:
+            _ROOT_ID = next(
+                (aid for aid, parent in coordinator.parent_of.items() if parent is None),
+                None,
+            )
+        except Exception:  # noqa: BLE001 - an unknown graph keeps the fallback
+            _ROOT_ID = None
+
+
+def _json(payload: dict[str, Any]) -> str:
+    return json.dumps(payload, ensure_ascii=False)
+
+
+def _flags(text: str) -> list[str]:
+    return [
+        match.group(0)
+        for match in _FLAG_RE.finditer(text or "")
+        if _PLACEHOLDER.match(match.group(0)) is None
+    ]
+
+
+def flags_in_text(text: str) -> list[str]:
+    """Public, placeholder-free flag scan used by the entrypoint's sink."""
+    return _flags(text)
+
+
+def _succeeded(result: Any) -> bool:
+    if isinstance(result, dict):
+        return bool(result.get("success"))
+    if isinstance(result, str):
+        try:
+            parsed = json.loads(result)
+        except (TypeError, ValueError):
+            return '"success": true' in result.lower()
+        return bool(parsed.get("success")) if isinstance(parsed, dict) else True
+    return True

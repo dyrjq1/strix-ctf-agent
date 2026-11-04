@@ -27,8 +27,29 @@ import sys
 import threading
 import time
 import traceback
+import urllib.error
+import urllib.parse
+import urllib.request
 from pathlib import Path
 from typing import Any
+
+from ctf_strix.success_stop import RecoveryExhausted
+from ctf_strix.success_stop import SolvedStop
+from ctf_strix.success_stop import SuccessLedger
+
+
+def _enable_local_cost_map() -> None:
+    """Keep LiteLLM from downloading its model-price table at import time.
+
+    LiteLLM fetches ``model_prices_and_context_window.json`` on first import
+    unless this flag is set; in a locked-down container that is a ~15s
+    connect/retry before the run even starts.  ``setdefault`` leaves an
+    operator-provided value alone.
+    """
+    os.environ.setdefault("LITELLM_LOCAL_MODEL_COST_MAP", "True")
+
+
+_enable_local_cost_map()
 
 #: 兜底 flag 形态（抽取器不可用时用）。与 ``flag_extract`` 的正则同源：
 #: CTFY 的 flag 可能是 ``FLAG{...}`` / ``ctfy{...}`` / ``flag{...}``。
@@ -51,6 +72,10 @@ _REPORT_EVERY = 8
 _CAPTURE_LIMIT = 400
 
 _TRUTHY = {"1", "true", "yes", "on"}
+
+#: Attachment list/download timeout. Short on purpose: the old no-target
+#: path is better than stalling on an unreachable platform.
+_ATTACHMENT_TIMEOUT = 20
 
 _FALLBACK_GOALS: dict[str, str] = {
     "web": (
@@ -486,6 +511,28 @@ def _extract_flag(blob: str, own_host: str | None = None) -> str | None:
         return found[0] if found else None
 
 
+def _extract_args_flags(raw: str) -> list[str]:
+    """Return flag-shaped strings from a lifecycle call's arguments.
+
+    A child cannot make a claim true by writing it: the value stays a guess in
+    ``arg_claims`` until an output from this run contains it.  This exists so
+    ``agent_finish`` gets the same provenance gate as ``finish_scan``.
+    """
+    from ctf_strix.parallel import flags_in_text
+
+    return flags_in_text(raw)
+
+
+def _parallel_flag(text: str, own_host: str) -> str | None:
+    """Extract a child's flag against the run's success rules.
+
+    ``flag_extract`` needs a host for its proximity rule; child tool output is
+    the same text the root receives, so the same extractor applies.  A child
+    on a host-less challenge (attachments) still uses its fallback.
+    """
+    return _extract_flag(text, own_host)
+
+
 def _write_result(path: Path, payload: dict[str, Any]) -> None:
     """原子写 result.json。
 
@@ -737,6 +784,275 @@ def _local_attachments(work: Path) -> list[dict[str, str]]:
     return out
 
 
+def _attachment_roots(work: Path) -> list[Path]:
+    """Directories that may already hold this challenge's attachments."""
+    return [work / "attachments", work / "files"]
+
+
+def _declared_attachment_names(task: dict[str, Any]) -> list[str]:
+    """File names task.json explicitly declares as attachments."""
+    out: list[str] = []
+    for value in (task.get("attachments"), task.get("files")):
+        if not isinstance(value, list):
+            continue
+        for item in value:
+            if isinstance(item, str):
+                name = item.strip()
+            elif isinstance(item, dict):
+                name = str(item.get("name") or item.get("filename") or "").strip()
+            else:
+                continue
+            if name and name not in out:
+                out.append(name)
+    return out
+
+
+def _has_local_attachments(task: dict[str, Any], work: Path) -> bool:
+    """True when this challenge's attachments are already on disk.
+
+    Only the attachment roots and names task.json declares count.  The platform
+    also drops ``README.md`` / ``mcp.json`` beside task.json; treating those as
+    attachments would skip the platform fetch and leave a file-only challenge
+    with nothing to analyse.
+    """
+    try:
+        declared = _declared_attachment_names(task)
+        if declared:
+            # Declared names are checkable, so a partial fetch is retried and a
+            # file the platform already placed at the work root is not fetched
+            # a second time (that would inject the same bytes twice).
+            return all(
+                _local_attachment_path(work, name) is not None for name in declared
+            )
+        for root in _attachment_roots(work):
+            if root.is_dir():
+                for candidate in root.rglob("*"):
+                    if candidate.is_file() and not candidate.name.startswith("."):
+                        return True
+    except OSError:
+        return False
+    return False
+
+
+def _local_attachment_path(work: Path, name: str) -> Path | None:
+    """Where ``name`` already sits locally, if anywhere.
+
+    Only bare file names are probed.  A ``../`` from a hostile task.json must not
+    make the fetch believe the file is present (or probe outside ``work``).
+    """
+    safe = _safe_attachment_name(name)
+    if safe is None:
+        return None
+    for base in (work, work / "attachments", work / "files"):
+        candidate = base / safe
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def _safe_attachment_name(raw: object) -> str | None:
+    """Return a bare file name, or None when the platform supplied a path."""
+    name = str(raw or "").strip()
+    if not name or name in {".", ".."}:
+        return None
+    if "/" in name or "\\" in name or ":" in name:
+        return None
+    if Path(name).name != name:
+        return None
+    return name
+
+
+def _fetch_platform_attachments(task: dict[str, Any], work: Path) -> list[Path]:
+    """Download this challenge's attachments from the player REST API.
+
+    The platform does not always drop attachment files into the working
+    directory, and ``task.json`` can declare ``"attachments": []`` even when
+    the challenge has them.  The API is authoritative:
+
+    - ``GET {platform}/api/v1/challenges/{challenge_id}/attachments``
+    - ``GET {platform}/api/v1/challenges/{challenge_id}/attachments/{name}``
+
+    Best effort: an unreachable platform, 403, malformed JSON or a timeout must
+    leave the caller on its previous path (usually ``no_target``) rather than
+    crash the run.  Files land in ``work/attachments/`` only after a successful
+    response, so a challenge without attachments keeps an unchanged directory.
+
+    Args:
+        task: Parsed task.json (``platform_url`` / ``challenge.id``).
+        work: Challenge working directory.
+
+    Returns:
+        Paths written by this call; empty when nothing was fetched.
+    """
+    try:
+        if _has_local_attachments(task, work):
+            return []
+
+        platform = _platform_url(task)
+        challenge_id = _challenge_id(task)
+        if not platform or not challenge_id:
+            return []
+
+        base = f"{platform}/api/v1/challenges/{challenge_id}/attachments"
+        headers = {"Accept": "application/json", "User-Agent": "ctfy-agent"}
+        token = _platform_token(task)
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+
+        # One budget for list + every download: a hanging platform must not cost
+        # the full timeout once per file.
+        deadline = time.monotonic() + _ATTACHMENT_TIMEOUT
+        try:
+            payload = _http_json(base, headers, timeout=_remaining(deadline))
+        except Exception as exc:  # noqa: BLE001 - fetching must never break a run
+            print(
+                f"[ctfy] attachment list unavailable: {type(exc).__name__}: {exc}",
+                flush=True,
+            )
+            return []
+
+        files = payload.get("files") if isinstance(payload, dict) else None
+        if not isinstance(files, list) or not files:
+            return []
+
+        target_dir = work / "attachments"
+        written: list[Path] = []
+        for item in files:
+            if not isinstance(item, dict):
+                continue
+            name = _safe_attachment_name(item.get("name"))
+            if name is None:
+                print(
+                    f"[ctfy] attachment skipped (unsafe name): {item.get('name')!r}",
+                    flush=True,
+                )
+                continue
+            if _local_attachment_path(work, name) is not None:
+                continue
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                print("[ctfy] attachment fetch budget spent; stopping", flush=True)
+                break
+            url = f"{base}/{urllib.parse.quote(name, safe='')}"
+            try:
+                blob = _http_bytes(url, headers, timeout=remaining)
+            except Exception as exc:  # noqa: BLE001 - one file must not stop the rest
+                print(
+                    f"[ctfy] attachment {name} unavailable: {type(exc).__name__}: {exc}",
+                    flush=True,
+                )
+                continue
+
+            try:
+                _write_bytes_atomic(target_dir / name, blob)
+            except OSError as exc:
+                print(
+                    f"[ctfy] attachment {name} not saved: {type(exc).__name__}: {exc}",
+                    flush=True,
+                )
+                continue
+            written.append(target_dir / name)
+
+        if written:
+            print(f"[ctfy] fetched {len(written)} attachment(s) from platform", flush=True)
+        return written
+    except Exception as exc:  # noqa: BLE001 - last-resort guard for the caller
+        print(f"[ctfy] attachment fetch failed: {type(exc).__name__}: {exc}", flush=True)
+        return []
+
+
+def _remaining(deadline: float) -> float:
+    """Positive seconds left in the fetch budget (never a negative timeout)."""
+    return max(deadline - time.monotonic(), 0.1)
+
+
+def _http_json(
+    url: str, headers: dict[str, str], timeout: float | None = None
+) -> Any:
+    """GET a JSON document; raises on any non-200 response."""
+    request = urllib.request.Request(url, headers=headers, method="GET")
+    status, body = _http_get(request, timeout or _ATTACHMENT_TIMEOUT)
+    if status != 200:
+        raise OSError(f"HTTP {status}")
+    return json.loads(body.decode("utf-8", "replace"))
+
+
+def _http_bytes(url: str, headers: dict[str, str], timeout: float | None = None) -> bytes:
+    """GET binary content; raises on any non-200 response."""
+    request = urllib.request.Request(url, headers=headers, method="GET")
+    status, body = _http_get(request, timeout or _ATTACHMENT_TIMEOUT)
+    if status != 200:
+        raise OSError(f"HTTP {status}")
+    return body
+
+
+def _http_get(request: urllib.request.Request, timeout: float) -> tuple[int, bytes]:
+    """Perform a GET and always close the response, including error bodies.
+
+    ``urlopen`` raises ``HTTPError`` for 4xx/5xx before a caller can use it as
+    a context manager, and the error object owns a socket.  Closing it here
+    keeps repeated failed fetches from leaking file descriptors.
+    """
+    response = None
+    try:
+        response = urllib.request.urlopen(request, timeout=timeout)
+        return getattr(response, "status", 200), response.read()
+    except urllib.error.HTTPError as exc:
+        try:
+            return exc.code, exc.read()
+        finally:
+            exc.close()
+    finally:
+        if response is not None:
+            response.close()
+
+
+def _write_bytes_atomic(path: Path, blob: bytes) -> None:
+    """Write bytes via a temp sibling plus ``os.replace`` (no half files)."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        tmp.write_bytes(blob)
+        os.replace(tmp, path)
+    finally:
+        try:
+            if tmp.exists():
+                tmp.unlink()
+        except OSError:
+            pass
+
+
+def _platform_url(task: dict[str, Any]) -> str:
+    """Platform root URL from the environment or task.json (no hardcoding)."""
+    raw = (
+        os.environ.get("CTFY_PLATFORM_URL")
+        or task.get("platform_url")
+        or task.get("platform")
+        or ""
+    )
+    return str(raw).strip().rstrip("/")
+
+
+def _challenge_id(task: dict[str, Any]) -> str:
+    """Challenge id from the environment or task.json."""
+    raw = (
+        os.environ.get("CTFY_EVAL_CHALLENGE_ID")
+        or task.get("challenge_id")
+        or (task.get("challenge") or {}).get("id")
+        or ""
+    )
+    return str(raw).strip()
+
+
+def _platform_token(task: dict[str, Any]) -> str:
+    """Bearer token the platform injected for player API calls."""
+    return (
+        os.environ.get("CTFY_TOKEN")
+        or os.environ.get("CTF_PLATFORM_TOKEN")
+        or str(task.get("token") or "")
+    ).strip()
+
+
 #: CTFY-0001 v3 的 ``schema_version``（规范版本号 == wire schema 版本）。
 #: ⚠️ 必须写进 result.json：`inspect_probe` 会因为缺它而报 `no_schema_version`
 #: （advisory，不 blocking，但白送的告警没有理由留着）。
@@ -782,14 +1098,11 @@ def main() -> int:
     # Ids whose value came from mirroring a sibling answer rather than from the
     # target. Kept here so a real answer found later can replace the guess.
     mirrored: set[str] = set()
-    kind = _challenge_kind(task, work)
     diag: dict[str, Any] = {}
-    # 附件只读一次：main 要用它判断"附件题是不是空的"，_run_agent 要把它注入
-    # sandbox。读两遍等于把同一批文件从磁盘搬两遍。
-    #
-    # ⚠️ **所有题型**都要收集，不只是 file：web 题也常带附件（SAMPLE-001 的
-    # admin slug 就写在 setup.txt 里），漏注入等于把题目的一半线索丢掉。
-    attachments = _local_attachments(work)
+    # 平台请求放在 try 里面：墙钟 ``WallclockExceeded`` 继承 BaseException，
+    # 在 try 外等待网络会让它直接逃出 main，连 result.json 都写不出来。
+    kind = "web"
+    attachments: list[dict[str, str]] = []
     publisher = None
 
     try:
@@ -801,6 +1114,17 @@ def main() -> int:
             stop_reason = "dry_run"
             error = None
         else:
+            # 平台不一定把附件投进工作目录，task.json 的 ``attachments`` 也可能是
+            # 空数组。先按题从选手 API 拉一遍，让 kind 判定能看到附件；失败只是
+            # warning，维持原来的 no_target 路径。
+            _fetch_platform_attachments(task, work)
+            kind = _challenge_kind(task, work)
+            # 附件只读一次：main 要用它判断"附件题是不是空的"，_run_agent 要把它
+            # 注入 sandbox。读两遍等于把同一批文件从磁盘搬两遍。
+            #
+            # ⚠️ **所有题型**都要收集，不只是 file：web 题也常带附件（SAMPLE-001
+            # 的 admin slug 就写在 setup.txt 里），漏注入等于把题目的一半线索丢掉。
+            attachments = _local_attachments(work)
             specs = _target_specs(task)
             scope = _raw_scope(task)
             if not specs and not (kind == "engagement" and scope) and kind != "file":
@@ -838,12 +1162,34 @@ def main() -> int:
                     qids=all_qids,
                     derived=mirrored,
                 )
+                if (
+                    stop_reason == "completed"
+                    and (diag.get("success") or {}).get("solved")
+                ):
+                    # Same spelling as the exception path, so downstream
+                    # analysis can count solves without knowing which route
+                    # ended the run.
+                    stop_reason = "solved"
                 if diag.pop("no_attempt_ran", False):
                     # 每个 attempt 都抛异常：这不是"跑了没解出"，是"根本没跑"。
                     # 两者在成功率统计里必须分开，否则根因分析全被污染。
                     error = error or "所有 attempt 都未能启动运行时"
                     stop_reason = "error"
 
+    except SolvedStop as exc:
+        # Confirmed success: nothing more to extract, and restarting the run
+        # would only risk losing the answer.  Keep any answers already found
+        # and write a distinct stop_reason so success is not read as "error".
+        error = None
+        stop_reason = "solved"
+        print(f"[ctfy] solved, stopping: {exc}", flush=True)
+    except RecoveryExhausted as exc:
+        # The runner kept ending turns without a lifecycle call.  This is a
+        # failed solve, but it is not a crash: the process is still healthy
+        # and result.json must say so.
+        error = str(exc)
+        stop_reason = "recovery_exhausted"
+        print(f"[ctfy] {exc}", flush=True)
     except WallclockExceeded as exc:
         # 墙钟到点不是崩溃：已抽到的答案照常进 result.json，归档口径
         # 用 stop_reason 区分开，避免污染"error"的根因分析。
@@ -882,6 +1228,12 @@ def main() -> int:
             "stop_reason": stop_reason,
             "writeup": _writeup(task, answers, error, time.time() - started, diag),
         }
+        parallel_diag = diag.get("parallel") if isinstance(diag, dict) else None
+        if parallel_diag:
+            # Keep the race accounting next to the top-level turns/token totals
+            # so an A/B can tell a parallel run from a single-threaded one
+            # without parsing the human-readable writeup.
+            payload["parallel"] = parallel_diag
         try:
             _write_result(result_path, payload)
             print(f"[ctfy] result written to {result_path}")
@@ -931,6 +1283,22 @@ def _make_publisher(task: dict[str, Any]) -> Any:
     )
 
 
+def _new_coordinator() -> Any:
+    """Create the coordinator that owns one attempt's agent graph.
+
+    The parallel guard needs the same object the vendored runner registers
+    children in.  Returning ``None`` falls back to the runner creating one;
+    the guard then cannot observe the graph until a tool call binds it, which
+    is still safe but loses the ability to stop children from an event.
+    """
+    try:
+        from strix.core.agents import AgentCoordinator
+
+        return AgentCoordinator()
+    except Exception:  # noqa: BLE001 - parallelism must not gate the run
+        return None
+
+
 def _usage_snapshot() -> dict[str, int]:
     """读 token 计量；没装计量器时返回 0（不编数字）。"""
     try:
@@ -938,11 +1306,12 @@ def _usage_snapshot() -> dict[str, int]:
 
         snap = snapshot()
         return {
+            "llm_calls": int(snap.get("llm_calls", 0)),
             "input_tokens": int(snap.get("input_tokens", 0)),
             "output_tokens": int(snap.get("output_tokens", 0)),
         }
     except Exception:  # noqa: BLE001 — 计量失败不能影响结果文件
-        return {"input_tokens": 0, "output_tokens": 0}
+        return {"llm_calls": 0, "input_tokens": 0, "output_tokens": 0}
 
 
 def _writeup(
@@ -968,6 +1337,9 @@ def _writeup(
         # Visible after the fact: a dropped claim is a modelling problem worth
         # reading, not noise to swallow.
         lines.append(f"evidence: {json.dumps(evidence, ensure_ascii=False)}")
+    parallel = (diag or {}).get("parallel")
+    if parallel:
+        lines.append(f"parallel: {json.dumps(parallel, ensure_ascii=False)}")
     if (diag or {}).get("guard_mount") == "failed":
         # Missing guards are not "nothing fired today": the wiring is broken and
         # every later conclusion about guard behaviour is void. Log loudly.
@@ -1314,6 +1686,10 @@ def _run_agent(
     # 本函数末尾要返回的诊断字典（与 `main` 里的 `diag` 同名但不同作用域）。
     # 守卫接线失败就写进这里，随 `out.update(diag)` 进 result.json。
     diag: dict[str, Any] = {}
+    # Structured proof that this run solved the challenge.  Everything that
+    # may stop the run early reports through this ledger; nothing here reads
+    # page text or model prose.
+    success = SuccessLedger()
 
     # ⚠️ 挂载钩子必须最先装。三个守卫都是替换 factory._with_bounded_result 来
     # 挂 on_invoke_tool 的，但 exec_command / write_stdin 走 Shell capability 的
@@ -1325,6 +1701,17 @@ def _run_agent(
     from ctf_strix.guard_mount import install_mount_hook
 
     install_mount_hook()
+
+    # Parallel hypothesis racing is opt-in.  The hook wraps create_agent /
+    # agent_finish / finish_scan on the same mount seam as the other guards, so
+    # it covers the shell and filesystem paths a child agent also uses.
+    parallel_on = False
+    try:
+        from ctf_strix import parallel
+
+        parallel_on = parallel.enabled() and parallel.install()
+    except Exception as exc:  # noqa: BLE001 -- parallelism must not gate the run
+        print(f"[ctfy] parallel guard failed: {type(exc).__name__}: {exc}", flush=True)
 
     # 两个守卫都装在正赛入口上。评测脚本装过、入口没装，等于只测了个空壳。
     from ctf_strix.enum_guard import install as install_enum_guard
@@ -1350,7 +1737,14 @@ def _run_agent(
     # checker 题也没有 flag——这两类必须让路，否则会误拦每一次正常收工。
     from ctf_strix.finish_guard import install as install_finish_guard
 
-    install_finish_guard(require_flag=kind not in {"engagement", "checker"})
+    install_finish_guard(
+        require_flag=kind not in {"engagement", "checker"},
+        success=success,
+    )
+
+    if parallel_on:
+        # The configured state is per run; the guard itself is process-wide.
+        parallel.reset_run()
 
     # 边跑边交。``answers`` 是收工时一次性交给平台的，而协议 §3 明说：跑完
     # 才交就拿不到即时判定，gated 题也永远解锁不了。评测入口
@@ -1359,8 +1753,9 @@ def _run_agent(
     # 装配结果同时写进 diag，并做成测试钉住。
     #
     # engagement 的交付物是报告，checker 没有 flag，两类都不许挂。
+    submitted_to = _autosubmit_target(task)
+    submitter: Any = None
     if kind not in {"engagement", "checker"}:
-        submitted_to = _autosubmit_target(task)
         if submitted_to is None:
             print("[ctfy] autosubmit off (no platform/instance/token)", flush=True)
             diag["autosubmit"] = "off"
@@ -1368,7 +1763,7 @@ def _run_agent(
             try:
                 from ctf_strix.autosubmit import install as install_autosubmit
 
-                install_autosubmit(*submitted_to)
+                submitter = install_autosubmit(*submitted_to, success=success)
                 print(f"[ctfy] autosubmit on (instance {submitted_to[1][:8]}...)", flush=True)
                 diag["autosubmit"] = "on"
             except Exception as exc:  # noqa: BLE001 -- 提交失败不能阻止跑题
@@ -1377,6 +1772,59 @@ def _run_agent(
                     flush=True,
                 )
                 diag["autosubmit"] = "failed"
+    elif submitted_to is not None:
+        # Checker-only challenges have no flag to submit, but the sidecar
+        # checker is still a direct, structured success signal.  A bare
+        # submitter gives the recovery guard that one probe.
+        try:
+            from ctf_strix.autosubmit import AutoSubmitter
+
+            submitter = AutoSubmitter(*submitted_to, success=success)
+            diag["checker_probe"] = "armed"
+        except Exception as exc:  # noqa: BLE001 -- probing is an optimisation, not a requirement
+            print(f"[ctfy] checker probe unavailable: {type(exc).__name__}: {exc}", flush=True)
+            diag["checker_probe"] = "failed"
+
+    # Mixed flag+checker challenges need both paths: flag questions go through
+    # finish_scan/autosubmit, checker questions only ever answer /check.  The
+    # submitter above is created either way so the recovery probe exists.
+    if kind not in {"engagement", "checker"} and submitted_to is not None and submitter is not None:
+        has_checker = any(
+            str(q.get("mode") or "").strip().lower() == "checker"
+            for q in (task.get("questions") or [])
+            if isinstance(q, dict)
+        )
+        if has_checker:
+            diag["checker_probe"] = "armed"
+
+    # The runner restarts an autonomous run that ends without a lifecycle call,
+    # once per remaining turn.  Bound that at the runner's own interactive
+    # limit, and use the first nudge to ask our checker whether the answer was
+    # already scored.  A direct "yes" stops the run before any restart.
+    from ctf_strix.success_stop import RECOVERY_LIMIT, install_recovery_guard
+
+    checker_probe = None
+    has_checker = any(
+        str(q.get("mode") or "").strip().lower() == "checker"
+        for q in (task.get("questions") or [])
+        if isinstance(q, dict)
+    )
+    if has_checker and submitter is not None:
+        async def checker_probe() -> bool:  # type: ignore[no-redef]
+            import asyncio
+
+            return await asyncio.to_thread(submitter.probe_checkers)
+
+    try:
+        install_recovery_guard(
+            limit=RECOVERY_LIMIT,
+            checker=checker_probe,
+            ledger=success,
+        )
+        diag["recovery_guard"] = "on"
+    except Exception as exc:  # noqa: BLE001 -- the wallclock still bounds the run
+        print(f"[ctfy] recovery guard failed: {type(exc).__name__}: {exc}", flush=True)
+        diag["recovery_guard"] = "failed"
 
     # 装完立刻验证接线。正赛里没有第二次机会，接线失败必须当场知道。
     from ctf_strix.guard_mount import verify_mount
@@ -1463,6 +1911,13 @@ def _run_agent(
     own_host = _host_of(_targets_from(task)[0]) if _targets_from(task) else ""
     save_threads: list[threading.Thread] = []
 
+    if parallel_on:
+        # The per-attempt coordinator is bound inside the attempt loop.  At
+        # this point only the ledgers exist; the coordinator that owns the
+        # agent graph is created together with the scan.
+        parallel.configure(success=success, evidence=ledger)
+        diag["parallel"] = parallel.stats()
+
     def _report_text() -> str:
         """当前进展的报告正文：agent 自己写过就用它，否则由活动记录拼。"""
         assert publisher is not None
@@ -1513,11 +1968,36 @@ def _run_agent(
     def sink(agent_id: str, event: object) -> None:
         nonlocal tool_outputs, root_tool_calls, root_agent
         if root_agent is None:
-            root_agent = agent_id
+            # Prefer the coordinator graph: on a resumed run the runner
+            # respawns children before the root emits its first event, so
+            # "first id seen" would mislabel a child as the root.
+            root_agent = (parallel.root_id() if parallel_on else None) or agent_id
+        # A structured success seen on the previous event means there is
+        # nothing left to learn from this run.  Raise here, before the runner
+        # can treat the next prose-only turn as an unfinished one and restart
+        # the session.
+        # Compare against the root id resolved above.  ``is_root`` returns
+        # True when the graph is unknown, which is correct for a single agent
+        # but would let a child raise SolvedStop in its detached task.
+        if success.solved and (not parallel_on or agent_id == root_agent):
+            raise SolvedStop(f"solved via {success.source}: {success.detail}")
         item = getattr(event, "item", None)
         item_type = getattr(item, "type", None)
 
         if item_type == "tool_call_item":
+            # Child agents may hand the root a finished answer through
+            # ``agent_finish``.  The text is prose, so it cannot be trusted as
+            # evidence by itself; the claim is recorded only when the same
+            # string appears in a tool output (which the parallel wrapper did
+            # when the child called that tool, or this output later does).
+            if parallel_on:
+                raw = getattr(item, "raw_item", None)
+                name = str(getattr(raw, "name", "?") or "?")
+                if name == "agent_finish":
+                    args_full = str(getattr(raw, "arguments", "") or "")
+                    for claim in _extract_args_flags(args_full):
+                        if claim not in arg_claims:
+                            arg_claims.append(claim)
             if agent_id == root_agent:
                 root_tool_calls += 1
                 raw = getattr(item, "raw_item", None)
@@ -1544,7 +2024,7 @@ def _run_agent(
                     pending_calls[call_id] = (name, args)
                 else:
                     pending_seq.append((name, args))
-            if engagement:
+            if engagement and agent_id == root_agent:
                 activity.append(f"`{name}` {args}")
                 if len(activity) > _CAPTURE_LIMIT:
                     del activity[:100]
@@ -1602,13 +2082,25 @@ def _run_agent(
                         f"[ctfy] flag captured from tool args: {claim}",
                         flush=True,
                     )
+                    success.observe_answer(claim, source="flag_extract")
                     break
 
         # ⚠️ 必须逐条输出单独判定，不能等最后拼起来一起判。拼接后
         # 本题靶机与别题 flag 的距离信息会被淹没，证据判定退化成瞎猜。
         flag = _extract_flag(text, own_host)
+        if parallel_on and agent_id != root_agent:
+            # A child's retrieved flag is a race win even when the root has not
+            # seen this output yet.  Record the answer here as well: the root
+            # may be interrupted before its own sink processes the output, and
+            # ``result.json`` is written from this map.
+            child_flag = flag or _parallel_flag(text, own_host)
+            if child_flag:
+                if _record_answer(answers, all_qids, child_flag, qid, derived=mirrors):
+                    print(f"[ctfy] flag captured by sub-agent: {child_flag}", flush=True)
+                parallel.note_success(agent_id, child_flag, root_id=root_agent)
         if flag and _record_answer(answers, all_qids, flag, qid, derived=mirrors):
             print(f"[ctfy] flag captured: {flag}", flush=True)
+            success.observe_answer(flag, source="flag_extract")
 
     scope_note = _scope_note(task)
     parts = [goal, scope_note]
@@ -1669,6 +2161,7 @@ def _run_agent(
 
     result: Any = None
     turns_total = 0
+    usage_before = _usage_snapshot()
     # 有多少个 attempt 真的跑起来了（run_strix_scan 正常返回）。
     # 全部失败时上层必须把 stop_reason 从 "completed" 改成 "error"。
     runs_ok = 0
@@ -1730,10 +2223,23 @@ def _run_agent(
                 f"[ctfy] attempt {index + 1}/{len(budgets)} turns={budget}",
                 flush=True,
             )
+            attempt_coordinator = None
+            if parallel_on:
+                # `run_strix_scan` creates an AgentCoordinator when none is
+                # supplied.  Supplying our own is what lets the race guard act
+                # on the live graph: a coordinator left over from the previous
+                # attempt is closed, and a race stop against it would silently
+                # address nothing.  The two-child ceiling stays run-wide, so
+                # only the graph binding is replaced here.
+                attempt_coordinator = _new_coordinator()
+                # Bind even when creation failed: ``None`` clears the previous
+                # attempt's closed graph instead of leaving a stale root id.
+                parallel.bind_attempt(attempt_coordinator)
             try:
                 result = await run_strix_scan(
                     scan_config=config,
                     scan_id=scan_id,
+                    coordinator=attempt_coordinator,
                     image="unused-local",
                     local_sources=[],
                     extra_files=(attachment_files or None) if index == 0 else None,
@@ -1751,7 +2257,27 @@ def _run_agent(
             used = _requests_of(result)
             turns_total += used if used > 0 else max(root_tool_calls - calls_before, 0)
 
-    asyncio.run(_go())
+    try:
+        asyncio.run(_go())
+    except SolvedStop:
+        # A solve recorded by finish_guard/autosubmit can arrive before the
+        # answer was copied into ``answers`` (the guard sees it in the tool
+        # arguments).  Settle it here while the ledger is still in scope, so
+        # the result file never says "solved" with an empty answer map.
+        if not engagement and success.answer and _record_answer(
+            answers, all_qids, success.answer, qid, derived=mirrors
+        ):
+            print(f"[ctfy] flag captured at stop: {success.answer}", flush=True)
+        raise
+    except RecoveryExhausted:
+        raise
+    finally:
+        # The runner may leave the guard installed for the next attempt in this
+        # process; leaving a checker bound to a dead submitter would keep
+        # probing a torn-down instance.
+        from ctf_strix.success_stop import uninstall_recovery_guard
+
+        uninstall_recovery_guard()
 
     # ``finish_scan`` is usually the last call, so no further tool output will
     # arrive to promote a claim recorded in its arguments.  Settle here as well,
@@ -1769,6 +2295,7 @@ def _run_agent(
                     f"[ctfy] flag captured from tool args: {claim}",
                     flush=True,
                 )
+                success.observe_answer(claim, source="flag_extract")
                 break
 
     # 兜底：sink 里若因竞态没抓住，这里逐条重扫一遍。
@@ -1779,6 +2306,7 @@ def _run_agent(
             flag = _extract_flag(text, own_host)
             if flag and _record_answer(answers, all_qids, flag, qid, derived=mirrors):
                 print(f"[ctfy] flag captured on rescan: {flag}", flush=True)
+                success.observe_answer(flag, source="flag_extract")
                 break
 
     # A flag the model wrote but never read is a guess.  Keep it visible in the
@@ -1805,7 +2333,21 @@ def _run_agent(
         out["report"] = publisher.snapshot()
     if ledger.observed or ledger.unsupported:
         out["evidence"] = ledger.summary()
+    # A checker-only solve has no flag to add, but the verdict still belongs
+    # in the diagnostics.
+    out["success"] = success.snapshot()
     out.update(diag)
+    if parallel_on:
+        # Tokens are process-wide already; turns are root-only in the vendor
+        # result, so publish both halves explicitly instead of silently
+        # under-counting a parallel run.
+        usage = parallel.usage_summary(
+            root_turns=turns,
+            before=usage_before,
+            after=_usage_snapshot(),
+        )
+        out["parallel"] = {**parallel.stats(), "usage": usage}
+        turns = usage["turns"]
     if attempts > 0 and runs_ok == 0 and not answers:
         # 一次都没跑起来，而且也没拿到答案。上层据此把 stop_reason 写成
         # "error"，否则"运行时压根没启动"会以 turns=0 + stop_reason=completed
