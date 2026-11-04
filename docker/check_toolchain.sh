@@ -6,15 +6,17 @@
 set -euo pipefail
 
 LOCK="${1:-/app/requirements.lock}"
-CLOSURE="${2:-/app/docker/a_tier_closure.txt}"
+A_CLOSURE="${2:-/app/docker/a_tier_closure.txt}"
+B_CLOSURE="${3:-/app/docker/b_tier_closure.txt}"
 
 echo "[toolchain] checking lock and closure"
-python3 - "$LOCK" "$CLOSURE" <<'PY'
+python3 - "$LOCK" "$A_CLOSURE" "$B_CLOSURE" <<'PY'
 import re
 import sys
 from pathlib import Path
 
-lock_path, closure_path = Path(sys.argv[1]), Path(sys.argv[2])
+lock_path = Path(sys.argv[1])
+closure_paths = [Path(arg) for arg in sys.argv[2:]]
 text = lock_path.read_text(encoding="ascii")
 if "\r" in text or not text.endswith("\n"):
     sys.exit(f"{lock_path}: must stay LF-terminated without CR")
@@ -29,13 +31,20 @@ for line in text.splitlines():
         sys.exit(f"{lock_path}: duplicate {name}")
     pins[name] = version
 
-closure = []
-for raw in closure_path.read_text(encoding="ascii").splitlines():
-    line = raw.strip()
-    if not line or line.startswith("#"):
-        continue
-    name, version = line.split("==", 1)
-    closure.append((name, version))
+closure: list[tuple[str, str]] = []
+seen: dict[str, str] = {}
+for closure_path in closure_paths:
+    for raw in closure_path.read_text(encoding="ascii").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        name, version = line.split("==", 1)
+        if name in seen:
+            if seen[name] != version:
+                sys.exit(f"{closure_path}: {name} conflicts across manifests")
+            continue
+        seen[name] = version
+        closure.append((name, version))
 
 problems = []
 for name, version in closure:
@@ -44,8 +53,8 @@ for name, version in closure:
     elif pins[name] != version:
         problems.append(f"version drift: {name} lock={pins[name]} closure={version}")
 if problems:
-    sys.exit("A-tier closure incomplete:\n  " + "\n  ".join(problems))
-print(f"[toolchain] lock: {len(pins)} pins; A-tier closure: {len(closure)} pins")
+    sys.exit("toolchain closure incomplete:\n  " + "\n  ".join(problems))
+print(f"[toolchain] lock: {len(pins)} pins; closure: {len(closure)} pins")
 PY
 
 echo "[toolchain] checking metadata (pip check)"
@@ -53,17 +62,17 @@ echo "[toolchain] checking metadata (pip check)"
 #
 # 只把 A 档闭包范围内的抱怨当致命错误：base image 自带的包如果有历史遗留的
 # 元数据问题，与本改动无关，不该让镜像构建红掉；而闭包里的包缺依赖必须红。
-python3 - "$CLOSURE" <<'PY'
+python3 - "$A_CLOSURE" "$B_CLOSURE" <<'PY'
 import re
 import subprocess
 import sys
 
-closure_path = sys.argv[1]
 closure = set()
-for raw in open(closure_path, encoding="ascii"):
-    line = raw.strip()
-    if line and not line.startswith("#"):
-        closure.add(re.sub(r"[-_.]+", "-", line.split("==", 1)[0]).lower())
+for closure_path in sys.argv[1:]:
+    for raw in open(closure_path, encoding="ascii"):
+        line = raw.strip()
+        if line and not line.startswith("#"):
+            closure.add(re.sub(r"[-_.]+", "-", line.split("==", 1)[0]).lower())
 
 proc = subprocess.run(
     [sys.executable, "-m", "pip", "check"], capture_output=True, text=True
@@ -80,8 +89,8 @@ for line in out.splitlines():
     if requirer in closure:
         fatal.append(line)
 if fatal:
-    sys.exit("A-tier dependency closure broken:\n  " + "\n  ".join(fatal))
-print("[toolchain] pip check: no A-tier closure gaps")
+    sys.exit("dependency closure broken:\n  " + "\n  ".join(fatal))
+print("[toolchain] pip check: no closure gaps")
 PY
 
 echo "[toolchain] importing and exercising the A-tier namespaces"
@@ -134,6 +143,78 @@ print("[toolchain] imports: Crypto=%s Cryptodome=%s z3=%s PIL=%s pwn=%s" % (
     Crypto.__version__, Cryptodome.__version__, z3.get_version_string(),
     PIL.__version__, pwn.version,
 ))
+PY
+
+echo "[toolchain] importing and exercising the B-tier namespaces"
+python3 - <<'PY'
+import importlib
+import importlib.util
+import io
+import struct
+import sys
+
+MODULES = ("numpy", "sympy", "gmpy2", "scipy", "matplotlib", "pefile",
+           "yara", "segno", "dnslib")
+missing = [name for name in MODULES if importlib.util.find_spec(name) is None]
+if missing:
+    sys.exit("missing namespaces: " + ", ".join(missing))
+
+import numpy as np
+import scipy
+import sympy
+import gmpy2
+import pefile
+import segno
+import yara
+from dnslib import DNSRecord
+from scipy import fft
+
+assert (np.array([[1, 2], [3, 4]]) @ np.array([[1, 0], [0, 1]])).tolist() == [[1, 2], [3, 4]]
+
+x = sympy.Symbol("x")
+assert sorted(sympy.solve(sympy.Eq(x**2, 4), x), key=str) == [-2, 2]
+
+assert gmpy2.powmod(2, 100, 1000003) == pow(2, 100, 1000003)
+
+spectrum = fft.fft([1.0, 0.0, 0.0, 0.0])
+assert abs(spectrum[0]) > 0.99
+
+import matplotlib
+matplotlib.use("Agg")
+from matplotlib.figure import Figure
+
+figure = Figure()
+axes = figure.subplots()
+axes.plot([0, 1], [0, 1])
+buffer = io.BytesIO()
+figure.savefig(buffer, format="png")
+assert buffer.getvalue()[:8] == b"\x89PNG\r\n\x1a\n"
+
+dos = bytearray(0x40)
+dos[0:2] = b"MZ"
+struct.pack_into("<I", dos, 0x3C, 0x40)
+coff = struct.pack("<HHIIIHH", 0x8664, 0, 0, 0, 0, 0xF0, 0x22)
+optional = bytearray(0xF0)
+struct.pack_into("<H", optional, 0, 0x20B)
+pe = pefile.PE(data=bytes(dos) + b"PE\0\0" + coff + bytes(optional), fast_load=True)
+assert pe.FILE_HEADER.Machine == 0x8664
+
+rule = yara.compile(source='rule t { strings: $a = "flag" condition: $a }')
+assert len(rule.match(data=b"xxflagxx")) == 1
+
+query = DNSRecord.question("example.com")
+assert str(DNSRecord.parse(query.pack()).q.qname) == "example.com."
+
+qr = io.BytesIO()
+segno.make("ctf").save(qr, kind="png")
+assert qr.getvalue()[:8] == b"\x89PNG\r\n\x1a\n"
+
+print("[toolchain] imports: numpy=%s sympy=%s gmpy2=%s scipy=%s matplotlib=%s "
+      "pefile=%s yara=%s segno=%s dnslib=ok" % (
+          np.__version__, sympy.__version__, gmpy2.version(),
+          scipy.__version__, matplotlib.__version__, pefile.__version__,
+          yara.__version__, segno.__version__,
+      ))
 PY
 
 echo "[toolchain] OK"

@@ -29,6 +29,34 @@ A_TIER_ROOTS = {
     "pwntools": "4.15.0",
 }
 
+#: B-tier roots added for crypto big-int math, audio/spectrograms, stego arrays
+#: and forensic file parsing.  angr/fpylll are deliberately excluded.
+B_TIER_ROOTS = {
+    "numpy": "2.2.6",
+    "sympy": "1.14.0",
+    "gmpy2": "2.3.2",
+    "scipy": "1.16.3",
+    "matplotlib": "3.11.2",
+    "pefile": "2024.8.26",
+    "yara-python": "4.5.4",
+    "segno": "1.6.6",
+    "dnslib": "0.9.26",
+}
+
+#: New transitive deps pulled in by the B-tier roots.  ``packaging``,
+#: ``pillow`` and ``python-dateutil`` already live in the A-tier manifest, so
+#: the build-time check merges both manifests.
+B_TIER_CLOSURE = frozenset(
+    {
+        "mpmath",
+        "contourpy",
+        "cycler",
+        "fonttools",
+        "kiwisolver",
+        "pyparsing",
+    }
+)
+
 #: pwntools 4.15.0 的完整传递闭包（含条件依赖）。
 #: ``pip download -r`` 实测 39 个 wheel（含 pwntools 自身）；
 #: 其中 15 个是 lock 原有的重叠项。``pip`` 是 base image 自带的安装器，
@@ -79,6 +107,21 @@ _MODULE_PINS = {
     "PIL": "pillow",
     "pwn": "pwntools",
     "z3": "z3-solver",
+    "numpy": "numpy",
+    "sympy": "sympy",
+    "gmpy2": "gmpy2",
+    "scipy": "scipy",
+    "matplotlib": "matplotlib",
+    "pefile": "pefile",
+    "yara": "yara-python",
+    "segno": "segno",
+    "dnslib": "dnslib",
+    "requests": "requests",
+    "capstone": "capstone",
+    "unicorn": "unicorn",
+    "paramiko": "paramiko",
+    "rpyc": "rpyc",
+    "plumbum": "plumbum",
 }
 
 #: ``from PIL import Image`` yields ``PIL`` then ``Image``; only the root
@@ -116,6 +159,26 @@ def test_pwntools_transitive_closure_is_fully_pinned() -> None:
     assert not missing, "pwntools closure missing from lock: " + ", ".join(missing)
 
 
+def test_lock_pins_the_b_tier_roots() -> None:
+    pins = _pins()
+    for name, version in B_TIER_ROOTS.items():
+        assert pins.get(name) == version, f"{name} is not pinned at {version}"
+
+
+def test_b_tier_transitive_closure_is_fully_pinned() -> None:
+    """``--no-deps`` also means every B-tier transitive pin must be present."""
+    pins = _pins()
+    missing = sorted(name for name in B_TIER_CLOSURE if name not in pins)
+    assert not missing, "B-tier closure missing from lock: " + ", ".join(missing)
+
+
+def test_b_tier_roots_do_not_drag_excluded_heavyweights() -> None:
+    """angr/fpylll were an explicit decision; a pin sneaking in is a regression."""
+    pins = _pins()
+    for name in ("angr", "fpylll"):
+        assert name not in pins, f"{name} was excluded from this batch by decision"
+
+
 def test_lock_is_sorted_unique_and_only_exact_pins() -> None:
     text = LOCK.read_text(encoding="ascii")
     assert "\r" not in text, "lock must keep its original LF line endings"
@@ -134,36 +197,50 @@ def test_dockerfile_runs_the_toolchain_check_after_installing() -> None:
     assert "pip install --no-deps -r /app/requirements.lock" in dockerfile
     assert "COPY docker/check_toolchain.sh /app/docker/check_toolchain.sh" in dockerfile
     assert "COPY docker/a_tier_closure.txt /app/docker/a_tier_closure.txt" in dockerfile
+    assert "COPY docker/b_tier_closure.txt /app/docker/b_tier_closure.txt" in dockerfile
     assert "bash /app/docker/check_toolchain.sh" in dockerfile
 
     install = dockerfile.index("pip install --no-deps -r /app/requirements.lock")
     check = dockerfile.index("bash /app/docker/check_toolchain.sh")
     assert check > install, "toolchain check must run after the install"
+    copy_b = dockerfile.index("COPY docker/b_tier_closure.txt")
+    assert copy_b < check, "the B-tier manifest must be in the image before the check"
 
 
 def test_docker_check_script_checks_metadata_and_imports() -> None:
     script = (ROOT / "docker" / "check_toolchain.sh").read_text(encoding="utf-8")
     assert "pip check" in script
-    match = re.search(r"MODULES = \(([^)]*)\)", script)
-    assert match, "check_toolchain.sh no longer lists the namespaces it smoke-tests"
-    listed = set(re.findall(r'"([^"]+)"', match.group(1)))
+    matches = re.findall(r"MODULES = \(([^)]*)\)", script)
+    assert len(matches) == 2, "expected an A-tier and a B-tier module list"
+    listed = set()
+    for group in matches:
+        listed |= set(re.findall(r'"([^"]+)"', group))
     for module in ("Crypto", "Cryptodome", "z3", "PIL", "pwn"):
         assert module in listed, f"check_toolchain.sh does not smoke-test {module}"
+    for module in B_TIER_ROOTS:
+        namespace = {"yara-python": "yara", "matplotlib": "matplotlib"}.get(module, module)
+        assert namespace in listed, f"check_toolchain.sh does not smoke-test {namespace}"
     assert "missing namespaces" in script, "no negative branch: a missing module would be silent"
+    assert "b_tier_closure.txt" in script, "B-tier manifest is never checked"
 
 
 def test_closure_manifest_matches_the_lock() -> None:
     """构建期核对用的闭包清单必须与 lock 完全一致，否则检查会失效或误报。"""
     pins = _pins()
-    lines = [
-        line for line in (ROOT / "docker" / "a_tier_closure.txt")
-        .read_text(encoding="ascii").splitlines()
-        if line.strip() and not line.startswith("#")
-    ]
-    assert len(lines) == len(PWNTOOLS_CLOSURE) + len(A_TIER_ROOTS)
-    for line in lines:
-        name, version = line.split("==", 1)
-        assert pins.get(name) == version, f"closure manifest drifted for {name}"
+    manifests = {
+        "a_tier_closure.txt": len(PWNTOOLS_CLOSURE) + len(A_TIER_ROOTS),
+        "b_tier_closure.txt": len(B_TIER_CLOSURE) + len(B_TIER_ROOTS),
+    }
+    for filename, expected in manifests.items():
+        lines = [
+            line for line in (ROOT / "docker" / filename)
+            .read_text(encoding="ascii").splitlines()
+            if line.strip() and not line.startswith("#")
+        ]
+        assert len(lines) == expected, f"{filename} pin count drifted"
+        for line in lines:
+            name, version = line.split("==", 1)
+            assert pins.get(name) == version, f"{filename} drifted for {name}"
 
 
 def test_dockerfile_has_no_comment_inside_a_continued_run() -> None:
@@ -262,3 +339,71 @@ def test_image_families_offer_the_locked_image_library() -> None:
     assert "pillow" in _pins()
     for family in ("png", "jpeg"):
         assert "PIL" in ft._NEXT[family], f"{family} hint never mentions Pillow"
+
+
+def test_skill_packs_do_not_tell_the_model_to_pip_install() -> None:
+    """No internet: a ``pip install`` line is a guaranteed wasted turn.
+
+    The skill body may still explain that installing fails; what it must not do
+    is present an install command as the prerequisite.
+
+    Both files matter: ``SKILL.md`` is the upstream document, but
+    ``skillpack.index_skills()`` registers ``<category>/<category>.md``, and
+    that is what the model actually reads.
+    """
+    offenders = []
+    pack = ROOT / "src" / "ctf_strix" / "skills_strix"
+    paths = sorted(pack.glob("*/SKILL.md")) + sorted(
+        p for p in pack.glob("*/*.md") if p.name == p.parent.name + ".md"
+    )
+    for path in paths:
+        for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+            if "pip install" in line:
+                offenders.append(f"{path.parent.name}/{path.name}:{number}: {line.strip()}")
+    assert not offenders, "skills still require pip:\n" + "\n".join(offenders)
+
+
+def test_prompt_environment_lists_what_the_image_really_has() -> None:
+    """The Environment block must match the lock, not the upstream wish list."""
+    from ctf_strix import prompt as prompt_mod
+
+    text = prompt_mod._CORE
+    pins = _pins()
+    expected = {
+        "numpy": "numpy",
+        "sympy": "sympy",
+        "gmpy2": "gmpy2",
+        "scipy": "scipy",
+        "matplotlib": "matplotlib",
+        "pefile": "pefile",
+        "yara": "yara-python",
+        "segno": "segno",
+        "dnslib": "dnslib",
+        "Crypto": "pycryptodome",
+        "Cryptodome": "pycryptodomex",
+        "z3": "z3-solver",
+        "PIL": "pillow",
+        "pwn": "pwntools",
+    }
+    for namespace, pin in expected.items():
+        assert pin in pins, f"prompt advertises {namespace} but {pin} is not pinned"
+        assert f"`{namespace}`" in text, f"Environment omits installed {namespace}"
+
+    lowered = text.lower()
+    assert "no internet" in lowered
+    assert "cannot be installed" in text
+    assert "plain Python" in text or "python3" in text
+    assert "nohup" in text, "long-task guidance is missing"
+    assert "write_stdin" in text, "long-task guidance is missing"
+
+
+def test_prompt_environment_is_free_of_task_specifics() -> None:
+    """Naming test: the block must read as image truth, never as a past failure."""
+    from ctf_strix import prompt as prompt_mod
+
+    text = prompt_mod._CORE
+    assert not re.search(r"FLAG\{", text)
+    ipv4 = re.findall(r"\b(?:\d{1,3}\.){3}\d{1,3}\b", text)
+    assert set(ipv4) <= {"127.0.0.1"}, f"task-specific IP leaked: {ipv4}"
+    assert "/admin" not in text.lower()
+    assert "http://" not in text and "https://" not in text

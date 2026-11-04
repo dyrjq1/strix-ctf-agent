@@ -22,26 +22,26 @@
 |---|---|
 | 项目根 | `C:\Users\rjq\Downloads\strix-ctf-agent` |
 | Python | `.venv\Scripts\python.exe`（系统 python 缺 `agents` 模块，**必须**用 venv） |
-| 全量测试 | **497 passed, 3 skipped**（2026-11-03 墙钟接线后；3 skipped 为 SIGALRM 专项，POSIX 才跑） |
-| Git | 分层 commit 已执行（HEAD `c86a3d0`）；本地与 GitHub main 因 Contents-API 上传 SHA 分叉（内容一致），待 git 端点可用时 fetch/reset 对齐。**墙钟修复未提交**（auto 模式拦 commit，待用户批准） |
+| 全量测试 | **506 passed, 4 skipped**（2026-11-03 CI 假绿修复后；skipped 为 SIGALRM 专项，POSIX 才跑） |
+| Git | 本地 HEAD `8785fca`；与 GitHub main SHA 分叉持续（Contents-API 兜底通道，内容一致），待 git 端点可用时 fetch/reset 对齐 |
 | 留出集 | `experiments/pools.json` SHA256 `55da418b…678` **未变**（本轮没跑题） |
-| 台账 | `docs/11-实验台账.md`，最新条目 §4.58 = 容器路径墙钟接线 |
-| 备份 | `backup/wallclock-fix-20261103/`、`backup/p19k-20261103/`、`backup/p19a-20261103/`、`backup/pi-20261103/`、`backup/p18-20261102/`、`backup/p17-20261102/` |
+| 台账 | `docs/11-实验台账.md`，最新条目 §4.61 = CI 假绿修复 + v2 构建 |
+| 备份 | `backup/ci-false-green-20261103/`、`backup/wallclock-fix-20261103/`、`backup/a-tier-20261103/`、`backup/p19k-20261103/`、`backup/p19a-20261103/`、`backup/pi-20261103/`、`backup/p18-20261102/` |
 | 平台成绩 | CTFARENA 已测 48 题解出 40（83.3%），全库 40/115（34.8%） |
-| 镜像 | `ghcr.io/dyrjq1/strix-ctf-agent:v1` 已构建（GitHub→Actions→ghcr，run 41614099921，公开可拉）。平台已注册为 agent "strix-ctf-agent" v1（wzm26 + 任启骐两账号）。部署验证赛首跑 822s / 0-2 题（归档需 owner 浏览器下载） |
+| 镜像 | **`:v2` 已构建**（2026-11-03，含墙钟 + A 档工具 + 真跑的镜像内 pytest；run 41641624206 全绿）。v1 的「镜像内测试通过」是假信号（CI ENTRYPOINT 吞 CMD，见 §4.61），v2 起为真。平台注册仍是 v1，**升级 v2 = 用户浏览器动作**。部署验证赛 v1 首跑 822s / 0-2（归档需 owner 浏览器下载） |
 | 平台账号 | 当前用 **wzm26**（user f8dd465d…，token 在用户本地）；主账号任启骐的旧 pf_ token 已失效 |
 
 ### 2026-11-03 平台实测情报（详见 memory/deploy-verification-findings）
 - **部署验证赛** = "Deploy verification e39f96d54 (temp)"（`b702278527c048ffa0f68b6e7337547f`，2 题：SAMPLE-004 crypto padding-oracle/TCP + CTFARENA-108 web），play_open，供验证镜像部署。
 - **正式赛程大改**（手册 11-02 更新）：初选赛 11-15 10:00–20:00（UTC+8）；正式赛 11-21/11-22 每日 10:00–20:00。Agent Track 注册 282 队 > 150 上限 → 11-14 入围测试大概率举行。`internet_policy` 已改 **deny**（人类也断网）。**智能体赛道出题方向仅限在线交互类**；正式赛设 authoring_windows（11-21 三个 2h 窗口）→ **agent 出题能力是空白**（平台 MCP 有 get_authoring_template / upload_authored_challenge 全套工具）。
-- 「时间限制没生效」根因：部署验证走 entrypoint→agent.py，此前无任何墙钟。修复 = 台账 §4.58，**待提交 + 构建 v2 才在平台生效**。
+- 「时间限制没生效」根因：部署验证走 entrypoint→agent.py，此前无任何墙钟。修复 = 台账 §4.58，**已提交并进 v2 镜像**。
 
-### 本轮（P18 → P19k）进度
+### 本轮（P18 → CI 修复）进度
 - ✅ P18 四项（流量记忆 / 机制计数 / triage 决策表）+ P19a CVE 路由 + P19j read_file 契约 + P19k 假设纪律块（均已提交）。
 - ✅ 镜像 v1 推送全链路打通（GitHub PAT → Actions → ghcr；CI 内含全量 pytest + 双 conformance 自检；顺手修了 entrypoint fallback 的 `OUT` unbound 与 CI 挂载属主问题）。
-- ✅ 墙钟接线（§4.58，未提交）：agent.py SIGALRM 看门狗 + entrypoint timeout 保险丝 + 11 条测试。
-- ⏳ A 档工具（pycryptodome/z3/Pillow/pwntools 闭包）：Codex 在跑。
-- ⏳ skip-4 重跑（CYBENCH-011/001、XBOW-007/052）：Codex 在 VM 跑。
+- ✅ 墙钟接线（§4.58，已提交 26d1a2f）+ A 档工具（§4.59，47205ce）+ CI 假绿修复（§4.61，7d132d9）。
+- ✅ skip-4 归因 + 部署验证原题对照（§4.60）：XBOW-007/052 解出，CYBENCH-011 轮次耗尽、CYBENCH-001 墙钟耗尽；SAMPLE-004/CTFARENA-108 本地 2/2。
+- ⏳ 诊断批 3 题（CTFARENA-043/047 + CYBENCH-001，当前代码 + A 档）：Codex 在 VM 跑。
 
 ---
 
@@ -397,16 +397,15 @@ curl -sS https://ctfy.tsinghua.edu.cn/api/v1/mcp/ \
 
 ## 16. 当前待办与不做清单
 
-待办（2026-11-03 更新，按优先级）：
+待办（2026-11-03 晚间更新，按优先级）：
 
-1. **墙钟修复提交 + 镜像 v2**（等用户批准 commit）：agent.py/entrypoint.sh/测试/台账在工作区；push → workflow_dispatch(tag=v2) → 部署验证赛复跑验证 822s 问题是否收敛。
-2. **部署验证赛 0/2 归因**：run 归档只有 owner 能在浏览器下载（平台页面 → 该 run → download archive），拿到 stdout+workdir 才能定位是没进题、方向错还是别的。
+1. **平台 agent 升级 v2 + 复跑部署验证赛**：`:v2` 已在 ghcr（真跑镜像内 pytest 全绿 + 墙钟生效 + A 档工具）。升级注册是用户浏览器动作。对照 v1 的 822s/0-2 验证墙钟与平台链路是否收敛。
+2. **部署验证赛 v1 0/2 归因**：run 归档只有 owner 能在浏览器下载（平台页面 → 该 run → download archive），拿到 stdout+workdir 才能定位是模型凭据桥接、env 注入还是 agent 启动。本地同题 2/2（154s/34s），能力已排除。
 3. **agent 出题能力（新空白）**：正式赛 authoring_windows 要求 agent 出在线交互类题；平台 MCP 有 get_authoring_template/upload_authored_challenge 全套。11-15 初选赛前不投入，初选赛稳进后是最高优先级。
 4. **初选赛前稳定性**（11-15 10:00–20:00 UTC+8，10h 窗口）：镜像注册链路、串行轮转、墙钟、result.json 落盘——全部要在此窗口前实测一遍。可能的 11-14 入围测试同理。
-5. 规则后的验证批：P18+P19a+J+K+墙钟接线一起在未参与改动的题上测迁移（含 4 道未测 agentic_ai）；experiments/pools.json 不能动。
-6. ⏳ 镜像 A 档工具（Codex 在跑）：pycryptodome/z3/Pillow，pwntools 闭包；`_NEXT` 白名单同步。
-7. ⏳ 历史 skip 4 题（Codex 在 VM 跑）：CYBENCH-011/001、XBOW-007/052 接入归因。
-8. 对齐本地/远程 git 分叉（fetch/reset）；提醒用户改 GitHub 密码（与 VM sudo 同密码）。
+5. ⏳ 诊断批 3 题（Codex 在 VM 跑）：CTFARENA-043/047（AI 安全零解出，旧代码跑的）+ CYBENCH-001（A 档工具迁移验证）。
+6. 规则后的验证批：P18+P19a+J+K+墙钟+A 档一起在未参与改动的题上测迁移（含未测 agentic_ai）；experiments/pools.json 不能动。
+7. 对齐本地/远程 git 分叉（fetch/reset）；提醒用户改 GitHub 密码（与 VM sudo 同密码）。
 
 已判定不做：
 

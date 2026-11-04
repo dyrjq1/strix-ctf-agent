@@ -39,6 +39,7 @@ WORKDIR /app
 # 依赖先装，源码后拷——改代码不会让依赖层失效，重建只要几秒。
 COPY requirements.lock /app/requirements.lock
 COPY docker/a_tier_closure.txt /app/docker/a_tier_closure.txt
+COPY docker/b_tier_closure.txt /app/docker/b_tier_closure.txt
 COPY docker/check_toolchain.sh /app/docker/check_toolchain.sh
 RUN chmod +x /app/docker/check_toolchain.sh
 # --no-deps：requirements.lock 是环境快照，里面有 fastmcp/mcp 的版本死结，

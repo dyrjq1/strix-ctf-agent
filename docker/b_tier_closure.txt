@@ -1,0 +1,22 @@
+# B-tier complete dependency closure (9 roots + their non-extra deps).
+# Measured with `pip download --no-deps --only-binary=:all:` for
+# cp312 / manylinux2014_x86_64 (glibc >= 2.17, so it also matches the
+# manylinux_2_36 image).  Roots: numpy, sympy, gmpy2, scipy, matplotlib,
+# pefile, yara-python, segno, dnslib.
+# Extra-only requirements are deliberately absent: they are not installed by
+# `pip install --no-deps`, and `pip check` ignores them.
+pefile==2024.8.26
+yara-python==4.5.4
+segno==1.6.6
+dnslib==0.9.26
+numpy==2.2.6
+sympy==1.14.0
+mpmath==1.3.0
+gmpy2==2.3.2
+scipy==1.16.3
+matplotlib==3.11.2
+contourpy==1.3.2
+cycler==0.12.1
+fonttools==4.68.0
+kiwisolver==1.5.1
+pyparsing==3.3.3
