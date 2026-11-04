@@ -48,6 +48,13 @@ def test_platform_files_and_dotfiles_are_excluded(tmp_path: Path) -> None:
     assert list(_paths(_local_attachments(tmp_path))) == ["/workspace/real.txt"]
 
 
+def test_platform_mcp_config_is_not_injected(tmp_path: Path) -> None:
+    """``mcp.json`` carries the endpoint and auth header; never ship it."""
+    (tmp_path / "mcp.json").write_text("{}", encoding="utf-8")
+    (tmp_path / "real.txt").write_text("keep", encoding="utf-8")
+    assert list(_paths(_local_attachments(tmp_path))) == ["/workspace/real.txt"]
+
+
 def test_local_source_tree_is_not_shipped_as_attachments(tmp_path: Path) -> None:
     (tmp_path / "src" / "ctf_strix").mkdir(parents=True)
     (tmp_path / "src" / "ctf_strix" / "agent.py").write_text("SECRET", encoding="utf-8")

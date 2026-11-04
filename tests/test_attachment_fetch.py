@@ -253,7 +253,12 @@ def test_list_timeout_does_not_crash_and_keeps_no_target(
 def test_fetch_sends_bearer_token_and_skips_when_local_files_exist(
     tmp_path: Path, monkeypatch
 ) -> None:
-    """The fetch uses CTFY_TOKEN, and does not re-download existing attachments."""
+    """The fetch uses CTFY_TOKEN and never re-downloads a file already on disk.
+
+    A second call still asks for the listing: task.json declares no names here,
+    and a directory that already holds one file says nothing about whether the
+    platform added more.  What must not repeat is the download.
+    """
     monkeypatch.setenv("CTFY_TOKEN", "tok-123")
     task = _task("http://unused.invalid")
     with _StubPlatform({"one.txt": b"1"}) as platform:
@@ -265,7 +270,10 @@ def test_fetch_sends_bearer_token_and_skips_when_local_files_exist(
 
         again = agent._fetch_platform_attachments(task, tmp_path)
         assert again == []
-        assert len(platform.requests) == before
+        new_requests = platform.requests[before:]
+        assert [path for path, _auth in new_requests] == [
+            "/api/v1/challenges/CHAL/attachments"
+        ]
 
 
 def test_unsafe_attachment_name_is_refused(tmp_path: Path) -> None:

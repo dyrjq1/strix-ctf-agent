@@ -27,12 +27,10 @@ import sys
 import threading
 import time
 import traceback
-import urllib.error
-import urllib.parse
-import urllib.request
 from pathlib import Path
 from typing import Any
 
+from ctf_strix import platform_attach as attach
 from ctf_strix.success_stop import RecoveryExhausted
 from ctf_strix.success_stop import SolvedStop
 from ctf_strix.success_stop import SuccessLedger
@@ -734,7 +732,10 @@ def _local_attachments(work: Path) -> list[dict[str, str]]:
     seen: set[Path] = set()
     # 平台自己写进工作目录的文件不是附件。混进去只会浪费 sandbox 的注入配额，
     # 还会让 agent 把 result.json 当成题目材料读。
-    reserved = {"task.json", "result.json"}
+    # ``mcp.json`` is the platform's own client configuration, not a
+    # challenge file: injecting it would both waste an ``extra_files`` slot
+    # and put the endpoint/token header in front of the model.
+    reserved = {"task.json", "result.json", "mcp.json"}
     # 本地调试时 ``CTFY_WORK_DIR`` 常常没设，cwd 是仓库根。不排掉这些目录的话
     # 会把整个源码树当成附件打包（50 个文件配额一次就满），还会让 agent 读到
     # 评测脚本里的常量——SAMPLE-004 就是这么把套题 id 当 flag 交上去的。
@@ -784,56 +785,6 @@ def _local_attachments(work: Path) -> list[dict[str, str]]:
     return out
 
 
-def _attachment_roots(work: Path) -> list[Path]:
-    """Directories that may already hold this challenge's attachments."""
-    return [work / "attachments", work / "files"]
-
-
-def _declared_attachment_names(task: dict[str, Any]) -> list[str]:
-    """File names task.json explicitly declares as attachments."""
-    out: list[str] = []
-    for value in (task.get("attachments"), task.get("files")):
-        if not isinstance(value, list):
-            continue
-        for item in value:
-            if isinstance(item, str):
-                name = item.strip()
-            elif isinstance(item, dict):
-                name = str(item.get("name") or item.get("filename") or "").strip()
-            else:
-                continue
-            if name and name not in out:
-                out.append(name)
-    return out
-
-
-def _has_local_attachments(task: dict[str, Any], work: Path) -> bool:
-    """True when this challenge's attachments are already on disk.
-
-    Only the attachment roots and names task.json declares count.  The platform
-    also drops ``README.md`` / ``mcp.json`` beside task.json; treating those as
-    attachments would skip the platform fetch and leave a file-only challenge
-    with nothing to analyse.
-    """
-    try:
-        declared = _declared_attachment_names(task)
-        if declared:
-            # Declared names are checkable, so a partial fetch is retried and a
-            # file the platform already placed at the work root is not fetched
-            # a second time (that would inject the same bytes twice).
-            return all(
-                _local_attachment_path(work, name) is not None for name in declared
-            )
-        for root in _attachment_roots(work):
-            if root.is_dir():
-                for candidate in root.rglob("*"):
-                    if candidate.is_file() and not candidate.name.startswith("."):
-                        return True
-    except OSError:
-        return False
-    return False
-
-
 def _local_attachment_path(work: Path, name: str) -> Path | None:
     """Where ``name`` already sits locally, if anywhere.
 
@@ -862,20 +813,57 @@ def _safe_attachment_name(raw: object) -> str | None:
     return name
 
 
+def _declared_attachment_names(task: dict[str, Any]) -> list[str]:
+    """File names task.json explicitly declares as attachments."""
+    out: list[str] = []
+    for value in (task.get("attachments"), task.get("files")):
+        if not isinstance(value, list):
+            continue
+        for item in value:
+            if isinstance(item, str):
+                name = item.strip()
+            elif isinstance(item, dict):
+                name = str(item.get("name") or item.get("filename") or "").strip()
+            else:
+                continue
+            if name and name not in out:
+                out.append(name)
+    return out
+
+
+def _declared_specs(task: dict[str, Any]) -> dict[str, "attach.FileSpec"]:
+    """Attachment names task.json declares, in declaration order.
+
+    Sizes are not declared there, so these entries carry ``size=None`` and a
+    download is validated against whatever the channel's own listing said.
+    """
+    specs: dict[str, "attach.FileSpec"] = {}
+    for name in _declared_attachment_names(task):
+        safe = attach.safe_attachment_name(name)
+        if safe is not None:
+            specs.setdefault(safe, attach.FileSpec(name=safe))
+    return specs
+
+
 def _fetch_platform_attachments(task: dict[str, Any], work: Path) -> list[Path]:
-    """Download this challenge's attachments from the player REST API.
+    """Download this challenge's attachments, one channel at a time per file.
 
-    The platform does not always drop attachment files into the working
-    directory, and ``task.json`` can declare ``"attachments": []`` even when
-    the challenge has them.  The API is authoritative:
+    The challenge-level REST endpoint is authoritative when it answers, but a
+    run token can be refused there (403) while the platform's own MCP endpoint
+    still serves the same bytes.  Degrading per *file* rather than per channel
+    matters because a listing can succeed while one download fails: treating
+    the channel as all-or-nothing leaves that file missing and the challenge
+    on the ``no_target`` path.
 
-    - ``GET {platform}/api/v1/challenges/{challenge_id}/attachments``
-    - ``GET {platform}/api/v1/challenges/{challenge_id}/attachments/{name}``
+    Order: the instance-level listing when the task names an instance (it is
+    the only source for per-team artifacts), then the challenge-level REST
+    listing, then MCP for anything still missing.  A listing is always asked
+    for -- a directory holding one old file must not hide the two the platform
+    now ships -- but a name already on disk is never downloaded twice.
 
-    Best effort: an unreachable platform, 403, malformed JSON or a timeout must
-    leave the caller on its previous path (usually ``no_target``) rather than
-    crash the run.  Files land in ``work/attachments/`` only after a successful
-    response, so a challenge without attachments keeps an unchanged directory.
+    Best effort by contract: an unreachable platform, 403, malformed JSON or a
+    timeout leaves the caller on its previous path.  Nothing is raised, and no
+    token or authorization header reaches the log.
 
     Args:
         task: Parsed task.json (``platform_url`` / ``challenge.id``).
@@ -884,127 +872,168 @@ def _fetch_platform_attachments(task: dict[str, Any], work: Path) -> list[Path]:
     Returns:
         Paths written by this call; empty when nothing was fetched.
     """
+    token = _platform_token(task)
+    # MCP may authenticate with a different variable than the REST token; its
+    # expanded Authorization header is collected below and redacted too.
+    secrets: list[str] = [token] if token else []
     try:
-        if _has_local_attachments(task, work):
+        declared = _declared_specs(task)
+        # task.json names every file and every one is already on disk: no
+        # request is worth making.  (A directory with *some* file is not the
+        # same thing; then the listing still has to decide what is missing.)
+        if declared and all(_local_attachment_path(work, name) for name in declared):
             return []
 
+        targets = dict(declared)
+        instances = _attachment_instance(task)
         platform = _platform_url(task)
         challenge_id = _challenge_id(task)
-        if not platform or not challenge_id:
-            return []
 
-        base = f"{platform}/api/v1/challenges/{challenge_id}/attachments"
-        headers = {"Accept": "application/json", "User-Agent": "ctfy-agent"}
-        token = _platform_token(task)
-        if token:
-            headers["Authorization"] = f"Bearer {token}"
-
-        # One budget for list + every download: a hanging platform must not cost
-        # the full timeout once per file.
         deadline = time.monotonic() + _ATTACHMENT_TIMEOUT
-        try:
-            payload = _http_json(base, headers, timeout=_remaining(deadline))
-        except Exception as exc:  # noqa: BLE001 - fetching must never break a run
-            print(
-                f"[ctfy] attachment list unavailable: {type(exc).__name__}: {exc}",
-                flush=True,
-            )
-            return []
-
-        files = payload.get("files") if isinstance(payload, dict) else None
-        if not isinstance(files, list) or not files:
-            return []
-
-        target_dir = work / "attachments"
+        # A hanging REST call would otherwise spend the whole budget and leave
+        # the MCP channel 0.1s: reserve half for that hop.
+        rest_deadline = time.monotonic() + _ATTACHMENT_TIMEOUT / 2
         written: list[Path] = []
-        for item in files:
-            if not isinstance(item, dict):
-                continue
-            name = _safe_attachment_name(item.get("name"))
-            if name is None:
-                print(
-                    f"[ctfy] attachment skipped (unsafe name): {item.get('name')!r}",
-                    flush=True,
-                )
-                continue
-            if _local_attachment_path(work, name) is not None:
-                continue
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                print("[ctfy] attachment fetch budget spent; stopping", flush=True)
-                break
-            url = f"{base}/{urllib.parse.quote(name, safe='')}"
-            try:
-                blob = _http_bytes(url, headers, timeout=remaining)
-            except Exception as exc:  # noqa: BLE001 - one file must not stop the rest
-                print(
-                    f"[ctfy] attachment {name} unavailable: {type(exc).__name__}: {exc}",
-                    flush=True,
-                )
-                continue
+        used: list[str] = []
 
-            try:
-                _write_bytes_atomic(target_dir / name, blob)
-            except OSError as exc:
+        def have(name: str) -> bool:
+            return _local_attachment_path(work, name) is not None
+
+        def skip(name: str) -> bool:
+            # A file already on disk is never fetched twice.
+            return have(name)
+
+        def absorb(result: "attach.ChannelResult") -> None:
+            """Record a channel's listing and write whatever it fetched."""
+            used.append(result.channel)
+            for spec in result.files:
+                safe = attach.safe_attachment_name(spec.name)
+                if safe is not None:
+                    # A real size beats "not declared in task.json".
+                    known = targets.get(safe)
+                    if known is None or known.size is None:
+                        targets[safe] = attach.FileSpec(
+                            name=safe, size=spec.size, per_team=spec.per_team
+                        )
+            for name, blob in result.blobs.items():
+                if have(name):
+                    continue
+                # The REST listing's size is authoritative even when the bytes
+                # arrive from MCP: one channel must not be able to smuggle in a
+                # different file than the one the first channel described.
+                claimed = targets.get(name)
+                if claimed is not None and claimed.size is not None:
+                    if len(blob) != claimed.size:
+                        print(
+                            f"[ctfy] attachment {name} not saved: size mismatch "
+                            f"(listed {claimed.size}, got {len(blob)})",
+                            flush=True,
+                        )
+                        continue
+                try:
+                    _write_bytes_atomic(work / "attachments" / name, blob)
+                except OSError as exc:
+                    print(
+                        f"[ctfy] attachment {name} not saved: "
+                        f"{type(exc).__name__}: {attach.redact(exc, secrets)}",
+                        flush=True,
+                    )
+                    continue
+                written.append(work / "attachments" / name)
+            if result.errors:
+                detail = "; ".join(attach.redact(e, secrets) for e in result.errors[:4])
+                print(f"[ctfy] {result.channel}: {detail}", flush=True)
+            print(f"[ctfy] {result.status()}", flush=True)
+
+        rest_listed = False
+
+        # 1. Instance-level REST first: per-team files have no other source.
+        if platform and instances and token:
+            result = attach.fetch_rest_instance(
+                platform,
+                instances[0],
+                token,
+                names=None,
+                should_skip=skip,
+                deadline=rest_deadline,
+            )
+            rest_listed = result.listed or rest_listed
+            absorb(result)
+
+        # 2. Challenge-level REST listing.  It supplies sizes, which then let
+        #    every later channel validate length.
+        if platform and challenge_id:
+            result = attach.fetch_rest_challenge(
+                platform,
+                challenge_id,
+                token,
+                names=None,
+                should_skip=skip,
+                deadline=rest_deadline,
+            )
+            rest_listed = result.listed or rest_listed
+            absorb(result)
+
+        # 3. MCP for whatever is still missing: the same platform config the
+        #    model may already be using, so its endpoint and header stay
+        #    authoritative.  When REST listed, it already named every file and
+        #    MCP only has to download the remainder.
+        missing = [name for name in targets if not have(name)]
+        need_listing = not targets and not rest_listed
+        if missing or need_listing:
+            config, why = attach.load_mcp_config(work)
+            if config is not None:
+                secrets.extend(config.secrets)
+            if config is None:
+                print(f"[ctfy] mcp attachment channel skipped: {why}", flush=True)
+            elif not challenge_id:
                 print(
-                    f"[ctfy] attachment {name} not saved: {type(exc).__name__}: {exc}",
+                    "[ctfy] mcp attachment channel skipped: no challenge id",
                     flush=True,
                 )
-                continue
-            written.append(target_dir / name)
+            else:
+                result = attach.fetch_mcp(
+                    config,
+                    challenge_id,
+                    names=None if need_listing else missing,
+                    should_skip=skip,
+                    deadline=deadline,
+                )
+                absorb(result)
 
         if written:
-            print(f"[ctfy] fetched {len(written)} attachment(s) from platform", flush=True)
+            print(
+                f"[ctfy] fetched {len(written)} attachment(s) from platform "
+                f"(channels: {', '.join(dict.fromkeys(used)) or 'none'})",
+                flush=True,
+            )
+        elif targets:
+            print(
+                "[ctfy] attachment fetch incomplete: "
+                f"{len([n for n in targets if not have(n)])} file(s) still missing",
+                flush=True,
+            )
         return written
     except Exception as exc:  # noqa: BLE001 - last-resort guard for the caller
-        print(f"[ctfy] attachment fetch failed: {type(exc).__name__}: {exc}", flush=True)
+        print(
+            f"[ctfy] attachment fetch failed: {type(exc).__name__}: "
+            f"{attach.redact(exc, secrets)}",
+            flush=True,
+        )
         return []
 
 
-def _remaining(deadline: float) -> float:
-    """Positive seconds left in the fetch budget (never a negative timeout)."""
-    return max(deadline - time.monotonic(), 0.1)
-
-
-def _http_json(
-    url: str, headers: dict[str, str], timeout: float | None = None
-) -> Any:
-    """GET a JSON document; raises on any non-200 response."""
-    request = urllib.request.Request(url, headers=headers, method="GET")
-    status, body = _http_get(request, timeout or _ATTACHMENT_TIMEOUT)
-    if status != 200:
-        raise OSError(f"HTTP {status}")
-    return json.loads(body.decode("utf-8", "replace"))
-
-
-def _http_bytes(url: str, headers: dict[str, str], timeout: float | None = None) -> bytes:
-    """GET binary content; raises on any non-200 response."""
-    request = urllib.request.Request(url, headers=headers, method="GET")
-    status, body = _http_get(request, timeout or _ATTACHMENT_TIMEOUT)
-    if status != 200:
-        raise OSError(f"HTTP {status}")
-    return body
-
-
-def _http_get(request: urllib.request.Request, timeout: float) -> tuple[int, bytes]:
-    """Perform a GET and always close the response, including error bodies.
-
-    ``urlopen`` raises ``HTTPError`` for 4xx/5xx before a caller can use it as
-    a context manager, and the error object owns a socket.  Closing it here
-    keeps repeated failed fetches from leaking file descriptors.
-    """
-    response = None
-    try:
-        response = urllib.request.urlopen(request, timeout=timeout)
-        return getattr(response, "status", 200), response.read()
-    except urllib.error.HTTPError as exc:
-        try:
-            return exc.code, exc.read()
-        finally:
-            exc.close()
-    finally:
-        if response is not None:
-            response.close()
+def _attachment_instance(task: dict[str, Any]) -> list[str]:
+    """Instance ids this run can address for attachment downloads."""
+    raw = os.environ.get("CTFY_EVAL_TARGET_INSTANCE") or task.get("target_instance")
+    out: list[str] = []
+    if isinstance(raw, str) and raw.strip():
+        out.append(raw.strip())
+    elif isinstance(raw, list):
+        for entry in raw:
+            if isinstance(entry, str) and entry.strip() and entry.strip() not in out:
+                out.append(entry.strip())
+    return out
 
 
 def _write_bytes_atomic(path: Path, blob: bytes) -> None:
