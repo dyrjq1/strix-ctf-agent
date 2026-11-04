@@ -15,10 +15,9 @@ Quick reference for OSINT CTF challenges. Each technique has a one-liner here; s
 
 ## Prerequisites
 
-**Python packages (all platforms):**
-```bash
-pip install shodan Pillow
-```
+**Python packages:** the image already ships `Pillow`. `shodan` is **not
+available** (and there is no internet) -- work on local artifacts with
+`requests` or plain Python instead.
 
 **Linux (apt):**
 ```bash

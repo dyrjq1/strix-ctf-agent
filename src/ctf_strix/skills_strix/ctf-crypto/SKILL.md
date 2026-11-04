@@ -15,12 +15,11 @@ Quick reference for crypto CTF challenges. Each technique has a one-liner here; 
 
 ## Prerequisites
 
-**Python packages (all platforms):**
-```bash
-pip install pycryptodome z3-solver sympy gmpy2 hashpumpy fpylll py_ecc
-# Coppersmith (optional): pip install coppersmith
-# Alternative Coppersmith lib: git clone https://github.com/jvdsn/crypto-attacks ~/.ctf-tools/crypto-attacks && pip install -r ~/.ctf-tools/crypto-attacks/requirements.txt
-```
+**Python packages:** the image already ships `pycryptodome`,
+`pycryptodomex`, `z3-solver`, `sympy`, and `gmpy2`. `hashpumpy`, `fpylll`,
+`py_ecc`, and the `coppersmith` / `crypto-attacks` helpers are **not
+available** (no pip, no git clone) -- implement those steps with `sympy`/`z3`
+or pure Python instead.
 
 **Linux (apt):**
 ```bash
@@ -35,7 +34,7 @@ brew install hashcat
 **Manual install:**
 - SageMath (optional — only for legacy Sage fallback snippets (collapsed sections)) — Linux: `apt install sagemath`, macOS: `brew install --cask sage`
 - RsaCtfTool — `git clone https://github.com/RsaCtfTool/RsaCtfTool` (automated RSA attacks)
-- crypto-attacks (Coppersmith) — `git clone https://github.com/jvdsn/crypto-attacks ~/.ctf-tools/crypto-attacks` + `pip install -r ~/.ctf-tools/crypto-attacks/requirements.txt` (alternative to `pip install coppersmith`)
+- crypto-attacks (Coppersmith) — not available (no internet); use the `sympy`/`z3` Coppersmith snippets in [advanced-math.md](advanced-math.md) instead
 
 > **Note:** `gmpy2` requires libgmp — Linux: `apt install libgmp-dev`, macOS: `brew install gmp`.
 
@@ -327,7 +326,7 @@ Divide-and-conquer SPN key recovery: attack each S-box position independently, i
 
 ## Useful Tools
 
-- **Python:** `pip install pycryptodome z3-solver sympy gmpy2`
+- **Python:** the image already has `pycryptodome`, `z3-solver`, `sympy`, and `gmpy2`
 - **SageMath (optional fallback):** `sage -python script.py` — only for collapsed Sage alternatives
 - **RsaCtfTool:** `python RsaCtfTool.py -n <n> -e <e> --uncipher <c>` — automated RSA attack suite (tries Wiener, Hastad, Fermat, Pollard, and many more)
 - **quipqiup.com:** Automated substitution cipher solver (frequency + word pattern analysis)

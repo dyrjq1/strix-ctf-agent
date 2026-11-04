@@ -15,9 +15,9 @@ Quick reference for RE challenges. For detailed techniques, see supporting files
 
 ## Prerequisites
 
-**Python packages (all platforms):**
-```bash
-pip install frida-tools angr qiling uncompyle6 capstone lief z3-solver
+**Python packages:** the image already ships `capstone` and `z3-solver`.
+`frida-tools`, `angr`, `qiling`, `uncompyle6`, and `lief` are **not
+available** -- use `capstone`/`unicorn`/`z3` or plain Python instead.
 # For Python 3.9+ bytecode: build pycdc from source
 git clone https://github.com/zrax/pycdc && cd pycdc && cmake . && make
 ```

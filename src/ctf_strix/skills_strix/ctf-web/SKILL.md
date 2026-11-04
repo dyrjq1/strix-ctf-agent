@@ -15,10 +15,9 @@ Use this skill as a routing and execution guide for web-heavy challenges. Keep t
 
 ## Prerequisites
 
-**Python packages (all platforms):**
-```bash
-pip install sqlmap flask-unsign requests httpx
-```
+**Python packages:** the image already ships `requests` and `httpx`.
+`sqlmap` and `flask-unsign` are **not available** -- write the request in
+Python or use `curl` instead.
 
 **Linux (apt):**
 ```bash

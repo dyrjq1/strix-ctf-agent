@@ -15,10 +15,9 @@ Quick reference for AI/ML CTF challenges. Each technique has a one-liner here; s
 
 ## Prerequisites
 
-**Python packages (all platforms):**
-```bash
-pip install torch transformers numpy scipy Pillow safetensors scikit-learn
-```
+**Python packages:** the image already ships `numpy`, `scipy`, and `Pillow`
+(`PIL`). `torch`, `transformers`, `safetensors`, and `scikit-learn` are **not
+available** -- use the installed libraries or plain Python instead.
 
 **Linux (apt):**
 ```bash

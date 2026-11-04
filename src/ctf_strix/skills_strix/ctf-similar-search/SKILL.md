@@ -16,9 +16,9 @@ Search for similar CTF challenge writeups using Tavily API.
 
 ## Prerequisites
 
-```bash
-pip install requests tavily
-```
+The image already ships `requests`. `tavily` is **not available** (no
+internet), so this skill's live search cannot run -- search local artifacts
+instead.
 
 Set your Tavily API key (from https://tavily.com) before running:
 

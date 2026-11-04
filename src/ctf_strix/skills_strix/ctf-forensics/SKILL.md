@@ -15,10 +15,11 @@ Quick reference for forensics CTF challenges. Each technique has a one-liner her
 
 ## Prerequisites
 
-**Python packages (all platforms):**
-```bash
-pip install volatility3 Pillow numpy matplotlib scipy librosa scikit-learn opencv-python-headless pymongo impacket brotli exrex stegano heatshrink2
-```
+**Python packages:** the image already ships `Pillow`, `numpy`, `matplotlib`,
+and `scipy`. `volatility3`, `librosa`, `scikit-learn`,
+`opencv-python-headless`, `pymongo`, `impacket`, `brotli`, `exrex`, `stegano`,
+and `heatshrink2` are **not available** -- use the installed libraries or
+plain Python instead.
 
 **Linux (apt):**
 ```bash

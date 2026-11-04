@@ -15,10 +15,9 @@ Quick reference for miscellaneous CTF challenges. Each technique has a one-liner
 
 ## Prerequisites
 
-**Python packages (all platforms):**
-```bash
-pip install "pwntools==4.15.0" "segno==1.6.6" z3-solver Pillow numpy requests dnslib
-```
+**Python packages:** the image already ships `pwntools` 4.15.0, `segno`
+1.6.6, `z3-solver`, `Pillow`, `numpy`, `requests`, and `dnslib` -- nothing to
+install.
 
 **Linux (apt):**
 ```bash

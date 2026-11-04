@@ -15,16 +15,12 @@ Quick reference for binary exploitation (pwn) CTF challenges. Each technique has
 
 ## Prerequisites
 
-**Python packages (all platforms):**
-```bash
-pip install "pwntools==4.15.0" "ROPgadget==7.7" "ropper==1.13.13"
-# or via script: bash scripts/install_ctf_tools.sh python
-```
+**Python packages:** the image already ships `pwntools` 4.15.0 and
+`ROPgadget` 7.7. `ropper` is **not available** -- use `ROPgadget` or
+`pwntools`' own ROP helpers instead.
 
-**uv alternative:**
-```bash
-uv venv && uv pip install "pwntools==4.15.0" "ROPgadget==7.7" "ropper==1.13.13"
-```
+**uv alternative:** not available (no internet); the system `python3` already
+has `pwntools` and `ROPgadget`.
 
 **Linux (apt):**
 ```bash
