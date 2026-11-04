@@ -2,11 +2,11 @@
 
 ## Why this exists
 
-CTFARENA-043 is the canonical failure.  The agent enumerated a namespace, the
-target answered with 52 ``note_<hex>`` identifiers, and the run ended without
-ever fetching a single one.  Nothing in the transcript said "you have 52
-identifiers and 0 detail reads", so the model could not notice it had already
-been handed the attack surface.
+A measured failure is canonical here: the agent enumerated a namespace, the
+target answered with dozens of ``note_<hex>`` identifiers, and the run ended
+without ever fetching a single one.  Nothing in the transcript said "you
+have N identifiers and 0 detail reads", so the model could not notice it had
+already been handed the attack surface.
 
 The published failure data has the same shape: failed runs sit at p50 551s
 while successful ones take 70s.  That is a *direction* problem, not a budget
@@ -237,10 +237,11 @@ def _normalise_path(url: str) -> str:
 def pending_targets(limit: int = 20) -> list[str]:
     """Identifiers the target returned that no request has ever addressed.
 
-    This is the direct antidote to CTFARENA-043: a response can hand over 52
-    ``note_*`` ids while the transcript shows one request, and nothing in the
-    model's context says "you have 52 keys and 0 doors opened".  Because the
-    ledger keeps every response, the count is decidable -- so it can be shown.
+    This is the direct antidote to the canonical failure above: a response can
+    hand over dozens of ``note_*`` ids while the transcript shows one request,
+    and nothing in the model's context says "you have N keys and 0 doors
+    opened".  Because the ledger keeps every response, the count is decidable
+    -- so it can be shown.
 
     Args:
         limit: cap on how many are listed; ``0`` (or negative) means "all".
@@ -328,7 +329,7 @@ def traffic_list(limit: int = 25, url_contains: str = "", only_errors: bool = Fa
         )
         lines.append(
             "these came back IN A RESPONSE -- fetching them is usually the next "
-            "step; enumerating more names instead is the CTFARENA-043 failure."
+            "step; enumerating more names instead is the known failure mode."
         )
     for item in shown:
         status = item.status if item.status is not None else item.phase or "ERR"
