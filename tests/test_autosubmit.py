@@ -29,7 +29,7 @@ def _mk(questions: list[dict[str, Any]]) -> tuple[AutoSubmitter, list[dict[str, 
     def fake_post(path: str, body: dict[str, Any]) -> dict[str, Any]:
         sent.append(body)
         # 只有交 "right" 才算对，其余判错
-        return {"correct": body["answer"] == "right"}
+        return {"correct": body["answer"] == "right", "question_id": body["question_id"]}
 
     sub._post = fake_post  # type: ignore[method-assign]
     return sub, sent
@@ -109,7 +109,7 @@ def test_correct_answer_stops_trying_more_candidates() -> None:
             sent.append(body)
         calls["n"] += 1
         # q1 的第一个候选就中；q2 全部判错
-        return {"correct": body["question_id"] == "q1"}
+        return {"correct": body["question_id"] == "q1", "question_id": body["question_id"]}
 
     sub._post = fake_post  # type: ignore[method-assign]
     verdict = sub.submit("FLAG{right_here}")
@@ -180,7 +180,10 @@ def _mk_oracle(questions, truth: dict[str, str]):
                 "question_id": body["question_id"],
             }
         posted.append(body)
-        return {"correct": truth.get(body["question_id"]) == body["answer"]}
+        return {
+            "correct": truth.get(body["question_id"]) == body["answer"],
+            "question_id": body["question_id"],
+        }
 
     sub._post = fake_post  # type: ignore[method-assign]
     return sub, posted, verified
@@ -235,7 +238,10 @@ def test_verify_unavailable_falls_back_to_submitting() -> None:
         if path.endswith("/verify-answer"):
             return {"error": "HTTP 404"}
         posted.append(body)
-        return {"correct": body["answer"] == "FLAG{right}"}
+        return {
+            "correct": body["answer"] == "FLAG{right}",
+            "question_id": body["question_id"],
+        }
 
     sub._post = fake_post  # type: ignore[method-assign]
     verdict = sub.submit("FLAG{wrong} FLAG{right}")

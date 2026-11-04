@@ -107,11 +107,44 @@ def test_solved_stop_is_not_an_exception_subclass() -> None:
 
 
 def test_finish_guard_marks_ledger_for_a_real_flag() -> None:
+    from ctf_strix.evidence import EvidenceLedger
+
+    evidence = EvidenceLedger()
+    evidence.observe_output("cat /flag -> FLAG{abc123}")
     ledger = SuccessLedger()
-    guard = FinishGuard(success=ledger)
+    guard = FinishGuard(success=ledger, evidence=evidence)
     assert guard.check('{"summary": "answer FLAG{abc123}"}') is None
     assert ledger.solved and ledger.source == "finish_guard"
     assert ledger.answer == "FLAG{abc123}"
+
+
+def test_finish_guard_refuses_a_flag_that_only_appears_in_the_summary() -> None:
+    """078: a flag-shaped string the run never read is a guess, not evidence."""
+    from ctf_strix.evidence import EvidenceLedger
+
+    evidence = EvidenceLedger()
+    ledger = SuccessLedger()
+    guard = FinishGuard(success=ledger, evidence=evidence)
+    fake = "FLAG{3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f}"
+    assert guard.check(f'{{"summary": "answer {fake}"}}') is not None
+    assert not ledger.solved
+    assert evidence.unsupported == [fake]
+
+
+def test_finish_guard_without_an_evidence_ledger_keeps_legacy_policy() -> None:
+    """Callers that have not wired provenance still behave as before."""
+    ledger = SuccessLedger()
+    guard = FinishGuard(success=ledger)
+    assert guard.check('{"summary": "answer FLAG{abc123}"}') is None
+    assert ledger.solved
+
+
+def test_finish_guard_uses_the_same_flag_shape_as_the_evidence_ledger() -> None:
+    """The guard must not accept a shape its own evidence recorder cannot see."""
+    from ctf_strix import finish_guard as finish_guard_mod
+    from ctf_strix.flag_extract import FLAG_RE
+
+    assert finish_guard_mod._FLAG_RE is FLAG_RE
 
 
 def test_finish_guard_does_not_mark_on_placeholder_or_prose() -> None:
@@ -151,7 +184,7 @@ def _submitter(ledger: SuccessLedger, response: dict) -> AutoSubmitter:
 
 def test_autosubmit_marks_on_direct_submission_verdict() -> None:
     ledger = SuccessLedger()
-    sub = _submitter(ledger, {"correct": True, "solve_rank": 20})
+    sub = _submitter(ledger, {"correct": True, "question_id": "flag", "solve_rank": 20})
     verdict = sub.submit("FLAG{right}")
     assert verdict["correct"] == ["flag=FLAG{right}"]
     assert ledger.solved and ledger.answer == "FLAG{right}"
@@ -190,7 +223,8 @@ def test_probe_checkers_uses_the_direct_check_response() -> None:
 
     def fake_post(path: str, body: dict) -> dict:
         posted.append((path, body))
-        return {"passed": True, "challenge_fully_solved": True}
+        return {"passed": True, "question_id": "outage", "timed_out": False,
+                "challenge_fully_solved": True}
 
     sub._post = fake_post  # type: ignore[method-assign]
     assert sub.probe_checkers() is True

@@ -1691,6 +1691,16 @@ def _run_agent(
     # page text or model prose.
     success = SuccessLedger()
 
+    # Every flag has to be seen in a tool output from *this* run before it is
+    # submitted; a flag the model only wrote down is a guess.  078 produced one
+    # (``3cada892...``) and it was one parameter away from being submitted via
+    # ``finish_scan``.  See docs/11 section 4.15.  The ledger is created before
+    # the finish guard so the guard can require that provenance instead of
+    # trusting a regex match in the model's own summary.
+    from ctf_strix.evidence import EvidenceLedger
+
+    ledger = EvidenceLedger()
+
     # ⚠️ 挂载钩子必须最先装。三个守卫都是替换 factory._with_bounded_result 来
     # 挂 on_invoke_tool 的，但 exec_command / write_stdin 走 Shell capability 的
     # _configure_shell_tools，**绕过**那个函数。不装钩子，守卫只覆盖
@@ -1732,70 +1742,119 @@ def _run_agent(
     from ctf_strix.sweep_guard import install as install_sweep_guard
 
     install_sweep_guard()
+    question_ids = [
+        str(q.get("id") or "").strip()
+        for q in (task.get("questions") or [])
+        if isinstance(q, dict) and str(q.get("id") or "").strip()
+    ]
+    question_modes = {
+        str(q.get("id") or "").strip(): str(q.get("mode") or "").strip().lower()
+        for q in (task.get("questions") or [])
+        if isinstance(q, dict) and str(q.get("id") or "").strip()
+    }
 
-    # 收工守卫：没有 flag 的 finish_scan 会被拒绝。engagement 没有 flag，
-    # checker 题也没有 flag——这两类必须让路，否则会误拦每一次正常收工。
-    from ctf_strix.finish_guard import install as install_finish_guard
-
-    install_finish_guard(
-        require_flag=kind not in {"engagement", "checker"},
-        success=success,
-    )
-
-    if parallel_on:
-        # The configured state is per run; the guard itself is process-wide.
-        parallel.reset_run()
-
-    # 边跑边交。``answers`` 是收工时一次性交给平台的，而协议 §3 明说：跑完
-    # 才交就拿不到即时判定，gated 题也永远解锁不了。评测入口
-    # ``scripts/run_strix_ctf.py`` 早就有 --autosubmit，**正赛入口从来没装过**
-    # ——这是第三次"评测有、交付没有"（前两次：sweep_guard、v2 原语），所以
-    # 装配结果同时写进 diag，并做成测试钉住。
+    # ``finish_scan`` is usually the last call, so its wiring must be resolved
+    # before the guard is installed: the guard needs the probe object, and the
+    # probe needs the resolved platform/instance/token.  Building the submitter
+    # first also removes the old ordering bug where the guard was installed
+    # before the submitter existed and therefore never saw a checker.
     #
-    # engagement 的交付物是报告，checker 没有 flag，两类都不许挂。
+    # Wrapper order matters: the last installed wrapper runs first.  Submission
+    # must run before the flag guard, otherwise a guard refusal on a non-flag
+    # answer (a 32-hex slug) swallows the only submission.  So the guard is
+    # installed here and the autosubmit wrapper right after it.
     submitted_to = _autosubmit_target(task)
     submitter: Any = None
+    if submitted_to is not None and kind != "engagement":
+        try:
+            from ctf_strix.autosubmit import AutoSubmitter
+
+            submitter = AutoSubmitter(
+                *submitted_to,
+                success=success,
+                fallback_question_ids=question_ids,
+                fallback_question_modes=question_modes,
+            )
+        except Exception as exc:  # noqa: BLE001 -- probing is an optimisation
+            print(f"[ctfy] autosubmit unavailable: {type(exc).__name__}: {exc}", flush=True)
+            diag["autosubmit"] = "failed"
+
+    # Proof-of-exploitation runs have an instance channel but no flag.  The
+    # arming condition is ``_autosubmit_target`` itself (platform + instance +
+    # token), never a bare instance id: without the other two the probe would
+    # post to an empty URL and look like a platform outage.  ``mode`` is not
+    # consulted -- measured tasks leave it empty and still grade /check.
+    checker_probe = None
+    if submitter is not None:
+        from ctf_strix.autosubmit import CheckerProbe
+
+        checker_probe = CheckerProbe(
+            submitter,
+            question_ids=question_ids,
+            known_question_ids=question_ids,
+            question_modes=question_modes,
+        )
+
+    # Finish guard: an answerless finish_scan is refused.  engagement and
+    # checker-only challenges have no flag, so those kinds let it through.
+    from ctf_strix.finish_guard import install as install_finish_guard
+
+    finish_guard = install_finish_guard(
+        require_flag=kind not in {"engagement", "checker"},
+        success=success,
+        evidence=ledger,
+        checker=(checker_probe.check if checker_probe is not None else None),
+    )
+    if kind != "engagement":
+        diag["checker_probe"] = "armed" if checker_probe is not None else "off"
+
     if kind not in {"engagement", "checker"}:
         if submitted_to is None:
             print("[ctfy] autosubmit off (no platform/instance/token)", flush=True)
             diag["autosubmit"] = "off"
+        elif submitter is None:
+            diag.setdefault("autosubmit", "failed")
         else:
             try:
                 from ctf_strix.autosubmit import install as install_autosubmit
 
-                submitter = install_autosubmit(*submitted_to, success=success)
+                install_autosubmit(
+                    *submitted_to,
+                    success=success,
+                    fallback_question_ids=question_ids,
+                    fallback_question_modes=question_modes,
+                    submitter=submitter,
+                )
                 print(f"[ctfy] autosubmit on (instance {submitted_to[1][:8]}...)", flush=True)
                 diag["autosubmit"] = "on"
-            except Exception as exc:  # noqa: BLE001 -- 提交失败不能阻止跑题
+            except Exception as exc:  # noqa: BLE001 -- submission failure must not stop the run
                 print(
                     f"[ctfy] autosubmit registration failed: {type(exc).__name__}: {exc}",
                     flush=True,
                 )
                 diag["autosubmit"] = "failed"
-    elif submitted_to is not None:
-        # Checker-only challenges have no flag to submit, but the sidecar
-        # checker is still a direct, structured success signal.  A bare
-        # submitter gives the recovery guard that one probe.
-        try:
-            from ctf_strix.autosubmit import AutoSubmitter
 
-            submitter = AutoSubmitter(*submitted_to, success=success)
-            diag["checker_probe"] = "armed"
-        except Exception as exc:  # noqa: BLE001 -- probing is an optimisation, not a requirement
-            print(f"[ctfy] checker probe unavailable: {type(exc).__name__}: {exc}", flush=True)
-            diag["checker_probe"] = "failed"
+    # The exec observer records a direct verdict printed by a shell call and
+    # then raises the existing SolvedStop root stop.  It is a read-only
+    # observer; a missing platform URL, instance, or question id leaves it
+    # disarmed rather than trusting a local file.
+    try:
+        from ctf_strix.success_stop import install_exec_observer
 
-    # Mixed flag+checker challenges need both paths: flag questions go through
-    # finish_scan/autosubmit, checker questions only ever answer /check.  The
-    # submitter above is created either way so the recovery probe exists.
-    if kind not in {"engagement", "checker"} and submitted_to is not None and submitter is not None:
-        has_checker = any(
-            str(q.get("mode") or "").strip().lower() == "checker"
-            for q in (task.get("questions") or [])
-            if isinstance(q, dict)
+        exec_observer = install_exec_observer(
+            success,
+            platform_url=_platform_url(task),
+            instance=(submitted_to[1] if submitted_to is not None else ""),
+            question_ids=tuple(question_ids),
         )
-        if has_checker:
-            diag["checker_probe"] = "armed"
+        diag["exec_observer"] = "armed" if exec_observer else "off"
+    except Exception as exc:  # noqa: BLE001 -- observation must not gate the run
+        print(f"[ctfy] exec observer failed: {type(exc).__name__}: {exc}", flush=True)
+        diag["exec_observer"] = "failed"
+
+    if parallel_on:
+        # The configured state is per run; the guard itself is process-wide.
+        parallel.reset_run()
 
     # The runner restarts an autonomous run that ends without a lifecycle call,
     # once per remaining turn.  Bound that at the runner's own interactive
@@ -1803,22 +1862,10 @@ def _run_agent(
     # already scored.  A direct "yes" stops the run before any restart.
     from ctf_strix.success_stop import RECOVERY_LIMIT, install_recovery_guard
 
-    checker_probe = None
-    has_checker = any(
-        str(q.get("mode") or "").strip().lower() == "checker"
-        for q in (task.get("questions") or [])
-        if isinstance(q, dict)
-    )
-    if has_checker and submitter is not None:
-        async def checker_probe() -> bool:  # type: ignore[no-redef]
-            import asyncio
-
-            return await asyncio.to_thread(submitter.probe_checkers)
-
     try:
         install_recovery_guard(
             limit=RECOVERY_LIMIT,
-            checker=checker_probe,
+            checker=(checker_probe.check if checker_probe is not None else None),
             ledger=success,
         )
         diag["recovery_guard"] = "on"
@@ -1891,13 +1938,6 @@ def _run_agent(
 
     captured: list[str] = []
     activity: list[str] = []
-    # Every flag has to be seen in a tool output from *this* run before it is
-    # submitted; a flag the model only wrote down is a guess.  078 produced one
-    # (``3cada892...``) and it was one parameter away from being submitted via
-    # ``finish_scan``.  See docs/11 section 4.15.
-    from ctf_strix.evidence import EvidenceLedger
-
-    ledger = EvidenceLedger()
     tool_outputs = 0
     root_tool_calls = 0
     root_agent: str | None = None
@@ -2336,6 +2376,8 @@ def _run_agent(
     # A checker-only solve has no flag to add, but the verdict still belongs
     # in the diagnostics.
     out["success"] = success.snapshot()
+    if finish_guard is not None and finish_guard.probe_note:
+        out["checker_probe_note"] = finish_guard.probe_note
     out.update(diag)
     if parallel_on:
         # Tokens are process-wide already; turns are root-only in the vendor

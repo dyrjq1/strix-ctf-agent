@@ -240,7 +240,7 @@ MITRE CAPEC / ATT&CK、OWASP WSTG、arXiv 论文、SANS。
 - 改前备份到 `backup/<slug>-<日期>/`，改后在 `docs/11-实验台账.md` 追加一节并写回滚路径
 - 不主动 git commit / 不建分支
 - 写文件一律「临时文件 + `os.replace` + 锚点唯一性 assert」；`pathlib.write_text(newline='\n')` 在 Windows 会先截断再抛错（踩过一次，写坏了 `nonweb.py`）
-- 保持原文件行尾（agent.py/catalogue.py/http_probe.py/file_triage.py 是 CRLF；nonweb.py/traffic.py/enum_guard.py/capabilities.py 是 LF）
+- 保持原文件行尾（以 `git ls-files --eol` 为准；`.gitattributes` 规定 `*.py/*.md/*.txt/*.sh` 为 `eol=lf`，本次涉及文件实测均为 LF，勿转 CRLF）
 
 ### 7.7 本项目实测结论（别重复踩）
 - 上下文「按龄裁剪」是**负优化**：缓存命中 95.7% → 57.8%，等效成本涨 6 倍，已回滚为内容封顶

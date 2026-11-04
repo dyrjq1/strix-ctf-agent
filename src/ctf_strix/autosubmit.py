@@ -23,6 +23,7 @@ SAMPLE-001 的日志最典型：第 24 秒就拿到了 slug
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import re
@@ -30,6 +31,8 @@ import threading
 import urllib.error
 import urllib.request
 from typing import TYPE_CHECKING, Any
+
+from ctf_strix.success_stop import answer_verdict, check_verdict, question_correct
 
 if TYPE_CHECKING:
     from agents import FunctionTool
@@ -71,6 +74,8 @@ class AutoSubmitter:
         instance: str,
         token: str,
         success: Any = None,
+        fallback_question_ids: list[str] | None = None,
+        fallback_question_modes: dict[str, str] | None = None,
     ) -> None:
         self.platform = platform.rstrip("/")
         self.instance = instance
@@ -78,6 +83,12 @@ class AutoSubmitter:
         # Optional structured-success ledger.  Only direct JSON verdicts from
         # calls this object made are ever reported to it.
         self.success = success
+        #: question ids from task.json, used only when the metadata GET is
+        #: forbidden.  Empty means "do not guess".
+        self.fallback_question_ids = list(fallback_question_ids or [])
+        #: declared mode per fallback id.  Without this a 403 fallback would
+        #: relabel dynamic questions as checker questions.
+        self.fallback_question_modes = dict(fallback_question_modes or {})
         self.attempts = 0
         self.correct: list[str] = []
         self.answers_tried: list[dict[str, Any]] = []
@@ -112,7 +123,9 @@ class AutoSubmitter:
         except Exception as e:  # noqa: BLE001 — 提交失败不能让收工本身失败
             return {"error": f"{type(e).__name__}: {e}"}
 
-    def _verify(self, qid: str, answer: str) -> dict[str, Any]:
+    def _verify(
+        self, qid: str, answer: str, *, multiple: bool = False
+    ) -> dict[str, Any]:
         """Ask the oracle-mode grader without spending a submission attempt.
 
         ``POST /api/v1/instances/{id}/verify-answer`` is documented in the
@@ -122,9 +135,15 @@ class AutoSubmitter:
         a per-question cap, so probing here first keeps the cap for answers
         that are worth recording.
 
+        ``verify-answer`` has no ``challenge_fully_solved`` field, so for a
+        multi-question challenge it proves only one question.  It therefore
+        never marks the run solved there; the later ``/submissions`` response
+        (which does carry the flag) is what may stop the run.
+
         Args:
             qid: question id.
             answer: the candidate string.
+            multiple: whether this run has more than one question.
 
         Returns:
             ``{"correct": bool, "question_id": str}``, or ``{}`` when the
@@ -137,29 +156,70 @@ class AutoSubmitter:
         )
         if "error" in body or "correct" not in body:
             return {}
-        if self.success is not None:
-            self.success.observe_structured(
-                body, source="platform_verify", answer=answer
+        if self.success is not None and answer_verdict(
+            body, qid, multiple=multiple
+        ):
+            self.success.mark(
+                "platform_verify", "correct=true", answer=answer
             )
         return body
 
-    def probe_checkers(self) -> bool:
+    def probe_checkers(
+        self,
+        *,
+        all_questions: bool = False,
+        question_ids: list[str] | None = None,
+        known_question_ids: list[str] | None = None,
+        question_modes: dict[str, str] | None = None,
+    ) -> bool:
         """Ask the platform's sidecar checker whether this instance is solved.
 
-        Only ``mode == "checker"`` questions are probed.  The verdict must be
-        the direct JSON body of our own ``POST /check``; a checker's page
-        saying "passed" is not this.  This is the recovery path's last chance
-        to notice a solve before the run is restarted.
+        Questions are selected by ``mode in ("", "checker")``; ``dynamic``,
+        ``static`` and ``seeded`` are answered through ``/submissions`` and are
+        deliberately skipped here.  An empty mode is included because a measured
+        task declared ``""`` while still grading a side effect through ``/check``.
+
+        A result only counts when it is the direct JSON body of our own
+        ``POST /check`` **and** it names the question that request asked about,
+        is not timed out, and -- for a multi-question challenge -- reports
+        ``challenge_fully_solved: true``.  A checker's page saying "passed" is
+        never enough.
+
+        Args:
+            all_questions: legacy switch kept for callers; selection is now
+                always ``mode in ("", "checker")``.
+            question_ids: explicit ids to probe.  The entrypoint already has
+                them in ``task.json``, so this avoids one metadata GET.
+            known_question_ids: every id in this run, used to decide whether a
+                ``challenge_fully_solved`` flag is required.
+            question_modes: declared mode per question id.  With explicit ids,
+                this keeps ``dynamic``/``static``/``seeded`` out of ``/check``.
 
         Returns:
-            True when a direct checker response says ``passed: true``.
+            True when a validated checker verdict says the run is complete.
         """
-        questions = self._questions()
+        if question_ids is not None:
+            modes = question_modes or {}
+            questions = [
+                {"id": qid, "mode": modes.get(qid, "")}
+                for qid in question_ids
+                if qid
+            ]
+        else:
+            questions = self._questions()
+        probe_ids = [str(q.get("id") or "") for q in questions if q.get("id")]
+        known = {
+            str(qid).strip()
+            for qid in (known_question_ids or probe_ids)
+            if str(qid).strip()
+        }
+        multiple = len(known) > 1
         for q in questions:
-            if q.get("mode") != "checker":
+            mode = str(q.get("mode") or "").strip().lower()
+            if mode not in ("", "checker"):
                 continue
-            qid = q.get("id")
-            if not qid:
+            qid = str(q.get("id") or "").strip()
+            if not qid or qid not in known:
                 continue
             body = self._post(
                 f"/api/v1/instances/{self.instance}/check",
@@ -168,11 +228,37 @@ class AutoSubmitter:
             if "error" in body:
                 self.last_error = str(body["error"])
                 continue
-            if body.get("passed") is True:
+            if check_verdict(body, qid, multiple=multiple):
                 if self.success is not None:
-                    self.success.observe_structured(body, source="checker")
+                    self.success.mark("checker", "passed=true")
                 return True
         return False
+
+    async def probe_checkers_async(
+        self,
+        *,
+        all_questions: bool = False,
+        question_ids: list[str] | None = None,
+        known_question_ids: list[str] | None = None,
+        question_modes: dict[str, str] | None = None,
+    ) -> bool:
+        """Run :meth:`probe_checkers` off the event loop.
+
+        The finish guard is awaited from inside the runner; a blocking
+        ``urlopen`` there would stall every other agent task.  One worker
+        thread per call is fine because :class:`CheckerProbe` caches the result
+        for the rest of the run.
+
+        Returns:
+            The same verdict as :meth:`probe_checkers`.
+        """
+        return await asyncio.to_thread(
+            self.probe_checkers,
+            all_questions=all_questions,
+            question_ids=question_ids,
+            known_question_ids=known_question_ids,
+            question_modes=question_modes,
+        )
 
     def _questions(self) -> list[dict[str, Any]]:
         """拉当前实例的 question 列表。
@@ -193,6 +279,18 @@ class AutoSubmitter:
         try:
             with urllib.request.urlopen(req, timeout=_TIMEOUT) as resp:  # noqa: S310
                 return json.loads(resp.read().decode() or "{}").get("questions") or []
+        except urllib.error.HTTPError as e:
+            self.last_error = f"HTTP {e.code}: {e.read()[:180].decode(errors='replace')}"
+            if e.code in (401, 403) and self.fallback_question_ids:
+                return [
+                    {
+                        "id": qid,
+                        "mode": self.fallback_question_modes.get(qid, ""),
+                    }
+                    for qid in self.fallback_question_ids
+                    if qid
+                ]
+            return []
         except Exception as e:  # noqa: BLE001
             self.last_error = f"{type(e).__name__}: {e}"
             return []
@@ -254,6 +352,7 @@ class AutoSubmitter:
             q for q in questions
             if q.get("mode") in ("dynamic", "static", "seeded")
         ]
+        multiple = len(questions) > 1
         if not pending:
             # 区分两种"没得投"：拿不到列表（错误）vs 只有 checker 题（正常）。
             if self.last_error:
@@ -266,6 +365,9 @@ class AutoSubmitter:
 
         tried: list[dict[str, Any]] = []
         correct: list[str] = []
+        #: Last explicit platform answer for "is the whole challenge done?".
+        #: ``None`` means the platform never said.
+        platform_flag: bool | None = None
         skipped: list[str] = []
         with self._lock:
             for q in pending:
@@ -279,7 +381,7 @@ class AutoSubmitter:
                 for ans in cands:
                     # 先问不记账的判分器。它正确 → 只写一条提交记录；
                     # 它不可用（旧平台 / 网络抖动）→ 退回直接提交。
-                    probe = self._verify(qid, ans)
+                    probe = self._verify(qid, ans, multiple=multiple)
                     if probe and not probe.get("correct"):
                         tried.append({"qid": qid, "answer": ans, "correct": False,
                                       "verified": True})
@@ -296,13 +398,28 @@ class AutoSubmitter:
                     tried.append({"qid": qid, "answer": ans, **{
                         k: res.get(k) for k in ("correct", "solve_rank", "detail", "error")
                     }})
-                    if res.get("correct"):
-                        if self.success is not None:
-                            self.success.observe_structured(
-                                res, source="platform_submit", answer=ans
-                            )
+                    if question_correct(res, qid):
                         correct.append(f"{qid}={ans}")
-                        break  # 这个 question 已经有了正确答案，换下一个 question
+                        flag = res.get("challenge_fully_solved")
+                        if flag is True:
+                            platform_flag = True
+                        elif flag is False:
+                            platform_flag = False
+                        if answer_verdict(res, qid, multiple=multiple):
+                            if self.success is not None:
+                                self.success.mark(
+                                    "platform_submit", "correct=true", answer=ans
+                                )
+                        # One right answer ends this question.  On a
+                        # multi-question challenge the outer loop moves on to
+                        # the next id; trying more candidates for a question
+                        # that is already correct only burns attempts.
+                        break
+                    if res.get("correct"):
+                        # The platform said correct but did not name the
+                        # question; keep it visible without marking the run.
+                        self.last_error = "correct response had no matching question_id"
+                        break  # this question already has the right answer
                     if isinstance(left, int):
                         left -= 1
                         if left <= 0:
@@ -310,7 +427,18 @@ class AutoSubmitter:
                             break
         self.answers_tried.extend(tried)
         self.correct.extend(correct)
-        verdict: dict[str, Any] = {"tried": tried, "correct": correct}
+        # A single correct answer on a multi-question challenge is progress,
+        # not a complete solve.  The platform's own flag wins when present;
+        # otherwise all pending ids answered is the only local evidence.
+        if not multiple or platform_flag is True:
+            fully_solved = True
+        else:
+            fully_solved = platform_flag is not False and len(correct) == len(pending)
+        verdict: dict[str, Any] = {
+            "tried": tried,
+            "correct": correct,
+            "challenge_fully_solved": fully_solved,
+        }
         if skipped:
             verdict["skipped"] = skipped
         self._persist(verdict)
@@ -362,12 +490,73 @@ class AutoSubmitter:
         return summary + "\n".join(lines)
 
 
+class CheckerProbe:
+    """One-shot, process-local cache shared by every finish/recovery guard.
+
+    The probe costs one HTTP round trip per question and can block for the
+    full request timeout, so it runs at most once per run.  A negative result
+    is cached too: if the platform was transiently unreachable at finish time,
+    later finish attempts and recovery nudges reuse "not solved" instead of
+    retrying.  That trade is deliberate -- without it, a flaky platform turns
+    every nudge into another multi-second stall.  The cache lives on this
+    object (never in the work directory), so a model cannot forge it and a
+    later run cannot inherit it.
+    """
+
+    def __init__(
+        self,
+        submitter: AutoSubmitter,
+        *,
+        question_ids: list[str] | None = None,
+        known_question_ids: list[str] | None = None,
+        question_modes: dict[str, str] | None = None,
+    ) -> None:
+        self.submitter = submitter
+        self.question_modes = dict(question_modes or {})
+        self.question_ids = list(question_ids or [])
+        self.known_question_ids = list(
+            known_question_ids if known_question_ids is not None else self.question_ids
+        )
+        self._done = False
+        self._result = False
+        self._lock = asyncio.Lock()
+        self.note = ""
+
+    async def check(self) -> bool:
+        """Probe once and return the cached verdict.
+
+        Returns:
+            True only for a validated direct ``passed`` verdict.
+        """
+        async with self._lock:
+            if self._done:
+                return self._result
+            self._done = True
+            try:
+                result = await self.submitter.probe_checkers_async(
+                    all_questions=True,
+                    question_ids=self.question_ids or None,
+                    known_question_ids=self.known_question_ids or None,
+                    question_modes=self.question_modes or None,
+                )
+            except Exception as exc:  # noqa: BLE001 -- probe failure is silent
+                self.note = f"{type(exc).__name__}: {exc}"
+                result = False
+            else:
+                self.note = "passed" if result else "not solved"
+            self._result = bool(result)
+            return self._result
+
+
 def install(
     platform: str,
     instance: str,
     token: str,
     max_refusals: int = 0,
     success: Any = None,
+    fallback_question_ids: list[str] | None = None,
+    fallback_question_modes: dict[str, str] | None = None,
+    submitter: AutoSubmitter | None = None,
 ) -> AutoSubmitter:
     """挂到 ``finish_scan`` 上：允许收工前先提交，答错则拒绝。
 
@@ -386,7 +575,18 @@ def install(
     """
     from strix.agents import factory
 
-    sub = AutoSubmitter(platform, instance, token, success=success)
+    # ``submitter`` lets the entrypoint build the object first (so the finish
+    # guard can hold its probe) and then install this wrapper afterwards.  The
+    # last installed wrapper runs first, which is what keeps submission ahead
+    # of the flag guard.
+    sub = submitter or AutoSubmitter(
+        platform,
+        instance,
+        token,
+        success=success,
+        fallback_question_ids=fallback_question_ids,
+        fallback_question_modes=fallback_question_modes,
+    )
     original = factory._with_bounded_result
     refusal_budget = {"left": max_refusals}
 

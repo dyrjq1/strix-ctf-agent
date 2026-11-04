@@ -345,6 +345,44 @@ def test_shipped_entrypoint_installs_autosubmit() -> None:
     assert "engagement" in src and "checker" in src
 
 
+def test_finish_guard_is_installed_once_after_the_probe_object() -> None:
+    """One install site, and the probe must exist before the guard is wired.
+
+    The old bug was ordering: ``finish_guard`` was installed before the
+    submitter existed, so it never saw a checker.  There was also a duplicate
+    ``has_checker`` computation.  Both are structural properties, so pin them
+    in the source rather than relying on a runtime that needs a sandbox.
+    """
+    tree = _agent_tree()
+    fn = _func(tree, "_run_agent")
+    src = AGENT.read_text(encoding="utf-8")
+
+    installs = [
+        n for n in ast.walk(fn)
+        if isinstance(n, ast.Call)
+        and isinstance(n.func, ast.Name)
+        and n.func.id == "install_finish_guard"
+    ]
+    assert len(installs) == 1, len(installs)
+    assert "has_checker" not in src
+
+    probe_at = src.index("checker_probe = CheckerProbe(")
+    guard_at = src.index("finish_guard = install_finish_guard(")
+    assert probe_at < guard_at, "probe must be built before the guard is installed"
+
+    # Submission runs before the guard: the last wrapper installed runs first,
+    # and a guard refusal would otherwise swallow the only submission.
+    autosubmit_at = src.index("from ctf_strix.autosubmit import install as install_autosubmit")
+    assert guard_at < autosubmit_at
+
+
+def test_finish_and_recovery_guards_share_one_probe_object() -> None:
+    """Finish and recovery must share the process-local one-shot cache."""
+    src = AGENT.read_text(encoding="utf-8")
+    shared = "checker=(checker_probe.check if checker_probe is not None else None)"
+    assert src.count(shared) == 2, src.count(shared)
+
+
 def test_autosubmit_failure_is_visible_in_diagnostics() -> None:
     """A silently failed registration is the bug being prevented."""
     src = AGENT.read_text(encoding="utf-8")
