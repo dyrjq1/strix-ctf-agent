@@ -1,9 +1,10 @@
 """Two-stage wall-clock watchdog: daemon thread + hard exit.
 
 The POSIX signal path has its own tests in ``test_agent_wallclock.py``.
-Everything here runs on every platform: where ``SIGALRM`` is absent the
-same assertions take the simulated/flag branch, so Windows coverage is
-real rather than skipped.
+The daemon, flag and subprocess hard-path tests run on every platform.
+Signal delivery is tested with real ``SIGALRM`` on POSIX and with a
+``SIGABRT`` + ``pthread_kill`` shim on Windows, so nothing here silently
+returns; the handler-guard test also runs without ``SIGALRM``.
 """
 
 from __future__ import annotations
@@ -86,10 +87,19 @@ def test_installed_handler_ignores_a_late_signal_after_cancel(monkeypatch):
     monkeypatch.setattr(agent, "_llm_wall_deadline", lambda s: time.monotonic() + s)
     error_policy.clear_wall_deadline()
     agent._install_hard_deadline(60)
-    handler = signal.getsignal(int(getattr(signal, "SIGALRM", 14)))
-    agent._cancel_hard_deadline()
-    if callable(handler):
+    installed = signal.getsignal(int(getattr(signal, "SIGALRM", 14)))
+    # On Windows there is no SIGALRM handler to install; the same guard is
+    # still exercised by building the handler directly.
+    handler = (
+        installed
+        if callable(installed)
+        else agent._wallclock_handler(60, guard=deadline.armed)
+    )
+    with pytest.raises(agent.WallclockExceeded):
         handler(int(getattr(signal, "SIGALRM", 14)), None)
+    agent._cancel_hard_deadline()
+    assert deadline.armed() is False
+    handler(int(getattr(signal, "SIGALRM", 14)), None)  # must not raise
 
 
 def test_soft_signal_goes_to_the_main_thread(monkeypatch):
@@ -145,26 +155,43 @@ def test_soft_signal_reaches_a_sleeping_main_thread(monkeypatch):
         signal.signal(real_signal, previous)
 
 
-def test_posix_soft_path_unwinds_main_then_cancel_is_safe(tmp_path):
-    """On POSIX, the daemon's pthread_kill must reach the main thread."""
-    if not hasattr(signal, "SIGALRM"):
-        # Windows cannot deliver SIGALRM.  The simulated assertions above
-        # cover the same handler/flag contract; the hard path is covered by
-        # the subprocess tests below.
-        return
-    result = tmp_path / "result.json"
-    error_policy.set_wall_deadline(time.monotonic() + 0.3)
-    assert agent._install_hard_deadline(0.3, result_path=result) is True
-    with pytest.raises(agent.WallclockExceeded):
-        time.sleep(5)
-    agent._cancel_hard_deadline()
+def test_soft_path_unwinds_main_then_cancel_is_safe(tmp_path, monkeypatch):
+    """The daemon's signal must reach the main thread on every platform.
+
+    Where ``SIGALRM`` exists this is the real delivery path.  On Windows it
+    is simulated with ``SIGABRT`` plus a ``pthread_kill`` shim, which still
+    proves the handler runs in the main thread rather than the watchdog's.
+    """
+    simulated = not hasattr(signal, "SIGALRM")
+    previous = None
+    if simulated:
+        if not hasattr(signal, "SIGABRT"):
+            pytest.skip("no signal available for the soft-path simulation")
+        previous = signal.getsignal(signal.SIGABRT)
+        monkeypatch.setattr(signal, "SIGALRM", signal.SIGABRT, raising=False)
+        monkeypatch.setattr(
+            signal,
+            "pthread_kill",
+            lambda ident, signum: signal.raise_signal(signum),
+            raising=False,
+        )
+    try:
+        result = tmp_path / "result.json"
+        error_policy.set_wall_deadline(time.monotonic() + 0.3)
+        assert agent._install_hard_deadline(0.3, result_path=result) is True
+        with pytest.raises(agent.WallclockExceeded):
+            time.sleep(5)
+        agent._cancel_hard_deadline()
+    finally:
+        if simulated:
+            signal.signal(signal.SIGABRT, previous)
 
 
 # b. Hard path: main is still alive after the soft window, so a subprocess
 #    must write the fallback and exit 233.
 def _run_watchdog_script(tmp_path: Path, body: str) -> subprocess.CompletedProcess:
     script = f"""
-import json, os, signal, time
+import json, os, signal, threading, time
 from pathlib import Path
 from ctf_strix import deadline, error_policy
 
@@ -262,6 +289,7 @@ agent.main()
 
 
 def test_hard_path_never_overwrites_a_result_written_during_the_window(tmp_path):
+    """c. A finished run is left alone: real result kept, no exit 233."""
     proc = _run_watchdog_script(
         tmp_path,
         """
@@ -274,12 +302,62 @@ result.write_text(
                 "stop_reason": "completed"}),
     encoding="utf-8",
 )
-time.sleep(10)
+time.sleep(2)
 """,
     )
-    assert proc.returncode == deadline.HARD_EXIT_CODE, proc.stderr
+    assert proc.returncode == 0, proc.stderr
     payload = json.loads((tmp_path / "result.json").read_text(encoding="utf-8"))
     assert payload["stop_reason"] == "completed"
+    assert payload["answers"] == {"flag": "REAL"}
+    assert "wallclock hard stop" not in proc.stderr
+
+
+def test_hard_path_does_not_overwrite_a_result_written_after_its_stale_check(
+    tmp_path,
+):
+    """a. The daemon already passed its last stale check when main finishes.
+
+    ``write_fallback_result`` is delayed until main has cancelled and written
+    the real file, which is exactly the old race: the pre-write snapshot was
+    ``None`` (no file at install time), and a skipped re-check replaced the
+    real answers with an empty fallback.
+    """
+    proc = _run_watchdog_script(
+        tmp_path,
+        """
+error_policy.set_wall_deadline(time.monotonic() + 0.3)
+assert deadline.install(
+    0.3, result_path=result, schema_version=3, soft_window=0.6, signal_armed=False
+)
+
+gate = threading.Event()
+main_done = threading.Event()
+real_write = deadline.write_fallback_result
+
+def gated_write(path, schema, wall, **kwargs):
+    gate.set()
+    main_done.wait(10)
+    return real_write(path, schema, wall, **kwargs)
+
+deadline.write_fallback_result = gated_write
+assert gate.wait(10), "hard path never reached"
+
+# main() starts cleanup (cancel first) and lands its real result.
+deadline.cancel()
+tmp = result.with_name(".real.tmp")
+tmp.write_text(
+    json.dumps({"schema_version": 3, "answers": {"flag": "REAL"},
+                "stop_reason": "solved"}),
+    encoding="utf-8",
+)
+os.replace(tmp, result)
+main_done.set()
+time.sleep(0.8)
+""",
+    )
+    assert proc.returncode == 0, proc.stderr
+    payload = json.loads((tmp_path / "result.json").read_text(encoding="utf-8"))
+    assert payload["stop_reason"] == "solved"
     assert payload["answers"] == {"flag": "REAL"}
 
 
@@ -407,3 +485,182 @@ def test_fallback_writes_when_the_old_file_is_unchanged(tmp_path):
     path.write_text('{"stale": true}', encoding="utf-8")
     before = deadline._file_identity(path)
     assert deadline.should_write_fallback(path, before) is True
+
+
+def test_cancel_after_the_soft_signal_prevents_the_hard_exit(tmp_path):
+    """The real soft-window cancel: fire, then cancel while still inside it."""
+    proc = _run_watchdog_script(
+        tmp_path,
+        """
+error_policy.set_wall_deadline(time.monotonic() + 0.2)
+assert deadline.install(
+    0.2, result_path=result, schema_version=3, soft_window=1.0, signal_armed=False
+)
+while not deadline.fired():
+    time.sleep(0.01)
+deadline.cancel()
+time.sleep(1.2)
+""",
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert not (tmp_path / "result.json").exists()
+
+
+def test_hard_path_still_exits_when_the_result_write_blocks(tmp_path):
+    """e. A wedged stat/write must not delay the guaranteed exit past ~1s."""
+    started = time.monotonic()
+    proc = _run_watchdog_script(
+        tmp_path,
+        """
+def hang(path, before):
+    time.sleep(30)
+
+deadline.should_write_fallback = hang
+error_policy.set_wall_deadline(time.monotonic() + 0.2)
+assert deadline.install(
+    0.2, result_path=result, schema_version=3, soft_window=0.2, signal_armed=False
+)
+time.sleep(20)
+""",
+    )
+    elapsed = time.monotonic() - started
+    assert proc.returncode == deadline.HARD_EXIT_CODE, proc.stderr
+    assert elapsed < 8, f"hard exit took {elapsed:.1f}s despite the 1s write bound"
+    assert "wallclock hard stop" in proc.stderr
+
+
+def test_hard_path_still_exits_when_the_write_itself_blocks(tmp_path):
+    """e. The write leg (tmp + replace) is also bounded by the helper join."""
+    started = time.monotonic()
+    proc = _run_watchdog_script(
+        tmp_path,
+        """
+def hang(*args, **kwargs):
+    time.sleep(30)
+
+deadline.write_fallback_result = hang
+error_policy.set_wall_deadline(time.monotonic() + 0.2)
+assert deadline.install(
+    0.2, result_path=result, schema_version=3, soft_window=0.2, signal_armed=False
+)
+time.sleep(20)
+""",
+    )
+    elapsed = time.monotonic() - started
+    assert proc.returncode == deadline.HARD_EXIT_CODE, proc.stderr
+    assert elapsed < 8, f"hard exit took {elapsed:.1f}s despite the 1s write bound"
+
+
+def test_fallback_recheck_requires_the_file_to_still_be_absent(tmp_path):
+    """The reviewer's repro: a snapshot of None must mean "still absent"."""
+    path = tmp_path / "result.json"
+    path.write_text(
+        json.dumps({"schema_version": 3, "answers": {"flag": "REAL"}}),
+        encoding="utf-8",
+    )
+    assert deadline.write_fallback_result(path, 3, 60, only_if_unchanged=None) is False
+    assert json.loads(path.read_text(encoding="utf-8"))["answers"] == {"flag": "REAL"}
+
+
+def test_fallback_recheck_writes_when_the_file_is_still_absent(tmp_path):
+    path = tmp_path / "result.json"
+    assert deadline.write_fallback_result(path, 3, 60, only_if_unchanged=None) is True
+    assert json.loads(path.read_text(encoding="utf-8"))["answers"] == {}
+
+
+def test_fallback_skips_the_swap_when_the_generation_moved(tmp_path):
+    path = tmp_path / "result.json"
+    generation = deadline._generation
+    deadline.cancel()
+    assert (
+        deadline.write_fallback_result(
+            path,
+            3,
+            60,
+            only_if_unchanged=None,
+            current_generation=generation,
+        )
+        is False
+    )
+    assert not path.exists()
+
+
+def test_install_rolls_back_when_the_watchdog_thread_cannot_start(
+    tmp_path, monkeypatch
+):
+    error_policy.set_wall_deadline(time.monotonic() + 60)
+    with monkeypatch.context() as scoped:
+        scoped.setattr(
+            threading.Thread,
+            "start",
+            lambda self: (_ for _ in ()).throw(RuntimeError("can't start new thread")),
+        )
+        assert deadline.install(60, result_path=tmp_path / "a.json") is False
+    assert not deadline.is_watching()
+    assert deadline.armed() is False
+    assert deadline.install(60, result_path=tmp_path / "b.json") is True
+    deadline.cancel()
+
+
+def test_non_positive_budget_cancels_an_existing_watchdog(tmp_path):
+    """10. "No budget" must turn an earlier watchdog off, not leave it armed."""
+    error_policy.set_wall_deadline(time.monotonic() + 60)
+    assert deadline.install(60, result_path=tmp_path / "a.json") is True
+    assert deadline.is_watching()
+    assert deadline.install(0, result_path=tmp_path / "b.json") is False
+    assert not deadline.is_watching()
+
+
+def test_install_failure_is_reported_and_warns(tmp_path, monkeypatch, capsys):
+    """d. No daemon means no soft signal either: report False and warn."""
+    error_policy.set_wall_deadline(time.monotonic() + 60)
+    monkeypatch.setattr(deadline, "install", lambda *args, **kwargs: False)
+    assert agent._install_hard_deadline(60, result_path=tmp_path / "result.json") is False
+    out = capsys.readouterr().out
+    assert "watchdog not installed" in out
+
+
+def test_result_is_on_disk_before_the_report_is_published(tmp_path, monkeypatch):
+    """b. A slow/failing publisher must not delay the graded artifact."""
+    task = {
+        "run_mode": "engagement",
+        "challenge": {"id": "X", "name": "x", "description": ""},
+        "questions": [{"id": "flag", "prompt": "p"}],
+        "target_endpoints": [
+            {"label": "web", "type": "http", "url": "http://127.0.0.1:9"}
+        ],
+        "result": {"path": str(tmp_path / "result.json")},
+    }
+    result = _prepare_main(tmp_path, monkeypatch, task)
+    seen: list[dict] = []
+
+    def fake_run_agent(task, answers, qid, **kwargs):
+        answers[qid] = "FLAG{real}"
+        return 1, {}
+
+    class FakePublisher:
+        authored = True
+        last_text = "final report"
+
+        def configured(self):
+            return True
+
+        def publish(self, text, force=False, source=""):
+            # If publish ran first this read would fail and the assertion
+            # below would never see the real answers.
+            seen.append(json.loads(result.read_text(encoding="utf-8")))
+            time.sleep(0.05)
+            return True, "ok"
+
+        def snapshot(self):
+            return {}
+
+    monkeypatch.setattr(agent, "_run_agent", fake_run_agent)
+    monkeypatch.setattr(agent, "_challenge_kind", lambda *args, **kwargs: "engagement")
+    monkeypatch.setattr(agent, "_fetch_platform_attachments", lambda *args, **kwargs: [])
+    monkeypatch.setattr(agent, "_local_attachments", lambda work: [])
+    monkeypatch.setattr(agent, "_make_publisher", lambda task: FakePublisher())
+
+    assert agent.main() == 0
+    assert seen, "publisher was never called"
+    assert seen[0]["answers"] == {"flag": "FLAG{real}"}

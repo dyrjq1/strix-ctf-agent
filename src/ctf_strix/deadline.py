@@ -7,7 +7,10 @@ That has two structural holes:
 2. A signal can only interrupt the main thread between bytecodes.  A main
    thread blocked inside a long C call (native TLS, a locked ``threading``
    primitive) never reaches the handler, and one ``except BaseException``
-   on the way up would swallow it.
+   on the way up would swallow it.  A daemon thread is not GIL-independent
+   either -- a C call that never releases the GIL also starves the watchdog
+   -- but the common blocking calls (sockets, sleeps, locks, subprocess
+   waits) do release it, which is the hole this module covers.
 
 This module adds a second, independent layer.  A daemon thread waits on the
 same deadline the retry policy uses (:func:`error_policy.remaining_wall`),
@@ -17,7 +20,9 @@ so there is exactly one clock.  At the deadline it:
   ``signal.pthread_kill`` on POSIX, a process-global flag elsewhere;
 * then waits :data:`error_policy.WALL_RESERVE_SECONDS` for that to happen;
 * if the main thread is still alive, writes a minimal fallback
-  ``result.json`` and calls ``os._exit(233)``.
+  ``result.json`` and calls ``os._exit(233)``.  When a complete result from
+  this run is already on disk it leaves the process alone instead: killing
+  a finished run would turn it into a spurious "crash" (exit 233).
 
 The fallback payload is deliberately minimal: the daemon thread cannot see
 ``main()``'s local ``answers``/turn counters, and a file with an empty answer
@@ -48,6 +53,19 @@ HARD_STOP_REASON = "wallclock_hard"
 #: How often the daemon re-checks the deadline.  A short poll keeps a long
 #: C call from delaying the kill, while staying far below the 20s window.
 _POLL_SECONDS = 0.25
+
+#: Bound on the hard path's file work.  A hung NFS/SMB mount must not keep
+#: the process alive past the wall budget: the exit is the guarantee.
+_WRITE_TIMEOUT_SECONDS = 1.0
+
+#: Bound on taking ``_lock`` for the final kill.  A writer wedged while
+#: holding the lock must not defeat the exit either.
+_FINAL_LOCK_TIMEOUT_SECONDS = 0.5
+
+#: Sentinel for "no identity re-check requested".  ``None`` is a meaningful
+#: snapshot (the file did not exist at install time), so it cannot double as
+#: the default.
+_UNSET = object()
 
 _lock = threading.Lock()
 _watchdog: threading.Thread | None = None
@@ -144,6 +162,22 @@ def _file_identity(path: Path | str) -> tuple[int, int, int] | None:
     return (int(stat.st_ino), int(stat.st_mtime_ns), int(stat.st_size))
 
 
+def _identity_matches(
+    path: Path | str,
+    snapshot: tuple[int, int, int] | None,
+) -> bool:
+    """Whether ``path`` still matches a snapshot taken at install time.
+
+    ``None`` means the file did not exist then, so it must still be absent:
+    a file that appeared since is a result ``main()`` wrote, and replacing it
+    with an empty-answer fallback would be strictly worse.
+    """
+    current = _file_identity(path)
+    if snapshot is None:
+        return current is None
+    return current == snapshot
+
+
 def should_write_fallback(
     result_path: Path | str,
     before_install: tuple[int, int, int] | None,
@@ -158,7 +192,8 @@ def should_write_fallback(
 
     Args:
         result_path: Destination declared by ``task.json``.
-        before_install: :func:`_file_identity` captured at install time.
+        before_install: :func:`_file_identity` captured at install time;
+            ``None`` when ``result.json`` did not exist then.
 
     Returns:
         ``False`` only when a complete file from this run already exists.
@@ -174,7 +209,9 @@ def write_fallback_result(
     result_path: Path | str,
     schema_version: int,
     wall_seconds: float,
-    only_if_unchanged: tuple[int, int, int] | None = None,
+    *,
+    only_if_unchanged: tuple[int, int, int] | None | object = _UNSET,
+    current_generation: int | None = None,
 ) -> bool:
     """Best-effort atomic write of the hard-timeout result file.
 
@@ -185,9 +222,13 @@ def write_fallback_result(
         result_path: Destination declared by ``task.json`` or ``result.json``.
         schema_version: Protocol schema version from the entrypoint.
         wall_seconds: Wall budget, used only for the human-readable writeup.
-        only_if_unchanged: When set, re-check the destination's identity just
-            before ``os.replace`` and skip the swap if ``main()`` wrote a real
-            result while this thread was preparing the fallback.
+        only_if_unchanged: Identity captured at install time.  ``None`` means
+            "the file did not exist then", so any file present at swap time is
+            a real result and the swap is skipped.  Omit the argument to
+            disable the re-check.
+        current_generation: When set, the swap is skipped unless the module
+            generation still matches.  Checked under the same lock as
+            :func:`cancel`, so a cancel cannot land between check and swap.
 
     Returns:
         ``True`` when the file was replaced, ``False`` on any failure.
@@ -200,12 +241,20 @@ def write_fallback_result(
         tmp = path.with_name(f".{path.name}.{os.getpid()}.hard.tmp")
         try:
             tmp.write_text(text, encoding="utf-8")
-            if (
-                only_if_unchanged is not None
-                and _file_identity(path) != only_if_unchanged
-            ):
-                return False
-            os.replace(tmp, path)
+            if only_if_unchanged is _UNSET and current_generation is None:
+                os.replace(tmp, path)
+            else:
+                with _lock:
+                    if (
+                        current_generation is not None
+                        and current_generation != _generation
+                    ):
+                        return False
+                    if only_if_unchanged is not _UNSET and not _identity_matches(
+                        path, only_if_unchanged
+                    ):
+                        return False
+                    os.replace(tmp, path)
         finally:
             try:
                 if tmp.exists():
@@ -247,13 +296,16 @@ def _run(
             break
         time.sleep(min(_POLL_SECONDS, remaining))
 
-    if stale():
-        return
-    _fired = True
-    try:
-        _soft_trigger(signal_armed)
-    except BaseException:  # noqa: BLE001 - the hard stage is the guarantee
-        pass
+    # Check, mark fired and trigger under the same lock ``cancel()`` uses: an
+    # old generation must not set the new run's flag or send it a signal.
+    with _lock:
+        if generation != _generation:
+            return
+        _fired = True
+        try:
+            _soft_trigger(signal_armed)
+        except BaseException:  # noqa: BLE001 - the hard stage is the guarantee
+            pass
 
     window_end = time.monotonic() + max(soft_window, 0.0)
     while time.monotonic() < window_end:
@@ -267,19 +319,59 @@ def _run(
         # main() already ended; there is no stuck thread to kill, and turning
         # a normal exit into 233 would misreport the run.
         return
-    try:
-        if result_path is not None and should_write_fallback(result_path, before_install):
-            write_fallback_result(
+
+    protected = False
+
+    def write_hard_result() -> None:
+        """File work, kept off the watchdog thread so it can be bounded."""
+        nonlocal protected
+        try:
+            if result_path is None:
+                return
+            if not should_write_fallback(result_path, before_install):
+                # A complete result from this run is already on disk.  The run
+                # is finished, not stuck: exit 233 would report a crash.
+                protected = True
+                return
+            wrote = write_fallback_result(
                 result_path,
                 schema_version,
                 wall_seconds,
                 only_if_unchanged=before_install,
+                current_generation=generation,
             )
-    except BaseException:  # noqa: BLE001 - a failed check must not skip the exit
+            if not wrote and not should_write_fallback(result_path, before_install):
+                # main() landed its result between the check above and the
+                # swap; that file wins.
+                protected = True
+        except BaseException:  # noqa: BLE001 - the exit still runs below
+            pass
+
+    writer = threading.Thread(
+        target=write_hard_result, name="ctfy-hard-result", daemon=True
+    )
+    try:
+        writer.start()
+        writer.join(_WRITE_TIMEOUT_SECONDS)
+    except BaseException:  # noqa: BLE001 - a failed helper must not skip the exit
         pass
-    finally:
-        _log_hard_stop(wall_seconds)
+
+    if protected:
+        return
+
+    _log_hard_stop(wall_seconds)
+    # The final generation check and the exit share ``_lock`` with ``cancel()``,
+    # so cleanup that has already started cannot be killed halfway through.
+    # Acquiring is bounded: the writer above may be wedged while holding the
+    # lock on a dead network mount, and the exit is still the guarantee.
+    acquired = _lock.acquire(timeout=_FINAL_LOCK_TIMEOUT_SECONDS)
+    try:
+        if acquired and generation != _generation:
+            return
         os._exit(HARD_EXIT_CODE)
+    finally:
+        if acquired:
+            _lock.release()
 
 
 def install(
@@ -308,11 +400,12 @@ def install(
         non-positive budget or an unset shared deadline.
     """
     global _watchdog, _generation, _fired, _armed  # noqa: PLW0603 - state
-    if wall_seconds <= 0:
-        return False
-    if deadline_seconds() is None:
+    if wall_seconds <= 0 or deadline_seconds() is None:
         # No shared deadline means main() never set one; inventing one here
-        # would be the second clock this design forbids.
+        # would be the second clock this design forbids.  Either way the
+        # documented meaning of "no budget" is "watchdog off", so an earlier
+        # in-process watchdog must not keep running on its old deadline.
+        cancel()
         return False
 
     window = (
@@ -320,6 +413,9 @@ def install(
         if soft_window is None
         else float(soft_window)
     )
+    # Snapshot outside the lock: on a slow mount, stat must not block
+    # cancel()/another watchdog's stale checks.
+    before_install = _file_identity(result_path) if result_path is not None else None
     with _lock:
         # A watchdog left over from an earlier in-process run is superseded,
         # not reused: it may still point at the previous result path and
@@ -338,13 +434,23 @@ def install(
                 window,
                 bool(signal_armed),
                 generation,
-                _file_identity(result_path) if result_path is not None else None,
+                before_install,
             ),
             name="ctfy-wallclock-watchdog",
             daemon=True,
         )
         _watchdog = thread
-        thread.start()
+        try:
+            thread.start()
+        except BaseException:
+            # Thread creation can fail under resource pressure.  Leaving the
+            # half-updated state behind would make is_watching() lie and could
+            # escape main() before it has written result.json.
+            _watchdog = None
+            _armed = False
+            _fired = False
+            soft_timeout_flag.clear()
+            return False
     return True
 
 

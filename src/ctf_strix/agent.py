@@ -729,6 +729,10 @@ def _install_hard_deadline(
         armed.
     """
     if wall_seconds <= 0:
+        # Documented contract: a non-positive budget disables the watchdog.
+        # That must also stop an earlier in-process watchdog; merely declining
+        # to install a new one would leave the old deadline armed.
+        deadline.cancel()
         return False
 
     global _deadline_owned  # noqa: PLW0603 - process-wide run state
@@ -755,16 +759,33 @@ def _install_hard_deadline(
         # the only soft channel, and the hard exit is the real guarantee.
         pass
 
-    installed = deadline.install(
-        wall_seconds,
-        result_path=result_path,
-        schema_version=BRIEF_SCHEMA_VERSION if schema_version is None else schema_version,
-        signal_armed=armed,
-    )
-    # ``install`` can only fail here when the deadline vanished between the
-    # check above and the call (a concurrent cancel).  Report the signal arm
-    # in that case: at least the soft path is live.
-    return installed or armed
+    try:
+        installed = deadline.install(
+            wall_seconds,
+            result_path=result_path,
+            schema_version=BRIEF_SCHEMA_VERSION
+            if schema_version is None
+            else schema_version,
+            signal_armed=armed,
+        )
+    except BaseException as exc:  # noqa: BLE001 - install must not escape main
+        # ``main`` calls this before its try/finally.  An exception here used
+        # to escape without writing result.json; nothing below needs it.
+        installed = False
+        print(
+            f"[ctfy] warning: watchdog install failed: {type(exc).__name__}: {exc}",
+            flush=True,
+        )
+    if not installed:
+        # There is no ``signal.alarm`` anymore: an armed handler with no
+        # daemon never fires.  Reporting the signal arm as success would be a
+        # lie, so fail loudly and let the caller see that timeouts are off.
+        print(
+            "[ctfy] warning: watchdog not installed (no live deadline); "
+            "the wall-clock hard stop is OFF",
+            flush=True,
+        )
+    return installed
 
 
 def _cancel_hard_deadline() -> None:
@@ -1400,17 +1421,6 @@ def main() -> int:
         # the next in-process run start already out of wall clock (tests and
         # embedded callers execute main() more than once per process).
         error_policy.clear_wall_deadline()
-        # 运行时半路崩掉时，_run_agent 的收尾保存不会执行。这里补一手：只要
-        # agent 真的写过报告，就把最后一版再保存一次——报告是唯一交付物，
-        # "写好了但没发出去"与"没写"在评分上完全等价。
-        if publisher is not None and getattr(publisher, "authored", False):
-            try:
-                ok, note = publisher.publish(
-                    publisher.last_text, force=True, source="agent"
-                )
-                print(f"[ctfy] report final ok={ok}: {note}", flush=True)
-            except Exception as exc:  # noqa: BLE001 — 收尾失败不能影响 result.json
-                print(f"[ctfy] report final failed: {type(exc).__name__}: {exc}", flush=True)
 
         tokens = _usage_snapshot()
         payload: dict[str, Any] = {
@@ -1435,6 +1445,11 @@ def main() -> int:
             # so an A/B can tell a parallel run from a single-threaded one
             # without parsing the human-readable writeup.
             payload["parallel"] = parallel_diag
+        # result.json is the graded artifact: land it before any network I/O.
+        # ``publisher.publish`` is synchronous (DNS, redirects, unreachable
+        # endpoints) and can burn the whole shutdown reserve; if it ran first,
+        # the platform could collect the process with no result file at all.
+        # Delivery is best-effort and never mutates the payload.
         try:
             _write_result(result_path, payload)
             print(f"[ctfy] result written to {result_path}")
@@ -1443,6 +1458,18 @@ def main() -> int:
             # 但在本地调试和 CTFY 的 stdout fallback 模式下仍然有意义。
             print(json.dumps(payload, ensure_ascii=False))
             print(f"[ctfy] FATAL: cannot write result file: {exc}", file=sys.stderr)
+
+        # 运行时半路崩掉时，_run_agent 的收尾保存不会执行。这里补一手：只要
+        # agent 真的写过报告，就把最后一版再保存一次——报告是唯一交付物，
+        # "写好了但没发出去"与"没写"在评分上完全等价。
+        if publisher is not None and getattr(publisher, "authored", False):
+            try:
+                ok, note = publisher.publish(
+                    publisher.last_text, force=True, source="agent"
+                )
+                print(f"[ctfy] report final ok={ok}: {note}", flush=True)
+            except Exception as exc:  # noqa: BLE001 — 收尾失败不能影响 result.json
+                print(f"[ctfy] report final failed: {type(exc).__name__}: {exc}", flush=True)
 
     return 0
 
