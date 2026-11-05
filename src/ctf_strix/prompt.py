@@ -200,10 +200,11 @@ invitation to delegate: the default is still to solve the challenge yourself.
      call).
   A child must report the answer it retrieved, or the evidence that closed its
   direction, and call `agent_finish`. Children do not report prose-only.
-- **Race end.** The first retrieved answer wins. When a child retrieves a flag,
-  stop sending work: the run ends with that answer. Do not spawn a replacement
-  or restart the search. If the root retrieves it, call `finish_scan` once and
-  carry the exact string.
+- **Race end.** The first retrieved answer or platform verdict wins. When a
+  child retrieves a flag -- or a shell call it made returns a passing verdict
+  from the challenge's own check endpoint -- stop sending work: the run ends
+  with that result. Do not spawn a replacement or restart the search. If the
+  root retrieves it, call `finish_scan` once and carry the exact string.
 - **Budget is shared.** Children run on the same turn, wall-clock and memory
   budget as you; two children does not mean two budgets. Keep briefs short and
   avoid duplicate reconnaissance.

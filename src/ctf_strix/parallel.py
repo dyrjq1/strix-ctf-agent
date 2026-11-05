@@ -11,6 +11,9 @@ behaviour:
 * children may not spawn grandchildren;
 * a flag seen in a child's tool output is a race win: the root is woken and
   every other child is stopped;
+* a structured platform verdict (``exec_verdict``) seen in a child's shell
+  output is the same win; #4b's observer already validated it, this module only
+  forwards the notification to the root;
 * a root ``finish_scan`` that carries a proven flag stops live children before
   the vendored tool's "no active agents" check can reject it.
 
@@ -53,6 +56,9 @@ _SUCCESS: Any = None
 _EVIDENCE: Any = None
 _COORDINATOR: Any = None
 _ROOT_ID: str | None = None
+_BRIDGE_INSTALLED = False
+_BRIDGE_ORIGINAL: Any = None
+_BRIDGE_PATCHED: Any = None
 
 
 def enabled() -> bool:
@@ -168,6 +174,7 @@ def stats() -> dict[str, Any]:
             "spawned": _SPAWNED,
             "race_announced": _ANNOUNCED,
             "race_stopped": _RACE_STOPPED,
+            "exec_bridge": _BRIDGE_INSTALLED,
         }
 
 
@@ -208,11 +215,35 @@ def usage_summary(
 
 
 def note_success(agent_id: str, flag: str, *, root_id: str | None = None) -> None:
-    """Announce a race win and stop the other agents.
+    """Announce a flag-based race win and stop the other agents.
 
     Called from the synchronous event sink.  The actual coordinator work is
     scheduled on the running loop; the sink can then return and let the runner
     deliver the next event, where ``success.solved`` raises ``SolvedStop``.
+    """
+    note_race_win(agent_id, flag, source="flag_extract", root_id=root_id)
+
+
+def note_race_win(
+    agent_id: str,
+    flag: str,
+    *,
+    source: str,
+    root_id: str | None = None,
+) -> None:
+    """Announce a validated race win and stop the other agents.
+
+    Two producers feed this: the text flag extractor (``flag_extract``) and
+    #4b's shell observer, which records a platform verdict (``exec_verdict``)
+    only after parsing a complete ``/check`` or ``/submissions`` response.  The
+    verdict arrives with no flag string, so the message carries the ledger
+    detail instead; both paths wake the root the same way.
+
+    Args:
+        agent_id: the child that won (or the root for a root-side win).
+        flag: the confirmed flag, or the verdict detail when no flag exists.
+        source: ledger source label, carried into diagnostics.
+        root_id: the root agent id, when already known.
     """
     global _ANNOUNCED, _ROOT_ID
     if not flag:
@@ -223,7 +254,10 @@ def note_success(agent_id: str, flag: str, *, root_id: str | None = None) -> Non
     # coordinator work.  `SolvedStop` is driven by `success.solved`; without
     # this the root could receive the message and still finish as completed.
     if _SUCCESS is not None:
-        _SUCCESS.observe_answer(flag, source="flag_extract")
+        if source == "flag_extract":
+            _SUCCESS.observe_answer(flag, source=source)
+        else:
+            _SUCCESS.mark(source, flag)
     with _LOCK:
         if _ANNOUNCED:
             return
@@ -237,7 +271,13 @@ def note_success(agent_id: str, flag: str, *, root_id: str | None = None) -> Non
         logger.warning("parallel race: no running loop to stop agents")
         return
     task = loop.create_task(
-        _stop_for_race(coordinator, root_id=root_id, winner_id=agent_id, flag=flag),
+        _stop_for_race(
+            coordinator,
+            root_id=root_id,
+            winner_id=agent_id,
+            flag=flag,
+            source=source,
+        ),
         name="ctf-parallel-stop",
     )
     _STOP_TASKS.add(task)
@@ -250,6 +290,7 @@ async def _stop_for_race(
     root_id: str | None,
     winner_id: str,
     flag: str,
+    source: str,
 ) -> None:
     global _RACE_STOPPED
     try:
@@ -259,6 +300,13 @@ async def _stop_for_race(
                 None,
             )
         if root_id is not None and winner_id != root_id:
+            if source == "flag_extract":
+                outcome = f"The answer seen in tool output was: {flag}"
+            else:
+                outcome = (
+                    "The platform verdict was already recorded by the shell "
+                    f"observer ({flag}); retrieve the answer if one exists"
+                )
             await coordinator.send(
                 root_id,
                 {
@@ -268,7 +316,7 @@ async def _stop_for_race(
                     "content": (
                         "A parallel sub-agent retrieved the answer. Stop all work now; "
                         "do not wait, do not spawn another agent, and do not restart the "
-                        f"search. The answer seen in tool output was: {flag}"
+                        f"search. {outcome}"
                     ),
                 },
                 interrupt=True,
@@ -314,6 +362,7 @@ def install() -> bool:
 def uninstall() -> None:
     """Restore the previous mount function (tests and rollback)."""
     global _INSTALLED, _ORIGINAL
+    uninstall_exec_bridge()
     if not _INSTALLED:
         return
     try:
@@ -324,6 +373,116 @@ def uninstall() -> None:
     finally:
         _INSTALLED = False
         _ORIGINAL = None
+
+
+def install_exec_bridge() -> bool:
+    """Forward a child's structured shell verdict to the race protocol.
+
+    #4b's exec observer validates a ``/check`` or ``/submissions`` response and
+    then raises ``SolvedStop``.  On the root that unwinds the run correctly; on
+    a child the exception escapes its detached task, so the root is never
+    woken and the other children keep burning turns.  This wrapper sits
+    outside the observer and turns that already-validated verdict into the same
+    race win a text flag produces.
+
+    It deliberately does **not** re-validate or widen anything: the solve must
+    already be in ``SuccessLedger``.  Text flags normally go through
+    ``note_success`` directly; the bridge only matters when a later shell call
+    would otherwise raise a second ``SolvedStop`` in the same child.
+
+    On the root the exception is re-raised so ``agent.main`` unwinds as before.
+    On a child it is consumed: that task is detached from the runner's
+    ``except Exception`` handling, and a ``BaseException`` escaping it would
+    only surface as ``Task exception was never retrieved``.  The race stop
+    scheduled by ``note_race_win`` is what ends the child.
+
+    Must be installed *after* ``success_stop.install_exec_observer`` so the
+    bridge is the outer wrapper on ``exec_command`` / ``write_stdin``.
+    """
+    global _BRIDGE_INSTALLED, _BRIDGE_ORIGINAL, _BRIDGE_PATCHED
+    if _BRIDGE_INSTALLED:
+        return True
+    try:
+        from strix.agents import factory
+    except Exception:  # noqa: BLE001 - vendor unavailable in some unit tests
+        return False
+
+    original = factory._with_bounded_result
+    _BRIDGE_ORIGINAL = original
+
+    def patched(tool: Any) -> Any:
+        tool = original(tool)
+        if getattr(tool, "name", "") not in ("exec_command", "write_stdin"):
+            return tool
+        if getattr(tool, "_ctf_parallel_bridge", False):
+            return tool
+        inner = tool.on_invoke_tool
+
+        async def invoke(ctx: Any, raw_input: str) -> Any:
+            try:
+                return await inner(ctx, raw_input)
+            except BaseException as exc:
+                from ctf_strix.success_stop import SolvedStop
+
+                if not isinstance(exc, SolvedStop):
+                    raise
+                success = _SUCCESS
+                if success is None or not getattr(success, "solved", False):
+                    raise
+                source = str(getattr(success, "source", "") or "")
+                context = _context(ctx)
+                agent_id = str(context.get("agent_id") or "")
+                root = _ROOT_ID or root_id()
+                # A child is proven either by the graph or by its parent_id.
+                # With neither signal we cannot tell, so leave the original
+                # exception alone rather than stopping a random agent.
+                is_child = context.get("parent_id") is not None or (
+                    root is not None and agent_id != root
+                )
+                if not is_child:
+                    raise
+                detail = str(getattr(success, "detail", "") or "verdict recorded")
+                # A child must never propagate SolvedStop: its task is detached
+                # from the runner's handler.  If the win was already announced
+                # by the flag path this call is a no-op; otherwise it wakes the
+                # root exactly once.
+                payload = str(getattr(success, "answer", "") or "") or detail
+                note_race_win(agent_id, payload, source=source, root_id=root)
+                return json.dumps(
+                    {
+                        "success": True,
+                        "note": "platform verdict recorded; race stop requested",
+                    }
+                )
+
+        tool.on_invoke_tool = invoke
+        tool._ctf_parallel_bridge = True  # type: ignore[attr-defined]
+        return tool
+
+    _BRIDGE_PATCHED = patched
+    factory._with_bounded_result = patched  # type: ignore[assignment]
+    _BRIDGE_INSTALLED = True
+    return True
+
+
+def uninstall_exec_bridge() -> None:
+    """Remove the bridge wrapper when it is still the outermost one."""
+    global _BRIDGE_INSTALLED, _BRIDGE_ORIGINAL, _BRIDGE_PATCHED
+    if not _BRIDGE_INSTALLED:
+        return
+    try:
+        from strix.agents import factory
+
+        # Only undo our own layer.  If another guard was installed after us,
+        # replacing the attribute here would silently unhook it.
+        if _BRIDGE_PATCHED is not None and factory._with_bounded_result is _BRIDGE_PATCHED:
+            factory._with_bounded_result = _BRIDGE_ORIGINAL  # type: ignore[assignment]
+    except Exception:  # noqa: BLE001 - a missing runtime has nothing to restore
+        pass
+    finally:
+        _BRIDGE_INSTALLED = False
+        _BRIDGE_ORIGINAL = None
+        _BRIDGE_PATCHED = None
 
 
 def wrap_tool(tool: Any) -> Any:

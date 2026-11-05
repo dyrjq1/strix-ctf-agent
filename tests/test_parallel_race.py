@@ -180,6 +180,7 @@ def test_prompt_carries_the_race_protocol_only_when_enabled(monkeypatch) -> None
     assert "Parallel hypothesis race" in enabled_text
     assert "list the candidate directions in `think`" in enabled_text
     assert "at most **two**" in enabled_text
+    assert "platform verdict" in enabled_text
 
     monkeypatch.delenv("CTF_ALLOW_SUBAGENTS")
     assert "Parallel hypothesis race" not in prompt.build({})

@@ -1881,6 +1881,24 @@ def _run_agent(
         print(f"[ctfy] exec observer failed: {type(exc).__name__}: {exc}", flush=True)
         diag["exec_observer"] = "failed"
 
+    # The observer above raises SolvedStop for a validated shell verdict.  On
+    # the root that unwinds the run correctly; on a child it would only kill
+    # that detached task, leaving the root and the other children running.
+    # Install the race bridge *outside* the observer so the same verdict wakes
+    # the root and stops the siblings.  It is a pure forwarder: the observer
+    # still owns the validation, and only success.source == "exec_verdict"
+    # crosses this seam.  
+    if parallel_on:
+        try:
+            bridged = parallel.install_exec_bridge()
+            diag["parallel_exec_bridge"] = "on" if bridged else "off"
+        except Exception as exc:  # noqa: BLE001 -- bridging must not gate the run
+            print(
+                f"[ctfy] parallel exec bridge failed: {type(exc).__name__}: {exc}",
+                flush=True,
+            )
+            diag["parallel_exec_bridge"] = "failed"
+
     if parallel_on:
         # The configured state is per run; the guard itself is process-wide.
         parallel.reset_run()
