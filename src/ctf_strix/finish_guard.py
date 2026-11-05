@@ -74,6 +74,29 @@ _REFUSAL = {
 }
 
 
+def _echo_refusal(flags: list[str]) -> dict[str, Any]:
+    """Refusal used when every flag in the summary is a self-echo.
+
+    Reusing the generic "no flag" text would tell the model to go get the
+    flag, which it may believe it already has.  Name the actual problem: the
+    only place the string appeared was an output that replayed the model's
+    own arguments.
+    """
+    listing = ", ".join(flags[:3])
+    return {
+        "success": False,
+        "error": (
+            "REFUSED: the only tool-output evidence for this flag is a "
+            "self-echo. The same literal was already in the tool call's own "
+            "arguments (command / request / payload), and the output merely "
+            f"repeated it back: {listing}. That is not retrieval. Read the "
+            "flag from an output whose call did not contain that literal "
+            "(for example `cat /flag`, a directory listing, or a query that "
+            "does not quote the guess), then quote it in the summary."
+        ),
+    }
+
+
 class FinishGuard:
     """拦下"没有 flag 的收工"。"""
 
@@ -94,8 +117,10 @@ class FinishGuard:
                 this run's tool output.  When supplied, a flag-shaped summary
                 still has to be backed by that output evidence; otherwise the
                 guard would accept a fabricated string the model merely
-                wrote down.  ``None`` keeps the legacy regex-only policy for
-                callers that have not wired an evidence ledger yet.
+                wrote down.  An output that only echoed the literal back from
+                the call's own arguments does not back it either, and the
+                refusal says so.  ``None`` keeps the legacy regex-only policy
+                for callers that have not wired an evidence ledger yet.
             checker: optional one-shot platform probe.  It is consulted before
                 an answerless finish is refused, and its result is cached for
                 the rest of this run.  A solved probe marks ``success``; a
@@ -118,7 +143,9 @@ class FinishGuard:
         #: is distinguishable from "probe never armed".
         self.probe_note = ""
 
-    def _evaluate_policy(self, raw_input: str) -> tuple[dict[str, Any] | None, bool]:
+    def _evaluate_policy(
+        self, raw_input: str
+    ) -> tuple[dict[str, Any] | None, bool, list[str]]:
         """Apply everything that does not need a platform call.
 
         A solve already recorded by any channel wins before the flag check:
@@ -126,33 +153,39 @@ class FinishGuard:
         verdict was recorded, because there is no flag string to quote.
 
         Returns:
-            ``(refusal, needs_probe)``.  ``refusal`` is ``None`` when the call
-            is allowed or when the probe still has to run.
+            ``(refusal, needs_probe, echo_only)``.  ``refusal`` is ``None``
+            when the call is allowed or when the probe still has to run;
+            ``echo_only`` lists the summary flags whose only output evidence
+            was a self-echo, so a later refusal can say so explicitly.
         """
         if self.success is not None and getattr(self.success, "solved", False):
             self.allowed += 1
-            return None, False
+            return None, False, []
         if not self.require_flag:
             self.allowed += 1
-            return None, False
+            return None, False, []
         found = [m.group(0) for m in _FLAG_RE.finditer(raw_input or "")]
         accepted = [flag for flag in found if _PLACEHOLDER.match(flag) is None]
+        echo_only: list[str] = []
         if accepted:
             if self.evidence is None:
                 supported = accepted
             else:
                 supported = [flag for flag in accepted if self.evidence.supports(flag)]
+                is_echo = getattr(self.evidence, "echoed_only", None)
                 for flag in accepted:
                     if flag not in supported:
                         reject = getattr(self.evidence, "reject", None)
                         if reject is not None:
                             reject(flag)
+                        if callable(is_echo) and is_echo(flag):
+                            echo_only.append(flag)
             if supported:
                 if self.success is not None:
                     self.success.observe_answer(supported[0], source="finish_guard")
                 self.allowed += 1
-                return None, False
-        return None, True
+                return None, False, []
+        return None, True, echo_only
 
     def _probe_taken(self, result: bool, note: str) -> None:
         with self._probe_lock:
@@ -171,7 +204,7 @@ class FinishGuard:
             self._probe_started = True
             return True
 
-    def _after_probe(self) -> dict[str, Any] | None:
+    def _after_probe(self, echo_only: list[str] | None = None) -> dict[str, Any] | None:
         if self._probe_result:
             if self.success is not None and not getattr(self.success, "solved", False):
                 self.success.mark("checker", "finish guard probe")
@@ -181,6 +214,8 @@ class FinishGuard:
             self.allowed += 1
             return None
         self.refusals += 1
+        if echo_only:
+            return _echo_refusal(echo_only)
         return dict(_REFUSAL)
 
     async def check_async(self, raw_input: str) -> dict[str, Any] | None:
@@ -196,11 +231,11 @@ class FinishGuard:
         Returns:
             A refusal dict, or ``None`` when the call may proceed.
         """
-        refusal, needs_probe = self._evaluate_policy(raw_input)
+        refusal, needs_probe, echo_only = self._evaluate_policy(raw_input)
         if refusal is not None or not needs_probe:
             return refusal
         if self.checker is None:
-            return self._after_probe()
+            return self._after_probe(echo_only)
         if self._probe_claim():
             try:
                 if inspect.iscoroutinefunction(self.checker):
@@ -217,7 +252,7 @@ class FinishGuard:
         elif not self._probe_ready.is_set():
             # Another finish call is probing; wait without blocking the loop.
             await asyncio.to_thread(self._probe_ready.wait)
-        return self._after_probe()
+        return self._after_probe(echo_only)
 
     def check(self, raw_input: str) -> dict[str, Any] | None:
         """Synchronous policy evaluation for legacy callers and unit tests.
@@ -234,10 +269,10 @@ class FinishGuard:
         Returns:
             A refusal dict, or ``None`` when the call may proceed.
         """
-        refusal, needs_probe = self._evaluate_policy(raw_input)
+        refusal, needs_probe, echo_only = self._evaluate_policy(raw_input)
         if refusal is not None or not needs_probe:
             return refusal
-        return self._after_probe()
+        return self._after_probe(echo_only)
 
 
 def install(

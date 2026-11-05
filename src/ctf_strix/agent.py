@@ -515,8 +515,10 @@ def _extract_args_flags(raw: str) -> list[str]:
     """Return flag-shaped strings from a lifecycle call's arguments.
 
     A child cannot make a claim true by writing it: the value stays a guess in
-    ``arg_claims`` until an output from this run contains it.  This exists so
-    ``agent_finish`` gets the same provenance gate as ``finish_scan``.
+    ``arg_claims`` until a tool output from this run proves it.  An output that
+    merely echoes the same literal back from the call's own arguments does not
+    count (see :meth:`ctf_strix.evidence.EvidenceLedger.echoed_only`).  This
+    exists so ``agent_finish`` gets the same provenance gate as ``finish_scan``.
     """
     from ctf_strix.parallel import flags_in_text
 
@@ -2202,7 +2204,8 @@ def _run_agent(
     pending_calls: dict[str, tuple[str, str]] = {}
     pending_seq: list[tuple[str, str]] = []
     # Flags the model wrote into a tool call's arguments.  Kept until a tool
-    # output proves the same string was actually read.
+    # output proves the same string was actually read -- a self-echo (same
+    # literal in the producing call's arguments) does not count.
     arg_claims: list[str] = []
     own_host = _host_of(_targets_from(task)[0]) if _targets_from(task) else ""
     save_threads: list[threading.Thread] = []
@@ -2299,12 +2302,24 @@ def _run_agent(
                     for claim in _extract_args_flags(args_full):
                         if claim not in arg_claims:
                             arg_claims.append(claim)
+            # Pair *every* agent's call with its output, not only the root's:
+            # a child (or a tcp payload) can echo a guess too, and echo
+            # detection needs the full argument text, not the display prefix.
+            raw = getattr(item, "raw_item", None)
+            name = str(getattr(raw, "name", "?") or "?")
+            args_full = str(getattr(raw, "arguments", "") or "")
+            args = args_full[:300]
+            call_id = str(
+                getattr(item, "call_id", "")
+                or getattr(raw, "call_id", "")
+                or ""
+            )
+            if call_id:
+                pending_calls[call_id] = (name, args_full)
+            else:
+                pending_seq.append((name, args_full))
             if agent_id == root_agent:
                 root_tool_calls += 1
-                raw = getattr(item, "raw_item", None)
-                name = str(getattr(raw, "name", "?") or "?")
-                args_full = str(getattr(raw, "arguments", "") or "")
-                args = args_full[:300]
                 # finish_scan carries the agent's final answer in its
                 # arguments, not in a tool output.  Scanning outputs only was
                 # losing challenges where the agent read the flag correctly
@@ -2316,15 +2331,6 @@ def _run_agent(
                         # Record, do not submit yet: the same string must show
                         # up in a tool output before it counts as retrieved.
                         arg_claims.append(found)
-                call_id = str(
-                    getattr(item, "call_id", "")
-                    or getattr(raw, "call_id", "")
-                    or ""
-                )
-                if call_id:
-                    pending_calls[call_id] = (name, args)
-                else:
-                    pending_seq.append((name, args))
             if engagement and agent_id == root_agent:
                 activity.append(f"`{name}` {args}")
                 if len(activity) > _CAPTURE_LIMIT:
@@ -2356,9 +2362,14 @@ def _run_agent(
             # Last resort: the previous output was never paired.  Reuse its
             # call in order rather than dropping the output from the digest.
             pair = attempt_pairs[len(attempt_outputs)]
-        if pair is not None:
+        # Only the root's calls feed the retry digest; child probes are a
+        # different line of attack and would bury the root's own history.
+        if pair is not None and agent_id == root_agent:
             attempt_pairs.append(pair)
             attempt_outputs.append(text)
+        # ``None`` means this output could not be paired with a call, so the
+        # arguments are unknown and the legacy "count everything" rule applies.
+        call_arguments = pair[1] if pair is not None else None
         tool_outputs += 1
 
         if engagement:
@@ -2372,8 +2383,10 @@ def _run_agent(
                     _publish(force=False, background=True)
             return
 
-        # Every flag-shaped string in this output is now *retrieved* evidence.
-        ledger.observe_output(text)
+        # A flag in this output is *retrieved* evidence unless the same literal
+        # was already in the call's own arguments: then the tool merely echoed
+        # the model's guess back (Q6), and that observation must not support it.
+        ledger.observe_output(text, arguments=call_arguments)
         if arg_claims:
             for claim in list(arg_claims):
                 if ledger.supports(claim) and _record_answer(
@@ -2389,17 +2402,33 @@ def _run_agent(
         # ⚠️ 必须逐条输出单独判定，不能等最后拼起来一起判。拼接后
         # 本题靶机与别题 flag 的距离信息会被淹没，证据判定退化成瞎猜。
         flag = _extract_flag(text, own_host)
+        if flag is not None and not ledger.supports(flag):
+            # The extractor's pick is the literal this call echoed back.  If
+            # the same output also carried another flag from a clean
+            # observation, promote that one instead of dropping the output.
+            from ctf_strix.flag_extract import FLAG_RE
+
+            flag = next(
+                (
+                    candidate
+                    for candidate in FLAG_RE.findall(text)
+                    if ledger.supports(candidate)
+                ),
+                None,
+            )
         if parallel_on and agent_id != root_agent:
             # A child's retrieved flag is a race win even when the root has not
             # seen this output yet.  Record the answer here as well: the root
             # may be interrupted before its own sink processes the output, and
             # ``result.json`` is written from this map.
             child_flag = flag or _parallel_flag(text, own_host)
-            if child_flag:
+            if child_flag and ledger.supports(child_flag):
                 if _record_answer(answers, all_qids, child_flag, qid, derived=mirrors):
                     print(f"[ctfy] flag captured by sub-agent: {child_flag}", flush=True)
                 parallel.note_success(agent_id, child_flag, root_id=root_agent)
-        if flag and _record_answer(answers, all_qids, flag, qid, derived=mirrors):
+        if flag and ledger.supports(flag) and _record_answer(
+            answers, all_qids, flag, qid, derived=mirrors
+        ):
             print(f"[ctfy] flag captured: {flag}", flush=True)
             success.observe_answer(flag, source="flag_extract")
 
@@ -2616,7 +2645,12 @@ def _run_agent(
     if not engagement and _needs_value(answers, all_qids, mirrors):
         for text in captured:
             flag = _extract_flag(text, own_host)
-            if flag and _record_answer(answers, all_qids, flag, qid, derived=mirrors):
+            # The sink already recorded every output in the ledger.  Re-check
+            # support here as well, otherwise a self-echoed guess that the
+            # sink correctly refused would be re-submitted by this rescan.
+            if flag and ledger.supports(flag) and _record_answer(
+                answers, all_qids, flag, qid, derived=mirrors
+            ):
                 print(f"[ctfy] flag captured on rescan: {flag}", flush=True)
                 success.observe_answer(flag, source="flag_extract")
                 break
@@ -2627,7 +2661,13 @@ def _run_agent(
     for claim in arg_claims:
         if not ledger.supports(claim) and answers.get(qid) != claim:
             ledger.reject(claim)
-            print(f"[ctfy] flag rejected (no tool output): {claim}", flush=True)
+            if ledger.echoed_only(claim):
+                print(
+                    f"[ctfy] flag rejected (self-echo in tool output): {claim}",
+                    flush=True,
+                )
+            else:
+                print(f"[ctfy] flag rejected (no tool output): {claim}", flush=True)
 
     # 最终保存必须在这里再走一次：agent 可能根本没调 finish_scan（被轮次上限
     # 或墙钟打断），那样上面的钩子从未触发，整轮发现会全部丢失。
@@ -2643,7 +2683,7 @@ def _run_agent(
     out: dict[str, Any] = {}
     if publisher is not None:
         out["report"] = publisher.snapshot()
-    if ledger.observed or ledger.unsupported:
+    if ledger.observed or ledger.echoed or ledger.unsupported:
         out["evidence"] = ledger.summary()
     # A checker-only solve has no flag to add, but the verdict still belongs
     # in the diagnostics.
