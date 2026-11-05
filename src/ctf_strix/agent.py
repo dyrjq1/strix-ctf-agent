@@ -30,6 +30,7 @@ import traceback
 from pathlib import Path
 from typing import Any
 
+from ctf_strix import deadline
 from ctf_strix import error_policy
 from ctf_strix import platform_attach as attach
 from ctf_strix.success_stop import RecoveryExhausted
@@ -659,33 +660,157 @@ def _wall_budget(task: dict[str, Any]) -> int:
     return _WALL_TIERS.get(difficulty, _WALL_TIERS["hard"])
 
 
-def _install_hard_deadline(wall_seconds: int) -> bool:
-    """装 SIGALRM 看门狗；平台不支持时（Windows 本地）返回 False。
+def _wallclock_handler(wall_seconds: int, *, guard: Any = None) -> Any:
+    """Build the ``SIGALRM`` handler that unwinds ``main`` cleanly.
 
-    到点在主线程抛 :class:`WallclockExceeded`，由 ``main`` 的收尾写出
-    ``stop_reason="wallclock"`` 的 result.json。被平台外部强杀是没有这个
-    待遇的——这正是看门狗存在的理由。
+    Args:
+        wall_seconds: Budget used in the exception text.
+        guard: Optional predicate checked before raising.  The installed
+            handler passes :func:`deadline.armed`; a signal that was already
+            in flight when ``main`` entered its ``finally`` block arrives
+            after :func:`_cancel_hard_deadline` cleared that flag, and must
+            not unwind the cleanup that is writing ``result.json``.
+    """
+
+    def _fire(signum: int, frame: Any) -> None:  # noqa: ARG001
+        if guard is not None and not guard():
+            return
+        raise WallclockExceeded(f"wall budget {wall_seconds}s spent")
+
+    return _fire
+
+
+def _check_soft_timeout() -> None:
+    """Raise on the flag-only soft path used where ``SIGALRM`` is absent.
+
+    Called from the event sink, which is the main thread's most frequent
+    checkpoint during a run.  A main thread stuck in one C call never reaches
+    it; that case is what the daemon's hard exit covers.
+    """
+    if deadline.soft_timeout_flag.is_set():
+        raise WallclockExceeded("wall budget spent (watchdog flag)")
+
+
+#: Whether :func:`_install_hard_deadline` created the shared deadline itself.
+#: If it did, :func:`_cancel_hard_deadline` must clear it: otherwise an
+#: in-process test/embedded caller leaves the next run already out of clock.
+_deadline_owned = False
+
+#: Whether this process currently has the ``SIGALRM`` handler installed.  A
+#: run with no wall budget must not rewrite a caller's signal disposition.
+_signal_installed = False
+
+
+def _install_hard_deadline(
+    wall_seconds: int,
+    *,
+    result_path: Path | None = None,
+    schema_version: int | None = None,
+) -> bool:
+    """Install the two-stage wall-clock watchdog.
+
+    Stage one is a signal/fast-flag request to unwind ``main`` so its normal
+    cleanup writes ``result.json`` (``stop_reason="wallclock"``).  Stage two
+    is a daemon thread that survives a main thread stuck in a C call: after
+    the shared shutdown reserve it writes a fallback file and calls
+    ``os._exit``.  Windows has no ``SIGALRM``; there the daemon still runs.
+
+    The absolute deadline lives in :mod:`error_policy`.  When the caller has
+    not set one yet (unit tests, embedded callers), this creates it from the
+    same ``monotonic`` clock rather than introducing a second one.
+
+    Args:
+        wall_seconds: Run wall budget; non-positive disables the watchdog.
+        result_path: Destination for the hard-path fallback file.
+        schema_version: Protocol schema version for that fallback.
+
+    Returns:
+        ``True`` when the watchdog (daemon thread and/or signal handler) is
+        armed.
     """
     if wall_seconds <= 0:
         return False
 
-    def _fire(signum: int, frame: Any) -> None:  # noqa: ARG001
-        raise WallclockExceeded(f"wall budget {wall_seconds}s spent")
+    global _deadline_owned  # noqa: PLW0603 - process-wide run state
+    if _deadline_owned:
+        # An earlier run created the deadline and never cleaned up (hard kill
+        # superseded it, or a unit test aborted).  Rebase it on this run's
+        # budget: a stale past deadline would fire the new watchdog at once.
+        error_policy.set_wall_deadline(_llm_wall_deadline(wall_seconds))
+    if error_policy.remaining_wall() is None:
+        error_policy.set_wall_deadline(_llm_wall_deadline(wall_seconds))
+        _deadline_owned = True
 
+    global _signal_installed  # noqa: PLW0603 - process-wide run state
+    armed = False
     try:
-        signal.signal(signal.SIGALRM, _fire)
-        signal.alarm(wall_seconds)
+        signal.signal(
+            signal.SIGALRM,
+            _wallclock_handler(wall_seconds, guard=deadline.armed),
+        )
+        armed = True
+        _signal_installed = True
     except (AttributeError, ValueError, OSError):
-        return False
-    return True
+        # No SIGALRM (Windows) or not the main thread: the daemon's flag is
+        # the only soft channel, and the hard exit is the real guarantee.
+        pass
+
+    installed = deadline.install(
+        wall_seconds,
+        result_path=result_path,
+        schema_version=BRIEF_SCHEMA_VERSION if schema_version is None else schema_version,
+        signal_armed=armed,
+    )
+    # ``install`` can only fail here when the deadline vanished between the
+    # check above and the call (a concurrent cancel).  Report the signal arm
+    # in that case: at least the soft path is live.
+    return installed or armed
 
 
 def _cancel_hard_deadline() -> None:
-    """撤销看门狗，避免 alarm 在写 result.json 的途中响起。"""
+    """Stop the watchdog before cleanup writes ``result.json``.
+
+    Cancelling only invalidates the daemon: a late ``SIGALRM`` would still
+    unwind the very cleanup that is writing the file.  POSIX therefore also
+    points ``SIGALRM`` at ``SIG_IGN`` for the remainder of the process; the
+    next run reinstalls its handler.
+    """
+    global _deadline_owned, _signal_installed  # noqa: PLW0603 - run state
+    # Disarm first: a handler dispatched by an in-flight signal between these
+    # lines must see the flag and return instead of raising into cleanup.
+    deadline.cancel()
+    if not _signal_installed:
+        # Nothing of ours is armed.  Leave a caller-installed SIGALRM (or the
+        # platform default) alone.
+        if _deadline_owned:
+            error_policy.clear_wall_deadline()
+            _deadline_owned = False
+        return
+    alarm = getattr(signal, "SIGALRM", None)
+    if alarm is not None:
+        # Block first: a signal already in flight must not interrupt the
+        # transition below.  It is discarded once the disposition is IGN.
+        try:
+            signal.pthread_sigmask(signal.SIG_BLOCK, {alarm})
+        except (AttributeError, OSError, ValueError):
+            pass
     try:
         signal.alarm(0)
     except (AttributeError, ValueError, OSError):
         pass
+    try:
+        signal.signal(signal.SIGALRM, signal.SIG_IGN)
+    except (AttributeError, ValueError, OSError):
+        pass
+    if alarm is not None:
+        try:
+            signal.pthread_sigmask(signal.SIG_UNBLOCK, {alarm})
+        except (AttributeError, OSError, ValueError):
+            pass
+    _signal_installed = False
+    if _deadline_owned:
+        error_policy.clear_wall_deadline()
+        _deadline_owned = False
 
 
 def _attempt_count() -> int:
@@ -1130,7 +1255,11 @@ def main() -> int:
     error_policy.set_wall_deadline(_llm_wall_deadline(wall_budget))
     if wall_budget > 0:
         os.environ.setdefault("CTFY_SOFT_DEADLINE", str(max(int(wall_budget * 0.75), 1)))
-        if _install_hard_deadline(wall_budget):
+        if _install_hard_deadline(
+            wall_budget,
+            result_path=result_path,
+            schema_version=BRIEF_SCHEMA_VERSION,
+        ):
             print(f"[ctfy] wall budget {wall_budget}s installed", flush=True)
     answers: dict[str, str] = {}
     error: str | None = None
@@ -2107,6 +2236,11 @@ def _run_agent(
 
     def sink(agent_id: str, event: object) -> None:
         nonlocal tool_outputs, root_tool_calls, root_agent
+        # The only main-thread checkpoint available during a run.  On POSIX
+        # ``SIGALRM`` reaches the main thread by itself; where it does not
+        # exist the daemon can only raise this flag, and this is where the
+        # run notices it.
+        _check_soft_timeout()
         if root_agent is None:
             # Prefer the coordinator graph: on a resumed run the runner
             # respawns children before the root emits its first event, so
