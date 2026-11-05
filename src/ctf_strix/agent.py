@@ -36,6 +36,10 @@ from ctf_strix import platform_attach as attach
 from ctf_strix.success_stop import RecoveryExhausted
 from ctf_strix.success_stop import SolvedStop
 from ctf_strix.success_stop import SuccessLedger
+from ctf_strix.usage_meter import begin_run as begin_usage_run
+from ctf_strix.usage_meter import OutputBudgetExceeded
+from ctf_strix.usage_meter import raise_if_tripped
+from ctf_strix.usage_meter import trip_info as usage_trip_info
 
 
 def _enable_local_cost_map() -> None:
@@ -1402,6 +1406,21 @@ def main() -> int:
         error = str(exc)
         stop_reason = "wallclock"
         print(f"[ctfy] {exc}", flush=True)
+    except OutputBudgetExceeded as exc:
+        # 单次 LLM 调用输出失控。和墙钟一样是「止损」，不是崩溃：已经
+        # 抽到的 answers 照常落盘，但归咎口径必须独立，否则无法从失败
+        # 统计里区分「模型想太多」和「代码炸了」。
+        error = str(exc)
+        stop_reason = "output_budget"
+        info = usage_trip_info() or {}
+        diag["output_budget"] = {
+            "output_tokens": exc.output_tokens,
+            "cap": exc.cap,
+            "call": info.get("call"),
+            "cumulative_output_tokens": info.get("cumulative_output_tokens"),
+            "agent_id": info.get("agent_id"),
+        }
+        print(f"[ctfy] {exc}", flush=True)
     except BaseException as exc:  # noqa: BLE001 - every failure must land in result.json
         error = f"{type(exc).__name__}: {exc}"
         # A credential rejection can escape the attempt loop when it happens
@@ -1441,6 +1460,11 @@ def main() -> int:
             # Top-level so a platform-side triage query can find a dead key
             # without parsing the free-text writeup.
             payload["llm_errors"] = llm_errors
+        output_budget = diag.get("output_budget") if isinstance(diag, dict) else None
+        if output_budget:
+            # Same reason as llm_errors: a stop caused by one runaway call must
+            # be queryable without parsing the writeup.
+            payload["output_budget"] = output_budget
         parallel_diag = diag.get("parallel") if isinstance(diag, dict) else None
         if parallel_diag:
             # Keep the race accounting next to the top-level turns/token totals
@@ -1914,6 +1938,9 @@ def _run_agent(
 
     from ctf_strix.local_backend import install as install_backend
 
+    # One process can host more than one run (tests / embedded callers).  A
+    # trip from the previous run must not refuse this run's first paid call.
+    begin_usage_run()
     install_backend()
 
     # Replace strix's short retry ladder with the CTF policy.  Installing here
@@ -2508,6 +2535,10 @@ def _run_agent(
         for index, budget in enumerate(budgets):
             if not engagement and qid in answers:
                 break
+            # A prior attempt hit the single-call output cap.  Starting another
+            # attempt would spend more wall clock on the same runaway path.
+            if usage_trip_info() is not None:
+                break
             # Each attempt gets a new strix agent id.  Without resetting this,
             # the sink keeps comparing against attempt 1 and undercounts every
             # later attempt as zero calls.
@@ -2592,6 +2623,10 @@ def _run_agent(
                         break
                 continue
             runs_ok += 1
+            # The root may have been stopped by a child agent's trip and return
+            # normally.  Do not launch the next attempt in that case.
+            if usage_trip_info() is not None:
+                break
             used = _requests_of(result)
             turns_total += used if used > 0 else max(root_tool_calls - calls_before, 0)
 
@@ -2616,6 +2651,11 @@ def _run_agent(
         from ctf_strix.success_stop import uninstall_recovery_guard
 
         uninstall_recovery_guard()
+
+    # A tripped child agent ends only its own task.  The root can return
+    # normally after ``request_stop``.  Re-raise here so the run still lands in
+    # ``main``'s output_budget branch instead of looking like a clean finish.
+    raise_if_tripped()
 
     if llm_errors:
         diag["llm_errors"] = llm_errors
