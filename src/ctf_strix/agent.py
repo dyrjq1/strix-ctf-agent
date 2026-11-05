@@ -30,6 +30,7 @@ import traceback
 from pathlib import Path
 from typing import Any
 
+from ctf_strix import error_policy
 from ctf_strix import platform_attach as attach
 from ctf_strix.success_stop import RecoveryExhausted
 from ctf_strix.success_stop import SolvedStop
@@ -712,6 +713,18 @@ def _attempt_turns(total: int, attempts: int, split: float) -> list[int]:
     return [first] + [base + (1 if i < extra else 0) for i in range(attempts - 1)]
 
 
+def _llm_wall_deadline(wall_seconds: int) -> float | None:
+    """Absolute ``monotonic`` deadline for the LLM retry policy.
+
+    ``0`` means the run is unbounded (see :func:`_wall_budget`); the policy
+    then falls back to its attempt cap.  A positive budget is measured from
+    process start, matching the alarm installed in :func:`main`.
+    """
+    if wall_seconds <= 0:
+        return None
+    return time.monotonic() + wall_seconds
+
+
 def _local_attachments(work: Path) -> list[dict[str, str]]:
     """把工作目录里的附件读成 strix 的 ``extra_files``。
 
@@ -1114,6 +1127,7 @@ def main() -> int:
     # harness 里生效，本入口没有。软截止同步设为墙钟的 75%（与 harness
     # ``_deadline_args`` 同口径）；已显式设置的 CTFY_SOFT_DEADLINE 不覆盖。
     wall_budget = _wall_budget(task)
+    error_policy.set_wall_deadline(_llm_wall_deadline(wall_budget))
     if wall_budget > 0:
         os.environ.setdefault("CTFY_SOFT_DEADLINE", str(max(int(wall_budget * 0.75), 1)))
         if _install_hard_deadline(wall_budget):
@@ -1199,11 +1213,22 @@ def main() -> int:
                     # analysis can count solves without knowing which route
                     # ended the run.
                     stop_reason = "solved"
+                if diag.get("llm_errors"):
+                    # The key was rejected: no amount of retrying this run
+                    # can help, and "error" would hide that from triage.
+                    error = "LLM credentials rejected: " + "; ".join(
+                        f"{item.get('reason')} status={item.get('status_code')}"
+                        for item in diag["llm_errors"]
+                    )
+                    stop_reason = "credential_failure"
                 if diag.pop("no_attempt_ran", False):
                     # 每个 attempt 都抛异常：这不是"跑了没解出"，是"根本没跑"。
                     # 两者在成功率统计里必须分开，否则根因分析全被污染。
-                    error = error or "所有 attempt 都未能启动运行时"
-                    stop_reason = "error"
+                    # A credential failure above is already the more specific
+                    # reason; do not overwrite it with the generic one.
+                    if stop_reason != "credential_failure":
+                        error = error or "所有 attempt 都未能启动运行时"
+                        stop_reason = "error"
 
     except SolvedStop as exc:
         # Confirmed success: nothing more to extract, and restarting the run
@@ -1225,14 +1250,27 @@ def main() -> int:
         error = str(exc)
         stop_reason = "wallclock"
         print(f"[ctfy] {exc}", flush=True)
-    except BaseException as exc:  # noqa: BLE001 — 任何异常都必须转成 result.json
+    except BaseException as exc:  # noqa: BLE001 - every failure must land in result.json
         error = f"{type(exc).__name__}: {exc}"
-        stop_reason = "error"
-        traceback.print_exc()
+        # A credential rejection can escape the attempt loop when it happens
+        # outside a model call (for example during provider setup).  Mark it
+        # the same way, so a dead key is never reported as a generic crash.
+        if error_policy.classify_error(exc) == "credential_failure":
+            stop_reason = "credential_failure"
+            detail = error_policy.credential_failure(exc)
+            if detail is not None:
+                diag.setdefault("llm_errors", []).append(detail)
+        else:
+            stop_reason = "error"
+            traceback.print_exc()
 
     finally:
         # 先撤看门狗：alarm 在收尾途中响起会把 result.json 也一起带走。
         _cancel_hard_deadline()
+        # The retry deadline belongs to this run.  Leaving it set would make
+        # the next in-process run start already out of wall clock (tests and
+        # embedded callers execute main() more than once per process).
+        error_policy.clear_wall_deadline()
         # 运行时半路崩掉时，_run_agent 的收尾保存不会执行。这里补一手：只要
         # agent 真的写过报告，就把最后一版再保存一次——报告是唯一交付物，
         # "写好了但没发出去"与"没写"在评分上完全等价。
@@ -1257,6 +1295,11 @@ def main() -> int:
             "stop_reason": stop_reason,
             "writeup": _writeup(task, answers, error, time.time() - started, diag),
         }
+        llm_errors = diag.get("llm_errors") if isinstance(diag, dict) else None
+        if llm_errors:
+            # Top-level so a platform-side triage query can find a dead key
+            # without parsing the free-text writeup.
+            payload["llm_errors"] = llm_errors
         parallel_diag = diag.get("parallel") if isinstance(diag, dict) else None
         if parallel_diag:
             # Keep the race accounting next to the top-level turns/token totals
@@ -1373,6 +1416,9 @@ def _writeup(
         # Missing guards are not "nothing fired today": the wiring is broken and
         # every later conclusion about guard behaviour is void. Log loudly.
         lines.append("guard_mount: FAILED (guards inert -- see stderr/logs)")
+    llm_errors = (diag or {}).get("llm_errors")
+    if llm_errors:
+        lines.append(f"llm_errors: {json.dumps(llm_errors, ensure_ascii=False)}")
     if error:
         lines.append(f"error: {error}")
     return "\n".join(lines)
@@ -1711,6 +1757,13 @@ def _run_agent(
     from ctf_strix.local_backend import install as install_backend
 
     install_backend()
+
+    # Replace strix's short retry ladder with the CTF policy.  Installing here
+    # (before the first attempt) means every later attempt in this process
+    # uses it as well.  A failure to install is reported once and leaves
+    # strix's stock behaviour intact, exactly as before.
+    error_policy.install()
+    llm_errors: list[dict[str, Any]] = []
 
     # 本函数末尾要返回的诊断字典（与 `main` 里的 `diag` 同名但不同作用域）。
     # 守卫接线失败就写进这里，随 `out.update(diag)` 进 result.json。
@@ -2339,6 +2392,14 @@ def _run_agent(
             except Exception as exc:  # noqa: BLE001 — turn 用尽属于正常终止
                 print(f"[ctfy] scan ended: {type(exc).__name__}: {exc}", flush=True)
                 turns_total += max(root_tool_calls - calls_before, 0)
+                if error_policy.classify_error(exc) == "credential_failure":
+                    # A rejected key cannot recover by starting another
+                    # attempt: fail fast and let main report
+                    # ``credential_failure`` instead of a generic error.
+                    detail = error_policy.credential_failure(exc)
+                    if detail is not None:
+                        llm_errors.append(detail)
+                        break
                 continue
             runs_ok += 1
             used = _requests_of(result)
@@ -2365,6 +2426,9 @@ def _run_agent(
         from ctf_strix.success_stop import uninstall_recovery_guard
 
         uninstall_recovery_guard()
+
+    if llm_errors:
+        diag["llm_errors"] = llm_errors
 
     # ``finish_scan`` is usually the last call, so no further tool output will
     # arrive to promote a claim recorded in its arguments.  Settle here as well,
