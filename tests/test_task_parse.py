@@ -401,3 +401,30 @@ def test_turn_budget_ignores_zero(monkeypatch: pytest.MonkeyPatch) -> None:
     """0 表示"平台没给"，不是"零轮"；后者会让 run 立刻结束。"""
     monkeypatch.setenv("CTFY_EVAL_MAX_TURNS", "0")
     assert _turn_budget({"max_turns": 0}) >= 100
+
+
+def test_bare_attachment_at_work_root_is_a_file_challenge(monkeypatch, tmp_path) -> None:
+    """2026-11-06：附件直接放在工作目录根上时，不能判成 no_target。
+
+    有些投递方式既不给 ``attachments/`` 子目录，也不写 ``task.json.attachments``。
+    SAMPLE-011 实测就是这么变成「0 回合、no_target」的。
+    """
+    monkeypatch.delenv("CTFY_TARGET_URL", raising=False)
+    task: dict[str, Any] = {"run_mode": "instance", "scope": [], "target_endpoints": []}
+    (tmp_path / "task.json").write_text("{}", encoding="utf-8")
+    (tmp_path / "result.json").write_text("{}", encoding="utf-8")
+    # 只有平台控制文件 → 仍是 web，不能把普通空目录误判成附件题。
+    assert _challenge_kind(task, tmp_path) == "web"
+
+    (tmp_path / "vaultsvc").write_bytes(b"\x7fELF")
+    assert _challenge_kind(task, tmp_path) == "file"
+
+
+def test_declared_attachments_still_win(monkeypatch, tmp_path) -> None:
+    monkeypatch.delenv("CTFY_TARGET_URL", raising=False)
+    task: dict[str, Any] = {
+        "run_mode": "instance",
+        "scope": [],
+        "attachments": ["vaultsvc"],
+    }
+    assert _challenge_kind(task, tmp_path) == "file"

@@ -431,6 +431,36 @@ def _round_note(work: Path) -> str:
     )
 
 
+#: 平台自己写进工作目录的文件，永远不算题目附件。
+#:
+#: ``README.md`` 是平台放的选手 API 说明（``test_attachment_fetch`` 的 fixture
+#: 就是这个形态），不是题目材料；题目真的只发一份 README 时应当在
+#: ``task.json.attachments`` 里显式声明。``.txt`` 不在此列——SAMPLE-011 的
+#: ``README.txt`` 就是货真价实的附件。
+_RESERVED_WORK_FILES = frozenset({"task.json", "result.json", "mcp.json", "README.md"})
+
+
+def _has_bare_artifacts(work: Path) -> bool:
+    """工作目录根上有没有「不是平台控制文件」的普通文件。
+
+    只看根上的**文件**：子目录 ``attachments/`` / ``files/`` 由调用方先判，
+    其它目录可能是本地调试时的仓库目录，误判成附件会让题型走错分支。
+
+    Args:
+        work: ``CTFY_WORK_DIR``。
+
+    Returns:
+        至少有一个非控制文件时返回 True；目录不可读时返回 False。
+    """
+    try:
+        for entry in work.iterdir():
+            if entry.is_file() and entry.name not in _RESERVED_WORK_FILES:
+                return True
+    except OSError:
+        return False
+    return False
+
+
 def _challenge_kind(task: dict[str, Any], work: Path | None = None) -> str:
     """判断题型：``web`` / ``tcp`` / ``file`` / ``checker`` / ``engagement``。
 
@@ -472,6 +502,12 @@ def _challenge_kind(task: dict[str, Any], work: Path | None = None) -> str:
         # 平台可能只把附件丢进工作目录，不写进 task.json。看目录是否存在，
         # 免得把"没给目标"误判成附件题、又或者反过来漏掉附件题。
         if any((work / name).is_dir() for name in ("attachments", "files")):
+            return "file"
+        # 2026-11-06：有些投递方式把附件直接放在工作目录**根**上，既没有
+        # ``attachments/`` 子目录、也没写进 ``task.json.attachments``。
+        # 只看子目录会让这类纯附件题落到 web 分支 → 没有 target → no_target，
+        # 一回合都不跑（SAMPLE-011 实测）。根上的非控制文件就是附件。
+        if _has_bare_artifacts(work):
             return "file"
 
     if not _targets_from(task) and all(_is_cidr(entry) for entry in raw):
@@ -921,7 +957,7 @@ def _local_attachments(work: Path) -> list[dict[str, str]]:
     # ``mcp.json`` is the platform's own client configuration, not a
     # challenge file: injecting it would both waste an ``extra_files`` slot
     # and put the endpoint/token header in front of the model.
-    reserved = {"task.json", "result.json", "mcp.json"}
+    reserved = _RESERVED_WORK_FILES
     # 本地调试时 ``CTFY_WORK_DIR`` 常常没设，cwd 是仓库根。不排掉这些目录的话
     # 会把整个源码树当成附件打包（50 个文件配额一次就满），还会让 agent 读到
     # 评测脚本里的常量——SAMPLE-004 就是这么把套题 id 当 flag 交上去的。
