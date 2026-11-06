@@ -29,6 +29,16 @@ from dataclasses import dataclass
 #: "没拿到 flag"。现在统一成同一组前缀。
 FLAG_RE = re.compile(r"(?:FLAG|flag|CTF|ctf|CTFY|ctfy)\{[0-9a-zA-Z_\-]{2,}\}")
 
+#: 「提交层认的答案形态」——**唯一真相**。``autosubmit`` 的候选抽取、
+#: ``skillpack.mask_flags`` 的装载遮蔽、``scripts/scrub_flags.py`` 的磁盘清理
+#: 都从这里取，不要再各写一份。
+#:
+#: 与 :data:`FLAG_RE` 只差花括号体内：``FLAG_RE`` 限制为
+#: ``[0-9a-zA-Z_-]``（防止把自由文本里的乱码当答案），这里放宽到
+#: ``[^}\s]{2,}``——writeup 里的历史 flag 常带 ``!``、``'``、``#``、``\``，
+#: 窄集抽不到，但 ``read_file`` 会原样喂给模型，被当成"检索到的证据"。
+CANDIDATE_RE = re.compile(r"(?:FLAG|flag|CTF|ctf|CTFY|ctfy)\{[^}\s]{2,}\}")
+
 #: 判为"模板/占位符"的形态（大小写不敏感）：
 #:
 #: - 内容是纯点，或纯 x/X；
@@ -45,9 +55,10 @@ FLAG_RE = re.compile(r"(?:FLAG|flag|CTF|ctf|CTFY|ctfy)\{[0-9a-zA-Z_\-]{2,}\}")
 #:   1. ``extract_flags`` / ``fallback_flag`` / ``finish_guard`` /
 #:      ``parallel`` / ``evidence``——输入来自 ``FLAG_RE``，字符集是
 #:      ``[0-9a-zA-Z_-]``，只可能出现纯点、纯 x 两种形态；
-#:   2. ``autosubmit.AutoSubmitter.candidates``——那里的 ``FLAG\{[^}\s]{2,}\}``
-#:      更宽，还会产出尖括号、纯星号、纯点这类 ``FLAG_RE`` 抽不出的形态，
-#:      所以下面这组形态必须按宽集写。不要再为宽集另起一份正则。
+#:   2. ``autosubmit.AutoSubmitter.candidates``——输入来自
+#:      :data:`CANDIDATE_RE`，比 ``FLAG_RE`` 宽，还会产出尖括号、纯星号、
+#:      纯点这类 ``FLAG_RE`` 抽不出的形态，所以下面这组形态必须按宽集写。
+#:      不要再为宽集另起一份正则。
 _PLACEHOLDER_BODY = re.compile(r"(?:\.{2,}|[xX]{2,}|<[^<>]*>|\*{3,})")
 
 #: 前缀单独拿出来：双花括号要按"整个花括号部分"判断，先切前缀更好写。
@@ -87,10 +98,48 @@ def is_placeholder(flag: str) -> bool:
         # 体内的字符全是符号（``…`` / ``???`` / ``***`` / ``...``）：
         # 真实 flag 至少有一个字母数字，这类只能当占位符。
         # 用 ``str.isalnum()`` 而不是 ASCII 正则：中文等非 ASCII 字母数字
-        # 也算"有内容"，不能把 ``FLAG{测试}`` 这种真实答案误杀。
+        # 也算"有内容"，不能把「前缀 + 中文」这种真实答案误杀。
         if not any(ch.isalnum() for ch in variant):
             return True
     return False
+
+
+#: 花括号体以这些字符开头 = 代码里的模板或格式串：f-string 的双花括号、
+#: shell 的 ``${x}``、printf 的 ``%s``、正则的 ``[a-z]+``。它们本来就不是
+#: 答案；抹掉反而会把技能包里的示例代码改坏（少一个花括号就不再是能跑的代码）。
+#:
+#: ⚠️ 判据必须收窄到「一眼能看出是代码」：裸 ``$`` 不算——花括号体以 ``$``
+#: 开头的（例如 ``$`` 加 ``3cr3t``）是真实 flag 的常见写法，放进来等于给
+#: 假阳性开后门（2026-11-06 CodeBuddy P1）。
+_CODE_BODY_PATTERNS = (
+    re.compile(r"^\{"),                       # f-string 转义 FLAG{{{x}}}
+    re.compile(r"^\$\{"),                     # shell ${x}
+    re.compile(r"^%[-0-9.]*[sdrxufeEgG]"),    # printf %s / %08x
+    re.compile(r"^\[[^\]]*\]"),               # 正则字符类 [a-z]+
+)
+
+
+def is_code_template(flag: str) -> bool:
+    """花括号体是不是代码里的模板/格式串。
+
+    与 :func:`is_placeholder` 分开放：那个判的是"读到的答案算不算占位符"，
+    这个判的是"这段文本本来就不是答案"。技能包里有大量可执行示例，
+    ``CANDIDATE_RE`` 会在 f-string 的 ``flag{`` 之后截出一段不完整的花括号体，
+    按占位符抹掉就会少一个花括号、把示例改坏。
+
+    Args:
+        flag: 一个候选答案。
+
+    Returns:
+        花括号体以 ``{`` / ``$`` / ``%`` / ``[`` 开头时返回 True。
+    """
+    text = (flag or "").strip()
+    brace = text.find("{")
+    if brace < 0:
+        return False
+    body = text[brace + 1 :]
+    return any(pat.match(body) for pat in _CODE_BODY_PATTERNS)
+
 
 #: ``ctf_recon.md`` 头里的靶机 URL，形如 ``# CTF Recon — https://host/``。
 _RECON_HEADER_RE = re.compile(r"CTF Recon\s*[—-]+\s*https?://([^/\s]+)")

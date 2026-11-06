@@ -18,6 +18,8 @@ import pytest
 
 from ctf_strix import skillpack
 
+from scrub_loader import load_scrub
+
 #: 索引里 ``[x.md](x.md)`` 形式的相对链接。
 _LINK = re.compile(r"\]\(([^)]+\.md)\)")
 
@@ -163,3 +165,88 @@ def test_ref_root_ignores_empty_jail_mount() -> None:
     finally:
         if old is not None:
             os.environ["CTF_SKILLS_REF"] = old
+
+
+def test_scrub_flags_check_passes_on_real_repo(capsys: pytest.CaptureFixture[str]) -> None:
+    """默认面直接跑一遍闸门：退 0 才算干净。
+
+    扫描量下限 2000 是防空转：路径或后缀白名单写错时零命中，看起来和"干净"
+    一模一样。真实默认面约 2800 个文件，取 2000 留出删减余量。
+    """
+    assert load_scrub().main(["--check"]) == 0
+    out = capsys.readouterr().out
+    match = re.search(r"scanned (\d+) files", out)
+    assert match, f"--check 没回报扫描数：\n{out}"
+    assert int(match.group(1)) > 2000, f"只扫到 {match.group(1)} 个文件，扫描根路径不对"
+
+
+def test_candidate_re_is_the_single_definition() -> None:
+    """提交层与装载层必须共用同一条正则，否则会"抹得掉、交不上"。
+
+    两边各写一份时的典型漂移：``skillpack`` 用 ``\\b`` 词边界，``autosubmit``
+    不用，``MetaCTF{...}`` 在一边被抹、在另一边被截成 ``CTF{...}`` 交上去。
+    """
+    from ctf_strix import autosubmit
+    from ctf_strix.flag_extract import CANDIDATE_RE
+
+    assert autosubmit._CAND_PATTERNS[0].pattern == CANDIDATE_RE.pattern
+    assert autosubmit._CAND_PATTERNS[0].flags == CANDIDATE_RE.flags
+
+
+def test_scrub_flags_check_is_a_gate(tmp_path: Path) -> None:
+    """``--check`` 是 CI 闸门：干净目录退 0，注入一处假 flag 退 1。"""
+    import os
+    import subprocess
+    import sys
+
+    repo = Path(__file__).resolve().parents[1]
+    script = repo / "scripts" / "scrub_flags.py"
+    sample = tmp_path / "skill.md"
+    sample.write_text("# demo\nnothing here\n", encoding="utf-8")
+
+    def run() -> "subprocess.CompletedProcess[str]":
+        env = dict(os.environ, PYTHONIOENCODING="utf-8")
+        return subprocess.run(
+            [sys.executable, str(script), "--check", str(tmp_path)],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            cwd=str(repo),
+            env=env,
+        )
+
+    clean = run()
+    assert clean.returncode == 0, clean.stdout + clean.stderr
+
+    sample.write_text("# demo\nFLAG{injected_secret}\n", encoding="utf-8")
+    dirty = run()
+    assert dirty.returncode == 1
+    assert "skill.md:2:" in dirty.stdout
+    assert "FLAG{injected_secret}" in dirty.stdout
+
+
+@pytest.mark.parametrize(
+    "code",
+    [
+        'print(f"Flag: flag{{{decoded}}}")',
+        'printf "flag{%s}"',
+        "FLAG{${secret}}",
+        "FLAG{[a-z]+}",
+    ],
+)
+def test_mask_flags_keeps_code_examples(code: str) -> None:
+    """代码里的模板串不能被抹：少一个花括号，示例就不再能跑。"""
+    assert skillpack.mask_flags(code) == code
+
+
+def test_mask_flags_still_masks_a_real_flag() -> None:
+    assert skillpack.mask_flags("got FLAG{abc123def}") == "got FLAG{...}"
+
+
+def test_dollar_prefixed_body_is_a_real_flag_not_code() -> None:
+    """裸 ``$`` 不能当代码模板：``FLAG{$3cr3t}`` 是真实 flag 的常见写法。"""
+    from ctf_strix.flag_extract import is_code_template, is_placeholder
+
+    assert not is_code_template("FLAG{$3cr3t}")
+    assert not is_placeholder("FLAG{$3cr3t}")
+    assert skillpack.mask_flags("FLAG{$3cr3t}") == "FLAG{...}"

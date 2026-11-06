@@ -35,6 +35,8 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
+from ctf_strix.flag_extract import CANDIDATE_RE, is_code_template, is_placeholder
+
 #: 原始技能包（唯一真相）。目录布局 ``<分类>/<分类>.md`` + 子文件。
 PACK_DIR: Path = Path(__file__).resolve().parent / "skills_strix"
 
@@ -43,11 +45,19 @@ PACK_DIR: Path = Path(__file__).resolve().parent / "skills_strix"
 #: 像答案"的 flag，``flag_extract`` 的兜底（唯一候选）会把它交上去。CTFARENA-035
 #: 就是这么被人工解掉的题污染成"agent 解出"的。装载时统一抹成 ``FLAG{...}``，
 #: 形态保留、内容消失；``FLAG{...}`` 又刚好命中 flag_extract 的占位符排除规则。
-_FLAGISH = re.compile(r"(?i)\b(FLAG|CTF|CTFY)\{[0-9A-Za-z_\-]{2,}\}")
+#:
+#: ⚠️ 用的是 :data:`ctf_strix.flag_extract.CANDIDATE_RE`，与提交层同一份定义。
+#: 它没有词边界：``MetaCTF{...}`` 只会匹配其中的 ``CTF{...}`` 片段，替换后
+#: ``Meta`` 前缀原样留在正文里，结果是 ``MetaCTF{...}``。这是预期行为——
+#: 提交层同样会把 ``MetaCTF{...}`` 截成 ``CTF{...}``，两边口径必须一致。
 
 
 def mask_flags(text: str) -> str:
-    """把文本里形如 ``FLAG{...}`` 的真实答案抹成 ``FLAG{...}`` 占位符。
+    """把文本里的候选答案形态抹成 ``FLAG{...}`` 占位符。
+
+    代码示例不能改坏：技能包里有 ``print(f"Flag: flag{{{decoded}}}")`` 这类
+    可执行片段，``CANDIDATE_RE`` 会截出 ``flag{{{decoded}``，直接替换会少一个
+    花括号、把示例变成语法错误。
 
     Args:
         text: 任意技能文本。
@@ -55,7 +65,15 @@ def mask_flags(text: str) -> str:
     Returns:
         抹掉答案内容的文本；前缀大小写保持不变。
     """
-    return _FLAGISH.sub(lambda m: m.group(1) + "{...}", text)
+
+    def repl(m: "re.Match[str]") -> str:
+        flag = m.group(0)
+        # 已经是模板的别动；代码模板（f-string / ${x} / printf / 正则类）也别动。
+        if is_placeholder(flag) or is_code_template(flag):
+            return flag
+        return flag.split("{", 1)[0] + "{...}"
+
+    return CANDIDATE_RE.sub(repl, text)
 
 
 #: frontmatter 必须留在文件最前，所以提示只能插在 frontmatter **之后**。

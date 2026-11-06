@@ -22,7 +22,7 @@ proof-of-concept: no
 
 > `nc chall.pwnable.tw 10301`
 >
-> Flag: `FLAG{4(7|-||>4|_||\||>|>|_|4|\/|(|\/|b|<(|=35|=|\/||\/|d|\|0|_.-}`
+> Flag: `FLAG{...}`
 
 ## Challenge Overview
 

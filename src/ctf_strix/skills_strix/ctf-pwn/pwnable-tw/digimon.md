@@ -23,7 +23,7 @@ proof-of-concept: no
 
 > `nc chall.pwnable.tw 10501`
 >
-> Flag: `FLAG{You_have_conquered_the_world_of_digimon!}`
+> Flag: `FLAG{...}`
 
 ## Challenge Overview
 

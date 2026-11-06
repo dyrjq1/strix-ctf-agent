@@ -722,7 +722,7 @@ makes it a class with inline methods and the trick stops compiling.
 ```bash
 LD_LIBRARY_PATH=$PWD/stubs ./harness ./lib/x86_64/libfoo.so \
     Java_com_hellocmu_picoctf_FlagstaffHill_fenugreek "opossum"
-# picoCTF{pining.for.the.fjords}
+# picoCTF{...}
 ```
 
 **Then verify it is a real transform, not a baked-in constant** — rerun with a

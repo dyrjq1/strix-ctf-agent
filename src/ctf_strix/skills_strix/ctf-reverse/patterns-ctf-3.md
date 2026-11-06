@@ -786,7 +786,7 @@ while v9 < len(v12) // 2:
     v9 += 2; v11 += 2
 ```
 
-CRT (via `sympy.ntheory.modular.crt` or a manual `mul_inv` routine) plus `matrix` dumped from the binary reproduces the flag `pctf{R3v3rS1Ng_#s_h311_L0t_Of_Fun}`.
+CRT (via `sympy.ntheory.modular.crt` or a manual `mul_inv` routine) plus `matrix` dumped from the binary reproduces the flag `pctf{...}`.
 
 **Key insight:** Five coprime moduli pin the key down uniquely modulo their product (~4.7e19), which fits in a 30-digit input — pick the smallest representative instead of brute-forcing, otherwise you waste hours on 100k+ equally valid but ugly keys. The second stage looks complicated but is really a pair of fixed index-generator functions over a static table; dump the table once and both rounds become direct array reads.
 

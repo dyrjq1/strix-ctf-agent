@@ -23,7 +23,7 @@ proof-of-concept: no
 
 > `nc chall.pwnable.tw 10405`
 >
-> Flag: `FLAG{now_you_can_try_to_fight_with_AlphaGo~}`
+> Flag: `FLAG{...}`
 
 ## Challenge Overview
 

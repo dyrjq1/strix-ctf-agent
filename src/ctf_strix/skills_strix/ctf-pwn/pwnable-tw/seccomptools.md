@@ -23,7 +23,7 @@ proof-of-concept: no
 
 > `nc chall.pwnable.tw 10408`
 >
-> Flag: `FLAG{u_r_master_of_secooooooomp!}`
+> Flag: `FLAG{...}`
 
 ## Challenge Overview
 

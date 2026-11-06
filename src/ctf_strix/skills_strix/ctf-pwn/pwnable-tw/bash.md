@@ -23,7 +23,7 @@ proof-of-concept: no
 
 > `nc chall.pwnable.tw 10108`
 >
-> Flag: `FLAG{1nt3nt3d_s0luti0n_1s_CVE-2016-9401_;)}`
+> Flag: `FLAG{...}`
 
 ## Challenge Overview
 
@@ -137,7 +137,7 @@ Variants use different Perl socket APIs:
 
 ### Path C — CVE-2016-9401: In-Process Memory Corruption (Intended Solution)
 
-The flag itself reveals this: `FLAG{1nt3nt3d_s0luti0n_1s_CVE-2016-9401_;)}`.
+The flag itself reveals this: `FLAG{...}`.
 
 1. Exploit the `popd` use-after-free to corrupt bash's heap
 2. Achieve control flow hijack within the bash process

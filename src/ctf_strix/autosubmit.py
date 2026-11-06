@@ -32,7 +32,7 @@ import urllib.error
 import urllib.request
 from typing import TYPE_CHECKING, Any
 
-from ctf_strix.flag_extract import is_placeholder
+from ctf_strix.flag_extract import CANDIDATE_RE, is_placeholder
 from ctf_strix.success_stop import answer_verdict, check_verdict, question_correct
 
 if TYPE_CHECKING:
@@ -41,9 +41,9 @@ if TYPE_CHECKING:
 #: 候选答案形态。与 ctf_goal.txt 的定义、平台判分口径一致。
 #: 顺序即优先级：显式 flag 标记优先于裸 hex（SAMPLE-001 的 slug 是 32 位 hex）。
 _CAND_PATTERNS: tuple[re.Pattern[str], ...] = (
-    # 前缀与 `flag_extract.FLAG_RE` 保持一致：CTFY 的交付示例就是 `ctfy{…}`，
-    # 少一个前缀等于把合法答案排除在候选之外。
-    re.compile(r"(?:FLAG|flag|CTF|ctf|CTFY|ctfy)\{[^}\s]{2,}\}"),
+    # 与 `flag_extract.CANDIDATE_RE` 同源：CTFY 的交付示例就是 `ctfy{…}`，
+    # 少一个前缀等于把合法答案排除在候选之外；正则本体不再复制一份。
+    CANDIDATE_RE,
     # 显式标注的答案。``seeded`` 题的答案常在实例创建时下发，形状任意
     # （不是 FLAG{...}，也不一定是 hex），只靠前两条正则永远抽不到。
     # 这条只认模型自己写的 ``answer: xxx`` / ``flag=xxx``，不猜自由文本；
