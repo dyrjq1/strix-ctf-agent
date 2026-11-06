@@ -56,7 +56,7 @@ def _enable_local_cost_map() -> None:
 _enable_local_cost_map()
 
 #: 兜底 flag 形态（抽取器不可用时用）。与 ``flag_extract`` 的正则同源：
-#: CTFY 的 flag 可能是 ``FLAG{...}`` / ``ctfy{...}`` / ``flag{...}``。
+#: CTFY 的 flag 可能是 ``FLAG{…}`` / ``ctfy{…}`` / ``flag{…}``。
 FLAG_PATTERN = re.compile(r"(?:FLAG|flag|CTF|ctf|CTFY|ctfy)\{[0-9a-zA-Z_\-]{4,}\}")
 
 #: 题型 → goal 文件。缺失文件时用 ``_FALLBACK_GOALS`` 里的最小版本。
@@ -507,7 +507,9 @@ def _extract_flag(blob: str, own_host: str | None = None) -> str | None:
         return best_flag(blob, own_host or "")
     except Exception:  # noqa: BLE001 — 抽取器不可用时不能拖垮整条链路
         # 降级：至少剔除 FLAG{...} 这种模板占位符。
-        found = [f for f in FLAG_PATTERN.findall(blob) if set(f.split("{", 1)[1][:-1]) != {"."}]
+        from ctf_strix.flag_extract import is_placeholder
+
+        found = [f for f in FLAG_PATTERN.findall(blob) if not is_placeholder(f)]
         # Take the FIRST, not the last: the docstring above says the last one is
         # exactly the wrong choice (stale recon notes from another challenge,
         # or a decoy in the same output).  Mechanical fix of a comment/code
@@ -863,6 +865,25 @@ def _attempt_turns(total: int, attempts: int, split: float) -> list[int]:
     rest = total - first
     base, extra = divmod(rest, attempts - 1)
     return [first] + [base + (1 if i < extra else 0) for i in range(attempts - 1)]
+
+
+def _is_turn_exhausted(exc: BaseException) -> bool:
+    """这次异常是不是「turn 预算用尽」，而不是「运行时没起来」。
+
+    两者都是异常，但在 result.json 里的含义完全相反：前者说明模型整整跑了
+    一个预算却没交生命周期调用（失败但健康），后者说明一次 run 都没启动。
+    2026-11-06 v6 冒烟里 ``max_turns=3`` 走了前者，却被记成 ``error`` +
+    「所有 attempt 都未能启动运行时」，把失败率的口径污染了。
+    """
+    # 名字先判：vendor 的 ``_exhausted_recovery`` 与 SDK 用的是同名异类，
+    # 一旦 import 路径变了，靠 isinstance 会静默退化成 "error"。
+    if type(exc).__name__ == "MaxTurnsExceeded":
+        return True
+    try:
+        from agents.exceptions import MaxTurnsExceeded
+    except Exception:  # noqa: BLE001 - 运行时不在时按普通异常处理
+        return False
+    return isinstance(exc, MaxTurnsExceeded)
 
 
 def _llm_wall_deadline(wall_seconds: int) -> float | None:
@@ -1385,6 +1406,15 @@ def main() -> int:
                     if stop_reason != "credential_failure":
                         error = error or "所有 attempt 都未能启动运行时"
                         stop_reason = "error"
+                if diag.pop("turns_exhausted", 0) and stop_reason == "completed":
+                    # 轮次跑到上限、一次生命周期调用都没交：这是"恢复耗尽"，
+                    # 不是崩溃。和 RecoveryExhausted 用同一个 stop_reason，
+                    # 下游统计不必再区分异常是从哪一层抛出来的。
+                    error = error or (
+                        f"turn budget exhausted after {turns_used} turns "
+                        "without a lifecycle call"
+                    )
+                    stop_reason = "recovery_exhausted"
 
     except SolvedStop as exc:
         # Confirmed success: nothing more to extract, and restarting the run
@@ -2522,6 +2552,7 @@ def _run_agent(
     # 有多少个 attempt 真的跑起来了（run_strix_scan 正常返回）。
     # 全部失败时上层必须把 stop_reason 从 "completed" 改成 "error"。
     runs_ok = 0
+    turns_exhausted = 0
     attempts = 1 if engagement else _attempt_count()
     scan_id = f"ctfy-{int(time.time())}"
     try:
@@ -2531,7 +2562,7 @@ def _run_agent(
     budgets = _attempt_turns(max_turns, attempts, min(max(split, 0.2), 0.9))
 
     async def _go() -> None:
-        nonlocal result, turns_total, root_agent, runs_ok
+        nonlocal result, turns_total, root_agent, runs_ok, turns_exhausted
         for index, budget in enumerate(budgets):
             if not engagement and qid in answers:
                 break
@@ -2613,6 +2644,12 @@ def _run_agent(
             except Exception as exc:  # noqa: BLE001 — turn 用尽属于正常终止
                 print(f"[ctfy] scan ended: {type(exc).__name__}: {exc}", flush=True)
                 turns_total += max(root_tool_calls - calls_before, 0)
+                if _is_turn_exhausted(exc):
+                    # Counted apart from a crash: the attempt did run, it just
+                    # never produced a lifecycle call.  ``main`` reports it as
+                    # ``recovery_exhausted`` instead of ``error``.
+                    turns_exhausted += 1
+                    continue
                 if error_policy.classify_error(exc) == "credential_failure":
                     # A rejected key cannot recover by starting another
                     # attempt: fail fast and let main report
@@ -2742,7 +2779,11 @@ def _run_agent(
         )
         out["parallel"] = {**parallel.stats(), "usage": usage}
         turns = usage["turns"]
-    if attempts > 0 and runs_ok == 0 and not answers:
+    if attempts > 0 and runs_ok == 0 and not answers and turns_exhausted:
+        # Ran to the turn cap without ever finishing.  This is the same verdict
+        # as an exhausted recovery guard, so upper layers can use one spelling.
+        out["turns_exhausted"] = turns_exhausted
+    if attempts > 0 and runs_ok == 0 and not answers and not turns_exhausted:
         # 一次都没跑起来，而且也没拿到答案。上层据此把 stop_reason 写成
         # "error"，否则"运行时压根没启动"会以 turns=0 + stop_reason=completed
         # 混进失败率里。

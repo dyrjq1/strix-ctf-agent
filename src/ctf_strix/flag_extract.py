@@ -23,14 +23,74 @@ from dataclasses import dataclass
 #: flag 形态。不设长度下限——CTFY 的 flag 是 32 位 hex，但别的平台可能更短，
 #: 卡长度会漏掉合法 flag。改用"排除模板"来挡 ``FLAG{...}`` 这类占位符。
 #:
-#: ⚠️ 前缀必须覆盖平台真实出现的形态。HANDOFF 的交付示例写的是 ``ctfy{...}``，
+#: ⚠️ 前缀必须覆盖平台真实出现的形态。HANDOFF 的交付示例写的是 ``ctfy{…}``，
 #: 而这里原来只认大写 ``FLAG``——同一个包里三个模块（本模块、``deadline_guard``、
 #: ``autosubmit``）对"什么算答案"各有一套正则，收工守卫认不出的答案会被判成
 #: "没拿到 flag"。现在统一成同一组前缀。
 FLAG_RE = re.compile(r"(?:FLAG|flag|CTF|ctf|CTFY|ctfy)\{[0-9a-zA-Z_\-]{2,}\}")
 
-#: 判为"模板/占位符"的形态：内容是纯点（或点加省略号）。
-_PLACEHOLDER = re.compile(r"^[A-Za-z]+\{\.{2,}\}$")
+#: 判为"模板/占位符"的形态（大小写不敏感）：
+#:
+#: - 内容是纯点，或纯 x/X；
+#: - 内容被尖括号包住（形如 ``<value>``，``<abc>`` 这种也算）；
+#: - 内容被双花括号包住（形如 ``{{flag}}``，未渲染的模板）；
+#: - 内容是三个以上星号。
+#:
+#: ⚠️ 2026-11-06 v6 冒烟：镜像自带源码的注释里就留着一个「全 x 的示例 flag」，
+#: agent 读自己的源码时把「示例」当成「检索到的证据」交了上去，一道不可能
+#: 解出的题被判 ``solved``。镜像源码里现在一律不写完整的模板字面量：
+#: 要么用 ``FLAG{…}``（Unicode 省略号），要么只描述花括号里面的形状。
+#:
+#: ⚠️ 只此一处定义，服务两个调用方，两边的字符集不同：
+#:   1. ``extract_flags`` / ``fallback_flag`` / ``finish_guard`` /
+#:      ``parallel`` / ``evidence``——输入来自 ``FLAG_RE``，字符集是
+#:      ``[0-9a-zA-Z_-]``，只可能出现纯点、纯 x 两种形态；
+#:   2. ``autosubmit.AutoSubmitter.candidates``——那里的 ``FLAG\{[^}\s]{2,}\}``
+#:      更宽，还会产出尖括号、纯星号、纯点这类 ``FLAG_RE`` 抽不出的形态，
+#:      所以下面这组形态必须按宽集写。不要再为宽集另起一份正则。
+_PLACEHOLDER_BODY = re.compile(r"(?:\.{2,}|[xX]{2,}|<[^<>]*>|\*{3,})")
+
+#: 前缀单独拿出来：双花括号要按"整个花括号部分"判断，先切前缀更好写。
+#: 长前缀必须排在前面：``re`` 的交替是最左优先，``CTF`` 会先吃掉 ``CTFY``
+#: 的三个字符，``rest`` 变成 ``Y{...}``，占位符判定直接失效（CodeBuddy P0）。
+_PREFIX_RE = re.compile(r"^(?:CTFY|FLAG|CTF)(?=\{)", re.IGNORECASE)
+
+def is_placeholder(flag: str) -> bool:
+    """这个字符串是不是模板占位符（纯点 / 纯 x / 尖括号 / 双花括号 / 纯星号）。
+
+    Args:
+        flag: 一个候选答案。不要求它匹配 ``FLAG_RE``——``autosubmit`` 的宽集
+            会传进尖括号包裹这类 ``FLAG_RE`` 认不出的形态。
+
+    Returns:
+        是占位符返回 True。真实 flag 一律 False；已知误杀风险只有两处：
+        「内容全是 x/X 的真 flag」和「只有两个字符的体」（例如 FLAG 后接
+        两个 x）。CTFY 的 32 位 hex 不可能长这样。
+    """
+    text = (flag or "").strip()
+    match = _PREFIX_RE.match(text)
+    if not match:
+        return False
+    rest = text[match.end():].strip()
+    if not rest.startswith("{"):
+        return False
+    # 双花括号包住的整体，以及宽正则截出的半截（少一个右花括号）：都是未渲染模板。
+    if rest.startswith("{{") and rest.endswith("}"):
+        return True
+    inner = rest[1:].strip()
+    # 宽正则可能少截一个右花括号，补两个规范化变体再判。
+    for variant in (inner, inner.rstrip("}").strip(), inner.strip("{}").strip()):
+        if not variant:
+            continue
+        if _PLACEHOLDER_BODY.fullmatch(variant):
+            return True
+        # 体内的字符全是符号（``…`` / ``???`` / ``***`` / ``...``）：
+        # 真实 flag 至少有一个字母数字，这类只能当占位符。
+        # 用 ``str.isalnum()`` 而不是 ASCII 正则：中文等非 ASCII 字母数字
+        # 也算"有内容"，不能把 ``FLAG{测试}`` 这种真实答案误杀。
+        if not any(ch.isalnum() for ch in variant):
+            return True
+    return False
 
 #: ``ctf_recon.md`` 头里的靶机 URL，形如 ``# CTF Recon — https://host/``。
 _RECON_HEADER_RE = re.compile(r"CTF Recon\s*[—-]+\s*https?://([^/\s]+)")
@@ -74,7 +134,7 @@ def extract_flags(log_text: str, own_host: str) -> list[str]:
     positions: dict[str, list[int]] = {}
     for m in FLAG_RE.finditer(log_text):
         flag = m.group(0)
-        if _PLACEHOLDER.match(flag):
+        if is_placeholder(flag):
             continue
         positions.setdefault(flag, []).append(m.start())
 
@@ -157,7 +217,7 @@ def fallback_flag(log_text: str, own_host: str) -> str | None:
     seen: dict[str, list[int]] = {}
     for m in FLAG_RE.finditer(log_text):
         flag = m.group(0)
-        if _PLACEHOLDER.match(flag):
+        if is_placeholder(flag):
             continue
         seen.setdefault(flag, []).append(m.start())
     if len(seen) != 1:

@@ -29,6 +29,14 @@ def test_placeholder_is_not_a_flag() -> None:
     assert refusal["success"] is False
 
 
+def test_x_placeholder_is_not_a_flag() -> None:
+    """``FLAG{xxxx}`` 来自镜像源码注释，2026-11-06 v6 冒烟据此误判 solved。"""
+    guard = FinishGuard()
+    refusal = guard.check('{"summary": "the answer is FLAG{xxxx}"}')
+    assert refusal is not None
+    assert refusal["success"] is False
+
+
 def test_refusal_budget_is_bounded() -> None:
     """解不出题时必须能干净收尾，不能把预算全耗在撞墙上。"""
     guard = FinishGuard()

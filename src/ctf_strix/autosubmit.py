@@ -32,6 +32,7 @@ import urllib.error
 import urllib.request
 from typing import TYPE_CHECKING, Any
 
+from ctf_strix.flag_extract import is_placeholder
 from ctf_strix.success_stop import answer_verdict, check_verdict, question_correct
 
 if TYPE_CHECKING:
@@ -40,7 +41,7 @@ if TYPE_CHECKING:
 #: 候选答案形态。与 ctf_goal.txt 的定义、平台判分口径一致。
 #: 顺序即优先级：显式 flag 标记优先于裸 hex（SAMPLE-001 的 slug 是 32 位 hex）。
 _CAND_PATTERNS: tuple[re.Pattern[str], ...] = (
-    # 前缀与 `flag_extract.FLAG_RE` 保持一致：CTFY 的交付示例就是 `ctfy{...}`，
+    # 前缀与 `flag_extract.FLAG_RE` 保持一致：CTFY 的交付示例就是 `ctfy{…}`，
     # 少一个前缀等于把合法答案排除在候选之外。
     re.compile(r"(?:FLAG|flag|CTF|ctf|CTFY|ctfy)\{[^}\s]{2,}\}"),
     # 显式标注的答案。``seeded`` 题的答案常在实例创建时下发，形状任意
@@ -315,7 +316,11 @@ class AutoSubmitter:
                 # 带捕获组的模式只取组内容（标签本身不是答案）。
                 v = m.group(1) if pat.groups else m.group(0)
                 v = v.rstrip(".,;:)]")
-                if v and v not in out:
+                # 占位符在提交前最后再挡一次：2026-11-06 就是它把一道不可能
+                # 解出的题判成了 solved。
+                # 带捕获组的分支会把 markdown 装饰一起带出来（``**FLAG{...}**``），
+                # 而 ``is_placeholder`` 要求前缀在首位，所以先剥一层再判。
+                if v and not is_placeholder(v.strip("*_`#> ")) and v not in out:
                     out.append(v)
         return out[:_MAX_CANDIDATES]
 

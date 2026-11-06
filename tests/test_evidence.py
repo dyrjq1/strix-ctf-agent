@@ -81,3 +81,15 @@ def test_stale_local_read_is_still_supported_by_design():
     ledger = EvidenceLedger()
     ledger.observe_output(STALE_FILE_OUTPUT)
     assert ledger.supports("FLAG{9c9c9c9c9c9c9c9c9c9c9c9c9c9c9c9c}")
+
+
+def test_placeholder_never_counts_as_evidence():
+    """2026-11-06 v6 冒烟：agent 读自己的源码，注释里的 ``FLAG{xxxx}`` 被当证据。
+
+    抽取层过滤只能挡住「按 proximity 挑一个」的那条路；finish_scan 参数、
+    并行 race-win 等路径直接问 ``ledger.supports()``，所以证据层也必须挡。
+    """
+    ledger = EvidenceLedger()
+    ledger.observe_output("cat /app/src/ctf_strix/finish_guard.py -> FLAG{xxxx}")
+    assert ledger.supports("FLAG{xxxx}") is False
+    assert "FLAG{xxxx}" not in ledger.observed

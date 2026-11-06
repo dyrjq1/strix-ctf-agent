@@ -354,6 +354,50 @@ def test_main_marks_rejected_credentials_in_result_json(tmp_path, monkeypatch):
         os.environ.pop("CTFY_SOFT_DEADLINE", None)
 
 
+def test_is_turn_exhausted_separates_budget_from_crash() -> None:
+    """turn 用尽与进程崩溃必须分得开：前者是失败但健康，后者是没跑起来。"""
+    from agents.exceptions import MaxTurnsExceeded
+
+    from ctf_strix.agent import _is_turn_exhausted
+
+    assert _is_turn_exhausted(MaxTurnsExceeded("Max turns (3) exceeded")) is True
+    assert _is_turn_exhausted(RuntimeError("boom")) is False
+
+
+def test_is_turn_exhausted_survives_a_moved_import_path() -> None:
+    """vendor 的 recovery 耗尽用的是同名异类；import 路径一变不能退回 error。"""
+    from ctf_strix.agent import _is_turn_exhausted
+
+    moved = type("MaxTurnsExceeded", (Exception,), {})
+    assert _is_turn_exhausted(moved("Agent exhausted recovery attempts")) is True
+
+
+def test_main_reports_turn_exhaustion_as_recovery_exhausted(tmp_path, monkeypatch) -> None:
+    """2026-11-06 v6 冒烟：max_turns 用尽被写成 error「所有 attempt 都未能启动运行时」。
+
+    它跑满了一个预算、只是没交生命周期调用，与 RecoveryExhausted 是同一种失败，
+    下游统计不该把两者分开记。
+    """
+    from ctf_strix import agent
+
+    _prepare_main(tmp_path, monkeypatch)
+
+    def _exhausted(*_args, **_kwargs):
+        return 3, {"turns_exhausted": 1}
+
+    monkeypatch.setattr(agent, "_run_agent", _exhausted)
+    try:
+        assert agent.main() == 0
+        payload = json.loads((tmp_path / "result.json").read_text(encoding="utf-8"))
+        assert payload["stop_reason"] == "recovery_exhausted"
+        assert "turn budget exhausted" in payload["writeup"]
+        assert "所有 attempt 都未能启动运行时" not in payload["writeup"]
+    finally:
+        import os
+
+        os.environ.pop("CTFY_SOFT_DEADLINE", None)
+
+
 def test_main_keeps_credential_failure_when_no_attempt_ran(tmp_path, monkeypatch):
     """b. The normal _run_agent path must not be overwritten by "no_attempt_ran"."""
     from ctf_strix import agent

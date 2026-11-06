@@ -29,12 +29,11 @@ from __future__ import annotations
 
 import asyncio
 import inspect
-import re
 import threading
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
-from ctf_strix.flag_extract import FLAG_RE
+from ctf_strix.flag_extract import FLAG_RE, is_placeholder
 
 if TYPE_CHECKING:
     from agents import FunctionTool
@@ -44,12 +43,6 @@ if TYPE_CHECKING:
 #: ``EvidenceLedger`` 永远记录不到的 flag 形状。这里复用同一定义，避免
 #: "守卫看得见、证据链看不见" 的假阴性/假阳性。
 _FLAG_RE = FLAG_RE
-
-#: 模板占位符（``FLAG{...}`` / ``FLAG{xxxx}``）。守卫只该认"看起来是内容"的
-#: flag；把占位符当答案会让 agent 在根本没解出题时就被放行。
-_PLACEHOLDER = re.compile(
-    r"^(?:FLAG|flag|CTF|ctf|CTFY|ctfy)\{(?:\.{2,}|x{2,}|X{2,}|<[^>]*>|\{[^}]*\})\}$"
-)
 
 #: 连续拒绝到这个次数就放行，避免解不出时把预算全耗在撞墙上。
 _MAX_REFUSALS = 3
@@ -165,7 +158,7 @@ class FinishGuard:
             self.allowed += 1
             return None, False, []
         found = [m.group(0) for m in _FLAG_RE.finditer(raw_input or "")]
-        accepted = [flag for flag in found if _PLACEHOLDER.match(flag) is None]
+        accepted = [flag for flag in found if not is_placeholder(flag)]
         echo_only: list[str] = []
         if accepted:
             if self.evidence is None:

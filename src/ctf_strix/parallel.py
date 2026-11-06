@@ -30,6 +30,8 @@ import re
 import threading
 from typing import Any
 
+from ctf_strix.flag_extract import is_placeholder
+
 logger = logging.getLogger(__name__)
 
 #: Hard ceiling from the run constraints: container memory is the limiting
@@ -38,10 +40,6 @@ logger = logging.getLogger(__name__)
 MAX_SUBAGENTS = 2
 
 _FLAG_RE = re.compile(r"(?:FLAG|flag|CTF|ctf|CTFY|ctfy)\{[^}\s]{2,}\}")
-_PLACEHOLDER = re.compile(
-    r"^(?:FLAG|flag|CTF|ctf|CTFY|ctfy)\{(?:\.{2,}|x{2,}|X{2,}|<[^>]*>|\{[^}]*\})$"
-)
-
 _LOCK = threading.Lock()
 _INSTALLED = False
 #: Strong references to race-stop tasks.  ``asyncio`` keeps only a weak
@@ -656,7 +654,7 @@ def _flags(text: str) -> list[str]:
     return [
         match.group(0)
         for match in _FLAG_RE.finditer(text or "")
-        if _PLACEHOLDER.match(match.group(0)) is None
+        if not is_placeholder(match.group(0))
     ]
 
 

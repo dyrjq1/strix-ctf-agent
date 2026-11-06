@@ -17,6 +17,7 @@ from typing import Any
 import pytest
 
 from ctf_strix.autosubmit import AutoSubmitter
+from ctf_strix.flag_extract import FLAG_RE, is_placeholder
 
 
 def _mk(questions: list[dict[str, Any]]) -> tuple[AutoSubmitter, list[dict[str, Any]]]:
@@ -261,3 +262,86 @@ def test_bare_prose_is_still_not_a_candidate() -> None:
     """Scraping free text would submit sentences; only labels and shapes count."""
     cands = AutoSubmitter.candidates("I looked around and the page said nothing useful.")
     assert cands == [], cands
+
+
+def test_placeholder_shapes_are_not_candidates() -> None:
+    """占位符不能成为提交候选。
+
+    2026-11-06 v6 冒烟：agent 读到自己源码注释里的示例 flag，证据链把它当成
+    "检索到的证据"，一道不可能解出的题被判 solved。提交是最后一道门，宽正则
+    能抽出的每种占位形态都要覆盖。
+    """
+    cands = AutoSubmitter.candidates(
+        "a=FLAG{xxxx} b=FLAG{...} c=FLAG{<value>} d=FLAG{***} e=FLAG{{flag}}"
+    )
+    assert cands == [], cands
+
+
+def test_real_flags_survive_placeholder_filter() -> None:
+    """过滤占位符不能误杀真实 flag。"""
+    hex32 = "0123456789abcdef0123456789abcdef"
+    cands = AutoSubmitter.candidates(f"FLAG{{r34l_fl4g_9f2a}} {hex32}")
+    assert cands[0] == "FLAG{r34l_fl4g_9f2a}"
+    assert hex32 in cands
+
+
+def test_ctfy_prefix_wins_over_ctf() -> None:
+    """``CTFY`` 必须排在 ``CTF`` 前面，否则被吃掉三个字符后判定失效。"""
+    for raw in ("ctfy{...}", "CTFY{xxxx}", "ctfy{<value>}", "ctfy{???}"):
+        assert is_placeholder(raw), raw
+        assert AutoSubmitter.candidates(f"answer: {raw}") == [], raw
+
+
+def test_non_ascii_flag_body_is_not_placeholder() -> None:
+    """中文体不是符号：判据必须是 Unicode 感知的 ``str.isalnum()``。"""
+    assert not is_placeholder("FLAG{测试}")
+    assert AutoSubmitter.candidates("answer: FLAG{测试}") == ["FLAG{测试}"]
+
+
+def test_image_source_has_no_extractable_placeholder() -> None:
+    """镜像会把这些目录打进去，里面不许出现任何 ``FLAG_RE`` 命中。
+
+    ``docker/Dockerfile`` 直接 ``COPY src/``，agent 读自己的源码时会把注释里
+    的示例当成「检索到的证据」。2026-11-06 的假 solved 就是这么来的。
+
+    当前窄集命中数是 0，所以判据是"零命中"而不是"零占位符"——后者放过了
+    ``MetaCTF{fake_banner_flag_here}`` 这种 ``is_placeholder`` 认不出的示例串。
+    ``FLAG{...}``（点）这种宽集才命中的写法抽不出候选、进不了证据链，
+    最后一道 ``candidates()`` 也会用 ``is_placeholder`` 挡掉，所以文档里
+    保留它是安全的（``test_*placeholder*`` 覆盖那一层）。
+    """
+    from pathlib import Path
+
+    from ctf_strix.flag_extract import FLAG_RE, is_placeholder
+
+    repo = Path(__file__).resolve().parents[1]
+    # 与 docker/Dockerfile 的 COPY 清单对齐：src / vendor/src / config / docker。
+    roots = [repo / "src", repo / "vendor" / "src", repo / "config", repo / "docker"]
+    files = [
+        path
+        for root in roots
+        if root.is_dir()
+        for path in sorted(root.rglob("*"))
+        if path.is_file()
+    ]
+    assert len(files) > 200, f"扫描范围异常，只找到 {len(files)} 个文件"
+
+    offenders: list[str] = []
+    scanned = 0
+    for path in files:
+        data = path.read_bytes()
+        if b"\x00" in data:
+            # 二进制资源（图片/字体）不是 agent 会当文本读的证据源，跳过。
+            continue
+        # 解不开就抛异常：``errors="replace"`` 会把非 UTF-8 文件解成乱码，
+        # 顺手切断 ASCII flag，测试就假绿了。
+        text = data.decode("utf-8")
+        scanned += 1
+        for lineno, line in enumerate(text.splitlines(), 1):
+            # 当前镜像内窄集命中数为 0，所以任何命中都算回归：既能抓
+            # ``FLAG{xxxx}`` 这类占位符，也能抓 ``MetaCTF{fake_banner_flag_here}``
+            # 这种"看着像真答案的示例"（``is_placeholder`` 认不出它）。
+            for match in FLAG_RE.finditer(line):
+                offenders.append(f"{path}:{lineno}: {match.group(0)}")
+    assert not offenders, "镜像源码里仍有占位串：\n" + "\n".join(offenders)
+    assert scanned > 200, f"实际只扫到 {scanned} 个文本文件，范围不对"

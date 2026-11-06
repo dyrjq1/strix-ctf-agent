@@ -243,11 +243,11 @@ nmap -sS target.ctf
 nmap -sV -sC target.ctf -p 22
 # PORT   STATE SERVICE VERSION
 # 22/tcp open  ssh?
-# |_banner: MetaCTF{fake_banner_flag_here}
+# |_banner: MetaCTF[example banner]
 
 # Step 3: Or simply connect with netcat to read the banner
 nc target.ctf 22
-# MetaCTF{fake_banner_flag_here}
+# MetaCTF[example banner]
 
 # Alternative: use curl or openssl for TLS-wrapped banners
 echo "" | timeout 3 nc -w 3 target.ctf 22

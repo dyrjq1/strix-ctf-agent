@@ -42,7 +42,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from ctf_strix.flag_extract import FLAG_RE
+from ctf_strix.flag_extract import FLAG_RE, is_placeholder
 
 
 @dataclass
@@ -59,7 +59,7 @@ class EvidenceLedger:
     unsupported: list[str] = field(default_factory=list)
 
     def observe_output(self, text: str, arguments: str | None = None) -> list[str]:
-        """Record every flag-shaped string present in one tool output.
+        """Record every *real* flag-shaped string present in one tool output.
 
         Args:
             text: Raw tool output.
@@ -73,7 +73,11 @@ class EvidenceLedger:
         Returns:
             The flags found in this output (possibly empty).
         """
-        found = FLAG_RE.findall(text or "")
+        # Template placeholders (``FLAG{…}``, all-x bodies) never count as
+        # evidence.  Without this, an agent that greps its own source reads the
+        # example in a docstring and the ledger "supports" it — which is exactly
+        # how an impossible challenge was reported as solved on 2026-11-06.
+        found = [flag for flag in FLAG_RE.findall(text or "") if not is_placeholder(flag)]
         from_args = set(FLAG_RE.findall(arguments or ""))
         # One output is one observation: a flag printed twice by the same call
         # must not inflate the diagnostic counters.

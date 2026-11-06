@@ -71,3 +71,33 @@ def test_fallback_rejects_stale_recon_target():
 def test_fallback_ignores_placeholders():
     log = LOG + "\nFLAG{...}\n"
     assert fallback_flag(log, HOST) == FLAG
+
+
+def test_placeholders_never_become_candidates():
+    """2026-11-06 v6 冒烟：镜像源码注释里的 ``FLAG{xxxx}`` 被当成检索到的证据。
+
+    占位符必须在抽取层就丢掉。只要它活到 ``EvidenceLedger.supports()``，
+    「读自己的源码」就会把一道不可能解出的题判成 solved。
+
+    ``own_host`` 传空串是关键：带 host 的文本会先被「靶机不在附近」淘汰，
+    那样这条用例无论修没修都通过，等于什么都没测。
+    """
+    text = "  [cccc3333] OUT  模板占位符（``FLAG{...}`` / ``FLAG{xxxx}``）\n"
+    assert best_flag(text, "") is None
+    assert fallback_flag(text, "") is None
+
+
+def test_placeholder_shapes_are_shared_with_finish_guard():
+    """占位符只允许有一套定义，抽取层与收工守卫必须同口径。"""
+    from ctf_strix.flag_extract import is_placeholder
+
+    for flag in ("FLAG{...}", "FLAG{xxxx}", "flag{XXXX}", "CTF{XxX}"):
+        assert is_placeholder(flag), flag
+    for flag in ("FLAG{0123456789abcdef}", "ctfy{x_y-z}"):
+        assert not is_placeholder(flag), flag
+
+
+def test_placeholder_does_not_mask_a_real_flag():
+    """同一段输出里既有占位符又有真 flag 时，真 flag 必须照常交付。"""
+    text = f"{HOST}\nplaceholder: FLAG{{xxxx}}\nreal: {FLAG}\n"
+    assert best_flag(text, HOST) == FLAG
