@@ -21,22 +21,11 @@ and `scipy`. `volatility3`, `librosa`, `scikit-learn`,
 and `heatshrink2` are **not available** -- use the installed libraries or
 plain Python instead.
 
-**Linux (apt):**
-```bash
-apt install binwalk foremost libimage-exiftool-perl tshark sleuthkit \
-  ffmpeg steghide testdisk john pcapfix
-```
-
-**macOS (Homebrew):**
-```bash
-brew install binwalk exiftool wireshark sleuthkit ffmpeg \
-  testdisk john-jumbo
-```
-
-**Ruby gems (all platforms):**
-```bash
-gem install zsteg
-```
+**Offline image: no installs and no internet.** `python3` ships `Pillow`,
+`numpy`, `scipy` and `matplotlib`, and `curl` works; `binwalk`, `foremost`,
+`exiftool`, `tshark`, `sleuthkit`, `ffmpeg`, `steghide`, `testdisk`, `john` and
+`zsteg` are not guaranteed present -- carve and decode with those libraries,
+`strings`, and plain byte-level parsing.
 
 ## Additional Resources
 
@@ -204,10 +193,9 @@ See [disk-and-memory.md](disk-and-memory.md) for full Volatility plugin referenc
 
 ## Windows Password Hashes
 
-```bash
-# Extract with impacket, crack with hashcat -m 1000
-python -c "from impacket.examples.secretsdump import *; SAMHashes('SAM', LocalOperations('SYSTEM').getBootKey()).dump()"
-```
+`impacket` and `hashcat` are not in this image. Read the bootkey-derived NTLM
+hashes out of the SAM/SYSTEM hives yourself (registry parsing in plain Python),
+then try the candidates from the challenge wordlist with `hashlib`.
 
 See [windows.md](windows.md) for SAM details and [network-advanced.md](network-advanced.md) for NTLMv2 cracking from PCAP.
 
@@ -318,7 +306,7 @@ See [linux-forensics.md](linux-forensics.md) for full browser credential decrypt
 - **Autostereogram solving:** Duplicate layer, difference blend, shift horizontally ~100px to reveal hidden 3D text. See [steganography.md](steganography.md#autostereogram--magic-eye-solving-bsidessf-2026).
 - **Two-layer byte+line interleaving:** Two files byte-interleaved, then scanlines interleaved. Deinterleave even/odd bytes first (valid images), then even/odd lines. See [steganography.md](steganography.md#two-layer-byteline-interleaving-bsidessf-2026).
 - **SMB RID recycling:** Guest auth + LSARPC `LsaLookupSids` with incrementing RIDs enumerates AD accounts from PCAP. See [network-advanced.md](network-advanced.md#smb-rid-recycling-via-lsarpc-midnight-2026).
-- **Timeroasting (MS-SNTP):** NTP requests with machine RIDs extract HMAC-MD5 hashes from DC; crack with hashcat -m 31300. See [network-advanced.md](network-advanced.md#timeroasting--ms-sntp-hash-extraction-midnight-2026).
+- **Timeroasting (MS-SNTP):** NTP requests with machine RIDs extract HMAC-MD5 hashes from DC; crack offline with a Python HMAC-MD5 loop. See [network-advanced.md](network-advanced.md#timeroasting--ms-sntp-hash-extraction-midnight-2026).
 - **Android forensics:** Extract APK with `adb pull`, analyze with `apktool`, check `shared_prefs/` and SQLite databases in `/data/data/<package>/`. See [disk-and-memory.md](disk-and-memory.md#android-forensics).
 - **Docker container forensics:** `docker save` exports layered tars; deleted files persist in earlier layers. `docker history --no-trunc` reveals build secrets. See [disk-and-memory.md](disk-and-memory.md#container-forensics-docker).
 - **Cloud storage forensics:** S3/GCP/Azure versioning preserves deleted objects. `list-object-versions` recovers deleted flags. See [disk-and-memory.md](disk-and-memory.md#cloud-storage-forensics-aws-s3--gcp--azure).
@@ -356,13 +344,11 @@ See [network-advanced.md](network-advanced.md#smb-rid-recycling-via-lsarpc-midni
 
 ## Timeroasting / MS-SNTP Hash Extraction (Midnight 2026)
 
-Extract crackable HMAC-MD5 hashes from MS-SNTP responses by sending NTP requests with machine account RIDs. Crack with `hashcat -m 31300`.
+Extract crackable HMAC-MD5 hashes from MS-SNTP responses by sending NTP requests with machine account RIDs. Crack with a Python HMAC-MD5 loop over a wordlist.
 
-```bash
-# Extract NTP payloads, convert to hashcat format, crack
-tshark -r capture.pcapng -Y "ntp && ip.src == <DC_IP>" -T fields -e udp.payload
-hashcat -m 31300 -a 0 -O hashes.txt rockyou.txt --username
-```
+Parse the UDP/123 payloads out of the PCAP in Python, then HMAC-MD5 each
+candidate offline with `hashlib.hmac`; the parsing details are in
+[network-advanced.md](network-advanced.md#timeroasting--ms-sntp-hash-extraction-midnight-2026).
 
 See [network-advanced.md](network-advanced.md#timeroasting--ms-sntp-hash-extraction-midnight-2026) for payload parsing script and full attack chain.
 

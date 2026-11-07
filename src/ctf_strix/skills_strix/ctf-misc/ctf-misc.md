@@ -19,18 +19,10 @@ Quick reference for miscellaneous CTF challenges. Each technique has a one-liner
 1.6.6, `z3-solver`, `Pillow`, `numpy`, `requests`, and `dnslib` -- nothing to
 install.
 
-**Linux (apt):**
-```bash
-apt install libzbar0 qrencode ffmpeg
-```
-
-**macOS (Homebrew):**
-```bash
-brew install ffmpeg qrencode
-```
-
-**Manual install:**
-- SageMath — Linux: `apt install sagemath`, macOS: `brew install --cask sage`
+**Offline image: no installs and no internet.** `python3` ships `PIL`, `numpy`
+and `z3-solver`, and `curl` works; `ffmpeg`, `qrencode`, `zbarimg` and SageMath
+are not guaranteed present -- generate QR with `segno`, decode with PIL/numpy
+or plain Python on the raw bytes.
 
 ## Additional Resources
 

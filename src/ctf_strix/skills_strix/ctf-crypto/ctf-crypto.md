@@ -18,25 +18,13 @@ Quick reference for crypto CTF challenges. Each technique has a one-liner here; 
 **Python packages:** the image already ships `pycryptodome`,
 `pycryptodomex`, `z3-solver`, `sympy`, and `gmpy2`. `hashpumpy`, `fpylll`,
 `py_ecc`, and the `coppersmith` / `crypto-attacks` helpers are **not
-available** (no pip, no git clone) -- implement those steps with `sympy`/`z3`
+available** (nothing can be installed here) -- implement those steps with `sympy`/`z3`
 or pure Python instead.
 
-**Linux (apt):**
-```bash
-apt install hashcat
-```
-
-**macOS (Homebrew):**
-```bash
-brew install hashcat
-```
-
-**Manual install:**
-- SageMath (optional — only for legacy Sage fallback snippets (collapsed sections)) — Linux: `apt install sagemath`, macOS: `brew install --cask sage`
-- RsaCtfTool — `git clone https://github.com/RsaCtfTool/RsaCtfTool` (automated RSA attacks)
-- crypto-attacks (Coppersmith) — not available (no internet); use the `sympy`/`z3` Coppersmith snippets in [advanced-math.md](advanced-math.md) instead
-
-> **Note:** `gmpy2` requires libgmp — Linux: `apt install libgmp-dev`, macOS: `brew install gmp`.
+**Offline image: no installs and no internet.** `python3` ships `gmpy2`,
+`sympy` and `z3-solver` (so no libgmp build step is needed); `hashcat`,
+SageMath and RsaCtfTool are not available -- use the `sympy`/`z3` Coppersmith
+snippets in [advanced-math.md](advanced-math.md) and pure-Python attacks.
 
 ## Additional Resources
 
@@ -80,15 +68,14 @@ python3 -c "from Crypto.Util.number import *; n=<N>; print(f'bits={n.bit_length(
 python3 -c "from sympy import factorint; print(factorint(<n>))"  # Small factors?
 openssl rsa -pubin -in key.pub -text -noout  # Extract n, e from PEM
 
-# Quick factorization tools
-python3 RsaCtfTool.py -n <n> -e <e> --uncipher <c>
+# Quick factorization tools (RsaCtfTool is not in this image; sympy is)
+python3 -c "from sympy import factorint; print(factorint(<n>))"  # then invert e mod lambda(n)
 
 # XOR analysis
 python3 -c "from pwn import xor; print(xor(bytes.fromhex('<hex>'), b'flag{'))"
 
-# Hash identification
-hashid '<hash>'
-hashcat --identify '<hash>'
+# Hash identification (no hashid/hashcat): 32 hex = MD5, 40 hex = SHA-1,
+# 64 hex = SHA-256; anything salted or iterated -> read the challenge code
 
 # Quick factorization (sympy, primary)
 python3 -c "from sympy import factorint; print(factorint(<n>))"

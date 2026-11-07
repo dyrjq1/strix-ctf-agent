@@ -57,12 +57,10 @@ Use this skill as a routing and execution guide for web-heavy challenges. Keep t
 
 ## Find Similar Writeups
 
-If you are stuck or want to see how others solved similar web challenges, follow the ctf-similar-search skill's methodology — describe the search request in natural language using the challenge name, competition name, or unique strings (code snippets, error messages) from the challenge:
-
-"DASCTF URL Storage"
-"def encrypt_flag(key)"
-
-This searches for reference writeups via Tavily API and can help identify the right exploitation path. Avoid generic terms like "SSRF" or "XSS" — use challenge-specific identifiers instead.
+Offline: no search API and no web access from this image, so reference writeups
+cannot be fetched and no `ctf-similar-search` skill is registered. Work from the
+local subfiles -- they index the techniques by bug class -- and from the
+challenge's own artifacts instead.
 
 ## First-Pass Workflow
 

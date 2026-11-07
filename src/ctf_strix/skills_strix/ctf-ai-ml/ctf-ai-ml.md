@@ -19,15 +19,9 @@ Quick reference for AI/ML CTF challenges. Each technique has a one-liner here; s
 (`PIL`). `torch`, `transformers`, `safetensors`, and `scikit-learn` are **not
 available** -- use the installed libraries or plain Python instead.
 
-**Linux (apt):**
-```bash
-apt install python3-dev
-```
-
-**macOS (Homebrew):**
-```bash
-brew install python@3
-```
+**Offline image: no installs and no internet.** `python3` and its headers are
+already in the image, so there is nothing to install; the attack code runs on
+`numpy`/`scipy`/`Pillow` and pure Python.
 
 ## Additional Resources
 

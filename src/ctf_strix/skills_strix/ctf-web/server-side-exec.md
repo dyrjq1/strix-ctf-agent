@@ -259,10 +259,10 @@ def leak_char(known_prefix, position):
 ## File Upload to RCE Techniques
 
 **Try in this order, stop at the first one that works:**
-1. Extension blacklist: `.php3` / `.phtml` / `.phar`, trailing dot or space, `%00`.
-2. `Content-Type` and magic bytes: `GIF89a` prefix, polyglot, MIME mismatch.
-3. Parser config: `.htaccess` (`AddType`), `.user.ini` (`auto_prepend_file`).
-4. Path traversal to a served/executed location, then race the validate-then-write gap.
+1. Extension blacklist: `.php3` / `.phtml` / `.phar`, trailing dot or space, `%00`. → 出口：换扩展名就被拒且提示非法类型，走第 2 步；上传后文件被改名到不可执行目录，直接跳第 4 步。
+2. `Content-Type` and magic bytes: `GIF89a` prefix, polyglot, MIME mismatch. → 出口：加 GIF89a 仍只当图片、从不解析，走第 3 步；服务器按内容二次编码重写文件，直接跳第 4 步。
+3. Parser config: `.htaccess` (`AddType`), `.user.ini` (`auto_prepend_file`). → 出口：`.htaccess` 被 403 或 `AllowOverride None` 生效，跳第 4 步。
+4. Path traversal to a served/executed location, then race the validate-then-write gap. → 出口：路径被规范化掉就转下面的 log poisoning / `.so` 覆盖打法。
 
 **Key insight:** File upload vulnerabilities become RCE when you can control either the file extension (`.htaccess`, `.php`, `.so`) or the upload path (path traversal). Try uploading server config files (`.htaccess`), shared libraries (`.so`), or use log poisoning as fallback when direct code upload is blocked.
 

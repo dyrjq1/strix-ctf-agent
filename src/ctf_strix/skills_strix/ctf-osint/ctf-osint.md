@@ -19,15 +19,10 @@ Quick reference for OSINT CTF challenges. Each technique has a one-liner here; s
 available** (and there is no internet) -- work on local artifacts with
 `requests` or plain Python instead.
 
-**Linux (apt):**
-```bash
-apt install whois dnsutils nmap libimage-exiftool-perl imagemagick curl
-```
-
-**macOS (Homebrew):**
-```bash
-brew install whois bind nmap exiftool imagemagick curl
-```
+**Offline image: no installs and no internet.** `python3` ships `requests` and
+the usual stdlib, and `curl` works; `whois`, `dig`, `nmap` and `exiftool` are not
+guaranteed present, and no public lookup service (Shodan, Wayback, social APIs)
+can be reached. Work from the artifacts the challenge hands you.
 
 **MCP servers (optional):** Playwright MCP ([microsoft/playwright-mcp](https://github.com/microsoft/playwright-mcp)) for browser-driven OSINT (JS-rendered pages, reverse-image/map flows) — see [tools-mcp.md](tools-mcp.md).
 
@@ -64,13 +59,11 @@ identify -verbose image.jpg | head -30
 # Web archive
 curl "https://web.archive.org/web/20230101*/target.com"
 
-# Username lookup (site is browser-only — no JSON API; curl returns 403)
-git clone https://github.com/WebBreacher/WhatsMyName
-cd WhatsMyName/scripts/checker && python3 wmn_check.py --help  # needs requests + playwright
+# Username lookup (offline: no clone and no browser -- probe handles with curl
+# and use the platform list in social-media.md as the checklist)
 
-# Shodan
-shodan search "hostname:target.com"
-shodan host <ip>
+# Shodan / ip-api style lookups need the internet, which this image lacks:
+# start from the artifacts in the challenge, not from a live API.
 ```
 
 ## String Identification
@@ -183,7 +176,7 @@ No auth needed. Endpoints: `public.api.bsky.app/xrpc/app.bsky.feed.searchPosts?q
 
 ## Shodan SSH Fingerprint Lookup
 
-Search Shodan by SSH host key fingerprint to identify servers: `shodan search "fingerprint:AA:BB:CC:..."`. See [web-and-dns.md](web-and-dns.md#shodan-ssh-fingerprint-lookup-ekoparty-ctf-2016).
+Search Shodan by SSH host key fingerprint to identify servers (Shodan is a web lookup -- the CLI is not in this image). See [web-and-dns.md](web-and-dns.md#shodan-ssh-fingerprint-lookup-ekoparty-ctf-2016).
 
 ## Gaming Platform OSINT
 

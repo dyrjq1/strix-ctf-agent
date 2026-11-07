@@ -22,29 +22,11 @@ Quick reference for binary exploitation (pwn) CTF challenges. Each technique has
 **uv alternative:** not available (no internet); the system `python3` already
 has `pwntools` and `ROPgadget`.
 
-**Linux (apt):**
-```bash
-apt install gdb binutils strace ltrace qemu-system-x86
-```
-
-**Optional cross-arch (ARM/MIPS — Debian/Ubuntu):**
-```bash
-apt install qemu-user qemu-user-static gdb-multiarch binutils-multiarch libc6-armhf-cross libc6-arm64-cross libc6-mips-cross
-```
-
-**macOS (Homebrew):**
-```bash
-brew install gdb binutils qemu
-```
-
-**Ruby gems (all platforms):**
-```bash
-gem install one_gadget seccomp-tools
-```
-
-**Manual install:**
-- pwndbg — Linux: [GitHub](https://github.com/pwndbg/pwndbg), macOS: `brew install pwndbg/tap/pwndbg-gdb`
-- checksec — included with pwntools (`checksec --file=binary`)
+**Offline image: no installs and no internet.** `python3` (with `pwntools`) and
+`curl` work; `gdb`, `qemu-user`, `one_gadget`, `seccomp-tools` and `pwndbg` are
+not guaranteed present. Build the exploit with `pwntools` and drive the target
+directly; `checksec --file=binary` ships inside `pwntools` and reads the ELF
+header offline.
 
 **MCP servers (optional):** WinDbg MCP ([svnscha/mcp-windbg](https://github.com/svnscha/mcp-windbg)) for Windows crash dumps, live breakpoint-driven exploitation, and kernel/driver debugging; IDA Pro MCP / Ghidra MCP for decompiling the vulnerable function — see [tools-mcp.md](tools-mcp.md).
 

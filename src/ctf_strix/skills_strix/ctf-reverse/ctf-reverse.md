@@ -16,30 +16,12 @@ Quick reference for RE challenges. For detailed techniques, see supporting files
 ## Prerequisites
 
 **Python packages:** the image already ships `capstone` and `z3-solver`.
-`frida-tools`, `angr`, `qiling`, `uncompyle6`, and `lief` are **not
-available** -- use `capstone`/`unicorn`/`z3` or plain Python instead.
-# For Python 3.9+ bytecode: build pycdc from source
-git clone https://github.com/zrax/pycdc && cd pycdc && cmake . && make
-```
+`frida-tools`, `angr`, `qiling`, `uncompyle6`, `lief` and a `pycdc` build are
+**not available** -- use `capstone`/`unicorn`/`z3` or plain Python instead.
 
-**Linux (apt):**
-```bash
-apt install gdb radare2 binutils strace ltrace apktool upx
-```
-
-**macOS (Homebrew):**
-```bash
-brew install gdb radare2 binutils apktool upx ghidra
-```
-
-**radare2 plugins:**
-```bash
-r2pm -ci r2ghidra   # Native Ghidra decompiler for radare2
-# The prebuilt r2ghidra zip is ABI-locked to one radare2 version (WARN: ABI mismatch: Expect 142 vs 152); r2pm -ci r2ghidra builds the plugin from source instead.
-```
-
-**Manual install:**
-- pwndbg — Linux: [GitHub](https://github.com/pwndbg/pwndbg), macOS: `brew install pwndbg/tap/pwndbg-gdb`
+**Offline image: no installs and no internet.** `python3` and `curl` work;
+`gdb`, `radare2`, `apktool`, `upx`, `ghidra` and the `r2pm` plugin registry are
+not guaranteed present. Disassemble with `capstone` and read the bytes directly.
 
 **MCP servers (optional, agent-driven RE):** IDA Pro MCP ([mrexodia/ida-pro-mcp](https://github.com/mrexodia/ida-pro-mcp)), Ghidra MCP ([bethington/ghidra-mcp](https://github.com/bethington/ghidra-mcp) — has a headless server, no GUI needed), JADX MCP ([zinja-coder/jadx-ai-mcp](https://github.com/zinja-coder/jadx-ai-mcp)) — see [tools-mcp.md](tools-mcp.md) for setup and usage.
 

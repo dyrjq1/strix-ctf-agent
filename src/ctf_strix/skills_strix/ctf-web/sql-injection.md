@@ -4,12 +4,12 @@ Comprehensive SQL injection techniques for CTF challenges. For other server-side
 
 ## 阶梯（按序试）
 
-1. 闭合判型：数字 / 单引号 / 双引号 / 括号 —— 先让语法错误消失。
-2. `order by N` 猜列数，直到报错为止。
-3. `union select` 找回显位：先全填 NULL，再逐列换成数据。
-4. 取库 → 取表 → 取列 → 取行（`information_schema` 或等价物）。
-5. 无回显：布尔三态计数，或时间盲注（`sleep` / 重查询）。
-6. WAF 在挡：注释符拆分、大小写混写、二次 URL 编码。
+1. 闭合判型：数字 / 单引号 / 双引号 / 括号 —— 先让语法错误消失。 → 出口：三种引号都无报错差异，直接跳第 5 步。
+2. `order by N` 猜列数，直到报错为止。 → 出口：`order by` 被过滤或列数无边界，跳第 5 步。
+3. `union select` 找回显位：先全填 NULL，再逐列换成数据。 → 出口：找不到回显位，直接跳第 5 步。
+4. 取库 → 取表 → 取列 → 取行（`information_schema` 或等价物）。 → 出口：`information_schema` 被禁就换等价表（`innodb_table_stats` / `sqlite_master`），仍不行跳第 5 步。
+5. 无回显：布尔三态计数，或时间盲注（`sleep` / 重查询）。 → 出口：盲注测不动就回第 6 步绕 WAF，再从第 2 步重跑。
+6. WAF 在挡：注释符拆分、大小写混写、二次 URL 编码。 → 出口：绕过后回到被挡的那一步（第 3/4 步）重试；绕不过就换注入点。
 
 ## Table of Contents
 - [Backslash Escape Quote Bypass](#backslash-escape-quote-bypass)
