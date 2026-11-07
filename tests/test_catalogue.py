@@ -142,7 +142,9 @@ def test_prompt_stays_inside_the_web_budget():
     # 5,505 after; 6,558 after the shared hypothesis block (+1,030).  Headroom
     # is 72 chars so an unrelated one-line addition does not need a threshold
     # edit, but a tool section cannot slip in unnoticed.
-    assert size < 6630, f"web prompt grew to {size} chars"
+    # L3b: 6,605 -> 6,680 (+75) for the stage-2 CLI names in the Environment
+    # bullet and ctf-web Prerequisites (impacket/flask-unsign/RsaCtfTool).
+    assert size < 6700, f"web prompt grew to {size} chars"
 
 
 def test_activate_defaults_to_web_so_unit_tests_keep_working():

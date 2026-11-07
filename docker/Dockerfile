@@ -57,15 +57,43 @@ COPY docker/check_toolchain.sh /app/docker/check_toolchain.sh
 RUN chmod +x /app/docker/check_toolchain.sh
 # --no-deps：requirements.lock 是环境快照，里面有 fastmcp/mcp 的版本死结，
 # 任何解析器都会拒绝（详见交付说明 §4）。照单装才是忠实复现。
-# 装完立刻自检：pip check 看元数据，check_toolchain.sh 再逐个 import 并做
-# 一次真实调用。lock 少一个传递依赖时是构建失败，而不是比赛里第一次
+# 自检（pip check + 逐个 import + 真实调用）放到第二波工具层之后统一跑一次：
+# check_toolchain.sh 也探 impacket/flask-unsign/RsaCtfTool，在这一层跑会因
+# 工具尚未安装而红。lock 少一个传递依赖时仍是构建失败，而不是比赛里第一次
 # from Crypto / from PIL 才失败。
 RUN set -eux; \
     if [ -n "$PIP_INDEX_URL" ]; then \
         pip install --no-deps -r /app/requirements.lock -i "$PIP_INDEX_URL"; \
     else \
         pip install --no-deps -r /app/requirements.lock; \
-    fi; \
+    fi
+
+# 第二波工具层：impacket 全套 CLI / flask-unsign / RsaCtfTool。
+# 三件都装进独立 venv /opt/ctftools，主 site-packages 与 requirements.lock 都不碰。
+# --system-site-packages：lock 已经钉死 cryptography/pycryptodomex/pycryptodome/
+# z3/gmpy2/jinja2/click，这里只读复用、只补缺的 pyOpenSSL/ldap3/flask 等，
+# 避免在 venv 里重复装一份 cryptography（pyOpenSSL 要的 >=49,<51 主环境已满足）。
+# 构建期联网只用于下载/安装；这些 CLI 运行期不需要网络（RsaCtfTool 的
+# --attack factordb 是显式选项，默认攻击链纯离线）。
+# 官方 release 资产直链（impacket 0.13.1，tag impacket_0_13_1）；digest 取自
+# GitHub API 的 asset.digest（2026-11-07 核对，
+# 下载后实测 sha256 一致，见 docs/11-实验台账.md §4.89）。
+ARG IMPACKET_WHEEL_URL="https://github.com/fortra/impacket/releases/download/impacket_0_13_1/impacket-0.13.1-py3-none-any.whl"
+ARG IMPACKET_WHEEL_SHA256=3e5349c1209cdd3b90bff6f8b61c0d89aea0f3dbba6ad02ad254b9d3ef2301d0
+ARG FLASK_UNSIGN_VERSION=1.2.1
+RUN set -eux; \
+    python3 -m venv --system-site-packages /opt/ctftools; \
+    wget -q -O /tmp/impacket.whl "$IMPACKET_WHEEL_URL"; \
+    echo "$IMPACKET_WHEEL_SHA256  /tmp/impacket.whl" | sha256sum -c -; \
+    /opt/ctftools/bin/pip install --no-cache-dir /tmp/impacket.whl; \
+    /opt/ctftools/bin/pip install --no-cache-dir "flask-unsign==${FLASK_UNSIGN_VERSION}"; \
+    git clone --depth 1 https://github.com/RsaCtfTool/RsaCtfTool.git /opt/RsaCtfTool; \
+    /opt/ctftools/bin/pip install --no-cache-dir -r /opt/RsaCtfTool/requirements.txt; \
+    /opt/ctftools/bin/pip install --no-cache-dir --no-deps /opt/RsaCtfTool; \
+    rm -rf /opt/RsaCtfTool/.git /tmp/impacket.whl; \
+    for cli in /opt/ctftools/bin/*.py /opt/ctftools/bin/flask-unsign /opt/ctftools/bin/RsaCtfTool; do \
+        ln -sf "$cli" /usr/local/bin/; \
+    done; \
     bash /app/docker/check_toolchain.sh
 
 # 源码：vendor 里是未改动的 strix 1.7.0，src 里是 ctf_strix 改造层。

@@ -22,9 +22,10 @@ available** (nothing can be installed here) -- implement those steps with `sympy
 or pure Python instead.
 
 **Offline image: no installs and no internet.** `python3` ships `gmpy2`,
-`sympy` and `z3-solver` (so no libgmp build step is needed); `hashcat`,
-SageMath and RsaCtfTool are not available -- use the `sympy`/`z3` Coppersmith
-snippets in [advanced-math.md](advanced-math.md) and pure-Python attacks.
+`sympy` and `z3-solver` (so no libgmp build step is needed); `RsaCtfTool` is
+installed (offline, no factordb by default); `hashcat` and SageMath are not
+available -- use the `sympy`/`z3` Coppersmith snippets in
+[advanced-math.md](advanced-math.md) and pure-Python attacks.
 
 ## Additional Resources
 
@@ -68,7 +69,7 @@ python3 -c "from Crypto.Util.number import *; n=<N>; print(f'bits={n.bit_length(
 python3 -c "from sympy import factorint; print(factorint(<n>))"  # Small factors?
 openssl rsa -pubin -in key.pub -text -noout  # Extract n, e from PEM
 
-# Quick factorization tools (RsaCtfTool is not in this image; sympy is)
+# Quick factorization tools (RsaCtfTool is installed; sympy also works)
 python3 -c "from sympy import factorint; print(factorint(<n>))"  # then invert e mod lambda(n)
 
 # XOR analysis
@@ -315,5 +316,5 @@ Divide-and-conquer SPN key recovery: attack each S-box position independently, i
 
 - **Python:** the image already has `pycryptodome`, `z3-solver`, `sympy`, and `gmpy2`
 - **SageMath (optional fallback):** `sage -python script.py` — only for collapsed Sage alternatives
-- **RsaCtfTool:** `python RsaCtfTool.py -n <n> -e <e> --uncipher <c>` — automated RSA attack suite (tries Wiener, Hastad, Fermat, Pollard, and many more)
+- **RsaCtfTool:** `RsaCtfTool -n <n> -e <e> --uncipher <c>` — automated RSA attack suite (tries Wiener, Hastad, Fermat, Pollard, and many more); add `--attack <name>` to force one
 - **quipqiup.com:** Automated substitution cipher solver (frequency + word pattern analysis)

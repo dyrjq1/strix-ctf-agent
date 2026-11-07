@@ -219,27 +219,42 @@ PY
 
 echo "[toolchain] checking offline attack tools"
 python3 - <<'PY'
+import glob
+import os
 import shutil
 import subprocess
 import sys
 
-# sqlmap exits non-zero on --version, so judge by *output*, not return code.
-# A missing binary or empty output still fails the build.
+# impacket 的 wheel 用 scripts=glob('examples/*.py') 把整套 CLI 落进 venv 的 bin/。
+# 少于 60 个说明这层装歪了（上游当前是 70 个）；三个高频脚本必须在 PATH 上。
+scripts = glob.glob("/opt/ctftools/bin/*.py")
+if len(scripts) < 60:
+    sys.exit(f"impacket CLI set incomplete: {len(scripts)} scripts in /opt/ctftools/bin")
+for name in ("secretsdump.py", "wmiexec.py", "psexec.py"):
+    if not shutil.which(name):
+        sys.exit(f"missing impacket CLI on PATH: {name}")
+print(f"[toolchain] impacket: {len(scripts)} CLI scripts (secretsdump/wmiexec/psexec on PATH)")
+
+# 每项是 (可执行文件, 参数...)。sqlmap 的 --version 返回非零，所以按*输出*判定；
+# 缺二进制或输出为空仍判构建失败。
 PROBES = {
-    "nmap": ("--version",),
-    "sqlmap": ("--version",),
-    "ffuf": ("-V",),
-    "smbclient": ("--version",),
+    "nmap": ("nmap", "--version"),
+    "sqlmap": ("sqlmap", "--version"),
+    "ffuf": ("ffuf", "-V"),
+    "smbclient": ("smbclient", "--version"),
+    "impacket": ("secretsdump.py", "-h"),
+    "flask-unsign": ("flask-unsign", "--help"),
+    "RsaCtfTool": ("RsaCtfTool", "--help"),
 }
-for name, args in PROBES.items():
-    exe = shutil.which(name)
+for label, argv in PROBES.items():
+    exe = shutil.which(argv[0])
     if not exe:
-        sys.exit(f"missing binary: {name}")
-    proc = subprocess.run([exe, *args], capture_output=True, text=True)
+        sys.exit(f"missing binary: {label} ({argv[0]})")
+    proc = subprocess.run([exe, *argv[1:]], capture_output=True, text=True)
     out = ((proc.stdout or "") + (proc.stderr or "")).strip()
     if not out:
-        sys.exit(f"{name} produced no version output")
-    print(f"[toolchain] {name}: {out.splitlines()[0][:90]}")
+        sys.exit(f"{label} produced no version output")
+    print(f"[toolchain] {label}: {out.splitlines()[0][:90]}")
 PY
 
 echo "[toolchain] OK"

@@ -16,10 +16,11 @@ Quick reference for forensics CTF challenges. Each technique has a one-liner her
 ## Prerequisites
 
 **Python packages:** the image already ships `Pillow`, `numpy`, `matplotlib`,
-and `scipy`. `volatility3`, `librosa`, `scikit-learn`,
-`opencv-python-headless`, `pymongo`, `impacket`, `brotli`, `exrex`, `stegano`,
-and `heatshrink2` are **not available** -- use the installed libraries or
-plain Python instead.
+`scipy`, and the `impacket` CLI set (`secretsdump.py`, `wmiexec.py`,
+`psexec.py`, ...). `volatility3`, `librosa`, `scikit-learn`,
+`opencv-python-headless`, `pymongo`, `brotli`, `exrex`, `stegano`, and
+`heatshrink2` are **not available** -- use the installed libraries or plain
+Python instead.
 
 **Offline image: no installs and no internet.** `python3` ships `Pillow`,
 `numpy`, `scipy` and `matplotlib`, and `curl` works; `binwalk`, `foremost`,
@@ -193,9 +194,9 @@ See [disk-and-memory.md](disk-and-memory.md) for full Volatility plugin referenc
 
 ## Windows Password Hashes
 
-`impacket` and `hashcat` are not in this image. Read the bootkey-derived NTLM
-hashes out of the SAM/SYSTEM hives yourself (registry parsing in plain Python),
-then try the candidates from the challenge wordlist with `hashlib`.
+`impacket` is installed (`secretsdump.py -sam SAM -system SYSTEM local` dumps the
+bootkey-derived NTLM hashes directly); `hashcat` is not, so try the candidate
+wordlist with `hashlib` after the dump.
 
 See [windows.md](windows.md) for SAM details and [network-advanced.md](network-advanced.md) for NTLMv2 cracking from PCAP.
 

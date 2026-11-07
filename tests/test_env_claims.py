@@ -19,7 +19,10 @@ WEB_INDEX = ROOT / "src" / "ctf_strix" / "skills_strix" / "ctf-web" / "ctf-web.m
 TOOLCHAIN = ROOT / "docker" / "check_toolchain.sh"
 
 #: Tools the dispatcher promised to add; the probe must name exactly these.
-ATTACK_TOOLS = frozenset({"nmap", "sqlmap", "ffuf", "smbclient"})
+#: Lower-cased because ``_toolchain_tools`` normalises the probe keys.
+ATTACK_TOOLS = frozenset(
+    {"nmap", "sqlmap", "ffuf", "smbclient", "impacket", "flask-unsign", "rsactftool"}
+)
 
 
 def _norm(token: str) -> str:
@@ -64,7 +67,7 @@ def _web_claims() -> tuple[set[str], set[str]]:
 
 def _toolchain_tools() -> set[str]:
     text = TOOLCHAIN.read_text(encoding="utf-8")
-    return {m.group(1).lower() for m in re.finditer(r'"([a-z0-9-]+)": \(', text)}
+    return {m.group(1).lower() for m in re.finditer(r'"([A-Za-z0-9_.-]+)": \(', text)}
 
 
 def test_prompt_claims_are_self_consistent() -> None:
@@ -108,3 +111,20 @@ def test_unavailable_tools_are_not_probed() -> None:
     _, w_absent = _web_claims()
     leaked = (p_absent | w_absent) & probed
     assert not leaked, f"declared absent but probed as installed: {sorted(leaked)}"
+
+
+#: Stage-2 CLI tools and the Dockerfile snippet that installs each one.
+STAGE2_INSTALLS = {
+    "impacket": "impacket-0.13.1-py3-none-any.whl",
+    "flask-unsign": "flask-unsign==",
+    "rsactftool": "/opt/RsaCtfTool",
+}
+
+
+def test_stage2_tools_have_install_lines() -> None:
+    """A prompt claim is only true if the build actually installs the tool."""
+    dockerfile = (ROOT / "docker" / "Dockerfile").read_text(encoding="utf-8")
+    available, _ = _prompt_claims()
+    for tool, marker in STAGE2_INSTALLS.items():
+        assert tool in available, f"{tool} is not claimed as installed in prompt.py"
+        assert marker in dockerfile, f"{tool}: build install marker missing ({marker!r})"
