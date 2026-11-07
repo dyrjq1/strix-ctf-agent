@@ -593,16 +593,267 @@ def _parallel_flag(text: str, own_host: str) -> str | None:
     return _extract_flag(text, own_host)
 
 
+_SUCCESS_STOP_REASONS = frozenset({"solved"})
+
+
+def _answer_is_empty(value: Any) -> bool:
+    """Whether an answers-map value carries no answer."""
+    if value is None:
+        return True
+    if isinstance(value, str):
+        return not value.strip()
+    return False
+
+
+def _read_previous_result(path: Path) -> dict[str, Any] | None:
+    """Read an existing result file for merge, treating damage as absence.
+
+    A half-written or hand-edited file must never block the new write: the
+    platform can only grade what is on disk now, and refusing to write because
+    the old bytes are unparseable would turn a recoverable run into no result
+    at all.
+    """
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return None
+    try:
+        parsed = json.loads(raw)
+    except (TypeError, ValueError):
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def _merge_result_payload(
+    previous: dict[str, Any] | None,
+    payload: dict[str, Any],
+) -> dict[str, Any]:
+    """Merge answers from a previous run into the new payload.
+
+    A platform restart starts a fresh run with an empty ``answers`` map.  The
+    old file is the only place the earlier run's flags survive, so replacing it
+    wholesale silently downgrades a solved challenge.  Both runs may also have
+    found different things, so the per-key rule is: a non-empty new value wins;
+    a missing/empty new value leaves the old value in place.
+
+    Non-answer fields follow the new run, with one guard: when the old file
+    held answers and this run found none, a success ``stop_reason`` must not be
+    rewritten as an unsolved/unclean one.  The previous reason is always kept
+    in ``previous_stop_reason`` for triage.
+    """
+    merged = dict(payload)
+    if previous is None:
+        return merged
+
+    old_answers = previous.get("answers")
+    new_answers = payload.get("answers")
+    old_map = old_answers if isinstance(old_answers, dict) else {}
+    new_map = new_answers if isinstance(new_answers, dict) else {}
+
+    merged_answers = dict(old_map)
+    for key, value in new_map.items():
+        if _answer_is_empty(value) and not _answer_is_empty(merged_answers.get(key)):
+            continue
+        merged_answers[key] = value
+    merged["answers"] = merged_answers
+
+    old_had_answers = any(not _answer_is_empty(v) for v in old_map.values())
+    new_has_answers = any(not _answer_is_empty(v) for v in new_map.values())
+    if old_had_answers and not new_has_answers:
+        old_stop = previous.get("stop_reason")
+        merged["previous_stop_reason"] = old_stop
+        if old_stop in _SUCCESS_STOP_REASONS and merged.get("stop_reason") not in _SUCCESS_STOP_REASONS:
+            merged["stop_reason"] = old_stop
+
+    return merged
+
+
 def _write_result(path: Path, payload: dict[str, Any]) -> None:
-    """原子写 result.json。
+    """原子写 result.json，并合并上一版 answers。
 
     先写临时文件再 rename：中途被杀不会留下半截 JSON —— 半截 JSON 比没有文件更糟，
     因为平台会尝试解析它然后再报错，把"超时"变成"格式错误"。
+
+    平台重启后的新 run 从空 answers 起步；若直接覆盖，上一轮已经找到的 flag
+    会随文件一起消失。合并只发生在 answers 上，其余字段仍以本次 payload 为准。
     """
     path.parent.mkdir(parents=True, exist_ok=True)
+    merged = _merge_result_payload(_read_previous_result(path), payload)
     tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.write_text(json.dumps(merged, ensure_ascii=False, indent=2), encoding="utf-8")
     tmp.replace(path)
+
+
+#: ``finish_scan`` is a local strix tool with an SDK-level 60 s timeout.  Bound
+#: each call below that so a platform-side stall becomes a model-visible result
+#: we can count, instead of an SDK timeout message the wrapper never sees.
+_FINISH_DEGRADE_TIMEOUT_SECONDS = 50.0
+#: Consecutive timeouts before the tool is bypassed and answers are persisted.
+_FINISH_DEGRADE_STREAK = 2
+
+
+def _has_answers(answers: dict[str, Any]) -> bool:
+    return any(not _answer_is_empty(value) for value in answers.values())
+
+
+class _FinishDegradationState:
+    """Consecutive-timeout counter for the finish_scan degradation path."""
+
+    __slots__ = ("consecutive_timeouts", "degraded")
+
+    def __init__(self) -> None:
+        self.consecutive_timeouts = 0
+        self.degraded = False
+
+
+def _persist_degraded_finish(
+    result_path: Path,
+    answers: dict[str, Any],
+    *,
+    reason: str,
+) -> None:
+    """Write the known answers before the run can be restarted.
+
+    This is deliberately a minimal payload: ``main``'s ``finally`` writes the
+    full one.  The point is that a process killed after a hung finish_scan
+    leaves a graded file behind, and ``_write_result`` merges it with any
+    earlier run's answers.
+    """
+    tokens = _usage_snapshot()
+    solved = _has_answers(answers)
+    payload: dict[str, Any] = {
+        "schema_version": BRIEF_SCHEMA_VERSION,
+        "answers": dict(answers),
+        "turns": 0,
+        "input_tokens": tokens["input_tokens"],
+        "output_tokens": tokens["output_tokens"],
+        "stop_reason": "solved" if solved else "completed",
+        "writeup": reason,
+    }
+    try:
+        _write_result(result_path, payload)
+        print(f"[ctfy] degraded finish persisted to {result_path}", flush=True)
+    except OSError as exc:  # noqa: BLE001 -- degradation must not raise
+        print(f"[ctfy] degraded finish write failed: {exc}", flush=True)
+
+
+def _finish_timeout_message(*, attempt: int, degraded: bool, has_answers: bool) -> str:
+    if degraded and has_answers:
+        instruction = (
+            "FINISH_SCAN IS UNAVAILABLE after two consecutive timeouts. Your "
+            "known answers were already written to result.json. Do not call "
+            "finish_scan again; end the run now."
+        )
+    elif degraded:
+        instruction = (
+            "FINISH_SCAN IS UNAVAILABLE after two consecutive timeouts. Keep "
+            "working with the other tools; result.json is written at run end."
+        )
+    else:
+        instruction = (
+            f"finish_scan timed out (attempt {attempt} of "
+            f"{_FINISH_DEGRADE_STREAK}). Your known answers are unchanged. "
+            "Retry finish_scan once; after the next timeout it is bypassed and "
+            "the answers already in result.json are kept."
+        )
+    return json.dumps(
+        {"success": False, "scan_completed": False, "error": instruction},
+        ensure_ascii=False,
+    )
+
+
+def install_finish_degradation(
+    answers: dict[str, Any],
+    result_path: Path,
+    *,
+    diag: dict[str, Any] | None = None,
+) -> _FinishDegradationState:
+    """Bypass a hung ``finish_scan`` after two consecutive timeouts.
+
+    The tool is strix's own (not a platform MCP tool) and the SDK's 60 s limit
+    is a property of that local tool, so the agent side can control this.  The
+    wrapper sits outermost and waits less than the SDK limit; a timeout becomes
+    a normal tool observation we can count.  On the second consecutive timeout
+    it persists the known answers and tells the model the tool is unavailable.
+    A later finish call then raises ``SolvedStop`` when there is an answer, so
+    the process exits cleanly through ``main`` instead of being restarted.
+    """
+    import asyncio
+
+    from strix.agents import factory
+
+    state = _FinishDegradationState()
+    original = factory._with_bounded_result
+
+    def patched(tool: Any) -> Any:
+        tool = original(tool)
+        if getattr(tool, "name", "") != "finish_scan":
+            return tool
+        if getattr(tool, "_ctf_finish_degraded", False):
+            return tool
+        inner = tool.on_invoke_tool
+
+        async def invoke(ctx: Any, raw_input: str) -> Any:
+            if state.degraded:
+                if _has_answers(answers):
+                    _persist_degraded_finish(
+                        result_path,
+                        answers,
+                        reason=(
+                            "finish_scan timed out twice; known answers were "
+                            "persisted and the run exited through the normal "
+                            "SolvedStop path."
+                        ),
+                    )
+                    raise SolvedStop(
+                        "finish_scan unavailable after repeated timeouts; "
+                        "answers already persisted"
+                    )
+                return _finish_timeout_message(
+                    attempt=state.consecutive_timeouts,
+                    degraded=True,
+                    has_answers=False,
+                )
+
+            try:
+                result = await asyncio.wait_for(
+                    inner(ctx, raw_input),
+                    timeout=_FINISH_DEGRADE_TIMEOUT_SECONDS,
+                )
+            except asyncio.TimeoutError:
+                state.consecutive_timeouts += 1
+                if state.consecutive_timeouts >= _FINISH_DEGRADE_STREAK:
+                    state.degraded = True
+                    _persist_degraded_finish(
+                        result_path,
+                        answers,
+                        reason=(
+                            "finish_scan timed out twice; the known answers "
+                            "were written before the run could be restarted."
+                        ),
+                    )
+                    if diag is not None:
+                        diag["finish_degradation"] = "degraded"
+                return _finish_timeout_message(
+                    attempt=state.consecutive_timeouts,
+                    degraded=state.degraded,
+                    has_answers=_has_answers(answers),
+                )
+            except asyncio.CancelledError:
+                # The SDK's own 60 s limit fired before ours.  Count it too,
+                # then let the SDK produce its standard timeout observation.
+                state.consecutive_timeouts += 1
+                raise
+
+            state.consecutive_timeouts = 0
+            return result
+
+        tool.on_invoke_tool = invoke
+        tool._ctf_finish_degraded = True  # type: ignore[attr-defined]
+        return tool
+
+    factory._with_bounded_result = patched  # type: ignore[assignment]
+    return state
 
 
 def _goal_dirs() -> list[Path]:
@@ -2488,6 +2739,26 @@ def _run_agent(
                     flush=True,
                 )
                 diag["autosubmit"] = "failed"
+
+    # finish_scan is a local strix tool with an SDK-level 60 s limit, so the
+    # agent side can bound it.  Install this *after* the autosubmit wrapper:
+    # the last installed wrapper runs first, which is what lets the timeout
+    # counter see the slow platform submission instead of being outside the
+    # SDK's wait_for.  engagement has no flags and its finish hook is separate.
+    if kind != "engagement":
+        try:
+            install_finish_degradation(
+                answers,
+                _result_path(_work_dir(), task),
+                diag=diag,
+            )
+            diag["finish_degradation"] = "armed"
+        except Exception as exc:  # noqa: BLE001 -- degradation must not gate the run
+            print(
+                f"[ctfy] finish degradation failed: {type(exc).__name__}: {exc}",
+                flush=True,
+            )
+            diag["finish_degradation"] = "failed"
 
     # The exec observer records a direct verdict printed by a shell call and
     # then raises the existing SolvedStop root stop.  It is a read-only
