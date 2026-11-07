@@ -83,14 +83,14 @@ ARG IMPACKET_WHEEL_SHA256=3e5349c1209cdd3b90bff6f8b61c0d89aea0f3dbba6ad02ad254b9
 ARG FLASK_UNSIGN_VERSION=1.2.1
 RUN set -eux; \
     python3 -m venv --system-site-packages /opt/ctftools; \
-    wget -q -O /tmp/impacket.whl "$IMPACKET_WHEEL_URL"; \
-    echo "$IMPACKET_WHEEL_SHA256  /tmp/impacket.whl" | sha256sum -c -; \
-    /opt/ctftools/bin/pip install --no-cache-dir /tmp/impacket.whl; \
+    wget -q -O /tmp/impacket-0.13.1-py3-none-any.whl "$IMPACKET_WHEEL_URL"; \
+    echo "$IMPACKET_WHEEL_SHA256  /tmp/impacket-0.13.1-py3-none-any.whl" | sha256sum -c -; \
+    /opt/ctftools/bin/pip install --no-cache-dir /tmp/impacket-0.13.1-py3-none-any.whl; \
     /opt/ctftools/bin/pip install --no-cache-dir "flask-unsign==${FLASK_UNSIGN_VERSION}"; \
     git clone --depth 1 https://github.com/RsaCtfTool/RsaCtfTool.git /opt/RsaCtfTool; \
     /opt/ctftools/bin/pip install --no-cache-dir -r /opt/RsaCtfTool/requirements.txt; \
     /opt/ctftools/bin/pip install --no-cache-dir --no-deps /opt/RsaCtfTool; \
-    rm -rf /opt/RsaCtfTool/.git /tmp/impacket.whl; \
+    rm -rf /opt/RsaCtfTool/.git /tmp/impacket-0.13.1-py3-none-any.whl; \
     for cli in /opt/ctftools/bin/*.py /opt/ctftools/bin/flask-unsign /opt/ctftools/bin/RsaCtfTool; do \
         ln -sf "$cli" /usr/local/bin/; \
     done; \
