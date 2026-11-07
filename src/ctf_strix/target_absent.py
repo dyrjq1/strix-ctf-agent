@@ -2,13 +2,13 @@
 
 ## Why this exists
 
-2026-11-06 platform run CTFARENA-043 sent 95 ``exec_command`` curls at a host
+2026-11-06 platform run sent 95 ``exec_command`` curls at a host
 that answered an identical Go-style ``404 page not found`` to every path.
 ``EnumerationGuard`` never fired: its counter is keyed per path *family*, and
 every one of those paths was a different family, so every count stayed at 0.
 The run burned the remaining wall clock instead of rotating to the next
-challenge.  SAMPLE-003 / SAMPLE-012 were placeholder tasks (236-byte README,
-no service behind the URL) and the agent guessed for 23 minutes.
+challenge.  Two placeholder sample tasks (236-byte README,
+no service behind the URL) left the agent guessing for 23 minutes.
 
 Both failures share one path-independent signal: **the target is not there**.
 It appears as many distinct paths answered by one identical, uninformative
@@ -27,7 +27,7 @@ response instead of on the request shape:
 
 ## Hard stop, not a hint
 
-The CTFARENA-043 lesson (see :mod:`ctf_strix.enum_guard`) is that text
+The dead-host lesson (see :mod:`ctf_strix.enum_guard`) is that text
 appended below the threshold changes nothing once the model has decided to
 keep probing.  So the crossing call returns a short ``ERROR:`` line instead
 of the tool output, and every later call to that origin is refused before the
@@ -257,8 +257,8 @@ class TargetAbsent(BaseException):
     runner and the tool wrappers are full of ``except Exception``, and a
     swallowed stop would hand control back to the probing loop.
 
-    Evidence: CTFARENA-043 (95 identical 404s, 2026-11-06) and the
-    SAMPLE-003 / SAMPLE-012 placeholders (23 minutes of guessing).
+    Evidence: one dead-host run (95 identical 404s, 2026-11-06) and the
+    placeholder samples above (23 minutes of guessing).
     """
 
     def __init__(self, message: str, *, origin: str = "", paths: int = 0) -> None:

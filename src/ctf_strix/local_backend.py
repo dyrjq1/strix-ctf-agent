@@ -54,9 +54,9 @@ _ACTIVE_ROOT: str | None = None
 #: 一个死端口，立即失败。实测表现：``curl`` 返回 ``000``，且
 #: ``Wall time: 0.0230 seconds``——不是超时，是连接被拒。
 #:
-#: 这个缺陷每次都要 agent 自己花轮次诊断：CTFARENA-013 的日志里能看到
+#: 这个缺陷每次都要 agent 自己花轮次诊断：一次 run 的日志里能看到
 #: ``env | grep -i proxy``、``ss -ltnp``，最后靠 ``curl --noproxy '*'`` 绕过
-#: 才成功；CTFARENA-012 没诊断出来，一直在 ``000`` 上重试到撞墙。
+#: 才成功；另一次没诊断出来，一直在 ``000`` 上重试到撞墙。
 #: 在适配层删掉这些变量，等于把所有题都省下这段诊断成本。
 _CAIDO_PROXY_KEYS = (
     "http_proxy",
@@ -107,10 +107,10 @@ async def _local_backend(
       ``/``——普通用户在本机没有写权限时会报错；以 root 运行就直接往主机 ``/``
       里写文件。
     · 反过来说，agent 的 ``cd /tmp``、``ls /workspace``、``find /`` 全都能看到
-      主机——于是它读到了别题的 ``/tmp/sample/files/SAMPLE-001/setup.txt``
+      主机——于是它读到了别题的 ``/tmp/sample/files/<instance>/setup.txt``
       和评测用的 ``challenges.json``。
 
-    第一版没意识到这一点，SAMPLE-001 的 agent 真的从主机捡了另一题的答案。
+    第一版没意识到这一点，agent 真的从主机捡了另一题的答案。
     对齐真实运行时（Docker 容器里 CWD 是干净的）是**正确性**问题，不是洁净癖。
 
     Args:
@@ -166,7 +166,7 @@ def _patch_extra_file_target() -> None:
     这在 Docker 里是对的（容器里 /workspace 就是工作目录），在本机 backend
     上却是错的：工作目录是私有临时目录，解到 ``/workspace`` 等于把附件丢到
     主机上另一个完全不相干的位置，agent 在自己的 CWD 里永远看不到它。
-    实测代价是 SAMPLE-002/001 各花 2-3 个 turn 满盘 find 一个"已注入"的附件。
+    实测代价是 每道题各花 2-3 个 turn 满盘 find 一个"已注入"的附件。
 
     这里替换两个符号，目标目录取最近一次建档的私有 root。
     """

@@ -8,7 +8,7 @@ wireguard profile（含该实例专属的私钥、对端、10.x 网段和内部 
 
 不接这条隧道，TCP 桥能"连上"但立刻被 reset：agent 看到的是
 ``banner: b''`` + ``ConnectionResetError``，然后花 300-600 秒去猜是不是
-TLS、是不是端口错。SAMPLE-004 两轮共烧掉 3.2M token，全部浪费在这里。
+TLS、是不是端口错。一次 run 两轮共烧掉 3.2M token，全部浪费在这里。
 
 ## 为什么自己解析 profile 而不调 ``wg-quick``
 

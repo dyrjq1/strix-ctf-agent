@@ -78,7 +78,7 @@ _sink: Path | None = None
 #: 当前是否有一次 LLM 请求在路上，以及它是什么时候发出的（epoch 秒）。
 #:
 #: 父进程的停滞检测只能看见 stdout 里的 TOOL/OUT 行，而模型"正在思考"这段
-#: 时间完全不产生任何行。SAMPLE-006 因此被误杀：83 秒后最后一个工具返回，
+#: 时间完全不产生任何行。一次 run 因此被误杀：83 秒后最后一个工具返回，
 #: 模型接着跑了一次 60 秒以上的长推理，看门狗直接判 stall——它没卡死，
 #: 只是在想。所以额外暴露一个在途标记：请求发出时置位，回来时清掉。
 _inflight_since: float | None = None
@@ -324,6 +324,13 @@ def install() -> None:
     with _lock:
         _persist_locked()
     _installed = True
+    # C8：逐调用遥测挂在同一组 hook 的外层，复用这里已归一化的 Usage。
+    try:
+        from ctf_strix import llm_telemetry
+
+        llm_telemetry.install()
+    except Exception:  # noqa: BLE001 - 遥测失败不能影响计量与解题
+        logger.warning("llm telemetry unavailable", exc_info=True)
 
 
 def reset_for_tests() -> None:
@@ -334,6 +341,12 @@ def reset_for_tests() -> None:
     """
     global _installed, _sink, _originals, _calls, _input_tokens
     global _output_tokens, _total_tokens, _inflight_since, _trip
+    try:
+        from ctf_strix import llm_telemetry
+
+        llm_telemetry.reset_for_tests()
+    except Exception:  # noqa: BLE001 - 清理失败不应让测试报错
+        pass
     with _lock:
         originals = _originals
         _originals = None

@@ -76,7 +76,7 @@ _OPAQUE_ID_RE = re.compile(r"\b([a-z][a-z0-9]{1,12}_[0-9a-f]{6,32})\b")
 #: 组合构造：两个以上取值来源相乘。任一条命中即视为"生成式枚举"。
 #:
 #: 2026-11-01 补：原版只认 `itertools.product` / 嵌套 for / `cands.add`。
-#: CTFARENA-050 复跑时的真实写法是**列表推导 + 线程池**：
+#: 一次复跑时的真实写法是**列表推导 + 线程池**：
 #:
 #: ```python
 #: paths = [f"/{x}" for x in a] + [f"/api/{x}" for x in a]
@@ -373,7 +373,7 @@ def install() -> SweepGuard:
 
     这个 `install()` 本身是 2026-11-01 才补的。在此之前 `sweep_guard` 只有
     两个纯函数，模块文档写得很完整、单测式的逻辑推演也对，但**没有任何
-    地方 import 它**——CTFARENA-050 用一条 `exec_command` 打了约 36,000 个
+    地方 import 它**——一次 run 用一条 `exec_command` 打了约 36,000 个
     路径变体，`enum_hits` 与 `sweep` 计数双双为 0，577 秒后失败。
     这是"守卫装了但等于没装"的第二次复现，所以这里同时把标记登记进
     `guard_mount.verify_mount()` 的期望集合，让没挂上在启动时就出声。

@@ -132,12 +132,12 @@ _MCP_DEPENDENT: Final[frozenset[str]] = frozenset(
 #:
 #: ⚠️ 正赛的 `internet_policy=deny`、`agent_internet=deny`，**agent 没有外网**，
 #: 这个工具在正赛里必然失败。但评测机有网，于是它会真的去搜——实测
-#: CTFARENA-012 有一轮直接发了 ``web_search "ctfy.run node2 CTF challenge FLAG{"``，
+#: 一次 run 有一轮直接发了 ``web_search "ctfy.run node2 CTF challenge FLAG{"``，
 #: 既浪费轮次，又让测试环境与正赛环境不一致（测试有网、正赛没网，
 #: 测出来的行为不能用来推断正赛）。
 #:
 #: 但“直接摘掉”会让模型撞上 ``Tool 'web_search' not found`` ——实测
-#: CTFARENA-095 的 DeepSeek 连撞 2 次，每次都是整整一轮 LLM 调用。
+#: 一次 run 的 DeepSeek 连撞 2 次，每次都是整整一轮 LLM 调用。
 #: 因此这里不摘，而是**换成同名桩**：schema 不变，调用立刻返回一句
 #: 确定性说明，模型下一轮就会转向本地手段，不浪费第二轮。
 _NETWORK_DEPENDENT: Final[frozenset[str]] = frozenset({"web_search", "web_get_contents"})
@@ -296,7 +296,7 @@ def install_ctf_toolset(
 
 
 #: 沙箱清单校验只接受 workspace 内的 workdir，而 agent 习惯写 ``/tmp``、
-#: ``/workspace``。实测 GLM-5.3-EV 在 CTFARENA-009 上连续两次因为
+#: ``/workspace``。实测 GLM-5.3-EV 在一道题上连续两次因为
 #: ``workdir=/tmp`` / ``workdir=/workspace`` 被直接拒绝，白烧 2 轮。
 #: 这里不改 vendor：把 workdir 改写成命令前缀 ``cd ... &&``，语义等价，
 #: 且 shell 本身在宿主上执行，``cd /tmp`` 本来就可达。

@@ -65,15 +65,31 @@ DeepSeek-V4.1-Flash 的上下文是 **1M**（官方 Models & Pricing 页），
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 import os
 import re
+from contextvars import ContextVar
+from itertools import count
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
 
 logger = logging.getLogger(__name__)
+
+#: 最近一次 apply 的观测值，供 :mod:`ctf_strix.llm_telemetry` 读取。
+#: 只写不改请求，``seq`` 让调用方区分本次请求与残留值。
+#: ``first_capped_index`` / ``capped_hash`` 记录「第一条被改写的 item」——
+#: prefix_hash 只看 system + 首条 item，看不见历史中段的改写。
+LAST_CAP_STATS: ContextVar[dict[str, Any] | None] = ContextVar(
+    "ctf_ctx_last_cap_stats", default=None
+)
+
+#: 全局单调序号。用实例自增会让新封顶器从 1 重数，跨测试/跨实例时
+#: 遥测无法区分"本次新值"与"上一实例的残留"。
+_CAP_SEQ = count(1)
 
 #: flag 形态（与 finish_guard / flag_extract 同口径）。被截断的输出里若出现
 #: flag，必须原样留下——否则压缩会把答案压没，这是最不可接受的失败模式。
@@ -222,6 +238,15 @@ def _cap_item(item: Any, *, cap: int, head: int, tail: int, arg_cap: int) -> tup
     return item, 0
 
 
+def _item_hash(item: Any) -> str:
+    """SHA-256 (first 16 hex) of an item *before* capping.  Pure, no IO."""
+    try:
+        seed = json.dumps(item, ensure_ascii=False, sort_keys=True, default=str)
+    except (TypeError, ValueError):
+        seed = str(item)
+    return hashlib.sha256(seed.encode("utf-8", "replace")).hexdigest()[:16]
+
+
 class HistoryCapper:
     """对历史做**幂等内容封顶**，保留前缀缓存的全部收益。
 
@@ -255,13 +280,31 @@ class HistoryCapper:
 
         out: list[Any] = []
         saved = 0
-        for item in items:
+        capped_items = 0
+        first_capped_index = -1
+        capped_hash = ""
+        for position, item in enumerate(items):
             new_item, delta = _cap_item(
                 item, cap=self.cap_chars, head=self.head, tail=self.tail, arg_cap=self.arg_cap
             )
             out.append(new_item)
             saved += delta
+            if delta:
+                capped_items += 1
+                if first_capped_index < 0:
+                    first_capped_index = position
+                    capped_hash = _item_hash(item)
 
+        LAST_CAP_STATS.set(
+            {
+                "seq": next(_CAP_SEQ),
+                "item_count": len(items),
+                "capped_items": capped_items,
+                "first_capped_index": first_capped_index,
+                "capped_hash": capped_hash,
+                "input_chars": self.last_request_chars,
+            }
+        )
         if saved:
             self.capped_requests += 1
             self.saved_chars += saved

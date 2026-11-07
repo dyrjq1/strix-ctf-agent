@@ -4,7 +4,7 @@
 
 `local_backend` 只把 strix 的 **workspace 逻辑根** 指到隔离目录，agent 的
 shell 仍然是宿主机的 shell：一句 ``cd /workspace`` 就能读到评测脚本、平台
-token、其他题的 box 目录。SAMPLE-004 实测就发生了——agent 读了
+token、其他题的 box 目录。一次实测就发生了——agent 读了
 ``scripts/eval_sample.py``、从 ``ps`` 里抄走队伍 token，然后直接打平台
 API 查实例，600 秒里 2M token 有一大半花在这上面，最后还把源码里的
 ``SAMPLE_SUITE`` 常量当成 flag 交了回来。
@@ -142,7 +142,7 @@ _PROBE = JAIL / "probe"
 def available() -> bool:
     """确认当前内核允许 unshare mount namespace（容器里常被禁）。
 
-    不可用时整条链路会退化成"只靠 prompt 约束"，那正是 SAMPLE-004 踩过的
+    不可用时整条链路会退化成"只靠 prompt 约束"，那正是过去踩过的
     坑，所以调用方必须把探测结果打出来，不能假装隔离生效了。
 
     Returns:

@@ -16,7 +16,7 @@
 另外挂 autosubmit 做即时提交。engagement 题没有 flag，交付物是报告，见
 :mod:`ctf_strix.engagement`。
 
-Idle watchdog (2026-11-06, CTFARENA-010): strix.log showed 121 turns and 120
+Idle watchdog (2026-11-06, a memory-poisoning run): strix.log showed 121 turns and 120
 LLM requests but only 6 tool calls.  After concluding the target was dead,
 the model wrote "I'll wait for the hard stop" and idled for roughly 20
 minutes until the 1380s wall clock expired.  A long stretch without any
@@ -24,7 +24,7 @@ tool call means the run is not learning anything, so :class:`IdleWatchdog`
 ends it early and ``main`` writes ``stop_reason="agent_idle"``.  The limit
 is ``CTF_IDLE_SECONDS`` (default 150; non-positive disables the watchdog).
 
-Target-absent fast fail (2026-11-06, CTFARENA-043 / SAMPLE-003 / 012):
+Target-absent fast fail (2026-11-06, dead-host and placeholder runs):
 a host that answers one identical uninformative body to every path is not a
 target to keep enumerating.  :mod:`ctf_strix.target_absent` counts distinct
 paths per identical body hash, and the sink ends the run as
@@ -348,7 +348,7 @@ def _question_ids(task: dict[str, Any]) -> list[str]:
     against its own record, so an id that is missing from the map is a
     question that was never answered -- even when the flag was found.  A
     challenge whose ``questions`` lists two visible ids used to collect one
-    key and score one question (ledger 4.9: CTFARENA-001 kept
+    key and score one question (ledger 4.9: a two-question run kept
     ``my_fully_solved=false`` after a correct flag).
 
     Gated questions are not listed here: the protocol says their prompt does
@@ -451,7 +451,7 @@ def _round_note(work: Path) -> str:
 #:
 #: ``README.md`` 是平台放的选手 API 说明（``test_attachment_fetch`` 的 fixture
 #: 就是这个形态），不是题目材料；题目真的只发一份 README 时应当在
-#: ``task.json.attachments`` 里显式声明。``.txt`` 不在此列——SAMPLE-011 的
+#: ``task.json.attachments`` 里显式声明。``.txt`` 不在此列——纯附件题的
 #: ``README.txt`` 就是货真价实的附件。
 _RESERVED_WORK_FILES = frozenset({"task.json", "result.json", "mcp.json", "README.md"})
 
@@ -522,7 +522,7 @@ def _challenge_kind(task: dict[str, Any], work: Path | None = None) -> str:
         # 2026-11-06：有些投递方式把附件直接放在工作目录**根**上，既没有
         # ``attachments/`` 子目录、也没写进 ``task.json.attachments``。
         # 只看子目录会让这类纯附件题落到 web 分支 → 没有 target → no_target，
-        # 一回合都不跑（SAMPLE-011 实测）。根上的非控制文件就是附件。
+        # 一回合都不跑（纯附件题实测）。根上的非控制文件就是附件。
         if _has_bare_artifacts(work):
             return "file"
 
@@ -685,7 +685,7 @@ def _turn_budget(task: dict[str, Any]) -> int:
 
 
 #: Default idle limit.  Long enough for normal tool-call gaps, far below
-#: the 1380s hard wall clock that CTFARENA-010 spent idling.
+#: the 1380s hard wall clock that a dead-target run spent idling.
 _IDLE_DEFAULT_SECONDS = 150.0
 
 
@@ -697,7 +697,7 @@ class IdleTimeout(BaseException):
     a swallowed stop would hand control back to the idle loop this exists
     to break.
 
-    Evidence: CTFARENA-010 on 2026-11-06 spent 121 turns / 120 LLM requests
+    Evidence: a dead-target run on 2026-11-06 spent 121 turns / 120 LLM requests
     on 6 tool calls, then idled ~20 minutes waiting for the wall clock.
     """
 
@@ -710,7 +710,7 @@ class IdleWatchdog:
     * **unarmed** (``_last is None``): the clock has not started.  Nothing
       can expire, because no model or tool event has been seen yet.  A run
       spends up to a minute in sandbox boot plus the first LLM response
-      before its first event; counting that as "idle" (CTFARENA-010's
+      before its first event; counting that as "idle" (that run's
       watchdog reported ``turns=0`` on a cold start) kills a healthy run.
     * **armed** (``_last`` is a timestamp): the last *tool* event.  The sink
       arms once on the first model/tool event of an attempt
@@ -763,7 +763,7 @@ def _idle_limit_seconds() -> float:
 
     A malformed value falls back to the default instead of disabling the
     watchdog: a typo in an operator env file must not silently restore the
-    CTFARENA-010 failure mode.
+    dead-target failure mode.
     """
     raw = os.environ.get("CTF_IDLE_SECONDS")
     if raw is None:
@@ -1124,7 +1124,7 @@ def _local_attachments(work: Path) -> list[dict[str, str]]:
     ``files/`` 子目录）。strix 的 sandbox 是私有临时目录，不注入的话 agent
     看不见这些文件。找不到任何文件时返回空列表，行为与改造前一致。
 
-    **所有题型都要注入**，不只是附件题：web 题也常带附件（SAMPLE-001 的
+    **所有题型都要注入**，不只是附件题：web 题也常带附件（一次 web 题的
     admin slug 就写在 ``setup.txt`` 里），漏注入等于把题目的一半线索丢掉。
 
     Returns:
@@ -1143,7 +1143,7 @@ def _local_attachments(work: Path) -> list[dict[str, str]]:
     reserved = _RESERVED_WORK_FILES
     # 本地调试时 ``CTFY_WORK_DIR`` 常常没设，cwd 是仓库根。不排掉这些目录的话
     # 会把整个源码树当成附件打包（50 个文件配额一次就满），还会让 agent 读到
-    # 评测脚本里的常量——SAMPLE-004 就是这么把套题 id 当 flag 交上去的。
+    # 评测脚本里的常量——有一次就是这么把套题 id 当 flag 交上去的。
     skip_dirs = {
         ".git", ".venv", "__pycache__", ".pytest_cache", "node_modules",
         "src", "vendor", "tests", "docs", "reports", "scripts", "docker",
@@ -1561,7 +1561,7 @@ def main() -> int:
             # 附件只读一次：main 要用它判断"附件题是不是空的"，_run_agent 要把它
             # 注入 sandbox。读两遍等于把同一批文件从磁盘搬两遍。
             #
-            # ⚠️ **所有题型**都要收集，不只是 file：web 题也常带附件（SAMPLE-001
+            # ⚠️ **所有题型**都要收集，不只是 file：web 题也常带附件（一次 web 题
             # 的 admin slug 就写在 setup.txt 里），漏注入等于把题目的一半线索丢掉。
             attachments = _local_attachments(work)
             specs = _target_specs(task)
@@ -2199,7 +2199,7 @@ def _record_answer(
     ``answers`` is a map keyed by question id, and the platform submits each key
     it finds: an id that is absent scores zero even when the string is right.
     A challenge whose ``questions`` lists two visible ids therefore used to
-    score one of them (ledger 4.9: CTFARENA-001 kept ``my_fully_solved=false``
+    score one of them (ledger 4.9: a two-id run kept ``my_fully_solved=false``
     after a correct flag).  Gated ids are never here -- their prompt does not
     exist until an earlier one is answered.
 
@@ -2313,7 +2313,7 @@ def _run_agent(
     # view_agent_graph / think / create_agent 这类流程工具——永远不会发出载荷。
     #
     # 这个是正赛入口，代价比评测更大：评测跑废了还能重跑，正赛一道题只有一次
-    # 机会。2026-10-28 的 CTFARENA-012 复跑就是被这个洞白烧了 1170 秒。
+    # 机会。2026-10-28 的一次复跑就是被这个洞白烧了 1170 秒。
     from ctf_strix.guard_mount import install_mount_hook
 
     install_mount_hook()
@@ -2342,7 +2342,7 @@ def _run_agent(
     install_journey_guard()
 
     # 单次调用内部的扫描守卫。``enum_guard`` 按**调用**去重，对"把几万个候选
-    # 塞进一条 exec_command 的 Python 循环"完全无能为力——CTFARENA-050 实测
+    # 塞进一条 exec_command 的 Python 循环"完全无能为力——一次实测
     # 打了约 36,000 次路径变体，枚举守卫计数为 0，577 秒后失败。
     #
     # 2026-11-02 外部审查发现：这个守卫只在 scripts/run_strix_ctf.py 里装过，
@@ -2353,7 +2353,7 @@ def _run_agent(
     install_sweep_guard()
 
     # Path-independent "the target is not there" guard.  ``enum_guard`` counts
-    # per path family, so CTFARENA-043's 95 curls at 95 distinct paths never
+    # per path family, so a single run's 95 curls at 95 distinct paths never
     # moved any counter; this one counts one identical body across paths.
     from ctf_strix.target_absent import install as install_target_absent
 
@@ -2774,7 +2774,7 @@ def _run_agent(
                 refusals=enum_guard.refusal_count(enum_guard.exhausted_family or ""),
             )
         if round_boundary and not success.solved and idle.expired(now):
-            # CTFARENA-010: after deciding the target was dead the model
+            # A dead-target run: after deciding the target was dead the model
             # wrote "I'll wait for the hard stop" and idled ~20 minutes.
             # Checked only when a round ends (streaming deltas are not a
             # decision point) and only against tool activity, so a long

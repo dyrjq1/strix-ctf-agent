@@ -3,7 +3,7 @@
 ## 为什么这件事必须在工具里做
 
 昨夜 7 题里 5 题的记录是 ``submissions: null``——agent 一次都没提交。
-SAMPLE-001 的日志最典型：第 24 秒就拿到了 slug
+一次附件题 run 的日志最典型：第 24 秒就拿到了 slug
 ``b5efdaae09d5900be5331f45e20180de``，然后直接调 ``finish_scan`` 宣布完成。
 
 原因不是模型笨，是**"解题"和"得分"在 CTFY 里是两个独立动作**，中间隔着一次
@@ -39,7 +39,7 @@ if TYPE_CHECKING:
     from agents import FunctionTool
 
 #: 候选答案形态。与 ctf_goal.txt 的定义、平台判分口径一致。
-#: 顺序即优先级：显式 flag 标记优先于裸 hex（SAMPLE-001 的 slug 是 32 位 hex）。
+#: 顺序即优先级：显式 flag 标记优先于裸 hex（一次 run 的 slug 是 32 位 hex）。
 _CAND_PATTERNS: tuple[re.Pattern[str], ...] = (
     # 与 `flag_extract.CANDIDATE_RE` 同源：CTFY 的交付示例就是 `ctfy{…}`，
     # 少一个前缀等于把合法答案排除在候选之外；正则本体不再复制一份。
@@ -66,7 +66,7 @@ _QA_ATTEMPT_CAP = 3
 
 # urllib 的 timeout 只吃**单个浮点数**，不是 requests 那样的 (connect, read)
 # 元组。传元组会抛 TypeError，而 `except Exception` 会把它吞成"没有 question"
-# ——这个 bug 让 SAMPLE-001 的 autosubmit 静默失效了两轮，日志只说
+# ——这个 bug 让一次 run 的 autosubmit 静默失效了两轮，日志只说
 # "本题没有 flag 类 question"，看不出是参数类型错了。
 _TIMEOUT = 45
 
@@ -395,7 +395,7 @@ class AutoSubmitter:
         #
         # 这个字段看起来正好是"还没答对的题"，但它不可信：实例一创建就可能是
         # true（平台把题库历史带下来）。我第一版就是用它做过滤，结果
-        # SAMPLE-001 收工时打印 "NOT SUBMITTED: 没有待答的 question" ——
+        # 一次 run 收工时打印 "NOT SUBMITTED: 没有待答的 question" ——
         # 明明 slug 就在 summary 里，却被自己的过滤器挡在门外。
         #
         # 实测证据（直接打平台 API）：
@@ -403,7 +403,7 @@ class AutoSubmitter:
         #   answered_correctly=true 时提交真 slug     → correct:true
         # 也就是说这个标记**不拦提交**，拿它当闸门纯属自伤。
         # ``seeded`` 是第三种会走 /submissions 的模式：答案在实例创建时下发
-        # （sample_chals 的 C2O-ALIST-002 就是它）。旧白名单只认 dynamic/static，
+        # （sample_chals 里的一次挑战就是它）。旧白名单只认 dynamic/static，
         # 这类题会被判成"只有非 flag 类 question"，答案是静默丢掉的。
         pending = [
             q for q in questions
@@ -530,7 +530,7 @@ class AutoSubmitter:
         ## 为什么必须落盘，而不是只交给父进程补交
 
         run 结束后运行时框架会销毁实例。父进程那套"事后解析日志、再提交"
-        的兜底于是撞上 ``instance_not_found``——SAMPLE-001 明明在收工时
+        的兜底于是撞上 ``instance_not_found``——一次 run 明明在收工时
         已经 ``ACCEPTED: slug=... flag=...``，父进程却判 FAIL。
 
         这里是**唯一一次**在实例还活着时提交的机会，结果必须落盘。

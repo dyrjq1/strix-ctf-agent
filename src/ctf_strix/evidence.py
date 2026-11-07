@@ -2,11 +2,11 @@
 
 Two failure modes were observed on 2026-10-31:
 
-* **CTFARENA-078, attempt 2** -- the model wrote a flag it never retrieved: a
+* **A fabricated-flag run, attempt 2** -- the model wrote a flag it never retrieved: a
   ``FLAG``-prefixed hex string appeared in no tool output at all, and the real
   answer was a different hex value.  Nothing stopped it from being submitted
   if it had been phrased as a ``finish_scan`` argument.
-* **CTFARENA-018, attempt 2** -- the model ``cat``-ed ``/tmp/flag.json``, left
+* **A stale-``/tmp`` run, attempt 2** -- the model ``cat``-ed ``/tmp/flag.json``, left
   behind by an earlier run on the shared host, and submitted that.  The flag
   was real, just for a different challenge.
 
@@ -17,7 +17,7 @@ appeared in a tool output produced during this run.
 It deliberately does **not** try to fix the second one.  Host ``/tmp`` is
 shared between runs; telling a genuine solve apart from a stale local read
 would need string heuristics, and those reject real solves that write a probe
-script to ``/tmp`` and print the answer from it (CTFARENA-009 did exactly
+script to ``/tmp`` and print the answer from it (one run did exactly
 that).  That has to be fixed by isolating the sandbox, not by guessing.
 
 One more failure mode does not need heuristics: **self-echo**.  A model can
@@ -27,7 +27,7 @@ retrieval.  This is decidable from data the run already has -- the call's own
 arguments -- so an observation is marked *echoed* when the same literal was
 already in that invocation's arguments.  Echoed observations never increment
 the support count; a later output whose arguments did **not** contain the
-literal restores it normally (CTFARENA-009's ``/tmp`` probe still counts).
+literal restores it normally (the same run's ``/tmp`` probe still counts).
 
 The ledger is orthogonal to :mod:`ctf_strix.flag_extract`:
 

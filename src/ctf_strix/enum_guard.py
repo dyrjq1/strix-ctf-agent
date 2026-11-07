@@ -3,7 +3,7 @@
 ## 为什么需要它
 
 `config/ctf_goal.txt` 里写过两版枚举收敛规则（"最多 6 次后必须转向假设"、
-"重复探测不算进展"），**实测都没生效**：CTFARENA-018 在新规则下仍然把
+"重复探测不算进展"），**实测都没生效**：一道题在新规则下仍然把
 `robots.txt / sitemap.xml / favicon.ico / api` 这一族路径刷了 4 遍，直到撞墙钟。
 
 原因不难理解——模型在第 5 次调用时，历史里那 4 次探测已经被后来的工具输出
@@ -17,7 +17,7 @@
 
 ## Why text injection stops at the hard threshold
 
-2026-11-06 platform run CTFARENA-043 recorded 95 ``exec_command`` curls
+2026-11-06 platform run recorded 95 ``exec_command`` curls
 against a host that returned an identical Go-style ``404 page not found``
 for every path.  ``EnumerationGuard.finish`` did detect the identical
 observations and appended "Stop now" text, but the model kept probing for
@@ -116,7 +116,7 @@ _BRUTE_MARK_RE = re.compile(
 #:
 #: Why a taxonomy at all: the per-family counter above answers "did I send the
 #: same request twice", but the costlier failure is *six different requests that
-#: are the same hypothesis*.  CTFARENA-043 enumerated 52 names, then probed
+#: are the same hypothesis*.  A single run enumerated 52 names, then probed
 #: ``/api/notes`` variants, ``?id=`` variants and ``/admin`` -- all of it inside
 #: one mechanism (information collection), so every fingerprint was new, every
 #: counter reset, and no guard said "you have not left this room".

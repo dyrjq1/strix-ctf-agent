@@ -117,7 +117,7 @@ def _hint_matches(hint: str, blob: str) -> bool:
 
     Substring matching is wrong here, and the failure was measured on the
     platform's own catalog: ``rag`` matched ``storage``, so a plain storage
-    administration challenge (``C2O-ALIST-001``) was handed the three AI
+    administration challenge was handed the three AI
     security tools plus their schema on every request.  Underscores and
     hyphens are part of a token, so ``ai_security`` and ``ai-security`` still
     match themselves but ``aisecurity`` does not accidentally match either.
@@ -134,8 +134,8 @@ def _hint_matches(hint: str, blob: str) -> bool:
     if re.search(pattern, blob) is None:
         return False
     # A hint can stand alone as a token and still belong to a longer tag that
-    # means something else.  ``llm_reasoning`` is CTFARENA's OSINT reasoning
-    # tag (measured on CTFARENA-037: a payroll kiosk, no model anywhere);
+    # means something else.  ``llm_reasoning`` is the practice suite's OSINT
+    # reasoning tag (measured on one payroll-kiosk challenge, no model anywhere);
     # matching the bare ``llm`` inside it bought three useless schemas on
     # every request.  Subtract known look-alikes, then test the hint again.
     for lookalike in _AISEC_LOOKALIKES:

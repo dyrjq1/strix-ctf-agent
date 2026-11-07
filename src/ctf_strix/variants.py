@@ -2,7 +2,7 @@
 
 Why this module exists
 ----------------------
-On CTFARENA-095 the DeepSeek arm spent 29 tool calls and the full 600s wall
+On one run the DeepSeek arm spent 29 tool calls and the full 600s wall
 clock without solving. The transcript shows it locked onto a single
 hypothesis ("nginx/Express differ in percent-decoding") and kept generating
 new payloads for that one hypothesis. It never once tried all-uppercase --

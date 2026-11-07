@@ -42,8 +42,8 @@ PACK_DIR: Path = Path(__file__).resolve().parent / "skills_strix"
 
 #: 技能包里带真实 flag 的 writeup 有 30+ 处。它们对解题毫无用处，却是最直接的
 #: 污染源：agent 一旦 ``read_file`` 到一份旧 writeup，日志里就会多出一个"看起来
-#: 像答案"的 flag，``flag_extract`` 的兜底（唯一候选）会把它交上去。CTFARENA-035
-#: 就是这么被人工解掉的题污染成"agent 解出"的。装载时统一抹成 ``FLAG{...}``，
+#: 像答案"的 flag，``flag_extract`` 的兜底（唯一候选）会把它交上去。有的题
+#: 就是这样被人工解过的旧 writeup 污染成"agent 解出"的。装载时统一抹成 ``FLAG{...}``，
 #: 形态保留、内容消失；``FLAG{...}`` 又刚好命中 flag_extract 的占位符排除规则。
 #:
 #: ⚠️ 用的是 :data:`ctf_strix.flag_extract.CANDIDATE_RE`，与提交层同一份定义。
