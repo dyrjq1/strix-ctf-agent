@@ -95,6 +95,55 @@ _CAP_SEQ = count(1)
 #: flag，必须原样留下——否则压缩会把答案压没，这是最不可接受的失败模式。
 _FLAG_RE = re.compile(r"(?:FLAG|flag|CTF|ctf|CTFY|ctfy)\{[^}\s]{2,}\}")
 
+#: 证据抽取的硬上限（字符）。证据块只装「结构性证据」，不装正文。
+_EVIDENCE_MAX_CHARS = 800
+#: 低优先级证据（hex / 带前缀 ID）的总长上限。它们量大且单项价值低：
+#: ``sha256sum`` / ``md5sum`` 一类输出会瞬间吃满整块，把中段的 Set-Cookie 挤掉。
+_EVIDENCE_LOW_PRIORITY_CHARS = 200
+#: 证据块标题。必须与 ``_ELISION_MARK`` 不同：后者是「已经压过、别再压」
+#: 的判据，前者只是本函数的输出标记。
+_EVIDENCE_MARK = "[evidence block]"
+
+#: HTTP 头：整行保留（值截 200）。cookie / 跳转 / 认证挑战全靠这些字段传递。
+_EVIDENCE_HEADER_RE = re.compile(
+    r"(?im)^[ \t]*(set-cookie|location|allow|www-authenticate|content-type)"
+    r"[ \t]*:[ \t]*(.+?)[ \t]*$"
+)
+#: HTTP 状态行：``HTTP/1.1 302 Found``。只认 ``HTTP/x.y NNN`` 形态。
+_EVIDENCE_STATUS_RE = re.compile(r"(?im)^[ \t]*(HTTP/\d\.\d[ \t]+\d{3}(?:[ \t]+[^\r\n]*)?)")
+
+#: 命名标识符：session id / token / key 一类。只认**字段名形态**，不认具体值。
+#: 左边界用 ``(?<![A-Za-z0-9])`` 而非 ``\b``：``session_token=`` / ``PHPSESSID=``
+#: 的前一个字符是下划线或字母，``\b`` 在那里不成立；``mytoken=`` 仍被挡住。
+_EVIDENCE_KV_RE = re.compile(
+    r"(?ix)"
+    r"(?<![A-Za-z0-9])(session[_-]?id|session[_-]?token|sessionid|phpsessid|session"
+    r"|access[_-]?token|auth[_-]?token"
+    r"|refresh[_-]?token|csrf[_-]?token|xsrf[_-]?token|token|jwt|api[_-]?key"
+    r"|secret|password|sid)\b[\"']?\s*[:=]\s*[\"']?([A-Za-z0-9._~+/%=-]{6,512})"
+)
+
+#: JWT 形态：三段 base64url，头部固定以 eyJ 开头（``{"`` 的 base64 前缀）。
+_EVIDENCE_JWT_RE = re.compile(
+    r"\beyJ[A-Za-z0-9_-]{5,512}\.[A-Za-z0-9_-]{5,512}\.[A-Za-z0-9_-]{0,512}"
+    r"(?=[\s\"'<>;,)\]}]|$)"
+)
+_EVIDENCE_UUID_RE = re.compile(
+    r"\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+    r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b"
+)
+#: hex64 / hex32。64 在前，避免 32 位模式把 64 位值切成两半。
+_EVIDENCE_HEX_RE = re.compile(r"\b(?:[0-9a-fA-F]{64}|[0-9a-fA-F]{32})\b")
+#: 带前缀的十六进制标识符（``<name>_<hex>`` 形态），与 traffic.py 的 ID 口径一致。
+_EVIDENCE_PREFIXED_ID_RE = re.compile(r"\b[A-Za-z][A-Za-z0-9]{1,20}_[0-9a-fA-F]{6,40}\b")
+#: 可点击 / 可提交的路径：href / action / src 的值。
+_EVIDENCE_PATH_ATTR_RE = re.compile(
+    r"(?i)\b(?:href|action|src)\s*=\s*[\"']([^\"'\s<>]{1,200})[\"']"
+)
+_EVIDENCE_PAGE_RE = re.compile(
+    r"[\w\-.~%]+\.(?:php\d?|phtml|html?|aspx?|jsp|jspx|json|xml)", re.I
+)
+
 
 def _env_int(name: str, default: int) -> int:
     raw = os.environ.get(name, "").strip()
@@ -156,86 +205,273 @@ def _text_of(item: Any) -> str:
     return str(content or "")
 
 
-def _cap_text(text: str, *, limit: int, head: int, tail: int) -> str:
-    """把一段超长文本压成"头 + 折叠说明 + 尾 + 其中的 flag 原文"。
+
+def _path_like(value: str) -> bool:
+    """路径形态判定：绝对/相对路径、完整 URL、或带扩展名的页面名。"""
+    if not value:
+        return False
+    if value.startswith(("/", "./", "../")) or "://" in value:
+        return True
+    return bool(_EVIDENCE_PAGE_RE.fullmatch(value))
+
+
+def _evidence_lines(
+    text: str,
+    max_chars: int = _EVIDENCE_MAX_CHARS,
+    *,
+    skip_head: int = 0,
+    skip_tail: int = 0,
+) -> list[str]:
+    """抽取结构性证据，按**首次出现位置**排序、去重、总长封顶。
+
+    纯确定性：同一段文本无论放在历史第几条、被调用几次，输出逐字节一致。
+    只认形态与字段名，不认任何具体样例值（命名测试红线）。
+
+    两级优先：状态行 / HTTP 头 / 命名标识符 / JWT / UUID / 路径为高优先级，
+    先按位置占用预算；hex 与带前缀 ID 为低优先级，只吃剩余预算，且总长不超过
+    ``_EVIDENCE_LOW_PRIORITY_CHARS``。否则 ``sha256sum`` 一类输出会把整块塞满
+    hex，把同一段里的 Set-Cookie / Location 全部挤掉。
+
+    ``skip_head`` / ``skip_tail`` 是**请求的**头/尾保留窗口（不是最终实际截取
+    的字符数）：窗口内的内容本来就会原样留在输出里，再抽进块只是重复占预算。
+    窗口按整行对齐，避免半行截断被当成行首而误匹配 ``^`` 锚点。
+    """
+    if not text or max_chars <= 0:
+        return []
+
+    start = 0
+    if skip_head > 0:
+        newline = text.find("\n", skip_head)
+        start = len(text) if newline < 0 else newline + 1
+    end = len(text)
+    if skip_tail > 0:
+        cut = len(text) - skip_tail
+        newline = text.rfind("\n", 0, cut)
+        end = 0 if newline < 0 else newline + 1
+    if end <= start:
+        return []
+    window = text[start:end]
+
+    high: list[tuple[int, str]] = []
+    low: list[tuple[int, str]] = []
+
+    for match in _EVIDENCE_STATUS_RE.finditer(window):
+        value = " ".join(match.group(1).split())
+        high.append((match.start(), f"status: {value[:200]}"))
+    for match in _EVIDENCE_HEADER_RE.finditer(window):
+        value = " ".join(match.group(2).split())
+        if value:
+            high.append((match.start(), f"{match.group(1).lower()}: {value[:200]}"))
+    for match in _EVIDENCE_KV_RE.finditer(window):
+        high.append((match.start(2), f"{match.group(1).lower()}: {match.group(2)[:200]}"))
+    for match in _EVIDENCE_JWT_RE.finditer(window):
+        high.append((match.start(), f"jwt: {match.group(0)[:200]}"))
+    for match in _EVIDENCE_UUID_RE.finditer(window):
+        high.append((match.start(), f"uuid: {match.group(0)}"))
+    for match in _EVIDENCE_PATH_ATTR_RE.finditer(window):
+        value = match.group(1)
+        if _path_like(value):
+            high.append((match.start(1), f"path: {value[:200]}"))
+    for match in _EVIDENCE_HEX_RE.finditer(window):
+        low.append((match.start(), f"hex: {match.group(0)}"))
+    for match in _EVIDENCE_PREFIXED_ID_RE.finditer(window):
+        low.append((match.start(), f"id: {match.group(0)}"))
+
+    high.sort(key=lambda pair: pair[0])  # 稳定排序：起点相同时保留抽取顺序
+    low.sort(key=lambda pair: pair[0])
+
+    lines: list[str] = []
+    seen: set[str] = set()
+    accepted: list[str] = []
+    used = 0
+
+    def _accept(candidate: str, cap: int) -> None:
+        """接受一行，占用 ``used`` 预算。
+
+        值级去重：候选行的值若已完整出现在某条已接受行里就跳过——
+        ``sid: <hex>`` / ``hex: <hex>`` 会被 ``set-cookie: sid=<hex>; ...``
+        吸收，一个 cookie 只占一行。长度 <6 的值不做包含判断，避免 ``/``
+        这种极短值误伤后续所有路径。
+        """
+        nonlocal used
+        if candidate in seen:
+            return
+        value = candidate.split(": ", 1)[1] if ": " in candidate else candidate
+        if len(value) >= 6 and any(value in existing for existing in accepted):
+            return
+        cost = len(candidate) + 1
+        if used + cost > cap:
+            return  # 后面更短的行仍有机会进来，顺序不变
+        seen.add(candidate)
+        accepted.append(value)
+        lines.append(candidate)
+        used += cost
+
+    for _, line in high:
+        _accept(line, max_chars)
+    low_cap = max(0, min(_EVIDENCE_LOW_PRIORITY_CHARS, max_chars - used))
+    low_absolute = used + low_cap
+    for _, line in low:
+        _accept(line, low_absolute)
+    return lines
+
+
+def _evidence_block(
+    text: str,
+    max_chars: int = _EVIDENCE_MAX_CHARS,
+    *,
+    skip_head: int = 0,
+    skip_tail: int = 0,
+) -> str:
+    """把证据行装成块；没有证据就返回空串（纯文本响应零行为变化）。
+
+    ``skip_head`` / ``skip_tail`` 见 :func:`_evidence_lines`：请求的头/尾窗口
+    里的内容本来就原样保留，不再重复抽进块。
+
+    为什么追加在**尾部**而不是头部：前缀缓存按 token 前缀匹配。证据块是
+    整段原文的纯函数，追加在已保留的头/尾之后，不移动任何已有 token，
+    所以同一 item 在任何一轮里都是同一串字节，历史前缀逐字节稳定（运行期
+    零漂移；部署这次改动的首轮会让旧缓存一次性失效，见台账 §4.84）；
+    若插在头部或中间，item 内所有后续 token 都会位移，跨请求 / 跨 agent
+    复用同一段观测时前缀命中直接归零。
+    """
+    lines = _evidence_lines(
+        text,
+        max_chars=max(0, max_chars - len(_EVIDENCE_MARK) - 1),
+        skip_head=skip_head,
+        skip_tail=skip_tail,
+    )
+    if not lines:
+        return ""
+    return "\n" + _EVIDENCE_MARK + "\n" + "\n".join(lines)
+
+
+def _cap_text(
+    text: str, *, limit: int, head: int, tail: int, evidence: bool = False
+) -> str:
+    """把超长文本压成「头 + 折叠说明 + 尾 + 证据块 + flag 原文」。
 
     幂等性是硬要求：已经压过的文本再进来必须原样返回。判据是
-    ``len(text) <= limit`` —— 折叠后的长度必然 <= limit，所以第二次调用
-    一定短路返回，输出与第一次完全一致。
+    ``len(text) <= limit`` —— 折叠后的长度必然 <= limit（预算推导见
+    :func:`_cap_text_ex`），所以第二次调用一定短路返回，输出与第一次完全一致。
 
-    这也顺带保证了"压缩后长度仍可能超限"的边界不会造成来回抖动。
+    证据块只从**中段**（头/尾保留窗口之外的部分）抽取，追加在尾部：它是原文的
+    纯函数，且不移动已保留的头/尾，所以历史条目的字节序列跨轮不变，运行期
+    零漂移（前缀缓存的推导见 :func:`_evidence_block`）。
+
+    返回值保持为字符串（公共 API 稳定）。需要知道证据块是否真的追加时，
+    内部调用方用 :func:`_cap_text_ex`，不要在输出里搜 ``_EVIDENCE_MARK``——
+    输入本身就可能以该标记开头，会造成子串误计。
+    """
+    return _cap_text_ex(text, limit=limit, head=head, tail=tail, evidence=evidence)[0]
+
+
+def _cap_text_ex(
+    text: str, *, limit: int, head: int, tail: int, evidence: bool = False
+) -> tuple[str, bool]:
+    """``_cap_text`` 的实现，额外返回「本次是否真的追加了证据块」。
+
+    证据预算 ``min(800, max(0, (limit - 320) // 2))``：最多吃掉 limit 的一半
+    再减 160，同时给头/尾留至少 200、折叠说明约 54 字符，因此 ``limit >= ~320``
+    时 ``len(out) <= limit`` 恒成立。旧公式 ``min(800, limit - 200)`` 在
+    limit=500 时会输出 555，不变量失效。
     """
     if limit <= 0 or len(text) <= limit:
-        return text
+        return text, False
 
-    # 已经是我们压过的（含折叠标记）就不再二次处理，避免套娃与长度漂移。
+    # 已经是压过的文本（含折叠标记）就整体放弃压缩：含 mark 的文本不再做
+    # 证据抽取，保证二次调用逐字节稳定（fail-open：不压缩，不是数据损坏）。
     if _ELISION_MARK in text:
-        return text
+        return text, False
 
     flags = sorted(set(_FLAG_RE.findall(text)))
     keep_flags = ("\n[flags seen in capped output] " + " ".join(flags)) if flags else ""
 
+    block = ""
+    if evidence:
+        evidence_budget = min(_EVIDENCE_MAX_CHARS, max(0, (limit - 320) // 2))
+        block = _evidence_block(
+            text, max_chars=evidence_budget, skip_head=head, skip_tail=tail
+        )
+
     # 头尾之和不能超过 limit，否则压完反而更长。
-    budget = max(limit - len(keep_flags) - 120, 200)
+    budget = max(limit - len(keep_flags) - len(block) - 120, 200)
     head = min(head, budget * 2 // 3)
     tail = min(tail, budget - head)
     removed = len(text) - head - tail
-    return (
+    out = (
         text[:head]
         + f"\n\n[... {removed} chars capped by CTF context manager ...]\n\n"
         + (text[-tail:] if tail > 0 else "")
+        + block
         + keep_flags
     )
+    return out, bool(block)
 
 
 #: ?????**????**??????????????????????????
 _ELISION_MARK = "chars capped by CTF context manager"
 
 
-def _cap_item(item: Any, *, cap: int, head: int, tail: int, arg_cap: int) -> tuple[Any, int]:
-    """对单条 item 做内容封顶，返回 ``(新 item, 省下的字符数)``。
+def _cap_item(
+    item: Any, *, cap: int, head: int, tail: int, arg_cap: int, evidence: bool = False
+) -> tuple[Any, int, bool]:
+    """对单条 item 做内容封顶，返回 ``(新 item, 省下的字符数, 是否加证据块)``。
 
     只看内容、不看位置：调用方传入的 items 列表里，任何一条都走同一条路径。
     结构（``type`` / ``call_id`` / ``name``）一律原样保留，只换文本字段。
+    第三个返回值来自 :func:`_cap_text_ex`——在输出里搜 ``_EVIDENCE_MARK`` 会
+    误计（输入本身就可能以该标记开头）。
     """
     if not isinstance(item, dict):
-        return item, 0
+        return item, 0, False
 
     kind = item.get("type")
 
     if kind == "function_call_output":
         output = item.get("output")
         if isinstance(output, str):
-            new = _cap_text(output, limit=cap, head=head, tail=tail)
-            return ({**item, "output": new}, len(output) - len(new)) if new != output else (item, 0)
+            new, block_added = _cap_text_ex(
+                output, limit=cap, head=head, tail=tail, evidence=evidence
+            )
+            if new != output:
+                return {**item, "output": new}, len(output) - len(new), block_added
+            return item, 0, False
         if isinstance(output, list):
             blocks: list[Any] = []
             saved = 0
             changed = False
+            block_added = False
             for block in output:
                 if isinstance(block, dict) and block.get("type") == "input_image":
                     blocks.append(block)  # 图片由 strix 自己的 image budget 管
                     continue
                 if isinstance(block, dict) and isinstance(block.get("text"), str):
-                    new = _cap_text(block["text"], limit=cap, head=head, tail=tail)
+                    new, added = _cap_text_ex(
+                        block["text"], limit=cap, head=head, tail=tail, evidence=evidence
+                    )
                     if new != block["text"]:
                         saved += len(block["text"]) - len(new)
                         changed = True
+                        block_added = block_added or added
                         block = {**block, "text": new}
                 blocks.append(block)
-            return ({**item, "output": blocks}, saved) if changed else (item, 0)
-        return item, 0
+            if changed:
+                return {**item, "output": blocks}, saved, block_added
+            return item, 0, False
+        return item, 0, False
 
     if kind == "function_call" and arg_cap > 0:
         args = item.get("arguments")
         if isinstance(args, str):
-            new = _cap_text(
+            new, _ = _cap_text_ex(
                 args, limit=arg_cap, head=arg_cap * 2 // 3, tail=arg_cap // 3
             )
-            return ({**item, "arguments": new}, len(args) - len(new)) if new != args else (item, 0)
-        return item, 0
+            if new != args:
+                return {**item, "arguments": new}, len(args) - len(new), False
+        return item, 0, False
 
-    return item, 0
+    return item, 0, False
 
 
 def _item_hash(item: Any) -> str:
@@ -261,11 +497,13 @@ class HistoryCapper:
         head: int = HEAD_CHARS,
         tail: int = TAIL_CHARS,
         arg_cap: int = ARG_CAP_CHARS,
+        evidence: bool = True,
     ) -> None:
         self.cap_chars = cap_chars
         self.head = head
         self.tail = tail
         self.arg_cap = arg_cap
+        self.evidence = evidence
         self.requests = 0
         self.capped_requests = 0
         self.saved_chars = 0
@@ -281,16 +519,24 @@ class HistoryCapper:
         out: list[Any] = []
         saved = 0
         capped_items = 0
+        evidence_items = 0
         first_capped_index = -1
         capped_hash = ""
         for position, item in enumerate(items):
-            new_item, delta = _cap_item(
-                item, cap=self.cap_chars, head=self.head, tail=self.tail, arg_cap=self.arg_cap
+            new_item, delta, block_added = _cap_item(
+                item,
+                cap=self.cap_chars,
+                head=self.head,
+                tail=self.tail,
+                arg_cap=self.arg_cap,
+                evidence=self.evidence,
             )
             out.append(new_item)
             saved += delta
             if delta:
                 capped_items += 1
+                if block_added:
+                    evidence_items += 1
                 if first_capped_index < 0:
                     first_capped_index = position
                     capped_hash = _item_hash(item)
@@ -300,6 +546,7 @@ class HistoryCapper:
                 "seq": next(_CAP_SEQ),
                 "item_count": len(items),
                 "capped_items": capped_items,
+                "evidence_items": evidence_items,
                 "first_capped_index": first_capped_index,
                 "capped_hash": capped_hash,
                 "input_chars": self.last_request_chars,

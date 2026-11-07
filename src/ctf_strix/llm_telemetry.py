@@ -180,12 +180,14 @@ def _record(context: Any, agent: Any, response: Any) -> None:
         "prefix_hash": (pending or {}).get("prefix_hash", ""),
         "item_count": _int((pending or {}).get("item_count")),
         "capped_items": 0,
+        "evidence_items": 0,
         "first_capped_index": -1,
         "capped_hash": "",
     }
     if stats is not None:
         record["item_count"] = _int(stats.get("item_count")) or record["item_count"]
         record["capped_items"] = _int(stats.get("capped_items"))
+        record["evidence_items"] = _int(stats.get("evidence_items"))
         record["first_capped_index"] = _int(stats.get("first_capped_index"), -1)
         record["capped_hash"] = str(stats.get("capped_hash") or "")
     _write(record)
