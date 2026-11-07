@@ -16,9 +16,8 @@ Use this skill as a routing and execution guide for web-heavy challenges. Keep t
 ## Prerequisites
 
 **Offline image: no installs and no internet.** `python3` already ships `requests`,
-`httpx`, `PIL` and `Crypto`, and `curl` works; `sqlmap` and `ffuf` are installed;
-`nuclei` and `flask-unsign` are **not available** -- write the request in Python or
-with `curl`.
+`httpx`, `PIL` and `Crypto`, and `curl` works; `sqlmap`, `ffuf`, `impacket` and `flask-unsign` are installed;
+`nuclei` and templates are **not available** -- write the request in Python or with `curl`.
 
 ## Additional Resources
 

@@ -60,11 +60,17 @@ COMMAND_FORMS = {
     "nuclei -": "nuclei",
     "flask-unsign --": "flask-unsign",
     "hashcat -": "hashcat",
+    "impacket ": "impacket",
+    "secretsdump.py ": "impacket",
+    "wmiexec.py ": "impacket",
+    "RsaCtfTool ": "RsaCtfTool",
 }
 
 #: Tools the offline image installs; pinned to the build-time probe by
 #: ``test_image_tools_match_build_probe``.
-IMAGE_TOOLS = frozenset({"nmap", "sqlmap", "ffuf", "smbclient"})
+IMAGE_TOOLS = frozenset(
+    {"nmap", "sqlmap", "ffuf", "smbclient", "impacket", "flask-unsign", "RsaCtfTool"}
+)
 
 #: An invocation of anything outside ``IMAGE_TOOLS`` is still a wasted turn.
 BANNED_COMMANDS = tuple(
@@ -114,7 +120,7 @@ def test_command_forms_are_installed_in_image() -> None:
 def test_image_tools_match_build_probe() -> None:
     """``IMAGE_TOOLS`` must equal the binaries ``check_toolchain.sh`` probes."""
     script = (ROOT / "docker" / "check_toolchain.sh").read_text(encoding="utf-8")
-    probed = set(re.findall(r'"([a-z0-9-]+)": \(', script))
+    probed = set(re.findall(r'"([A-Za-z0-9_.-]+)": \(', script))
     assert IMAGE_TOOLS == probed, (
         f"IMAGE_TOOLS={sorted(IMAGE_TOOLS)} but build probes {sorted(probed)}"
     )
@@ -190,3 +196,13 @@ def test_subfile_banned_census() -> None:
     print(f"\n[subfile BANNED census] {total} hits across {len(rows)} subfiles")
     for rel, count, tokens in rows:
         print(f"  {count:3d}  {rel}  {tokens}")
+
+
+def test_stage2_artifacts_are_digest_pinned() -> None:
+    """Downloaded build artifacts must carry a sha256 the build verifies."""
+    text = (ROOT / "docker" / "Dockerfile").read_text(encoding="utf-8")
+    urls = re.findall(r'^ARG IMPACKET_WHEEL_URL="?([^"\n]+)"?$', text, re.MULTILINE)
+    assert urls and urls[0].endswith(".whl"), "impacket wheel URL missing"
+    digests = re.findall(r"^ARG \w+_SHA256=([0-9a-f]{64})$", text, re.MULTILINE)
+    assert len(digests) >= 2, f"expected ffuf + impacket digests, got {digests}"
+    assert "sha256sum -c -" in text, "downloaded wheel is not integrity-checked"
