@@ -107,12 +107,14 @@ def test_register_empty_pack_returns_empty(tmp_path: Path) -> None:
 
 
 def test_prompt_hint_has_routing_and_path() -> None:
-    """分流约束必须同时含"先 triage、只挑一个"和子文件绝对路径。"""
-    hint = skillpack.prompt_hint(["ctf-triage/ctf-triage"], ref="/var/ctf/jail/skills")
+    """The hint must carry the triage entry, the one-index rule and the path."""
+    hint = skillpack.prompt_hint(
+        ["ctf-triage/ctf-triage", "ctf-web/ctf-web"], ref="/var/ctf/jail/skills"
+    )
     assert "ctf-triage/ctf-triage" in hint
-    assert "一个" in hint
-    assert "/var/ctf/jail/skills/<分类>/x.md" in hint
-    assert "勿 load_skill" in hint
+    assert "exactly one" in hint
+    assert "/var/ctf/jail/skills/<category>/x.md" in hint
+    assert "do NOT `load_skill`" in hint
     assert "read_file" not in hint
     assert "exec_command" in hint
     assert "view_image" in hint

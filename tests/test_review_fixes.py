@@ -157,7 +157,7 @@ def test_install_order_is_mount_hook_then_all_three_guards() -> None:
     assert "verify_mount" in sequence, "wiring must be verified right after install"
 
 
-def test_verify_mount_is_asked_for_all_three_marks() -> None:
+def test_verify_mount_is_asked_for_every_guard_mark() -> None:
     """A verifier that omits a mark cannot notice that guard missing."""
     func = _func(_agent_tree(), "_run_agent")
     call = next(
@@ -172,6 +172,7 @@ def test_verify_mount_is_asked_for_all_three_marks() -> None:
         "_ctf_guarded",
         "_ctf_journey_guarded",
         "_ctf_sweep_guarded",
+        "_ctf_target_guarded",
     }, f"verify_mount must require every guard mark, got {literal}"
 
 

@@ -59,6 +59,11 @@ _CAND_PATTERNS: tuple[re.Pattern[str], ...] = (
 #: 单实例里可能有多个待答 question，每个候选都试一遍，但别无限放大请求量。
 _MAX_CANDIDATES = 6
 
+#: QA 题的 question 元数据来自 task.json，没有 ``attempts_remaining``。
+#: 平台对 qa 每题的作答上限是 3；不自己记账就会把 6 个候选一次打光，
+#: 正确解排在第 4 位以后就永远交不上，日志里还看不出发生过什么。
+_QA_ATTEMPT_CAP = 3
+
 # urllib 的 timeout 只吃**单个浮点数**，不是 requests 那样的 (connect, read)
 # 元组。传元组会抛 TypeError，而 `except Exception` 会把它吞成"没有 question"
 # ——这个 bug 让 SAMPLE-001 的 autosubmit 静默失效了两轮，日志只说
@@ -77,10 +82,18 @@ class AutoSubmitter:
         success: Any = None,
         fallback_question_ids: list[str] | None = None,
         fallback_question_modes: dict[str, str] | None = None,
+        run_mode: str = "instance",
+        challenge_id: str = "",
+        competition_id: str = "",
     ) -> None:
         self.platform = platform.rstrip("/")
         self.instance = instance
         self.token = token
+        #: ``qa`` 题没有实例，答案按 ``(challenge_id, competition_id)`` 记账，
+        #: 走 ``POST /api/v1/qa/submissions``。
+        self.run_mode = str(run_mode or "instance").strip().lower()
+        self.challenge_id = str(challenge_id or "").strip()
+        self.competition_id = str(competition_id or "").strip()
         # Optional structured-success ledger.  Only direct JSON verdicts from
         # calls this object made are ever reported to it.
         self.success = success
@@ -95,6 +108,16 @@ class AutoSubmitter:
         self.answers_tried: list[dict[str, Any]] = []
         self.last_error: str | None = None
         self._lock = threading.Lock()
+
+    @property
+    def is_qa(self) -> bool:
+        """是否走 QA 提交通道（无实例，按 challenge/competition 记账）。
+
+        只认显式的 ``run_mode == "qa"``。instance 模式下 ``instance`` 为空是
+        配置异常，不能静默当成 qa —— 那只是把一个错请求换到另一个通道上，
+        失败起来同样看不出根因。
+        """
+        return self.run_mode == "qa"
 
     # ---------------------------------------------------------------- HTTP
     def _post(self, path: str, body: dict[str, Any]) -> dict[str, Any]:
@@ -126,7 +149,7 @@ class AutoSubmitter:
 
     def _verify(
         self, qid: str, answer: str, *, multiple: bool = False
-    ) -> dict[str, Any]:
+    ) -> dict[str, Any] | None:
         """Ask the oracle-mode grader without spending a submission attempt.
 
         ``POST /api/v1/instances/{id}/verify-answer`` is documented in the
@@ -151,6 +174,10 @@ class AutoSubmitter:
             endpoint is unavailable -- callers then fall back to the old
             submit-everything behaviour.
         """
+        if self.is_qa:
+            # QA 没有实例路径下的 verify-answer。唯一的判分器就是提交本身，
+            # 而它会消耗一次答题机会。
+            return None
         body = self._post(
             f"/api/v1/instances/{self.instance}/verify-answer",
             {"question_id": qid, "answer": answer},
@@ -273,6 +300,17 @@ class AutoSubmitter:
             question 列表；拿不到时返回空列表。
         """
         self.last_error = None
+        if self.is_qa:
+            # QA 题没有实例可查。旧路径会 GET ``/api/v1/instances//``，
+            # 404 被下面的 except 吞成空列表 —— 提交链就此静默断开。
+            return [
+                {
+                    "id": qid,
+                    "mode": self.fallback_question_modes.get(qid) or "dynamic",
+                }
+                for qid in self.fallback_question_ids
+                if qid
+            ]
         req = urllib.request.Request(
             f"{self.platform}/api/v1/instances/{self.instance}",
             headers={"Authorization": f"Bearer {self.token}"},
@@ -334,6 +372,20 @@ class AutoSubmitter:
         Returns:
             ``{"tried": [...], "correct": [...]}``，供调用方拼进 summary。
         """
+        if not self.is_qa and not str(self.instance or "").strip():
+            # instance 模式没有 instance id 是配置错，不是 qa 题。
+            return {
+                "tried": [],
+                "correct": [],
+                "note": "instance mode without instance_id",
+            }
+        if self.is_qa and not (self.challenge_id and self.competition_id):
+            # 请求体缺一不可；发出去只会换回 422，看起来像平台故障。
+            return {
+                "tried": [],
+                "correct": [],
+                "note": "qa 模式缺少 challenge_id/competition_id",
+            }
         cands = self.candidates(raw_input)
         if not cands:
             return {"tried": [], "correct": [], "note": "summary 里没有任何答案候选"}
@@ -364,6 +416,8 @@ class AutoSubmitter:
                 why = f"拉 question 列表失败：{self.last_error}"
             elif questions:
                 why = f"本题只有非 flag 类 question：{[q.get('id') for q in questions]}"
+            elif self.is_qa:
+                why = "qa 题的 task.json 没有 questions[].id，无法定位要交哪一题"
             else:
                 why = "本题没有 flag 类 question"
             return {"tried": [], "correct": [], "note": why}
@@ -380,10 +434,13 @@ class AutoSubmitter:
                 # ``attempts_remaining`` 是平台按 question 记账的剩余次数。为 0
                 # 时继续打只会拿到拒绝，白白在日志里制造"我试过了"的假象。
                 left = q.get("attempts_remaining")
+                qa_budget = self.is_qa and not isinstance(left, int)
+                if qa_budget:
+                    left = _QA_ATTEMPT_CAP
                 if isinstance(left, int) and left <= 0:
                     skipped.append(f"{qid}: attempts_remaining=0")
                     continue
-                for ans in cands:
+                for pos, ans in enumerate(cands):
                     # 先问不记账的判分器。它正确 → 只写一条提交记录；
                     # 它不可用（旧平台 / 网络抖动）→ 退回直接提交。
                     probe = self._verify(qid, ans, multiple=multiple)
@@ -392,14 +449,25 @@ class AutoSubmitter:
                                       "verified": True})
                         continue
                     self.attempts += 1
-                    res = self._post(
-                        "/api/v1/submissions",
-                        {
-                            "instance_id": self.instance,
-                            "question_id": qid,
-                            "answer": ans,
-                        },
-                    )
+                    if self.is_qa:
+                        res = self._post(
+                            "/api/v1/qa/submissions",
+                            {
+                                "challenge_id": self.challenge_id,
+                                "competition_id": self.competition_id,
+                                "question_id": qid,
+                                "answer": ans,
+                            },
+                        )
+                    else:
+                        res = self._post(
+                            "/api/v1/submissions",
+                            {
+                                "instance_id": self.instance,
+                                "question_id": qid,
+                                "answer": ans,
+                            },
+                        )
                     tried.append({"qid": qid, "answer": ans, **{
                         k: res.get(k) for k in ("correct", "solve_rank", "detail", "error")
                     }})
@@ -428,7 +496,14 @@ class AutoSubmitter:
                     if isinstance(left, int):
                         left -= 1
                         if left <= 0:
-                            skipped.append(f"{qid}: attempts_remaining exhausted")
+                            if qa_budget:
+                                untried = len(cands) - pos - 1
+                                skipped.append(
+                                    f"{qid}: qa attempt cap {_QA_ATTEMPT_CAP} reached, "
+                                    f"{untried} candidates untried"
+                                )
+                            else:
+                                skipped.append(f"{qid}: attempts_remaining exhausted")
                             break
         self.answers_tried.extend(tried)
         self.correct.extend(correct)
@@ -562,6 +637,9 @@ def install(
     fallback_question_ids: list[str] | None = None,
     fallback_question_modes: dict[str, str] | None = None,
     submitter: AutoSubmitter | None = None,
+    run_mode: str = "instance",
+    challenge_id: str = "",
+    competition_id: str = "",
 ) -> AutoSubmitter:
     """挂到 ``finish_scan`` 上：允许收工前先提交，答错则拒绝。
 
@@ -591,6 +669,9 @@ def install(
         success=success,
         fallback_question_ids=fallback_question_ids,
         fallback_question_modes=fallback_question_modes,
+        run_mode=run_mode,
+        challenge_id=challenge_id,
+        competition_id=competition_id,
     )
     original = factory._with_bounded_result
     refusal_budget = {"left": max_refusals}

@@ -15,10 +15,48 @@
 警告。工具结果一定会回到模型上下文，且紧挨着下一步决策——这是纠正行为
 最有效的位置。
 
-## 为什么用"结果注入"而不是"直接拒绝"
+## Why text injection stops at the hard threshold
 
-直接拒绝会让 agent 反复重试同一个调用，反而烧更多轮次。注入警告保留了原
-结果，模型能继续干活，只是被明确告知"这条路重复了，该换机制"。
+2026-11-06 platform run CTFARENA-043 recorded 95 ``exec_command`` curls
+against a host that returned an identical Go-style ``404 page not found``
+for every path.  ``EnumerationGuard.finish`` did detect the identical
+observations and appended "Stop now" text, but the model kept probing for
+another 20 minutes until the wall clock expired.
+
+The conclusion is narrow: below the hard threshold, injecting a warning into
+the tool result is still right -- it preserves the result and reaches the
+model next to its decision.  At the hard threshold, text is not enough: the
+call must return an error instead of the tool output, and that family must
+be refused from then on.
+
+## Why a hard block also needs *path diversity*
+
+A hard block is a claim about enumeration, and enumeration is by definition
+many *different* paths under one family.  Two shapes are not enumeration and
+must never be blocked:
+
+* a two-segment path such as ``/api/login`` or ``/api/flag`` -- these are
+  single endpoints, not a family of leaves.  They were folded into the
+  ``api`` family, so five wrong passwords locked the whole ``/api/*`` tree
+  and the login that finally carried the right password was refused too;
+* one path retried with different parameters -- password guessing, status
+  polling, a form resubmitted.  Repeating one identical request is a cheap
+  mistake, not exploration, and the soft warning already covers it.
+
+So the block additionally requires ``_BLOCK_MIN_DIVERSITY`` distinct request
+paths *within the family*.  The judgement stays a single principle (path
+diversity == enumeration); it is deliberately **not** a whitelist of path
+keywords such as ``login`` or ``admin``, which would be a hard-coded guess
+about what a challenge looks like.
+
+## Why a refusal escalates to a stop
+
+A blocked call returns instantly and still produces a tool call, which
+refreshes the idle clock.  A model that keeps retrying a blocked family
+therefore burns the whole turn budget without a single new observation.  After
+``_ENUM_REFUSAL_LIMIT`` refusals of one family the guard reports
+:class:`EnumExhausted`, which ``agent.py`` raises from the event sink and maps
+to ``stop_reason="enum_exhausted"``.
 """
 
 from __future__ import annotations
@@ -43,6 +81,18 @@ _PROBE_TOOLS = PROBE_TOOLS
 _WARN_REPEATS = 2
 #: 到这里升级成硬指令（禁止继续打这一族）。
 _HARD_REPEATS = 4
+#: How many distinct request paths a family must have shown before a hard
+#: block is allowed.  Physical basis: enumeration means many *different*
+#: paths under one family.  With fewer than three, the model is retrying one
+#: endpoint (login guessing, status polling) and a block would refuse the one
+#: call that carries the right value.
+_BLOCK_MIN_DIVERSITY: Final[int] = 3
+#: How many calls may be refused for one blocked family before the run stops
+#: with :class:`EnumExhausted`.  Physical basis: the hard error already told
+#: the model to change mechanism; three more attempts is the budget for it to
+#: actually do so, and past that every retry is pure turn waste.
+_ENUM_REFUSAL_LIMIT: Final[int] = 3
+
 #: 跨族连续零新信息的警告阈值，以及之后每隔多少次重复提醒。
 _STALL_AFTER = 6
 _STALL_REPEAT = 4
@@ -164,7 +214,18 @@ assert {name for _cid, name, _re in _MECHANISM_RES} == set(MECHANISM_NAMES)
 
 #: A URL's "family" is everything but the last path segment, with the query
 #: dropped.  ``/api/notes/note_a`` and ``/api/notes/note_b`` are one family.
-_FAMILY_RE: Final = re.compile(r"https?://[^\s\"'<>]+")
+_FAMILY_RE: Final = re.compile(r"https?://[^\s\"'<>|&]+")
+
+#: A URL written inline in a shell command picks up whatever punctuation
+#: follows it: ``curl -s https://h/api/x/1;``, ``echo $(curl .../1)``,
+#: a backtick-quoted URL, or a JSON-escaped quote whose tail is a backslash.
+#: ``_FAMILY_RE`` stops at whitespace, quotes and shell operators (``|``,
+#: ``&``); the remaining tail punctuation used to stay in the extracted path,
+#: so ``/api/x/1``, ``/api/x/1;``, ``/api/x/1)`` counted as three *different*
+#: paths -- enough for the diversity gate to hard-block a single endpoint, the
+#: exact shape B4 exists to prevent.  Only the tail is stripped: a ``;`` in
+#: the middle of a path is part of the path.
+_PATH_TAIL_PUNCT: Final = ";,)]}`\\|&"
 
 
 def _path_family(args: str) -> str | None:
@@ -192,6 +253,36 @@ def _path_family(args: str) -> str | None:
     if "/" not in path:
         return url.rsplit("/", 1)[0]
     return url.rsplit("/", 1)[0]
+
+
+def _request_path(args: str) -> str | None:
+    """Return the (query-free) path of the first URL in ``args``.
+
+    Used for the path-diversity gate: two requests to the same family are
+    only enumeration when they ask for *different* paths.
+
+    Args:
+        args: the raw tool-argument blob.
+
+    Returns:
+        ``/a/b/c`` style path, ``"/"`` for a bare origin, or ``None`` when
+        there is no URL to read.
+    """
+    match = _FAMILY_RE.search(args or "")
+    if match is None:
+        return None
+    url = (
+        match.group(0)
+        .split("?", 1)[0]
+        .split("#", 1)[0]
+        .rstrip(_PATH_TAIL_PUNCT)
+        .rstrip("/")
+        .rstrip(_PATH_TAIL_PUNCT)
+    )
+    tail = url.split("://", 1)[-1]
+    if "/" not in tail:
+        return "/"
+    return "/" + tail.split("/", 1)[1]
 
 
 def _mechanism_of(args: str) -> str | None:
@@ -262,7 +353,15 @@ def _fingerprint(tool_name: str, args: str) -> str | None:
         segs = [s for s in segs if not s[:1].isupper()]
         if not segs:
             continue
-        families.add(segs[-2] if len(segs) >= 2 else segs[-1])
+        # 两段路径是一个*端点*，不是一族叶子：``/api/login`` 与 ``/api/flag``
+        # 必须分属不同族。以前取 ``segs[-2]`` 把两者都叫成 "api"，五次登入失败
+        # 就把整个 ``/api/*`` 永久封死，连带着正确密码那一次也一起拒掉。
+        if len(segs) == 1:
+            families.add(segs[0])
+        elif len(segs) == 2:
+            families.add("/".join(segs))
+        else:
+            families.add(segs[-2])
 
     # 爆破工具本身就是在枚举，即使 URL 里没有业务关键词也要计。
     # 它们的特征是把占位符放在路径里，或用字典文件扫。
@@ -386,6 +485,25 @@ def _obs_signature(result: Any, args: str) -> str:
     return hashlib.sha1(payload.encode("utf-8", "replace")).hexdigest()[:12]
 
 
+class EnumExhausted(BaseException):
+    """The model kept retrying a hard-blocked family instead of rerouting.
+
+    ``BaseException`` for the same reason as :class:`agent.IdleTimeout`: the
+    runner and the tool wrappers are full of ``except Exception``, and a
+    swallowed stop would hand control back to the retry loop this exists to
+    break.
+
+    Attributes:
+        family: the family that stayed blocked.
+        refusals: how many calls were refused for it.
+    """
+
+    def __init__(self, message: str, *, family: str = "", refusals: int = 0) -> None:
+        super().__init__(message)
+        self.family = family
+        self.refusals = refusals
+
+
 class EnumerationGuard:
     """统计"信息增益为零"的重复探测，并在工具结果里注入纠正提示。
 
@@ -430,6 +548,17 @@ class EnumerationGuard:
         self.leaves: dict[str, set[str]] = {}
         #: 读 bundle 原文的次数（含 curl/wget/cat .js）。
         self.bundle_hits: int = 0
+        #: Fingerprints whose family hit the hard threshold.  Wrapper calls
+        #: with one of these keys are refused before the tool runs.
+        self.blocked: set[str] = set()
+        #: Calls refused because their family was already blocked.
+        self.blocked_calls: int = 0
+        #: Refusals per blocked family (drives :class:`EnumExhausted`).
+        self.refusal_counts: Counter[str] = Counter()
+        #: The family whose refusal count reached the limit, if any.
+        self.exhausted_family: str | None = None
+        #: Distinct request paths seen per family (path-diversity gate).
+        self._family_paths: dict[str, set[str]] = {}
 
     def mechanism_counts(self) -> dict[str, int]:
         """Return a read-only snapshot of the per-CAPEC-class probe counts.
@@ -441,6 +570,67 @@ class EnumerationGuard:
             Class name → number of classified probes so far.
         """
         return dict(self.mechanisms)
+
+    @property
+    def exhausted(self) -> bool:
+        """True once one family has been refused past the retry budget."""
+        return self.exhausted_family is not None
+
+    def refusal_count(self, key: str) -> int:
+        """How many calls were refused for ``key``."""
+        return int(self.refusal_counts.get(key, 0))
+
+    def exhausted_detail(self) -> str:
+        """One-line reason for the ``EnumExhausted`` exception."""
+        family = (self.exhausted_family or "target").split("|", 2)[-1]
+        return (
+            f"enumeration exhausted: '{family}' stayed blocked after "
+            f"{self.refusal_count(self.exhausted_family or '')} refused calls; "
+            "the model kept retrying instead of changing mechanism"
+        )
+
+    def stats(self) -> dict[str, Any]:
+        """Read-only snapshot for the run diagnostics."""
+        return {
+            "blocked_calls": self.blocked_calls,
+            "blocked": sorted(self.blocked),
+            "exhausted": self.exhausted,
+            "exhausted_family": self.exhausted_family,
+            "observe_calls": self.observe_calls,
+        }
+
+    def note_answer(self) -> None:
+        """An answer is recorded: lift every block and clear every counter.
+
+        Once there is something to submit, no block may stand between the run
+        and the answer, and no accumulated count may escalate to a stop.  The
+        run-wide call counter is a statistic and is left alone.
+        """
+        self.blocked.clear()
+        self.counts.clear()
+        self.warned.clear()
+        self._seen.clear()
+        self._global.clear()
+        self.leaves.clear()
+        self._family_paths.clear()
+        self.refusal_counts.clear()
+        self.exhausted_family = None
+        self.stall = 0
+        self.class_streak = 0
+
+    def soft_reset(self) -> None:
+        """Drop the per-attempt escalation state, keep the hard blocks.
+
+        Called when a new attempt starts.  A second attempt is the instruction
+        to change mechanism, so a refusal count inherited from the previous one
+        must not end the retry attempt on its very first call -- the model gets
+        one honest chance under the new instruction.  The blocks themselves
+        stay: that family produced no new information, so probing it again is
+        still wasted work.  ``blocked_calls`` is a run-wide statistic and is
+        left alone, like in :meth:`note_answer`.
+        """
+        self.refusal_counts.clear()
+        self.exhausted_family = None
 
     def begin(self, tool_name: str, args: str) -> tuple[str | None, str]:
         """调用前登记。
@@ -455,6 +645,33 @@ class EnumerationGuard:
         self.observe_calls += 1
         return _fingerprint(tool_name, args), args
 
+    def refusal(self, token: tuple[str | None, str]) -> str | None:
+        """Return the hard error when this call's family is already blocked.
+
+        The wrapper calls this after :meth:`begin` and before invoking the
+        underlying tool, so a blocked family never reaches the target again.
+
+        Args:
+            token: :meth:`begin`'s return value.
+
+        Returns:
+            The short error text for a blocked family, otherwise ``None``.
+        """
+        key, _args = token
+        if key is None or key not in self.blocked:
+            return None
+        self.blocked_calls += 1
+        self.refusal_counts[key] += 1
+        # Escalate to a run-level stop once the model has had
+        # ``_ENUM_REFUSAL_LIMIT`` chances to reroute.  The sink reads this and
+        # raises EnumExhausted; until then the cheap refusal is just a hint.
+        if (
+            self.exhausted_family is None
+            and self.refusal_counts[key] >= _ENUM_REFUSAL_LIMIT
+        ):
+            self.exhausted_family = key
+        return self._blocked_error(key)
+
     def finish(self, token: tuple[str | None, str], result: Any) -> str | None:
         """调用后结算，返回要追加到结果末尾的提示（或 None）。
 
@@ -466,6 +683,12 @@ class EnumerationGuard:
             提示文本；无需提示时返回 None。
         """
         key, args = token
+        if key is not None and key in self.blocked:
+            # Not dead code even though the wrapper checks ``refusal`` first:
+            # a concurrent tool call can block the family between ``begin``
+            # and this call, and the public ``observe()`` path never runs
+            # ``refusal`` at all.
+            return self._blocked_error(key)
         if _is_bundle_read(args):
             self.bundle_hits += 1
             if self.bundle_hits in (2, 4):
@@ -475,6 +698,10 @@ class EnumerationGuard:
                     "Stop downloading/cat-ing .js: feed those paths to method_sweep, "
                     "then POST to the most plausible one."
                 )
+        if key is not None:
+            path = _request_path(args)
+            if path is not None:
+                self._family_paths.setdefault(key, set()).add(path)
         sig = _obs_signature(result, args)
         fresh = (key, sig) not in self._global
         self._global.add((key, sig))
@@ -519,14 +746,11 @@ class EnumerationGuard:
 
         n = self.counts[key]
         family = key.split("|")[-1]
-        if n >= _HARD_REPEATS and (n - _HARD_REPEATS) % 3 == 0:
-            return (
-                f"\n\n[ENUMERATION GUARD] {n + 1} probes of '{family}' returned the "
-                "IDENTICAL response. Re-sending cannot produce new information. Stop now.\n"
-                "Switch mechanism: parameter injection, auth bypass, file read, SSTI, "
-                "SSRF pivot, or use the access you already have (code execution / DB "
-                "read) to locate the flag file."
-            )
+        if n >= _HARD_REPEATS and (
+            len(self._family_paths.get(key, ())) >= _BLOCK_MIN_DIVERSITY
+        ):
+            self.blocked.add(key)
+            return self._blocked_error(key)
         if n >= _WARN_REPEATS and f"{key}|{sig}" not in self.warned:
             self.warned.add(f"{key}|{sig}")
             return (
@@ -542,6 +766,21 @@ class EnumerationGuard:
         if class_hint:
             return class_hint
         return self._stall_hint()
+
+    @staticmethod
+    def _blocked_error(key: str) -> str:
+        """Build the short hard-reject message for a blocked family.
+
+        The family segment is truncated so the message stays well under 400
+        characters even when a path segment is pathological.
+        """
+        family = key.split("|", 2)[-1][:80]
+        return (
+            f"ERROR: [ENUMERATION GUARD] '{family}' returned the IDENTICAL "
+            "response too many times; this family is blocked. Change mechanism "
+            "now: auth bypass, injection, SSRF pivot, file read, or use existing "
+            "access. Do not resend this family."
+        )
 
     def _class_hint(self, mechanism: str) -> str | None:
         """Name the untried mechanism classes once a class run gets long.
@@ -637,9 +876,16 @@ def install() -> EnumerationGuard:
         async def invoke(ctx: Any, raw_input: str) -> Any:
             # 工具名从 tool 闭包取；大 agent 共用同一个守卫，计数是全局的
             token = guard.begin(tool.name, raw_input)
+            refusal = guard.refusal(token)
+            if refusal is not None:
+                # Hard block: return before invoking the tool at all.
+                return refusal
             result = await inner(ctx, raw_input)
             hint = guard.finish(token, result)
             if hint:
+                if hint.startswith("ERROR:"):
+                    # A hard block replaces the tool output entirely.
+                    return hint
                 # 结果体量不确定（可能不是 str），统一转成字符串追加。
                 return f"{result}{hint}"
             return result

@@ -146,9 +146,10 @@ def test_switching_class_resets_the_streak():
 def test_identical_response_still_wins_over_the_class_hint():
     """完全相同的响应是更强的信号；类别提示不能把它盖掉。"""
     guard = eg.EnumerationGuard()
-    args = _probe("https://x.test/admin/users")
     hints = []
-    for _ in range(6):
+    for index in range(6):
+        # 3 个不同叶子：硬封锁要求族内路径多样性 >= 3。
+        args = _probe(f"https://x.test/admin/users/leaf-{index % 3}")
         token = guard.begin("http_probe", args)
         hint = guard.finish(token, "[HTTP 403] forbidden")
         if hint:

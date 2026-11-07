@@ -185,6 +185,7 @@ def stage(ref: str | None = None, pack: Path | None = None) -> Path:
 
     Args:
         ref: 子文件根路径，默认 :func:`ref_root`。
+        kind: 题型（web/file/tcp/...）；只渲染该题型能执行的工具方向。
         pack: 技能包根目录，默认 :data:`PACK_DIR`。
 
     Returns:
@@ -231,29 +232,31 @@ def register(registry: Path | None = None, register_fn: Any | None = None) -> li
     return names
 
 
-def prompt_hint(names: list[str] | None = None, ref: str | None = None) -> str:
-    """生成写进 ``user_instructions`` 的分流约束。
+def prompt_hint(
+    names: list[str] | None = None,
+    ref: str | None = None,
+    kind: str | None = None,
+) -> str:
+    """生成写进 ``user_instructions`` 的路由契约。
 
-    prompt 里没有这句，模型会把索引当普通文本读完就动手，不会去 ``read_file``
-    子文件；也可能一次加载两个方向索引，把上下文挤掉一半。
+    提示里没有这一块，模型会把索引当普通文本读完就动手，不会去读子文件；
+    也可能一次加载两个方向索引，把上下文挤掉一半。
+
+    内容由 :mod:`ctf_strix.routing` 提供：判据表 + 存活闸门 + 证伪要求 +
+    预算复盘点。这里只负责把"已注册的技能名"和"子文件根路径"传下去，
+    避免提示指向一个没装上的方向。
 
     Args:
         names: :func:`register` 的返回值，默认现算。
         ref: 子文件根路径，默认 :func:`ref_root`。
+        kind: 题型（web/file/tcp/...）；只渲染该题型能执行的工具方向。
 
     Returns:
-        多行中文指令；没有技能时返回空串。
+        多行指令；没有可用技能时返回空串。
     """
+    from ctf_strix import routing
+
     skill_names = names if names is not None else [f"{c}/{n}" for c, n, _ in index_skills()]
     if not skill_names:
         return ""
-    root = ref or ref_root()
-    joined = "、".join(skill_names)
-    return (
-        "【CTF 技能库】可用方向：" + joined + "\n"
-        "拿到题先 load_skill([\"ctf-triage/ctf-triage\"]) 定型，再只加载对应方向的**一个**索引"
-        "（不要同时加载两个以上，单个索引 1k-10k token）。\n"
-        "非技能子文件：文本 exec_command(cat/sed -n)，图片 view_image；"
-        + root
-        + "/<分类>/x.md；勿 load_skill。"
-    )
+    return routing.render(skill_names, ref or ref_root(), kind=kind)

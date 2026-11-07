@@ -60,11 +60,12 @@ def test_different_bodies_still_count_as_new_information() -> None:
 
 
 def test_guard_fires_on_repeated_identical_shell_output() -> None:
-    """端到端：同一个探测重复 3 次必须出警告，第 5 次必须出硬停。"""
-    args = 'curl -s https://x.test/api/widgets -H "Origin: null"'
+    """端到端：同一族 3 个不同叶子 + 同响应：先警告，到阈值必须硬停。"""
+    # 3 个不同叶子：硬封锁现在要求族内路径多样性 >= 3（同一路径重试只警告）。
     guard = EnumerationGuard()
     hints: list[str] = []
     for i in range(5):
+        args = f'curl -s https://x.test/api/widgets/leaf-{i % 3} -H "Origin: null"'
         token = guard.begin("exec_command", args)
         hint = guard.finish(
             token, _shell_output(f"{i:06x}", f"{i}.0", "HTTP 403 origin not trusted")

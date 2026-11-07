@@ -15,6 +15,20 @@
 两条都走会让同一题消耗两次 attempt，所以默认只走 `answers`；评测脚本可以
 另外挂 autosubmit 做即时提交。engagement 题没有 flag，交付物是报告，见
 :mod:`ctf_strix.engagement`。
+
+Idle watchdog (2026-11-06, CTFARENA-010): strix.log showed 121 turns and 120
+LLM requests but only 6 tool calls.  After concluding the target was dead,
+the model wrote "I'll wait for the hard stop" and idled for roughly 20
+minutes until the 1380s wall clock expired.  A long stretch without any
+tool call means the run is not learning anything, so :class:`IdleWatchdog`
+ends it early and ``main`` writes ``stop_reason="agent_idle"``.  The limit
+is ``CTF_IDLE_SECONDS`` (default 150; non-positive disables the watchdog).
+
+Target-absent fast fail (2026-11-06, CTFARENA-043 / SAMPLE-003 / 012):
+a host that answers one identical uninformative body to every path is not a
+target to keep enumerating.  :mod:`ctf_strix.target_absent` counts distinct
+paths per identical body hash, and the sink ends the run as
+``stop_reason="target_absent"`` so the serial rotation moves on.
 """
 
 from __future__ import annotations
@@ -35,7 +49,9 @@ from ctf_strix import error_policy
 from ctf_strix import platform_attach as attach
 from ctf_strix.success_stop import RecoveryExhausted
 from ctf_strix.success_stop import SolvedStop
+from ctf_strix.enum_guard import EnumExhausted
 from ctf_strix.success_stop import SuccessLedger
+from ctf_strix.target_absent import TargetAbsent
 from ctf_strix.usage_meter import begin_run as begin_usage_run
 from ctf_strix.usage_meter import OutputBudgetExceeded
 from ctf_strix.usage_meter import raise_if_tripped
@@ -668,6 +684,135 @@ def _turn_budget(task: dict[str, Any]) -> int:
         return 500
 
 
+#: Default idle limit.  Long enough for normal tool-call gaps, far below
+#: the 1380s hard wall clock that CTFARENA-010 spent idling.
+_IDLE_DEFAULT_SECONDS = 150.0
+
+
+class IdleTimeout(BaseException):
+    """No tool call arrived for longer than the idle limit.
+
+    ``BaseException`` for the same reason as :class:`WallclockExceeded`:
+    the runner and the tool wrappers are full of ``except Exception``, and
+    a swallowed stop would hand control back to the idle loop this exists
+    to break.
+
+    Evidence: CTFARENA-010 on 2026-11-06 spent 121 turns / 120 LLM requests
+    on 6 tool calls, then idled ~20 minutes waiting for the wall clock.
+    """
+
+
+class IdleWatchdog:
+    """Pure clock arithmetic for the idle check (no threads, no sleeping).
+
+    Two states, and the difference is the whole point:
+
+    * **unarmed** (``_last is None``): the clock has not started.  Nothing
+      can expire, because no model or tool event has been seen yet.  A run
+      spends up to a minute in sandbox boot plus the first LLM response
+      before its first event; counting that as "idle" (CTFARENA-010's
+      watchdog reported ``turns=0`` on a cold start) kills a healthy run.
+    * **armed** (``_last`` is a timestamp): the last *tool* event.  The sink
+      arms once on the first model/tool event of an attempt
+      (:meth:`arm`), then refreshes on every tool call *and its output*
+      (:meth:`note_activity`).  Long prose alone never refreshes it, so a
+      model that stops calling tools still trips at a round boundary.
+
+    The sink only *checks* :meth:`expired` at round boundaries; streaming
+    deltas are not a decision point.  Keeping the arithmetic here lets unit
+    tests pass explicit timestamps instead of sleeping.
+    """
+
+    __slots__ = ("limit", "_last")
+
+    def __init__(self, limit: float, *, now: float | None = None) -> None:
+        self.limit = float(limit)
+        self._last = None if now is None else float(now)
+
+    @property
+    def armed(self) -> bool:
+        """True once the clock has seen its first model or tool event."""
+        return self._last is not None
+
+    def arm(self, now: float) -> None:
+        """Start the clock if it is not started; later calls are no-ops."""
+        if self._last is None:
+            self._last = float(now)
+
+    def reset(self) -> None:
+        """Return to the unarmed state (used at every attempt boundary)."""
+        self._last = None
+
+    def note_activity(self, now: float) -> None:
+        """Remember that a tool call or tool output was seen at ``now``."""
+        self._last = float(now)
+
+    def expired(self, now: float) -> bool:
+        """True when ``now`` is at least ``limit`` past the last activity.
+
+        An unarmed clock never expires; so does a non-positive limit,
+        matching ``CTF_IDLE_SECONDS=0`` and the wall-clock budget contract.
+        """
+        if self.limit <= 0 or self._last is None:
+            return False
+        return (float(now) - self._last) >= self.limit
+
+
+def _idle_limit_seconds() -> float:
+    """Parse ``CTF_IDLE_SECONDS``; default 150, non-positive disables.
+
+    A malformed value falls back to the default instead of disabling the
+    watchdog: a typo in an operator env file must not silently restore the
+    CTFARENA-010 failure mode.
+    """
+    raw = os.environ.get("CTF_IDLE_SECONDS")
+    if raw is None:
+        return _IDLE_DEFAULT_SECONDS
+    try:
+        return float(str(raw).strip())
+    except (TypeError, ValueError):
+        return _IDLE_DEFAULT_SECONDS
+
+
+#: Run-item types that count as *tool* activity for the idle clock.  Both the
+#: call and its output are progress: a tool that runs for minutes is exactly
+#: the case the old call-only clock killed.
+_TOOL_ACTIVITY_TYPES: tuple[str, ...] = ("tool_call_item", "tool_call_output_item")
+
+#: Run-item types that may *start* the clock.  They are all model or tool
+#: output (``openai-agents`` item types), so sandbox-boot or MCP setup traffic
+#: -- which is neither -- cannot arm it.  ``message_item`` is kept alongside
+#: the SDK spelling for older fakes in the test suite.
+_MODEL_ITEM_TYPES: tuple[str, ...] = (
+    "message_item",
+    "message_output_item",
+    "reasoning_item",
+    "tool_call_item",
+    "tool_call_output_item",
+    "handoff_call_item",
+    "handoff_output_item",
+    "tool_search_call_item",
+    "tool_search_output_item",
+)
+
+#: Raw provider event that closes one model round.  ``openai-agents`` puts a
+#: :class:`RawResponsesStreamEvent` on the sink for every provider chunk; only
+#: this terminal one (``ResponseCompletedEvent``) means "the model finished
+#: speaking, the runner is about to act".  Tool-call run items are emitted at
+#: ``response.output_item.done``, i.e. *before* this event, so a long
+#: generation that ends in a tool call refreshes the clock first and is never
+#: mistaken for idling.
+_ROUND_END_EVENT = "response.completed"
+
+
+def _is_round_boundary(event: object) -> bool:
+    """True for the event that ends one LLM round of the streamed run."""
+    if getattr(event, "type", None) != "raw_response_event":
+        return False
+    data = getattr(event, "data", None)
+    return getattr(data, "type", None) == _ROUND_END_EVENT
+
+
 class WallclockExceeded(BaseException):
     """Run 的墙钟预算耗尽。
 
@@ -733,6 +878,44 @@ def _check_soft_timeout() -> None:
     """
     if deadline.soft_timeout_flag.is_set():
         raise WallclockExceeded("wall budget spent (watchdog flag)")
+
+
+#: 「止损」终止（以下异常类）：都继承 ``BaseException``，会绕过 ``main`` 里的普通收尾。
+#: 统计必须在抛出点挂到异常上，否则 result.json 只能写 ``turns=0``、诊断全空。
+_STOP_TYPES: tuple[type[BaseException], ...] = (
+    SolvedStop,
+    RecoveryExhausted,
+    WallclockExceeded,
+    OutputBudgetExceeded,
+    IdleTimeout,
+    TargetAbsent,
+    EnumExhausted,
+)
+
+
+def _attach_stop_state(exc: BaseException, turns: int, diag: dict[str, Any]) -> None:
+    """把 ``_run_agent`` 的轮次与诊断挂到止损异常上。
+
+    用属性而不是构造参数：这些异常在 sink、恢复守卫、用量表等多个位置抛出，
+    改构造签名要波及每一处调用，也盖不住将来新增的抛出点。挂载失败不影响
+    异常本身继续向上抛——止损语义不能被诊断拖累。
+    """
+    try:
+        exc.stop_turns = max(int(turns), 0)  # type: ignore[attr-defined]
+        exc.stop_diag = dict(diag)  # type: ignore[attr-defined]
+    except (AttributeError, TypeError, ValueError):
+        return
+
+
+def _take_stop_state(exc: BaseException) -> tuple[int, dict[str, Any]]:
+    """取回 :func:`_attach_stop_state` 挂上的快照；没有时给 ``(0, {})``。"""
+    raw_turns = getattr(exc, "stop_turns", 0)
+    try:
+        turns = max(int(raw_turns), 0)
+    except (TypeError, ValueError):
+        turns = 0
+    raw_diag = getattr(exc, "stop_diag", None)
+    return turns, dict(raw_diag) if isinstance(raw_diag, dict) else {}
 
 
 #: Whether :func:`_install_hard_deadline` created the shared deadline itself.
@@ -1458,6 +1641,9 @@ def main() -> int:
         # and write a distinct stop_reason so success is not read as "error".
         error = None
         stop_reason = "solved"
+        stop_turns, stop_diag = _take_stop_state(exc)
+        turns_used = max(turns_used, stop_turns)
+        diag.update(stop_diag)
         print(f"[ctfy] solved, stopping: {exc}", flush=True)
     except RecoveryExhausted as exc:
         # The runner kept ending turns without a lifecycle call.  This is a
@@ -1465,12 +1651,52 @@ def main() -> int:
         # and result.json must say so.
         error = str(exc)
         stop_reason = "recovery_exhausted"
+        stop_turns, stop_diag = _take_stop_state(exc)
+        turns_used = max(turns_used, stop_turns)
+        diag.update(stop_diag)
+        print(f"[ctfy] {exc}", flush=True)
+    except IdleTimeout as exc:
+        # Not a crash and not wall-clock exhaustion: the agent stopped
+        # calling tools.  A separate reason keeps triage able to tell an
+        # idle reasoning loop from slow-but-progressing work.
+        error = str(exc)
+        stop_reason = "agent_idle"
+        stop_turns, stop_diag = _take_stop_state(exc)
+        turns_used = max(turns_used, stop_turns)
+        diag.update(stop_diag)
         print(f"[ctfy] {exc}", flush=True)
     except WallclockExceeded as exc:
         # 墙钟到点不是崩溃：已抽到的答案照常进 result.json，归档口径
         # 用 stop_reason 区分开，避免污染"error"的根因分析。
         error = str(exc)
         stop_reason = "wallclock"
+        stop_turns, stop_diag = _take_stop_state(exc)
+        turns_used = max(turns_used, stop_turns)
+        diag.update(stop_diag)
+        print(f"[ctfy] {exc}", flush=True)
+    except TargetAbsent as exc:
+        # The target answered every probed path with the same non-answer, so
+        # no further probing of it can succeed.  Distinct from "error" and
+        # from "wallclock": the run stopped on evidence, not on a clock or a
+        # crash.  The serial rotation reads this reason and moves on.
+        error = str(exc)
+        stop_reason = "target_absent"
+        stop_turns, stop_diag = _take_stop_state(exc)
+        turns_used = max(turns_used, stop_turns)
+        diag.update(stop_diag)
+        print(f"[ctfy] {exc}", flush=True)
+    except EnumExhausted as exc:
+        # The model kept retrying a family that was already hard-blocked
+        # instead of changing mechanism.  Every retry used to return fast and
+        # still produced a tool call (which refreshed the idle clock), so the
+        # run burned its whole turn budget silently.  Same pipeline as
+        # TargetAbsent: a stop reason of its own, answers and diagnostics
+        # still land in result.json.
+        error = str(exc)
+        stop_reason = "enum_exhausted"
+        stop_turns, stop_diag = _take_stop_state(exc)
+        turns_used = max(turns_used, stop_turns)
+        diag.update(stop_diag)
         print(f"[ctfy] {exc}", flush=True)
     except OutputBudgetExceeded as exc:
         # 单次 LLM 调用输出失控。和墙钟一样是「止损」，不是崩溃：已经
@@ -1478,6 +1704,9 @@ def main() -> int:
         # 统计里区分「模型想太多」和「代码炸了」。
         error = str(exc)
         stop_reason = "output_budget"
+        stop_turns, stop_diag = _take_stop_state(exc)
+        turns_used = max(turns_used, stop_turns)
+        diag.update(stop_diag)
         info = usage_trip_info() or {}
         diag["output_budget"] = {
             "output_tokens": exc.output_tokens,
@@ -1531,6 +1760,18 @@ def main() -> int:
             # Same reason as llm_errors: a stop caused by one runaway call must
             # be queryable without parsing the writeup.
             payload["output_budget"] = output_budget
+        success_diag = diag.get("success") if isinstance(diag, dict) else None
+        if success_diag:
+            # 止损终止与正常收尾共用同一份：只看 stop_reason 分不出"平台确认
+            # 已解出"和"跑完没解出"，这条诊断必须能自证。
+            payload["success"] = success_diag
+        enum_diag = diag.get("enum_guard") if isinstance(diag, dict) else None
+        if enum_diag:
+            # The counters used to exist only on stdout: a platform-side triage
+            # could not see that a family was hard-blocked, how many calls it
+            # refused, or that the guard escalated to a stop.  The value is a
+            # dict of scalars and lists, so it serialises as-is.
+            payload["enum_guard"] = enum_diag
         parallel_diag = diag.get("parallel") if isinstance(diag, dict) else None
         if parallel_diag:
             # Keep the race accounting next to the top-level turns/token totals
@@ -1754,6 +1995,38 @@ def _autosubmit_target(task: dict[str, Any]) -> tuple[str, str, str] | None:
     return platform, instance, token
 
 
+def _qa_target(task: dict[str, Any]) -> tuple[str, str, str, str] | None:
+    """解析 QA 轨的 ``(platform, token, challenge_id, competition_id)``。
+
+    ``run_mode == "qa"`` 的题没有 ``target_instance``：平台按
+    ``(challenge_id, competition_id, question_id)`` 记账，提交走
+    ``POST /api/v1/qa/submissions``。四个字段缺一个都组装不出合法请求体，
+    所以这里要么全给、要么不武装 —— 半成品请求只会换回 422，看起来像平台故障。
+
+    Returns:
+        四元组；不是 qa 题或字段不全时返回 ``None``。
+    """
+    if str(task.get("run_mode") or "").strip().lower() != "qa":
+        return None
+    try:
+        from ctf_strix.engagement import challenge_id_of
+        from ctf_strix.engagement import competition_id_of
+        from ctf_strix.engagement import platform_of
+    except Exception:  # noqa: BLE001 -- a broken report module must not stop scoring
+        return None
+    platform = platform_of(task)
+    token = (
+        os.environ.get("CTFY_TOKEN")
+        or os.environ.get("CTF_PLATFORM_TOKEN")
+        or str(task.get("token") or "")
+    ).strip()
+    challenge = challenge_id_of(task)
+    competition = competition_id_of(task)
+    if not (platform and token and challenge and competition):
+        return None
+    return platform, token, challenge, competition
+
+
 def install_toolset(task: dict[str, Any], kind: str) -> tuple[str, list[str]]:
     """Register every capability this challenge kind is entitled to.
 
@@ -1835,7 +2108,7 @@ def install_toolset(task: dict[str, Any], kind: str) -> tuple[str, list[str]]:
 
         names = skillpack.register()
         if names:
-            hint = skillpack.prompt_hint(names)
+            hint = skillpack.prompt_hint(names, kind=kind)
             print(f"[ctfy] skills registered={len(names)} ref={skillpack.ref_root()}", flush=True)
         else:
             print("[ctfy] skills pack missing, routing hint not installed", flush=True)
@@ -2059,7 +2332,10 @@ def _run_agent(
     # 两个守卫都装在正赛入口上。评测脚本装过、入口没装，等于只测了个空壳。
     from ctf_strix.enum_guard import install as install_enum_guard
 
-    install_enum_guard()
+    # Keep the instance: the sink reads its escalation state (a family the
+    # model keeps retrying after the hard block) and the run summary needs
+    # ``blocked_calls``; a discarded return value made both invisible.
+    enum_guard = install_enum_guard()
 
     from ctf_strix.journey_guard import install as install_journey_guard
 
@@ -2075,6 +2351,13 @@ def _run_agent(
     from ctf_strix.sweep_guard import install as install_sweep_guard
 
     install_sweep_guard()
+
+    # Path-independent "the target is not there" guard.  ``enum_guard`` counts
+    # per path family, so CTFARENA-043's 95 curls at 95 distinct paths never
+    # moved any counter; this one counts one identical body across paths.
+    from ctf_strix.target_absent import install as install_target_absent
+
+    target_guard = install_target_absent()
     question_ids = [
         str(q.get("id") or "").strip()
         for q in (task.get("questions") or [])
@@ -2097,17 +2380,36 @@ def _run_agent(
     # answer (a 32-hex slug) swallows the only submission.  So the guard is
     # installed here and the autosubmit wrapper right after it.
     submitted_to = _autosubmit_target(task)
+    qa_target = (
+        _qa_target(task)
+        if submitted_to is None and kind != "engagement"
+        else None
+    )
     submitter: Any = None
-    if submitted_to is not None and kind != "engagement":
+    if kind != "engagement" and (submitted_to is not None or qa_target is not None):
         try:
             from ctf_strix.autosubmit import AutoSubmitter
 
-            submitter = AutoSubmitter(
-                *submitted_to,
-                success=success,
-                fallback_question_ids=question_ids,
-                fallback_question_modes=question_modes,
-            )
+            if qa_target is not None:
+                qa_platform, qa_token, qa_challenge, qa_competition = qa_target
+                submitter = AutoSubmitter(
+                    qa_platform,
+                    "",
+                    qa_token,
+                    success=success,
+                    fallback_question_ids=question_ids,
+                    fallback_question_modes=question_modes,
+                    run_mode="qa",
+                    challenge_id=qa_challenge,
+                    competition_id=qa_competition,
+                )
+            else:
+                submitter = AutoSubmitter(
+                    *submitted_to,
+                    success=success,
+                    fallback_question_ids=question_ids,
+                    fallback_question_modes=question_modes,
+                )
         except Exception as exc:  # noqa: BLE001 -- probing is an optimisation
             print(f"[ctfy] autosubmit unavailable: {type(exc).__name__}: {exc}", flush=True)
             diag["autosubmit"] = "failed"
@@ -2118,7 +2420,8 @@ def _run_agent(
     # post to an empty URL and look like a platform outage.  ``mode`` is not
     # consulted -- measured tasks leave it empty and still grade /check.
     checker_probe = None
-    if submitter is not None:
+    if submitter is not None and submitted_to is not None:
+        # QA 没有实例，``/instances//check`` 只会 404；只有实例通道能探。
         from ctf_strix.autosubmit import CheckerProbe
 
         checker_probe = CheckerProbe(
@@ -2142,8 +2445,12 @@ def _run_agent(
         diag["checker_probe"] = "armed" if checker_probe is not None else "off"
 
     if kind not in {"engagement", "checker"}:
-        if submitted_to is None:
+        if submitted_to is None and qa_target is None:
             print("[ctfy] autosubmit off (no platform/instance/token)", flush=True)
+            diag["autosubmit"] = "off"
+        elif qa_target is not None and not question_ids:
+            # 没有 qid 就不知道要交哪一项；装上也只是在收工时静默丢弃答案。
+            print("[ctfy] autosubmit off (qa task has no questions[].id)", flush=True)
             diag["autosubmit"] = "off"
         elif submitter is None:
             diag.setdefault("autosubmit", "failed")
@@ -2151,14 +2458,29 @@ def _run_agent(
             try:
                 from ctf_strix.autosubmit import install as install_autosubmit
 
-                install_autosubmit(
-                    *submitted_to,
-                    success=success,
-                    fallback_question_ids=question_ids,
-                    fallback_question_modes=question_modes,
-                    submitter=submitter,
-                )
-                print(f"[ctfy] autosubmit on (instance {submitted_to[1][:8]}...)", flush=True)
+                if qa_target is not None:
+                    install_autosubmit(
+                        qa_target[0],
+                        "",
+                        qa_target[1],
+                        success=success,
+                        fallback_question_ids=question_ids,
+                        fallback_question_modes=question_modes,
+                        submitter=submitter,
+                        run_mode="qa",
+                        challenge_id=qa_target[2],
+                        competition_id=qa_target[3],
+                    )
+                    print(f"[ctfy] autosubmit on (qa {qa_target[2]})", flush=True)
+                else:
+                    install_autosubmit(
+                        *submitted_to,
+                        success=success,
+                        fallback_question_ids=question_ids,
+                        fallback_question_modes=question_modes,
+                        submitter=submitter,
+                    )
+                    print(f"[ctfy] autosubmit on (instance {submitted_to[1][:8]}...)", flush=True)
                 diag["autosubmit"] = "on"
             except Exception as exc:  # noqa: BLE001 -- submission failure must not stop the run
                 print(
@@ -2228,7 +2550,12 @@ def _run_agent(
     from ctf_strix.guard_mount import verify_mount
 
     wired = verify_mount(
-        ("_ctf_guarded", "_ctf_journey_guarded", "_ctf_sweep_guarded")
+        (
+            "_ctf_guarded",
+            "_ctf_journey_guarded",
+            "_ctf_sweep_guarded",
+            "_ctf_target_guarded",
+        )
     )
     print(f"[ctfy] guard mount verified={wired}", flush=True)
     if not wired:
@@ -2356,6 +2683,7 @@ def _run_agent(
         print(f"[ctfy] report save ok={ok}: {note}", flush=True)
 
     started_at = time.time()
+    idle = IdleWatchdog(_idle_limit_seconds())
 
     def sink(agent_id: str, event: object) -> None:
         nonlocal tool_outputs, root_tool_calls, root_agent
@@ -2364,6 +2692,23 @@ def _run_agent(
         # exist the daemon can only raise this flag, and this is where the
         # run notices it.
         _check_soft_timeout()
+        # The item has to be read before any early return: a slow tool's
+        # output event must refresh the clock before this function decides
+        # anything about idleness, otherwise a 150s ``nmap`` is killed and
+        # its output (possibly the flag) is thrown away.
+        item = getattr(event, "item", None)
+        item_type = getattr(item, "type", None)
+        round_boundary = _is_round_boundary(event)
+        now = time.time()
+        if item_type in _MODEL_ITEM_TYPES or round_boundary:
+            # First real model/tool event of this attempt arms the clock.
+            # Sandbox boot and provider setup emit neither, so a slow cold
+            # start can no longer be reported as ``agent_idle`` at turns=0.
+            idle.arm(now)
+        if item_type in _TOOL_ACTIVITY_TYPES:
+            # A tool call *and* its output are progress.  Refresh first, then
+            # judge: the output is never dropped because the tool was slow.
+            idle.note_activity(now)
         if root_agent is None:
             # Prefer the coordinator graph: on a resumed run the runner
             # respawns children before the root emits its first event, so
@@ -2378,8 +2723,66 @@ def _run_agent(
         # but would let a child raise SolvedStop in its detached task.
         if success.solved and (not parallel_on or agent_id == root_agent):
             raise SolvedStop(f"solved via {success.source}: {success.detail}")
-        item = getattr(event, "item", None)
-        item_type = getattr(item, "type", None)
+        # An answer recorded anywhere in this run disarms the target-absent
+        # guard: there is something to submit, so stopping early would trade a
+        # score for wall clock.
+        if answers or success.solved:
+            target_guard.note_answer()
+            # An answer disarms the enumeration guard too: whatever was
+            # blocked while the value was unknown must open again, and the
+            # retry counter that would escalate to EnumExhausted resets.
+            enum_guard.note_answer()
+        if round_boundary and target_guard.tripped and not success.solved:
+            # The crossing tool call already returned the hard error.  Raise
+            # from the sink, at a round boundary; ``main`` maps TargetAbsent
+            # to its own stop reason (mirrors IdleTimeout).
+            #
+            # This is *not* the boundary of the round that tripped: the
+            # vendor queue order is ``tool_call_item -> response.completed(N)
+            # -> [tools run] -> output batch`` (every event is queued as soon
+            # as it is produced), so boundary N arrives *before* round N's
+            # outputs.  Safety comes from the FIFO queue plus boundary N+1
+            # landing after all of round N's outputs; the boundary event
+            # itself carries no item.  The stop therefore fires on the *next*
+            # round's boundary, after a sibling call's output (possibly the
+            # flag) has reached this sink.
+            #
+            # Cost: one extra generation.  Round N+1's ``tool_call_item`` has
+            # already been emitted and this raise cancels it before it runs.
+            # If that extra generation breaches the output budget,
+            # ``stop_reason`` lands on ``output_budget`` instead (rare).
+            raise TargetAbsent(
+                target_guard.stop_detail(),
+                origin=target_guard.tripped_origin or "",
+                paths=target_guard.threshold,
+            )
+        if round_boundary and enum_guard.exhausted and not success.solved:
+            # Refused calls return instantly and still produce a tool call,
+            # so retrying a blocked family is free for the model and burns
+            # the turn budget with no new observation.  End the run instead.
+            #
+            # Same boundary gate as the target-absent raise above, on the
+            # same physical basis: boundary N arrives *before* round N's
+            # outputs, and the refusal is counted inside the wrapper *during*
+            # that round.  The FIFO queue delivers every output of round N
+            # before boundary N+1, so the stop lands there without dropping a
+            # sibling call's output (the B1 invariant).  Cost: one extra
+            # generation whose already-planned tool call this raise cancels.
+            raise EnumExhausted(
+                enum_guard.exhausted_detail(),
+                family=enum_guard.exhausted_family or "",
+                refusals=enum_guard.refusal_count(enum_guard.exhausted_family or ""),
+            )
+        if round_boundary and not success.solved and idle.expired(now):
+            # CTFARENA-010: after deciding the target was dead the model
+            # wrote "I'll wait for the hard stop" and idled ~20 minutes.
+            # Checked only when a round ends (streaming deltas are not a
+            # decision point) and only against tool activity, so a long
+            # single generation is never killed mid-stream while a pure
+            # prose loop still trips at the boundary.
+            raise IdleTimeout(
+                f"no tool call for {idle.limit:g}s (idle reasoning loop)"
+            )
 
         if item_type == "tool_call_item":
             # Child agents may hand the root a finished answer through
@@ -2584,6 +2987,11 @@ def _run_agent(
 
     result: Any = None
     turns_total = 0
+    # Attempt in flight, if any: the call count when it started.  A stop raised
+    # mid-attempt bypasses the per-attempt accounting below, so the snapshot
+    # settles that attempt's calls itself.  Without this, a second attempt's
+    # work vanished whenever an earlier attempt had already counted turns.
+    in_flight_calls_before: int | None = None
     usage_before = _usage_snapshot()
     # 有多少个 attempt 真的跑起来了（run_strix_scan 正常返回）。
     # 全部失败时上层必须把 stop_reason 从 "completed" 改成 "error"。
@@ -2599,6 +3007,7 @@ def _run_agent(
 
     async def _go() -> None:
         nonlocal result, turns_total, root_agent, runs_ok, turns_exhausted
+        nonlocal in_flight_calls_before
         for index, budget in enumerate(budgets):
             if not engagement and qid in answers:
                 break
@@ -2617,6 +3026,7 @@ def _run_agent(
             call_start = len(attempt_pairs)
             output_start = len(attempt_outputs)
             calls_before = root_tool_calls
+            in_flight_calls_before = calls_before
             config = dict(scan_config)
             if index > 0:
                 from ctf_strix.attempt_digest import build_digest
@@ -2663,6 +3073,18 @@ def _run_agent(
                 # Bind even when creation failed: ``None`` clears the previous
                 # attempt's closed graph instead of leaving a stale root id.
                 parallel.bind_attempt(attempt_coordinator)
+            # A fresh attempt starts *unarmed*: its clock begins with its own
+            # first model/tool event.  Seeding it with ``now`` counted sandbox
+            # boot and the first LLM response against the limit, which is how
+            # a healthy cold start got reported as ``agent_idle`` at turns=0.
+            idle.reset()
+            # The escalation state must not leak across attempts either.  A new
+            # attempt *is* the instruction to change mechanism, so a refusal
+            # count inherited from the previous attempt would end the retry on
+            # its first (still exploratory) call.  The hard blocks stay: the
+            # family produced no new information, so re-probing it is still
+            # wasted work.
+            enum_guard.soft_reset()
             try:
                 result = await run_strix_scan(
                     scan_config=config,
@@ -2680,6 +3102,7 @@ def _run_agent(
             except Exception as exc:  # noqa: BLE001 — turn 用尽属于正常终止
                 print(f"[ctfy] scan ended: {type(exc).__name__}: {exc}", flush=True)
                 turns_total += max(root_tool_calls - calls_before, 0)
+                in_flight_calls_before = None
                 if _is_turn_exhausted(exc):
                     # Counted apart from a crash: the attempt did run, it just
                     # never produced a lifecycle call.  ``main`` reports it as
@@ -2702,20 +3125,155 @@ def _run_agent(
                 break
             used = _requests_of(result)
             turns_total += used if used > 0 else max(root_tool_calls - calls_before, 0)
+            in_flight_calls_before = None
+
+    def _snapshot_stats() -> tuple[int, dict[str, Any]]:
+        """当前轮次与诊断的快照。
+
+        正常收尾和五类止损终止（SolvedStop / RecoveryExhausted / IdleTimeout / 墙钟 /
+        输出预算）共用这一份口径：两条路径写出的 result.json 必须能横向
+        比较，否则每次异常终止都看起来像"一次都没跑"。
+        """
+        if llm_errors:
+            diag["llm_errors"] = llm_errors
+        snapshot_turns = turns_total
+        if in_flight_calls_before is not None:
+            snapshot_turns += max(root_tool_calls - in_flight_calls_before, 0)
+        if snapshot_turns <= 0:
+            snapshot_turns = root_tool_calls
+        out_now: dict[str, Any] = {}
+        if publisher is not None:
+            out_now["report"] = publisher.snapshot()
+        if ledger.observed or ledger.echoed or ledger.unsupported:
+            out_now["evidence"] = ledger.summary()
+        # A checker-only solve has no flag to add, but the verdict still belongs
+        # in the diagnostics.
+        out_now["success"] = success.snapshot()
+        if enum_guard is not None:
+            # The block counters used to be written but never read; the run
+            # summary is the only place an operator can see that a family was
+            # hard-blocked (and how many paid retries it swallowed).
+            out_now["enum_guard"] = enum_guard.stats()
+            print(
+                "[ctfy] enum guard: "
+                f"blocked_calls={enum_guard.blocked_calls} "
+                f"blocked={len(enum_guard.blocked)} "
+                f"exhausted={enum_guard.exhausted}",
+                flush=True,
+            )
+        if finish_guard is not None and finish_guard.probe_note:
+            out_now["checker_probe_note"] = finish_guard.probe_note
+        out_now.update(diag)
+        if parallel_on:
+            # Tokens are process-wide already; turns are root-only in the vendor
+            # result, so publish both halves explicitly instead of silently
+            # under-counting a parallel run.
+            usage = parallel.usage_summary(
+                root_turns=snapshot_turns,
+                before=usage_before,
+                after=_usage_snapshot(),
+            )
+            out_now["parallel"] = {**parallel.stats(), "usage": usage}
+            snapshot_turns = usage["turns"]
+        return snapshot_turns, out_now
 
     try:
         asyncio.run(_go())
-    except SolvedStop:
+        # A tripped child agent ends only its own task.  The root can return
+        # normally after ``request_stop``.  Re-raise here so the run still lands in
+        # ``main``'s output_budget branch instead of looking like a clean finish.
+        raise_if_tripped()
+
+        # ``finish_scan`` is usually the last call, so no further tool output will
+        # arrive to promote a claim recorded in its arguments.  Settle here as well,
+        # otherwise a correct answer reported at the end would be dropped.
+        #
+        # "Still missing" means every visible id without evidence, not just the
+        # primary one: mirroring fills the keys, so absence alone would say
+        # "done" while the second question only holds a guess.
+        if not engagement and _needs_value(answers, all_qids, mirrors):
+            for claim in arg_claims:
+                if ledger.supports(claim) and _record_answer(
+                    answers, all_qids, claim, qid, derived=mirrors
+                ):
+                    print(
+                        f"[ctfy] flag captured from tool args: {claim}",
+                        flush=True,
+                    )
+                    success.observe_answer(claim, source="flag_extract")
+                    break
+
+        # 兜底：sink 里若因竞态没抓住，这里逐条重扫一遍。
+        # ⚠️ 不要对 "\n".join(captured) 整体判定——拼接后本题靶机的出现位置被
+        # 稀释到几千字符之外，证据判定会退化成"取最后一个"，正是踩过的坑。
+        if not engagement and _needs_value(answers, all_qids, mirrors):
+            for text in captured:
+                flag = _extract_flag(text, own_host)
+                # The sink already recorded every output in the ledger.  Re-check
+                # support here as well, otherwise a self-echoed guess that the
+                # sink correctly refused would be re-submitted by this rescan.
+                if flag and ledger.supports(flag) and _record_answer(
+                    answers, all_qids, flag, qid, derived=mirrors
+                ):
+                    print(f"[ctfy] flag captured on rescan: {flag}", flush=True)
+                    success.observe_answer(flag, source="flag_extract")
+                    break
+
+        # A flag the model wrote but never read is a guess.  Keep it visible in the
+        # diagnostics instead of submitting it.  Run this *after* the rescan: a
+        # rescan hit is itself proof the string was printed by a tool.
+        for claim in arg_claims:
+            if not ledger.supports(claim) and answers.get(qid) != claim:
+                ledger.reject(claim)
+                if ledger.echoed_only(claim):
+                    print(
+                        f"[ctfy] flag rejected (self-echo in tool output): {claim}",
+                        flush=True,
+                    )
+                else:
+                    print(f"[ctfy] flag rejected (no tool output): {claim}", flush=True)
+
+        # 最终保存必须在这里再走一次：agent 可能根本没调 finish_scan（被轮次上限
+        # 或墙钟打断），那样上面的钩子从未触发，整轮发现会全部丢失。
+        if engagement and publisher is not None:
+            for thread in save_threads:
+                thread.join(timeout=25)
+            _publish(force=True, background=False)
+
+        turns, out = _snapshot_stats()
+        if attempts > 0 and runs_ok == 0 and not answers and turns_exhausted:
+            # Ran to the turn cap without ever finishing.  This is the same verdict
+            # as an exhausted recovery guard, so upper layers can use one spelling.
+            out["turns_exhausted"] = turns_exhausted
+        if attempts > 0 and runs_ok == 0 and not answers and not turns_exhausted:
+            # 一次都没跑起来，而且也没拿到答案。上层据此把 stop_reason 写成
+            # "error"，否则"运行时压根没启动"会以 turns=0 + stop_reason=completed
+            # 混进失败率里。
+            #
+            # `and not answers` 是防御：将来若有人在进循环前就填好了 answers，
+            # 那不是"没跑起来"，不该被标成 error。
+            out["no_attempt_ran"] = True
+        return turns, out
+    except BaseException as exc:
         # A solve recorded by finish_guard/autosubmit can arrive before the
         # answer was copied into ``answers`` (the guard sees it in the tool
         # arguments).  Settle it here while the ledger is still in scope, so
         # the result file never says "solved" with an empty answer map.
-        if not engagement and success.answer and _record_answer(
-            answers, all_qids, success.answer, qid, derived=mirrors
-        ):
-            print(f"[ctfy] flag captured at stop: {success.answer}", flush=True)
-        raise
-    except RecoveryExhausted:
+        if isinstance(exc, SolvedStop) and not engagement and success.answer:
+            if _record_answer(answers, all_qids, success.answer, qid, derived=mirrors):
+                print(f"[ctfy] flag captured at stop: {success.answer}", flush=True)
+        # 这五类异常直接穿过 ``main`` 的赋值语句，``turns_used, diag`` 永远
+        # 停留在初值。统计在抛出点挂上去，收尾才能写出真实轮次与诊断。
+        # 快照本身失败绝不能盖掉止损原文：那会把"已解出"降级成"崩溃"。
+        if isinstance(exc, _STOP_TYPES):
+            try:
+                _attach_stop_state(exc, *_snapshot_stats())
+            except Exception as snap_exc:  # noqa: BLE001
+                print(
+                    "[ctfy] stop-state snapshot failed: "
+                    f"{type(snap_exc).__name__}: {snap_exc}",
+                    flush=True,
+                )
         raise
     finally:
         # The runner may leave the guard installed for the next attempt in this
@@ -2724,110 +3282,6 @@ def _run_agent(
         from ctf_strix.success_stop import uninstall_recovery_guard
 
         uninstall_recovery_guard()
-
-    # A tripped child agent ends only its own task.  The root can return
-    # normally after ``request_stop``.  Re-raise here so the run still lands in
-    # ``main``'s output_budget branch instead of looking like a clean finish.
-    raise_if_tripped()
-
-    if llm_errors:
-        diag["llm_errors"] = llm_errors
-
-    # ``finish_scan`` is usually the last call, so no further tool output will
-    # arrive to promote a claim recorded in its arguments.  Settle here as well,
-    # otherwise a correct answer reported at the end would be dropped.
-    #
-    # "Still missing" means every visible id without evidence, not just the
-    # primary one: mirroring fills the keys, so absence alone would say
-    # "done" while the second question only holds a guess.
-    if not engagement and _needs_value(answers, all_qids, mirrors):
-        for claim in arg_claims:
-            if ledger.supports(claim) and _record_answer(
-                answers, all_qids, claim, qid, derived=mirrors
-            ):
-                print(
-                    f"[ctfy] flag captured from tool args: {claim}",
-                    flush=True,
-                )
-                success.observe_answer(claim, source="flag_extract")
-                break
-
-    # 兜底：sink 里若因竞态没抓住，这里逐条重扫一遍。
-    # ⚠️ 不要对 "\n".join(captured) 整体判定——拼接后本题靶机的出现位置被
-    # 稀释到几千字符之外，证据判定会退化成"取最后一个"，正是踩过的坑。
-    if not engagement and _needs_value(answers, all_qids, mirrors):
-        for text in captured:
-            flag = _extract_flag(text, own_host)
-            # The sink already recorded every output in the ledger.  Re-check
-            # support here as well, otherwise a self-echoed guess that the
-            # sink correctly refused would be re-submitted by this rescan.
-            if flag and ledger.supports(flag) and _record_answer(
-                answers, all_qids, flag, qid, derived=mirrors
-            ):
-                print(f"[ctfy] flag captured on rescan: {flag}", flush=True)
-                success.observe_answer(flag, source="flag_extract")
-                break
-
-    # A flag the model wrote but never read is a guess.  Keep it visible in the
-    # diagnostics instead of submitting it.  Run this *after* the rescan: a
-    # rescan hit is itself proof the string was printed by a tool.
-    for claim in arg_claims:
-        if not ledger.supports(claim) and answers.get(qid) != claim:
-            ledger.reject(claim)
-            if ledger.echoed_only(claim):
-                print(
-                    f"[ctfy] flag rejected (self-echo in tool output): {claim}",
-                    flush=True,
-                )
-            else:
-                print(f"[ctfy] flag rejected (no tool output): {claim}", flush=True)
-
-    # 最终保存必须在这里再走一次：agent 可能根本没调 finish_scan（被轮次上限
-    # 或墙钟打断），那样上面的钩子从未触发，整轮发现会全部丢失。
-    if engagement and publisher is not None:
-        for thread in save_threads:
-            thread.join(timeout=25)
-        _publish(force=True, background=False)
-
-
-    turns = turns_total
-    if turns <= 0:
-        turns = root_tool_calls
-    out: dict[str, Any] = {}
-    if publisher is not None:
-        out["report"] = publisher.snapshot()
-    if ledger.observed or ledger.echoed or ledger.unsupported:
-        out["evidence"] = ledger.summary()
-    # A checker-only solve has no flag to add, but the verdict still belongs
-    # in the diagnostics.
-    out["success"] = success.snapshot()
-    if finish_guard is not None and finish_guard.probe_note:
-        out["checker_probe_note"] = finish_guard.probe_note
-    out.update(diag)
-    if parallel_on:
-        # Tokens are process-wide already; turns are root-only in the vendor
-        # result, so publish both halves explicitly instead of silently
-        # under-counting a parallel run.
-        usage = parallel.usage_summary(
-            root_turns=turns,
-            before=usage_before,
-            after=_usage_snapshot(),
-        )
-        out["parallel"] = {**parallel.stats(), "usage": usage}
-        turns = usage["turns"]
-    if attempts > 0 and runs_ok == 0 and not answers and turns_exhausted:
-        # Ran to the turn cap without ever finishing.  This is the same verdict
-        # as an exhausted recovery guard, so upper layers can use one spelling.
-        out["turns_exhausted"] = turns_exhausted
-    if attempts > 0 and runs_ok == 0 and not answers and not turns_exhausted:
-        # 一次都没跑起来，而且也没拿到答案。上层据此把 stop_reason 写成
-        # "error"，否则"运行时压根没启动"会以 turns=0 + stop_reason=completed
-        # 混进失败率里。
-        #
-        # `and not answers` 是防御：将来若有人在进循环前就填好了 answers，
-        # 那不是"没跑起来"，不该被标成 error。
-        out["no_attempt_ran"] = True
-    return turns, out
 
 
 def _requests_of(result: Any) -> int:
