@@ -49,8 +49,27 @@ BANNED = (
     "pip install",
 )
 
-# Naming a missing tool is fine; printing an invocation of it is not.
-BANNED_COMMANDS = ("ffuf -", "sqlmap -", "nuclei -", "flask-unsign --", "hashcat -")
+#: Command-shaped invocations an index may print, and the tool each one runs.
+#: An index may only invoke tools the image installs (see ``docker/Dockerfile``
+#: and ``docker/check_toolchain.sh``); naming a missing tool in prose stays fine.
+COMMAND_FORMS = {
+    "ffuf -": "ffuf",
+    "sqlmap -": "sqlmap",
+    "nmap -": "nmap",
+    "smbclient -": "smbclient",
+    "nuclei -": "nuclei",
+    "flask-unsign --": "flask-unsign",
+    "hashcat -": "hashcat",
+}
+
+#: Tools the offline image installs; pinned to the build-time probe by
+#: ``test_image_tools_match_build_probe``.
+IMAGE_TOOLS = frozenset({"nmap", "sqlmap", "ffuf", "smbclient"})
+
+#: An invocation of anything outside ``IMAGE_TOOLS`` is still a wasted turn.
+BANNED_COMMANDS = tuple(
+    form for form, tool in COMMAND_FORMS.items() if tool not in IMAGE_TOOLS
+)
 
 
 def _read(name: str) -> str:
@@ -79,6 +98,26 @@ def test_no_install_or_outbound_recipe(name: str) -> None:
     hits = [token for token in BANNED if token in low]
     hits += [token for token in BANNED_COMMANDS if token in low]
     assert not hits, f"{name} still tells the agent to run: {hits}"
+
+
+def test_command_forms_are_installed_in_image() -> None:
+    """Positive direction: every invocation an index prints names a real tool."""
+    for name in INDEXES:
+        low = _read_index(name).lower()
+        invoked = {tool for form, tool in COMMAND_FORMS.items() if form in low}
+        unknown = invoked - IMAGE_TOOLS
+        assert not unknown, (
+            f"{name} invokes tools the image does not install: {sorted(unknown)}"
+        )
+
+
+def test_image_tools_match_build_probe() -> None:
+    """``IMAGE_TOOLS`` must equal the binaries ``check_toolchain.sh`` probes."""
+    script = (ROOT / "docker" / "check_toolchain.sh").read_text(encoding="utf-8")
+    probed = set(re.findall(r'"([a-z0-9-]+)": \(', script))
+    assert IMAGE_TOOLS == probed, (
+        f"IMAGE_TOOLS={sorted(IMAGE_TOOLS)} but build probes {sorted(probed)}"
+    )
 
 
 def test_sqli_ladder_is_six_ordered_steps() -> None:

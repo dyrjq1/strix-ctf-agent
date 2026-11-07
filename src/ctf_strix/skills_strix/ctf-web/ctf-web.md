@@ -16,8 +16,9 @@ Use this skill as a routing and execution guide for web-heavy challenges. Keep t
 ## Prerequisites
 
 **Offline image: no installs and no internet.** `python3` already ships `requests`,
-`httpx`, `PIL` and `Crypto`, and `curl` works; `sqlmap`, `ffuf`, `nuclei` and
-`flask-unsign` are **not available** -- write the request in Python or with `curl`.
+`httpx`, `PIL` and `Crypto`, and `curl` works; `sqlmap` and `ffuf` are installed;
+`nuclei` and `flask-unsign` are **not available** -- write the request in Python or
+with `curl`.
 
 ## Additional Resources
 
@@ -85,7 +86,7 @@ curl -si https://target.com/
 curl -s https://target.com/robots.txt
 curl -sI https://target.com/
 
-# SQLi quick test (no sqlmap: send the payload yourself)
+# SQLi quick test (sqlmap is installed; or send the payload yourself)
 curl -s "https://target.com/page?id=1%27"
 
 # JWT decode (no verification)

@@ -82,7 +82,8 @@ that scores is the answer string, graded exactly. There is no report to write.
 
 ## Environment (verified facts, not guesses)
 
-- No nmap/sqlmap/ffuf/nuclei/Caido/Docker; HTTP via `requests` or `curl`.
+- No nuclei/Caido/Docker; nmap/sqlmap/ffuf are installed. HTTP via `requests`
+  or `curl`.
 - `python3` has: `requests` `Crypto` `Cryptodome` `z3` `PIL` `pwn` `numpy`
   `sympy` `gmpy2` `scipy` `matplotlib` `pefile` `yara` `segno` `dnslib`
   `capstone` `unicorn` `paramiko` `rpyc` `plumbum`.

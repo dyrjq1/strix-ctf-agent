@@ -20,9 +20,10 @@ available** (and there is no internet) -- work on local artifacts with
 `requests` or plain Python instead.
 
 **Offline image: no installs and no internet.** `python3` ships `requests` and
-the usual stdlib, and `curl` works; `whois`, `dig`, `nmap` and `exiftool` are not
-guaranteed present, and no public lookup service (Shodan, Wayback, social APIs)
-can be reached. Work from the artifacts the challenge hands you.
+the usual stdlib, and `curl` works; `nmap` is installed, while `whois`, `dig` and
+`exiftool` are not guaranteed present, and no public lookup service (Shodan,
+Wayback, social APIs) can be reached. Work from the artifacts the challenge
+hands you.
 
 **MCP servers (optional):** Playwright MCP ([microsoft/playwright-mcp](https://github.com/microsoft/playwright-mcp)) for browser-driven OSINT (JS-rendered pages, reverse-image/map flows) — see [tools-mcp.md](tools-mcp.md).
 

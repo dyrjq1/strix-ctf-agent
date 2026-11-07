@@ -30,9 +30,22 @@ RUN set -eux; \
         file xxd binutils unzip zip \
         gdb strace ltrace \
         netcat-openbsd iproute2 dnsutils \
+        nmap sqlmap smbclient \
         vim-tiny less procps \
         libssl-dev libffi-dev \
     && rm -rf /var/lib/apt/lists/*
+
+# ffuf：Debian bookworm 的 apt 只有 1.1.0；按派单取上游静态二进制并锁版本。
+# 构建期下载 + sha256 校验，运行期离线，不引入外网依赖。
+ARG FFUF_VERSION=2.3.0
+ARG FFUF_SHA256=b2a3c725fcb9da175159682f54d6e9149f2905b00d84d155e7efc5d599975ceb
+RUN set -eux; \
+    wget -q -O /tmp/ffuf.tar.gz \
+        "https://github.com/ffuf/ffuf/releases/download/v${FFUF_VERSION}/ffuf_${FFUF_VERSION}_linux_amd64.tar.gz"; \
+    echo "${FFUF_SHA256}  /tmp/ffuf.tar.gz" | sha256sum -c -; \
+    tar -xzf /tmp/ffuf.tar.gz -C /usr/local/bin ffuf; \
+    chmod +x /usr/local/bin/ffuf; \
+    rm -f /tmp/ffuf.tar.gz
 
 WORKDIR /app
 

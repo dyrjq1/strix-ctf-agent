@@ -217,4 +217,29 @@ print("[toolchain] imports: numpy=%s sympy=%s gmpy2=%s scipy=%s matplotlib=%s "
       ))
 PY
 
+echo "[toolchain] checking offline attack tools"
+python3 - <<'PY'
+import shutil
+import subprocess
+import sys
+
+# sqlmap exits non-zero on --version, so judge by *output*, not return code.
+# A missing binary or empty output still fails the build.
+PROBES = {
+    "nmap": ("--version",),
+    "sqlmap": ("--version",),
+    "ffuf": ("-V",),
+    "smbclient": ("--version",),
+}
+for name, args in PROBES.items():
+    exe = shutil.which(name)
+    if not exe:
+        sys.exit(f"missing binary: {name}")
+    proc = subprocess.run([exe, *args], capture_output=True, text=True)
+    out = ((proc.stdout or "") + (proc.stderr or "")).strip()
+    if not out:
+        sys.exit(f"{name} produced no version output")
+    print(f"[toolchain] {name}: {out.splitlines()[0][:90]}")
+PY
+
 echo "[toolchain] OK"
