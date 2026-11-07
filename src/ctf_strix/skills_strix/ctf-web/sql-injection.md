@@ -2,6 +2,15 @@
 
 Comprehensive SQL injection techniques for CTF challenges. For other server-side attacks (SSTI, SSRF, XXE, command injection, GraphQL), see [server-side.md](server-side.md).
 
+## 阶梯（按序试）
+
+1. 闭合判型：数字 / 单引号 / 双引号 / 括号 —— 先让语法错误消失。
+2. `order by N` 猜列数，直到报错为止。
+3. `union select` 找回显位：先全填 NULL，再逐列换成数据。
+4. 取库 → 取表 → 取列 → 取行（`information_schema` 或等价物）。
+5. 无回显：布尔三态计数，或时间盲注（`sleep` / 重查询）。
+6. WAF 在挡：注释符拆分、大小写混写、二次 URL 编码。
+
 ## Table of Contents
 - [Backslash Escape Quote Bypass](#backslash-escape-quote-bypass)
 - [Hex Encoding for Quote Bypass](#hex-encoding-for-quote-bypass)
