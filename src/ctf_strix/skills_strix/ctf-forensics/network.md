@@ -520,10 +520,12 @@ wireshark capture-dec.pcapng
 Corrupted packet capture files can be repaired to make them openable in Wireshark.
 
 ```bash
-# Install pcapfix
-# apt install pcapfix  (or brew install pcapfix)
+# pcapfix is NOT in the offline image (no apt there). Hand-patch the
+# common cases with python3 struct: bad magic/version/snaplen in the
+# global header, truncated final packet. Heavily mangled pcapng
+# rebuilds need the real tool -- run those on an online host.
 
-# Repair corrupted pcap/pcapng file
+# Repair corrupted pcap/pcapng file (online host)
 pcapfix -d corrupted.pcap        # basic repair with verbose output
 pcapfix -d corrupted.pcapng      # also handles pcapng format
 

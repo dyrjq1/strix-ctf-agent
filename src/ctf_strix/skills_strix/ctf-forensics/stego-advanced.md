@@ -61,12 +61,26 @@ for r in radii:
 **Pattern (Melodie):** WAV contains SSTV signal (Scottie 1) that decodes to "SEEMS LIKE A DEADEND". Real flag in 2-bit LSB of audio samples.
 
 ```bash
-# Decode SSTV (red herring)
-qsstv  # Will show decoy message
+# Decode SSTV (red herring): qsstv NOT in the offline image -- see the
+# SSTV note in ../ctf-misc/audio.md (hand-rolled numpy FM demod or an
+# online host) just far enough to confirm it is a decoy
 
-# Extract real flag from LSB
-pip install stego-lsb
-stegolsb wavsteg -r -i audio.wav -o out.bin -n 2 -b 1000
+# Extract real flag from LSB: stego-lsb NOT in the image either; stdlib:
+python3 - <<'PY'
+import wave, numpy as np
+w = wave.open('audio.wav')
+d = np.frombuffer(w.readframes(w.getnframes()), '<i2')
+if w.getnchannels() == 2: d = d[0::2]          # stereo: assume left channel; try d[1::2] too
+# 2 LSB/sample. Two orders occur in the wild: per-sample interleaved
+# (bit1 then bit0 within each sample) and bit-plane (all bit1, then
+# all bit0). Extract both instead of guessing.
+inter = np.stack([(d >> 1 & 1), (d & 1)], axis=1).ravel().astype(np.uint8)
+plane = np.concatenate([(d >> k & 1) for k in (1, 0)]).astype(np.uint8)
+for tag, bits in (('inter', inter), ('plane', plane)):
+    for order in ('big', 'little'):
+        open('out_%s_%s.bin' % (tag, order), 'wb').write(np.packbits(bits, bitorder=order).tobytes())
+PY
+strings out_*.bin | grep -iE 'flag|ctf'
 ```
 
 **Lesson:** Obvious signals may be decoys. Always check LSB even when another encoding is found.

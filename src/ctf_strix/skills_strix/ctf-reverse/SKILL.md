@@ -23,13 +23,16 @@ code object with `marshal` and disassemble it with the stdlib `dis` module
 instead of pycdc.
 
 **CLI tools on PATH:** `gdb`, binutils (`objdump`, `readelf`, `nm`,
-`strings`), `strace`, `ltrace`, `file`, and `xxd` are installed.
+`strings`), `strace`, `ltrace`, `file`, `xxd`, `upx`, and `radare2` (`r2`)
+with `rabin2` are installed; the `r2pipe` Python module bridges `r2` to
+Python scripts.
 
-**Not in the image:** `radare2`, `ghidra`, `IDA`, `apktool`, `upx`, and
-`pwndbg` are not available (no internet). Triage with `file`/`readelf`,
-disassemble with `objdump -d -M intel` or capstone; for packed binaries,
-detect the packer with `file`/`strings` and trace to the OEP with
-`gdb`/`strace` rather than `upx -d`.
+**Not in the image:** `ghidra`, `IDA`, `apktool`, and `pwndbg` are not
+available (no internet). Triage with `file`/`readelf`/`rabin2 -I`;
+disassemble with `objdump -d -M intel`, capstone, or `r2` in batch mode
+(`r2 -q -A -c 'pdf @ main' ./crackme` -- see
+[radare2-r2pipe.md](radare2-r2pipe.md)); for packed binaries, try `upx -d`
+first, and if the unpacker refuses, trace to the OEP with `gdb`/`strace`.
 
 ## Additional Resources
 

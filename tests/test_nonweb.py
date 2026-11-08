@@ -15,12 +15,16 @@ part that actually breaks.
 from __future__ import annotations
 
 import io
+import shutil
 import socket
+import subprocess
 import sys
 import tarfile
 import threading
 import zipfile
 from pathlib import Path
+
+import pytest
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "src"))
@@ -519,19 +523,25 @@ def test_network_tools_are_not_probe_tools() -> None:
         assert not probe_surface.is_probe_tool(name)
 
 def test_unpack_names_7z_instead_of_calling_it_unknown(tmp_path: Path) -> None:
-    """A 7z that cannot be read must not look like a corrupt file.
+    """A 7z that cannot be extracted must not look like a corrupt file.
 
     "detected unknown, nothing extracted" invites a retry of the same tool.
-    The magic bytes are conclusive, so say what it is and that this image has
-    no reader -- that is the observation that changes the next action.
+    The magic bytes are conclusive, so say what it is and where the reader
+    situation stands -- that is the observation that changes the next action.
     """
     archive = tmp_path / "a.7z"
     archive.write_bytes(b"7z\xbc\xaf\x27\x1c" + b"\x00" * 300)
     out = nonweb.unpack_archive(str(archive), out_dir=str(tmp_path / "out"))
     assert "detected 7z" in out, out
-    assert "no 7z reader" in out, out
-    assert "offset 0x0" in out, out
     assert "unknown" not in out, out
+    if shutil.which("7z"):
+        # Real binary present: garbage bytes make it fail, and the failure
+        # must be attributed to 7z, not to a missing reader.
+        assert "7z failed" in out, out
+        assert "no 7z reader" not in out, out
+    else:
+        assert "no 7z reader" in out, out
+        assert "offset 0x0" in out, out
 
 
 def test_unpack_finds_a_rar_signature_behind_an_sfx_stub(tmp_path: Path) -> None:
@@ -543,6 +553,43 @@ def test_unpack_finds_a_rar_signature_behind_an_sfx_stub(tmp_path: Path) -> None
     assert "no rar reader" in out, out
     # The message must not pretend the file *is* a bare RAR: it is an SFX stub.
     assert "offset 0x1002" in out, out
+
+
+@pytest.mark.skipif(shutil.which("7z") is None, reason="no 7z binary on this host")
+def test_unpack_extracts_7z_when_the_binary_is_present(tmp_path: Path) -> None:
+    """With the system 7z available, a real archive must extract and recurse."""
+    payload = tmp_path / "work" / "payload.txt"
+    payload.parent.mkdir()
+    payload.write_bytes(b"payload-7z-roundtrip")
+    archive = tmp_path / "a.7z"
+    subprocess.run(
+        ["7z", "a", "-t7z", str(archive), str(payload)],
+        capture_output=True, check=True, cwd=str(tmp_path),
+    )
+    out = nonweb.unpack_archive(str(archive), out_dir=str(tmp_path / "out"))
+    assert "detected 7z" in out, out
+    assert "no 7z reader" not in out, out
+    assert "payload.txt" in out, out
+    assert any(p.name == "payload.txt" for p in (tmp_path / "out").rglob("*"))
+
+
+@pytest.mark.skipif(shutil.which("7z") is None, reason="no 7z binary on this host")
+def test_unpack_recurses_into_a_7z_inside_a_zip(tmp_path: Path) -> None:
+    """A 7z nested in a zip must be picked up on the next walk level."""
+    payload = tmp_path / "payload.txt"
+    payload.write_bytes(b"payload-zip-7z-nesting")
+    inner = tmp_path / "inner.7z"
+    subprocess.run(
+        ["7z", "a", "-t7z", str(inner), str(payload)],
+        capture_output=True, check=True, cwd=str(tmp_path),
+    )
+    outer = tmp_path / "outer.zip"
+    with zipfile.ZipFile(outer, "w") as handle:
+        handle.write(inner, "inner.7z")
+    out = nonweb.unpack_archive(str(outer), out_dir=str(tmp_path / "out"))
+    assert "d2" in out, out
+    assert "inner.7z" in out, out
+    assert "payload.txt" in out, out
 
 
 def test_unpack_archive_handles_data_appended_after_eocd(tmp_path: Path) -> None:

@@ -26,12 +26,14 @@ as a Python package.)
 `unzip`, `curl`, `gdb`, `strace`, `nc`, `nmap`, and the impacket CLIs
 (`secretsdump.py`, ...) are installed.
 
-**Not in the image:** `binwalk`, `foremost`, `exiftool`, `tshark`,
-`sleuthkit`, `ffmpeg`, `steghide`, `testdisk`, `john`, `pcapfix`, and
-`zsteg` are not available (no internet). Carve files by scanning for magic
-bytes in Python, parse pcaps with pure-Python struct unpacking (pcap/pcapng
-headers are simple), and read metadata with a small struct parser or
-`Pillow` where the format supports it.
+**Not in the image:** `foremost`, `ffmpeg`, `testdisk`, `john`, `pcapfix`,
+and `zsteg` are not available (no internet). The rest of the classic
+forensics CLI set IS installed: `binwalk` (carve/extract), `exiftool`
+(metadata), `7z`, `upx`, `zbarimg`, `sox`, `pngcheck`, `pdftotext`,
+`tcpdump`, `tshark`, `steghide`, and Sleuth Kit (`fls`/`icat`/`mmls`).
+Parse pcaps with `tshark -r` (or pure-Python struct unpacking when scripting
+fits better), and fall back to `Pillow`/byte-level parsing for anything
+still missing.
 
 ## Additional Resources
 

@@ -24,10 +24,9 @@ ship with the challenge, using `requests` or plain Python.
 are installed -- useful when the task mounts a local target or hands you a
 capture instead of a live lookup.
 
-**Not in the image:** `whois`, `exiftool`, and `imagemagick` are not
-available -- extract EXIF with a small Python struct parser (JPEG APP1 is
-plain TIFF) or `Pillow` where supported, and do image conversions in
-`Pillow` instead of `convert`/`magick`.
+**Not in the image:** `whois` and `imagemagick` are not available --
+`exiftool` IS installed (read EXIF/metadata with `exiftool -a -G1 file`),
+and image conversions go through `Pillow` instead of `convert`/`magick`.
 
 ## Additional Resources
 

@@ -52,21 +52,16 @@ for i in range(msg_length):
 
 **Pattern:** Server computes `hash(SECRET || user_data)` using MD5, SHA-1, or SHA-256 (Merkle-Damgard constructions). Given a valid hash and the original data, extend it with arbitrary appended data and compute a valid hash — without knowing the secret.
 
-```bash
-# Using HashPump (install: apt install hashpump)
-hashpump --keylength 8 \
-  --signature 'ef16c2bffbcf0b7567217f292f9c2a9a50885e01e002fa34db34c0bb916ed5c3' \
-  --data 'original_data' \
-  --additional ';admin=true'
-# Outputs: new_signature and new_data (with padding bytes)
-```
-
 ```python
-# Python: hashpumpy
-import hashpumpy
-new_hash, new_data = hashpumpy.hashpump(
-    original_hash, original_data, append_data, secret_length
+# Offline image: hashpump / hashpumpy are NOT installed (no internet to
+# apt/pip anything). Use the stdlib sha_extend recipe from
+# ../ctf-misc/ctf-misc.md (SHA-1 by default, compress=sha256_compress
+# for SHA-256; modern-ciphers-3.md carries a shorter SHA-1 variant):
+forged_data, new_hash = sha_extend(
+    original_data, append_data, secret_length, original_hash
 )
+# -> forged_data = original_data + padding + append_data
+# -> new_hash = valid H(secret || forged_data), no secret needed
 ```
 
 **Key insight:** Merkle-Damgard hashes (MD5, SHA-1, SHA-256) process data in blocks, and the hash output IS the internal state. Given `H(secret || msg)`, you can compute `H(secret || msg || padding || extension)` without knowing `secret` — just initialize the hash state from the known output and continue hashing. Only HMAC (`H(K XOR opad || H(K XOR ipad || msg))`) is immune. If the secret length is unknown, try lengths 1-32.
@@ -546,7 +541,8 @@ forged_tag = (c0 + sum(bytes_to_long(b) * pow(H, i + 1, n) for i, b in enumerate
 **Pattern (decrypto):** Cookie stores `user = iv || AES-CBC(key, plaintext)` plus a separate `signature = SHA1(secret || decrypt(ct))` tag. The session cookie leaks the AES key (e.g. trailing 32 bytes of a base64 session blob). To forge `UID 0`, length-extend the signature with `\nUID 0\n`, decrypt the current ciphertext to learn the plaintext, append hashpump's padding + extension, re-encrypt with the known key, and send both updated `user` and `signature`.
 
 ```python
-import hashpumpy, binascii, base64, urllib
+# stdlib sha_extend from ../ctf-misc/ctf-misc.md (hashpumpy NOT in image)
+import binascii, base64, urllib
 from Crypto.Cipher import AES
 from Crypto.Util.Padding import pad, unpad
 
@@ -558,13 +554,13 @@ iv, ct = user[:16], user[16:]
 def decrypt(c): return unpad(AES.new(key, AES.MODE_CBC, iv).decrypt(c), 16)
 def encrypt(p): return AES.new(key, AES.MODE_CBC, iv).encrypt(pad(p, 16))
 
-# Length-extend signature (secret length guessed = 8)
-new_sig, new_plain = hashpumpy.hashpump(cookies['signature'], decrypt(ct), b'\nUID 0\n', 8)
+# Length-extend signature (secret length guessed = 8); SHA-1 = default
+new_plain, new_sig = sha_extend(decrypt(ct), b'\nUID 0\n', 8, cookies['signature'])
 cookies['signature'] = new_sig
 cookies['user']      = binascii.hexlify(iv + encrypt(new_plain))
 ```
 
-**Key insight:** Hash length extension applies whenever the MAC is `H(secret || data)` over a Merkle-Damgard hash (MD5/SHA-1/SHA-256). If the *same* `data` also lives inside a *separately* keyed cipher whose key is recoverable, you can combine primitives: hashpumpy produces the extended plaintext and new tag, then you re-encrypt with the leaked AES key so the server's CBC decryption matches the extended string the signature now covers. Parse-order quirks (later fields overriding earlier ones) let the appended `\nUID 0\n` win.
+**Key insight:** Hash length extension applies whenever the MAC is `H(secret || data)` over a Merkle-Damgard hash (MD5/SHA-1/SHA-256). If the *same* `data` also lives inside a *separately* keyed cipher whose key is recoverable, you can combine primitives: the stdlib sha_extend produces the extended plaintext and new tag, then you re-encrypt with the leaked AES key so the server's CBC decryption matches the extended string the signature now covers. Parse-order quirks (later fields overriding earlier ones) let the appended `\nUID 0\n` win.
 
 ---
 

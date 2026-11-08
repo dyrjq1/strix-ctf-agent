@@ -19,7 +19,7 @@ Custom hash reversal, CRC brute-force, noisy RSA oracles, sponge collisions, CBC
 - [CBC IV Recovery from Block-2 Known Plaintext (RITSEC 2018)](#cbc-iv-recovery-from-block-2-known-plaintext-ritsec-2018)
 - [Iterated SHA-256 Timing Oracle on Character Match (35C3 2018)](#iterated-sha-256-timing-oracle-on-character-match-35c3-2018)
 - [GF(p) Linear-System AES Key Recovery from PCAP Matrix (35C3 Junior 2018)](#gfp-linear-system-aes-key-recovery-from-pcap-matrix-35c3-junior-2018)
-- [SHA-1 Length Extension with UTF-8 High-Byte Bypass (OTW Advent 2018)](#sha-1-length-extension-with-utf-8-high-byte-bypass-otw-advent-2018)
+- [SHA-1 Length Extension Behind a <0x80 Byte Filter (OTW Advent 2018)](#sha-1-length-extension-behind-a-0x80-byte-filter-otw-advent-2018)
 - [Cross-Session Cube-Root Recovery via CRT (X-MAS 2018)](#cross-session-cube-root-recovery-via-crt-x-mas-2018)
 - [CBC Previous-Block Byte Flipping for Cookie Privilege Escalation (picoCTF 2018)](#cbc-previous-block-byte-flipping-for-cookie-privilege-escalation-picoctf-2018)
 
@@ -456,19 +456,50 @@ Use `tshark -r file.pcap -Y 'data.len>0' -T fields -e data` to dump the packet b
 
 ---
 
-### SHA-1 Length Extension with UTF-8 High-Byte Bypass (OTW Advent 2018)
+### SHA-1 Length Extension Behind a <0x80 Byte Filter (OTW Advent 2018)
 
-**Pattern:** Server checks that all appended bytes to a length-extendable SHA-1 MAC are `< 0x80`. Standard `hashpumpy`/`hlextend` output contains `0x80` and padding bytes that fail the check. Rewrite the padding region using valid multi-byte UTF-8 sequences (e.g., `\xc2\x80` → U+0080) that survive the filter but SHA-1 treats identically.
+**Pattern:** Server rejects any message byte `>= 0x80` before verifying a length-extendable SHA-1 MAC. A standard forged message (orig + glue padding + extension) contains the mandatory `0x80` pad byte, so it fails the check. **The advertised "re-encode the padding as UTF-8" bypass does NOT work — see the key insight for the two independent reasons; do not burn attempts on it.**
 
 ```python
-import hlextend
-h = hlextend.new('sha1')
-forged = h.extend(b';cat flag', b'A'*msg_len, key_len, old_mac)
-# Replace any 0x80-0xFF bytes with UTF-8 two-byte equivalents
-safe = forged.replace(b'\x80', b'\xc2\x80')
+import struct  # hlextend/hashpumpy are NOT in the image -- stdlib forge:
+
+M = 0xFFFFFFFF
+
+def _rotl(x, n): return ((x << n) | (x >> (32 - n))) & M
+
+def _md_pad(n):  # big-endian bit length, shared by SHA-1/SHA-256
+    return b"\x80" + b"\x00" * ((55 - n) % 64) + struct.pack(">Q", 8 * n)
+
+def sha1_compress(state, block):
+    w = list(struct.unpack(">16I", block))
+    for i in range(16, 80):
+        w.append(_rotl(w[i-3] ^ w[i-8] ^ w[i-14] ^ w[i-16], 1))
+    a, b, c, d, e = state
+    for i in range(80):
+        if   i < 20: f, k = (b & c) | (~b & d), 0x5A827999
+        elif i < 40: f, k = b ^ c ^ d, 0x6ED9EBA1
+        elif i < 60: f, k = (b & c) | (b & d) | (c & d), 0x8F1BBCDC
+        else:        f, k = b ^ c ^ d, 0xCA62C1D6
+        a, b, c, d, e = ((_rotl(a, 5) + f + e + k + w[i]) & M,
+                         a, _rotl(b, 30), c, d)
+    return tuple((s + v) & M for s, v in zip(state, (a, b, c, d, e)))
+
+def sha1_extend(orig, append, key_len, mac_hex):
+    h = tuple(int(mac_hex[i:i+8], 16) for i in range(0, len(mac_hex), 8))
+    forged = orig + _md_pad(key_len + len(orig)) + append
+    tail = append + _md_pad(key_len + len(forged))
+    for i in range(0, len(tail), 64):
+        h = sha1_compress(h, tail[i:i+64])
+    return forged, "".join("%08x" % v for v in h)
+
+forged, new_mac = sha1_extend(b'A'*msg_len, b';cat flag', key_len, old_mac)
+# sanity: this recipe is only valid if the server hashes the RAW bytes
+# below -- any sanitizing layer between submit and hash breaks the MAC
+import hashlib
+assert hashlib.sha1(key + forged).hexdigest() == new_mac
 ```
 
-**Key insight:** ASCII-only filters can be bypassed by substituting multi-byte Unicode sequences whose byte values stay below `0x80`. Any length-extension attack behind an ASCII validator is still exploitable with UTF-8 creativity.
+**Key insight:** The UTF-8 substitution is bogus, for two independent reasons: (1) `\xc2\x80` itself contains the byte `0x80` (it is the UTF-8 encoding of U+0080), so it fails the very filter it claims to pass; (2) even if some sanitized variant passed the filter, SHA-1 hashes bytes, not code points — the MAC is valid only over the raw forged bytes, so any post-hoc rewriting makes the server's recomputed MAC mismatch. A strict whole-message `< 0x80` filter is therefore a real mitigation: MD-style glue padding requires the `0x80` byte by construction. What still works: if the filter only inspects the user-visible tail, keep `append` pure ASCII and the standard forgery stands; if the server canonicalizes input (e.g., decodes then re-encodes) before hashing, model that canonicalization as part of the message and redo the extension math over the bytes that will actually be hashed.
 
 **References:** OverTheWire Advent Bonanza 2018 — Day 16, writeup 12754
 

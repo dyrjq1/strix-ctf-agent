@@ -70,7 +70,16 @@ COMMAND_FORMS = {
 #: Tools the offline image installs; pinned to the build-time probe by
 #: ``test_image_tools_match_build_probe``.
 IMAGE_TOOLS = frozenset(
-    {"nmap", "sqlmap", "ffuf", "smbclient", "impacket", "flask-unsign", "RsaCtfTool"}
+    {
+        "nmap", "sqlmap", "ffuf", "smbclient", "impacket", "flask-unsign",
+        "RsaCtfTool",
+        # Pack C (misc/rev tooling).  Must stay in lockstep with the PROBES
+        # dict in docker/check_toolchain.sh; the equality test is the wiring
+        # sentinel that keeps both surfaces honest.
+        "binwalk", "exiftool", "7z", "upx", "sox", "pngcheck", "tcpdump",
+        "steghide", "tshark", "fls", "pdftotext", "zbarimg", "radare2",
+        "rabin2",
+    }
 )
 
 #: An invocation of anything outside ``IMAGE_TOOLS`` is still a wasted turn.

@@ -32,13 +32,19 @@ Non-image steganography techniques (PDF, SVG, terminal, text, compression, sprea
 ## Quick Tools
 
 ```bash
-steghide extract -sf image.jpg
-zsteg image.png              # PNG/BMP analysis
-stegsolve                    # Visual analysis
+steghide extract -sf image.jpg   # installed (empty passphrase: -p "")
+zbarimg qr.png                   # QR/barcode decode
+exiftool -a -G1 image.jpg        # metadata
+pngcheck -v image.png            # PNG structure/CRC
+sox audio.wav -n spectrogram     # audio spectrogram
+7z l bundle.zip; binwalk -e blob # containers & carving
 
-# Steghide brute-force (0xFun 2026)
-stegseek image.jpg rockyou.txt  # Faster than stegcracker
-# Common weak passphrases: "simple", "password", "123456"
+# NOT installed: zsteg, stegsolve (GUI), stegseek, stegcracker.
+# zsteg replacement: LSB-plane walk in Pillow + numpy (bit planes, incl.
+#   alpha); stegsolve replacement: export planes in Pillow and inspect.
+# steghide brute-force replacement: python loop of `steghide extract -sf
+#   ... -p` over a candidate wordlist (rockyou.txt is NOT in the image --
+#   use challenge words: "simple", "password", "123456", challenge title).
 ```
 
 ---
@@ -182,16 +188,14 @@ with open('image.png', 'rb') as f:
         print(f'Number of frames: {num_frames}')
 "
 
-# Extract frames using apngdis
-apngdis image.apng  # produces frame_01.png, frame_02.png, ...
-
-# Alternative: use PHP or Python libraries
-# pip install apng
+# apngdis and the `apng` pip package are NOT in the offline image;
+# Pillow (>= 9.2, installed) reads APNG natively:
 python3 -c "
-from apng import APNG
-im = APNG.open('image.apng')
-for i, (png, control) in enumerate(im.frames):
-    png.save(f'frame_{i:02d}.png')
+from PIL import Image
+im = Image.open('image.apng')
+for i in range(getattr(im, 'n_frames', 1)):
+    im.seek(i)
+    im.save(f'frame_{i:02d}.png')
 "
 ```
 

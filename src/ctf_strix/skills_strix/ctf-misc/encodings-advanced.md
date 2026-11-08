@@ -407,8 +407,9 @@ MaxiCode is a hexagonal 2D barcode used by UPS, occasionally found in CTF forens
 # Decode using zxing library:
 # Online: https://zxing.org/w/decode.jspx (upload image)
 
-# Python — prefer zxing-cpp (pyzbar/ZBar does not support MaxiCode):
-# pip install zxing-cpp Pillow
+# Python — zxing-cpp (pyzbar/ZBar does not support MaxiCode) is an
+# online-host tool: NOT in the offline image (in-image zbarimg covers
+# QR/barcodes but NOT MaxiCode); on a host: pip install zxing-cpp Pillow
 python3 -c "
 import zxingcpp
 from PIL import Image

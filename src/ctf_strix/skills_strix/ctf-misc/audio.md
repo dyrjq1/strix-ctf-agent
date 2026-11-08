@@ -18,10 +18,10 @@ See also: [rf-sdr.md](rf-sdr.md) — RF/SDR IQ signal processing for radio/air-g
 ## Prerequisites
 
 ```bash
-pip install numpy
-# Optional: scipy for signal processing (not required for Morse extraction below)
-# System tools
-apt install sox qsstv
+# Offline image, no pip/apt (no internet): numpy + scipy + matplotlib
+# and sox (with mp3/flac/ogg codecs) are already installed. qsstv is
+# NOT in the image -- the spectrogram and Morse recipes below run
+# in-image, but SSTV decoding does not (see that section).
 ```
 
 ---
@@ -41,13 +41,15 @@ sox audio.wav -n spectrogram -o spec.png -x 2048 -y 1025 -z 120
 sox audio.wav -n spectrogram -o spec.png -y 513 -z 120
 ```
 
-**Key insight:** Hidden data often appears in upper frequency bands (15–22 kHz) invisible to human hearing but captured in full-spectrum recordings. Use Audacity's spectrogram view for interactive exploration — adjust the frequency scale to examine specific bands. Look for text shapes, QR codes, or binary bar patterns rendered across time.
+**Key insight:** Hidden data often appears in upper frequency bands (15–22 kHz) invisible to human hearing but captured in full-spectrum recordings. Audacity is not in the image — explore interactively with the sox spectrogram options above (vary -x/-y/-z) or a matplotlib specgram in Python. Look for text shapes, QR codes, or binary bar patterns rendered across time.
 
 ---
 
 ## SSTV Decoding
 
 **Pattern:** Audio file is a Slow Scan Television (SSTV) transmission — an image encoded as frequency-modulated audio tones, commonly used in amateur radio and CTF challenges.
+
+**In-image note:** qsstv is not in the offline image and cannot be installed — the commands below are online-host material. In-image fallback: demodulate with numpy (instantaneous frequency of the analytic signal; 1500 Hz = black, 2300 Hz = white, 1200 Hz sync pulses, mode timing from the VIS code).
 
 ```bash
 # Launch qsstv GUI — play audio through system output and use pulseaudio loopback

@@ -492,11 +492,13 @@ Common esoteric chains: Piet → base64 → Malbolge, Brainfuck → Ook → Whit
 **Pattern:** A blob that looks like a wall of Chinese characters (CJK Unified Ideographs) is actually a **base65536** encoding: each character carries two bytes of data, mapping 0x0000..0xFFFF to a picked subset of 65,536 Unicode codepoints. Detect by `file` reporting "Unicode text, UTF-8" with mostly CJK codepoints; decode with the `base65536` npm package or the Python port.
 
 ```bash
-# Node.js / npm path
+# Online-host path only: the offline image has no npm/pip installs and
+# no internet; base65536 needs its codepoint table, so it is not
+# decodable in-image
 npm install -g base65536
 echo -n "宝䀈䀋..." | base65536 --decode > out.bin
 
-# Python port
+# Python port (online-host only, same reason)
 pip install base65536
 python3 - <<'PY'
 import base65536, sys

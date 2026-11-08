@@ -20,8 +20,9 @@ Quick reference for RE challenges. For detailed techniques, see supporting files
 **not available** -- use `capstone`/`unicorn`/`z3` or plain Python instead.
 
 **Offline image: no installs and no internet.** `python3` and `curl` work;
-`gdb`, `radare2`, `apktool`, `upx`, `ghidra` and the `r2pm` plugin registry are
-not guaranteed present. Disassemble with `capstone` and read the bytes directly.
+on PATH: `gdb`, `upx`, `radare2` (`r2`) and `rabin2` (plus the `r2pipe`
+Python bridge); `apktool`, `ghidra` and the `r2pm` plugin registry are not
+available. Disassemble with `r2`/`capstone` and read the bytes directly.
 
 **MCP servers (optional, agent-driven RE):** IDA Pro MCP ([mrexodia/ida-pro-mcp](https://github.com/mrexodia/ida-pro-mcp)), Ghidra MCP ([bethington/ghidra-mcp](https://github.com/bethington/ghidra-mcp) — has a headless server, no GUI needed), JADX MCP ([zinja-coder/jadx-ai-mcp](https://github.com/zinja-coder/jadx-ai-mcp)) — see [tools-mcp.md](tools-mcp.md) for setup and usage.
 

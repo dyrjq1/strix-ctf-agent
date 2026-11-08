@@ -20,16 +20,16 @@ Quick reference for miscellaneous CTF challenges. Each technique has a one-liner
 `dnslib` -- nothing to install.
 
 **CLI tools on PATH:** binutils (`objdump`, `strings`), `file`, `xxd`,
-`unzip`/`zip`, `curl`, `jq`, `gdb`, `strace`, and `nc` are installed.
+`unzip`/`zip`, `7z`, `curl`, `jq`, `gdb`, `strace`, `nc`, plus `binwalk`,
+`zbarimg` (QR/barcode *decode*), `sox`, and `pngcheck`.
 
-**Not in the image:** `zbar`/`zbarimg` (QR *decode*), `qrencode`, `ffmpeg`,
-`sox`, SageMath, `binwalk`, `7z`, and the `magic` Python module are not
-available and cannot be fetched. `segno` generates QR codes but cannot
-decode them -- decode QR by hand with Pillow + numpy (find the three finder
-patterns, sample the module grid, unmask, then Reed-Solomon decode in
-Python); see [encodings.md](encodings.md) for QR reconstruction from
-partial data. Audio: read WAV with the stdlib `wave` module and analyze it
-with `numpy` FFT (spectrogram via `matplotlib`).
+**Not in the image:** `qrencode`, `ffmpeg`, SageMath, and the `magic`
+Python module are not available and cannot be fetched. QR: generate with
+`segno`, decode with `zbarimg`; reconstruct a damaged code by hand with
+Pillow + numpy (finder patterns + module grid + unmask + Reed-Solomon via
+`reedsolo`; see [encodings.md](encodings.md)). Audio: convert and inspect
+with `sox` (`libsox-fmt-all` covers mp3/flac/ogg) and analyze WAV with
+`numpy` FFT (spectrogram via `matplotlib`).
 
 ## Additional Resources
 
@@ -136,13 +136,15 @@ print(flag.decode())
 ```bash
 file unknown_file
 xxd unknown_file | head
-# binwalk is not in the image: carve embedded files by magic bytes in Python
+binwalk unknown_file        # magic-byte scan; ships in the image
+binwalk -e unknown_file     # carve into _unknown_file.extracted/
+# damaged blobs binwalk misses: hand-carve by magic bytes in Python (ctf-misc.md)
 ```
 
 ## Archive Extraction
 
 ```bash
-unzip archive.zip          # 7z not in image; exotic formats: python3 zipfile/tarfile
+unzip archive.zip          # 7z x also ships (7z/zip/xz/bz2/gz; no RAR); exotic: python3 zipfile/tarfile
 tar -xzf archive.tar.gz   # Gzip
 tar -xjf archive.tar.bz2  # Bzip2
 tar -xJf archive.tar.xz   # XZ
@@ -159,7 +161,8 @@ done
 
 ```bash
 python3 -c "import segno; segno.make('data').save('out.png')"   # Generate (segno)
-# Decode: no zbarimg/pyzbar in the image -- hand-roll with Pillow+numpy
+zbarimg --raw out.png   # Decode: zbar-tools ships in the image
+# Damaged code with no zbarimg hit: hand-roll with Pillow+numpy
 # (finder patterns -> sample grid -> unmask -> Reed-Solomon); see encodings.md
 ```
 
@@ -172,8 +175,8 @@ See [encodings.md](encodings.md) for QR structure, repair techniques, chunk reas
 ## Audio Challenges
 
 ```bash
-# Spectrogram (hidden text/images in frequency domain) -- sox is not in the
-# image; plot it with numpy + matplotlib instead:
+# Spectrogram (hidden text/images in frequency domain) -- sox ships in the
+# image; numpy + matplotlib stays as the custom-processing alternative:
 python3 -c "import wave,numpy as np,matplotlib.pyplot as plt; w=wave.open('audio.wav'); d=np.frombuffer(w.readframes(w.getnframes()),dtype=np.int16); plt.specgram(d,Fs=w.getframerate()); plt.savefig('spec.png')"
 
 # Channel inspection (identify stereo vs mono, sample rate, bit depth)
@@ -237,12 +240,16 @@ MD5: `0x67452301` | SHA-256: `0x6a09e667` | MurmurHash64A: `0xC6A4A7935BD1E995`
 
 ## SHA-256 Length Extension Attack
 
-MAC = `SHA-256(SECRET || msg)` with known msg/hash -> forge valid MAC via `hlextend`. Vulnerable: SHA-256, MD5, SHA-1. NOT: HMAC, SHA-3.
+MAC = `SHA-256(SECRET || msg)` with known msg/hash -> forge a valid MAC by
+injecting the known hash as the compression state. `hlextend`/`hashpumpy`
+are NOT in the image -- use the pure-stdlib recipe (validated against
+`hashlib`) in [ctf-misc.md](ctf-misc.md). Vulnerable: SHA-256, MD5, SHA-1.
+NOT: HMAC, SHA-3.
 
 ```python
-import hlextend
-sha = hlextend.new('sha256')
-new_data = sha.extend(b'extension', b'original_message', len_secret, known_hash_hex)
+forged, new_mac = sha_extend(orig, append, len_secret, known_hash_hex)
+# forged = orig || glue_padding || append; hashlib.sha256(secret+forged)
+# .hexdigest() == new_mac  (sha1 default; compress=sha256_compress for -256)
 ```
 
 ## Technique Quick References

@@ -20,8 +20,9 @@ available** (and there is no internet) -- work on local artifacts with
 `requests` or plain Python instead.
 
 **Offline image: no installs and no internet.** `python3` ships `requests` and
-the usual stdlib, and `curl` works; `nmap` is installed, while `whois`, `dig` and
-`exiftool` are not guaranteed present, and no public lookup service (Shodan,
+the usual stdlib, and `curl` works; `nmap` and `exiftool` (image/GPS/document
+metadata) are installed; `dig` ships with the dnsutils package, `whois` is not,
+and no public lookup service (Shodan,
 Wayback, social APIs) can be reached. Work from the artifacts the challenge
 hands you.
 

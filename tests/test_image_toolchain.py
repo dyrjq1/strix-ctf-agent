@@ -29,8 +29,9 @@ A_TIER_ROOTS = {
     "pwntools": "4.15.0",
 }
 
-#: B-tier roots added for crypto big-int math, audio/spectrograms, stego arrays
-#: and forensic file parsing.  angr/fpylll are deliberately excluded.
+#: B-tier roots added for crypto big-int math, audio/spectrograms, stego
+#: arrays, forensic file parsing, and (pack C) pcap crafting, radare2
+#: bridging and Reed-Solomon error correction.  angr/fpylll are excluded.
 B_TIER_ROOTS = {
     "numpy": "2.2.6",
     "sympy": "1.14.0",
@@ -41,6 +42,11 @@ B_TIER_ROOTS = {
     "yara-python": "4.5.4",
     "segno": "1.6.6",
     "dnslib": "0.9.26",
+    # Pack C: zero hard dependencies, so B_TIER_CLOSURE is unchanged -- only
+    # the expected pin count in b_tier_closure.txt grows by these three.
+    "scapy": "2.8.0",
+    "r2pipe": "2.1.0",
+    "reedsolo": "1.7.0",
 }
 
 #: New transitive deps pulled in by the B-tier roots.  ``packaging``,
@@ -222,6 +228,14 @@ def test_docker_check_script_checks_metadata_and_imports() -> None:
         assert namespace in listed, f"check_toolchain.sh does not smoke-test {namespace}"
     assert "missing namespaces" in script, "no negative branch: a missing module would be silent"
     assert "b_tier_closure.txt" in script, "B-tier manifest is never checked"
+    # CB review: MODULES lists can drift from the real import statements;
+    # deleting an import while keeping the list would otherwise stay green.
+    for stmt in (
+        "import r2pipe",
+        "from reedsolo import RSCodec",
+        "from scapy.all import IP, TCP",
+    ):
+        assert stmt in script, f"check_toolchain.sh lost its real import: {stmt}"
 
 
 def test_closure_manifest_matches_the_lock() -> None:

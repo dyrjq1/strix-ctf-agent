@@ -19,7 +19,8 @@ Quick reference for crypto CTF challenges. Each technique has a one-liner here; 
 `pycryptodomex`, `z3-solver`, `sympy`, and `gmpy2`. `hashpumpy`, `fpylll`,
 `py_ecc`, and the `coppersmith` / `crypto-attacks` helpers are **not
 available** (nothing can be installed here) -- implement those steps with `sympy`/`z3`
-or pure Python instead.
+or pure Python instead (hash length extension: ready-made stdlib `sha_extend`
+recipe in [ctf-misc/ctf-misc.md](../ctf-misc/ctf-misc.md)).
 
 **Offline image: no installs and no internet.** `python3` ships `gmpy2`,
 `sympy` and `z3-solver` (so no libgmp build step is needed); `RsaCtfTool` is
@@ -271,7 +272,7 @@ Extend ciphertext by one bit per oracle query to leak plaintext via parity. Mani
 
 ## Hash Length Extension Attack
 
-Exploits Merkle-Damgard hashes (`hash(SECRET || user_data)`) — append arbitrary data and compute valid hash without knowing the secret. Use `hashpump` or `hashpumpy`. See [modern-ciphers-2.md](modern-ciphers-2.md#hash-length-extension-attack-plaidctf-2014).
+Exploits Merkle-Damgard hashes (`hash(SECRET || user_data)`) — append arbitrary data and compute valid hash without knowing the secret. `hashpump`/`hashpumpy` are not in the image; use the stdlib `sha_extend` recipe ([ctf-misc/ctf-misc.md](../ctf-misc/ctf-misc.md)). See [modern-ciphers-2.md](modern-ciphers-2.md#hash-length-extension-attack-plaidctf-2014).
 
 ## Compression Oracle (CRIME-Style)
 

@@ -23,9 +23,11 @@ Quick reference for forensics CTF challenges. Each technique has a one-liner her
 Python instead.
 
 **Offline image: no installs and no internet.** `python3` ships `Pillow`,
-`numpy`, `scipy` and `matplotlib`, and `curl` works; `binwalk`, `foremost`,
-`exiftool`, `tshark`, `sleuthkit`, `ffmpeg`, `steghide`, `testdisk`, `john` and
-`zsteg` are not guaranteed present -- carve and decode with those libraries,
+`numpy`, `scipy`, `matplotlib`, `scapy` and `reedsolo`, and `curl` works. On
+PATH: `binwalk`, `exiftool`, `7z`, `upx`, `zbarimg`, `sox`, `pngcheck`,
+`pdftotext`, `tcpdump`, `tshark`, `steghide`, Sleuth Kit (`fls`/`icat`/`mmls`)
+and `radare2`/`rabin2`; still missing: `foremost`, `ffmpeg`, `testdisk`,
+`john` and `zsteg` -- for those, carve and decode with the installed CLIs,
 `strings`, and plain byte-level parsing.
 
 ## Additional Resources

@@ -16,13 +16,13 @@ Quick reference for miscellaneous CTF challenges. Each technique has a one-liner
 ## Prerequisites
 
 **Python packages:** the image already ships `pwntools` 4.15.0, `segno`
-1.6.6, `z3-solver`, `Pillow`, `numpy`, `requests`, and `dnslib` -- nothing to
-install.
+1.6.6, `z3-solver`, `Pillow`, `numpy`, `matplotlib`, `requests`, `dnslib`,
+`scapy`, `reedsolo`, and `r2pipe` -- nothing to install.
 
-**Offline image: no installs and no internet.** `python3` ships `PIL`, `numpy`
-and `z3-solver`, and `curl` works; `ffmpeg`, `qrencode`, `zbarimg` and SageMath
-are not guaranteed present -- generate QR with `segno`, decode with PIL/numpy
-or plain Python on the raw bytes.
+**Offline image: no installs and no internet.** `python3` and `curl` work; on
+PATH: `7z`, `binwalk`, `zbarimg` (QR/barcode decode), `sox`, `pngcheck` and
+`upx`; `ffmpeg`, `qrencode` and SageMath are not available -- generate QR
+with `segno`, decode with `zbarimg`, and handle audio with `sox` + `numpy`.
 
 ## Additional Resources
 
@@ -230,12 +230,85 @@ MD5: `0x67452301` | SHA-256: `0x6a09e667` | MurmurHash64A: `0xC6A4A7935BD1E995`
 
 ## SHA-256 Length Extension Attack
 
-MAC = `SHA-256(SECRET || msg)` with known msg/hash -> forge valid MAC via `hlextend`. Vulnerable: SHA-256, MD5, SHA-1. NOT: HMAC, SHA-3.
+MAC = `SHA-256(SECRET || msg)` with known msg/hash -> forge a valid MAC by
+injecting the known hash as the compression state and absorbing the tail.
+`hlextend`/`hashpumpy` are NOT in the image; the pure-stdlib recipe below is
+validated against `hashlib`. Vulnerable: SHA-256, MD5, SHA-1 (MD5 = same
+shape, little-endian length word). NOT: HMAC, SHA-3.
 
 ```python
-import hlextend
-sha = hlextend.new('sha256')
-new_data = sha.extend(b'extension', b'original_message', len_secret, known_hash_hex)
+import struct
+from math import isqrt
+
+M = 0xFFFFFFFF
+
+def _rotl(x, n): return ((x << n) | (x >> (32 - n))) & M
+def _rotr(x, n): return ((x >> n) | (x << (32 - n))) & M
+
+def _md_pad(n):  # SHA-1 and SHA-256 share this padding (big-endian length)
+    return b"\x80" + b"\x00" * ((55 - n) % 64) + struct.pack(">Q", 8 * n)
+
+def sha1_compress(state, block):          # state: 5-tuple, block: 64 bytes
+    w = list(struct.unpack(">16I", block))
+    for i in range(16, 80):
+        w.append(_rotl(w[i-3] ^ w[i-8] ^ w[i-14] ^ w[i-16], 1))
+    a, b, c, d, e = state
+    for i in range(80):
+        if   i < 20: f, k = (b & c) | (~b & d), 0x5A827999
+        elif i < 40: f, k = b ^ c ^ d, 0x6ED9EBA1
+        elif i < 60: f, k = (b & c) | (b & d) | (c & d), 0x8F1BBCDC
+        else:        f, k = b ^ c ^ d, 0xCA62C1D6
+        a, b, c, d, e = ((_rotl(a, 5) + f + e + k + w[i]) & M,
+                         a, _rotl(b, 30), c, d)
+    return tuple((s + v) & M for s, v in zip(state, (a, b, c, d, e)))
+
+# SHA-256 constants derived exactly from the primes (FIPS 180-4), so no
+# 64-entry table: K[i] = frac(cbrt(p)) * 2**32, H[i] = frac(sqrt(p)) * 2**32.
+def _icbrt(n):
+    x = 1 << (n.bit_length() // 3 + 2)
+    while (y := (2 * x + n // (x * x)) // 3) < x:
+        x = y
+    return x
+
+def _primes(count):
+    out, n = [], 2
+    while len(out) < count:
+        if all(n % p for p in out):
+            out.append(n)
+        n += 1
+    return out
+
+K256 = [_icbrt(p << 96) - _icbrt(p) * 2**32 for p in _primes(64)]
+H256 = [isqrt(p << 64) - isqrt(p) * 2**32 for p in _primes(8)]
+
+def sha256_compress(state, block):        # state: 8-word list
+    w = list(struct.unpack(">16I", block))
+    for i in range(16, 64):
+        s0 = _rotr(w[i-15], 7) ^ _rotr(w[i-15], 18) ^ (w[i-15] >> 3)
+        s1 = _rotr(w[i-2], 17) ^ _rotr(w[i-2], 19) ^ (w[i-2] >> 10)
+        w.append((w[i-16] + s0 + w[i-7] + s1) & M)
+    a, b, c, d, e, f, g, h = state
+    for i in range(64):
+        t1 = (h + (_rotr(e, 6) ^ _rotr(e, 11) ^ _rotr(e, 25))
+              + ((e & f) ^ (~e & g)) + K256[i] + w[i]) & M
+        t2 = ((_rotr(a, 2) ^ _rotr(a, 13) ^ _rotr(a, 22))
+              + ((a & b) ^ (a & c) ^ (b & c))) & M
+        a, b, c, d, e, f, g, h = (t1 + t2) & M, a, b, c, (d + t1) & M, e, f, g
+    return [(s + v) & M for s, v in zip(state, (a, b, c, d, e, f, g, h))]
+
+def sha_extend(orig, append, key_len, mac_hex, compress=sha1_compress):
+    """hlextend replacement: returns (forged, new_mac); hashlib-validated."""
+    h = tuple(int(mac_hex[i:i+8], 16) for i in range(0, len(mac_hex), 8))
+    forged = orig + _md_pad(key_len + len(orig)) + append
+    tail = append + _md_pad(key_len + len(forged))
+    for i in range(0, len(tail), 64):     # injected state already equals mac
+        h = compress(h, tail[i:i+64])
+    return forged, "".join("%08x" % v for v in h)
+
+# SHA-1 (default): hashlib.sha1(secret + forged).hexdigest() == new_mac
+forged, new_mac = sha_extend(b"original_message", b"extension",
+                             len_secret, known_hash_hex)
+# SHA-256: same call with compress=sha256_compress
 ```
 
 ## Technique Quick References

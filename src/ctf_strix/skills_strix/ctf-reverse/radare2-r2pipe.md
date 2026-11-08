@@ -1,6 +1,6 @@
 # CTF Reverse - Radare2 Scripting and r2pipe Automation
 
-Scripted radare2 for CTF reverse work: batch one-liners, byte patching, in-place decompilation with r2ghidra, ESIL single-function emulation, JSON output parsing, and xref-based checker mapping. Reach for it when a task needs repeatable automation — patching a branch, brute-forcing a checker, or emulating a decrypt routine — instead of an interactive session. For interactive GDB workflows see [tools.md](tools.md) and [tools-dynamic.md](tools-dynamic.md); everything here is verified on radare2 `6.2.2 +37863 abi:142` (linux-x86-64) with r2pipe `1.9.8` on a PIE x86-64 ELF built with `cc -O0`.
+Scripted radare2 for CTF reverse work: batch one-liners, byte patching, in-place decompilation with r2ghidra, ESIL single-function emulation, JSON output parsing, and xref-based checker mapping. Reach for it when a task needs repeatable automation — patching a branch, brute-forcing a checker, or emulating a decrypt routine — instead of an interactive session. For interactive GDB workflows see [tools.md](tools.md) and [tools-dynamic.md](tools-dynamic.md); everything here is verified on radare2 `6.2.2 +37863 abi:142` (linux-x86-64) with r2pipe `1.9.8` on a PIE x86-64 ELF built with `cc -O0`. In the offline image the shipped pair is radare2 5.9.4 + r2pipe 2.1.0 (batch mode, JSON commands and ESIL all work). The r2ghidra plugin (`pdg`/`pdgj`) is NOT installed there -- fall back to `pdc` pseudocode, plain `pdf` + capstone, or ESIL emulation for decompiler-grade questions.
 
 ## When to script radare2
 
@@ -61,6 +61,12 @@ A symbolic target needs analysis: `r2 -w -q -c 'wx b00190 @ dbg.check+0x50' t` f
 **Key insight:** All flags before the filename, `-w` or the patch is dropped, and the only trustworthy confirmation is re-reading the patched bytes with `p8`, `xxd`, or `radiff2`.
 
 ## Decompiling in place with r2ghidra
+
+**Offline-image note:** the contest image has no internet and no preinstalled
+r2ghidra, so `r2pm -ci r2ghidra` cannot fetch or build the plugin there -- do
+not burn turns on it. In-image substitutes: `pdc` pseudocode, plain `pdf` +
+capstone, or ESIL emulation (see the shipped-pair note at the top of this
+card). The rest of this section applies to an online host.
 
 r2ghidra is ABI-locked to the radare2 version, so check that first: the prebuilt `r2ghidra-6.2.4-linux-x86-64.zip` loads against ABI 152 and refuses on r2 6.2.2 (`abi:142`) with `WARN: ABI mismatch: Expect 142 vs 152 from '.../core_ghidra.so'` followed by the usual `You need to install the plugin with r2pm -ci r2ghidra` advice. There is NO `r2ghidra-6.2.2-*-linux-x86-64.zip` asset (all variants 404); the 6.2.2 tag ships only macos/w64 zips, a generic zip, a tar.xz, and `r2ghidra_6.2.2_amd64.deb`, all listed at [github.com/radareorg/r2ghidra/releases](https://github.com/radareorg/r2ghidra/releases). Pick the asset matching your own r2 version and ABI, not the newest one. The verified install is the version-matched `.deb`, unpacked without root because `dpkg-deb` is missing — the shipped `.so` is native C++ (NEEDED: libr_core.so, libr_anal.so, libstdc++, libm, libc, no libjvm), so no JDK is needed for this path:
 

@@ -320,37 +320,32 @@ mac = hashlib.sha256(secret + message).hexdigest()
 # Server sends: mac + message to client, verifies by recomputing H(secret || message)
 
 # Attack: extend the message without knowing the secret
-# hashpumpy does the heavy lifting:
-import hashpumpy
+# stdlib sha_extend does the heavy lifting (recipe: ../ctf-misc/ctf-misc.md;
+# hashpumpy / hash_extender are NOT in the image)
 
 original_mac = "a1b2c3..."     # known hash
 original_msg = b"user=alice"   # known message
 secret_len   = 16              # known or brute-forced (try 1-100)
 extension    = b"&admin=true"  # data to append
 
-new_mac, new_msg = hashpumpy.hashpump(
-    original_mac,   # original hexdigest
+new_msg, new_mac = sha_extend(
     original_msg,   # original data (without secret)
     extension,      # data to append
-    secret_len      # secret length
+    secret_len,     # secret length (brute-force 1-100 if unknown)
+    original_mac,   # original hexdigest
+    compress=sha256_compress,
 )
 
 # new_msg = original_msg + padding + extension
 # new_mac = valid H(secret || new_msg) without knowing secret
 ```
 
-```bash
-# Alternative: hash_extender tool
-hash_extender \
-    --data "user=alice" \
-    --secret-min 1 --secret-max 50 \
-    --append "&admin=true" \
-    --signature "a1b2c3..." \
-    --format sha256
-
-# Or: manual Python with hashpumpy, brute-force secret length
+```python
+# No hash_extender / hashpumpy in the image -- brute-force the secret
+# length with the same stdlib recipe:
 for length in range(1, 101):
-    new_mac, new_msg = hashpumpy.hashpump(orig_mac, orig_msg, extension, length)
+    new_msg, new_mac = sha_extend(orig_msg, extension, length, orig_mac,
+                                  compress=sha256_compress)
     r = requests.get(url, params={"data": new_msg.hex(), "mac": new_mac})
     if "success" in r.text:
         print(f"Secret length: {length}, Flag: {r.text}")
@@ -365,4 +360,4 @@ This padding is part of `new_msg` — the server will verify it as-is.
 
 **Vulnerable algorithms:** MD5, SHA-1, SHA-224, SHA-256, SHA-384, SHA-512 (all Merkle-Damgård). **Not vulnerable:** HMAC (uses two separate hash passes), SHA-3/Keccak (sponge construction), BLAKE2/3.
 
-**Key insight:** Any Merkle-Damgård hash used as `H(secret || data)` without HMAC construction leaks internal state at the message boundary, enabling arbitrary message extension. Use `hashpumpy` or `hash_extender`. If the secret length is unknown, brute-force it (1-100 is a reasonable range for CTFs) — the valid extension will produce a server-accepted MAC.
+**Key insight:** Any Merkle-Damgård hash used as `H(secret || data)` without HMAC construction leaks internal state at the message boundary, enabling arbitrary message extension. Reimplement it with the stdlib `sha_extend` recipe ([ctf-misc/ctf-misc.md](../ctf-misc/ctf-misc.md)) -- `hashpumpy`/`hash_extender` are not installed. If the secret length is unknown, brute-force it (1-100 is a reasonable range for CTFs) — the valid extension will produce a server-accepted MAC.

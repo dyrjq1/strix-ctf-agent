@@ -46,8 +46,10 @@ import html
 import io
 import lzma
 import re
+import shutil
 import socket
 import struct
+import subprocess
 import tarfile
 import time
 import zipfile
@@ -66,8 +68,11 @@ _BLOB_MAX_CHARS: Final = 256 * 1024
 #: chasing its own tail.
 _BLOB_MAX_LAYERS: Final = 8
 
-#: Formats ``_sniff`` can name but cannot read.  Used only to turn "nothing
-#: extracted" into an actionable message; extraction is never attempted.
+#: Formats ``_sniff`` can name but this module has no stdlib reader for.
+#: 7z is extracted with the system binary when present (``_from_7z``) and
+#: falls back to this set only when that binary is missing; RAR always
+#: stays here (p7zip cannot read RAR).  Either way "nothing extracted"
+#: must become an actionable message instead of silence.
 _NAMES_ONLY: Final = frozenset({"7z", "rar"})
 
 #: Extraction budget, shared across recursion depth.  Without sharing, five
@@ -509,12 +514,14 @@ def _sniff(path: Path) -> str:
         return "xz"
     if len(head) >= 262 and head[257:262] == b"ustar":
         return "tar"
-    # 7z and RAR are *named* but deliberately not extracted: Python's stdlib
-    # has no reader for either and this image ships no 7z/rar binary.  Naming
-    # them matters because "detected unknown, nothing extracted" reads exactly
-    # like a corrupt file -- the model then retries unpack_archive instead of
-    # changing method.  A RAR self-extracting stub can precede the signature by
-    # up to 64 KB (rarlab technote), so search that window rather than byte 0.
+    # 7z and RAR are *named* before any extraction attempt: Python's stdlib
+    # has no reader for either.  The system 7z binary (when present) handles
+    # real 7z archives in walk(); RAR never extracts -- p7zip cannot read it.
+    # Naming matters because "detected unknown, nothing extracted" reads
+    # exactly like a corrupt file -- the model then retries unpack_archive
+    # instead of changing method.  A RAR self-extracting stub can precede the
+    # signature by up to 64 KB (rarlab technote), so search that window
+    # rather than byte 0.
     window = head[: 64 * 1024]
     if window.find(b"\x37\x7a\xbc\xaf\x27\x1c") >= 0:
         return "7z"
@@ -676,6 +683,53 @@ def _from_stream(path: Path, kind: str, sink: _Sink) -> None:
     sink.write(target, data)
 
 
+def _from_7z(path: Path, sub: Path, budget: dict[str, int]) -> list[str]:
+    """Extract with the system 7z binary, then enforce the same gates.
+
+    The binary writes files itself, so the pre-write checks in ``_Sink``
+    cannot apply; instead everything it produced is validated post hoc and
+    rule-breakers are deleted and reported, mirroring ``_Sink``'s refusals.
+    ``-p`` pins an empty password so an encrypted archive fails fast instead
+    of blocking on an interactive prompt.
+    """
+    sub.mkdir(parents=True, exist_ok=True)
+    proc = subprocess.run(
+        ["7z", "x", "-y", "-bd", "-p", f"-o{sub}", str(path.resolve())],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    if proc.returncode != 0:
+        tail = (proc.stderr or proc.stdout or "").strip().splitlines()
+        detail = tail[-1][:120] if tail else f"exit code {proc.returncode}"
+        raise OSError(detail)
+    skipped: list[str] = []
+    for child in sorted(sub.rglob("*")):
+        if child.is_symlink():
+            child.unlink()
+            skipped.append(f"{child.relative_to(sub).as_posix()}: symlink")
+            continue
+        if not child.is_file():
+            continue
+        rel = child.relative_to(sub).as_posix()
+        if budget["files"] >= _UNPACK_MAX_FILES:
+            child.unlink()
+            skipped.append(f"{rel}: over file budget")
+            continue
+        size = child.stat().st_size
+        if size > _UNPACK_MEMBER_MAX:
+            child.unlink()
+            skipped.append(f"{rel}: over member limit")
+            continue
+        if budget["bytes"] + size > _UNPACK_MAX_BYTES:
+            child.unlink()
+            skipped.append(f"{rel}: over byte budget")
+            continue
+        budget["files"] += 1
+        budget["bytes"] += size
+    return skipped
+
+
 def _unique_dir(base: Path) -> Path:
     """Never mix this extraction into a previous run's output."""
     if not base.exists():
@@ -740,23 +794,33 @@ def unpack_archive(path: str = "", max_depth: int = 3, out_dir: str = "extracted
             kind = _sniff(item)
         if not kind or depth > depth_cap:
             return
-        if kind in _NAMES_ONLY:
-            # Recognized but unreadable here.  Stop before _from_stream, which
-            # would otherwise raise KeyError on the opener table.
-            return
         sub = root if depth == 1 else root / f"_d{depth}"
-        sink = _Sink(sub, budget)
-        try:
-            if kind == "zip":
-                _from_zip(item, sink)
-            elif kind == "tar":
-                _from_tar(item, sink)
-            else:
-                _from_stream(item, kind, sink)
-        except (zipfile.BadZipFile, tarfile.TarError, OSError) as exc:
-            lines.append(f"! {item.name}: {kind} failed ({type(exc).__name__})")
+        if kind == "7z" and shutil.which("7z"):
+            # The system binary reads formats the stdlib cannot; _from_7z
+            # validates its output against the same gates as _Sink.
+            try:
+                skipped.extend(_from_7z(item, sub, budget))
+            except (OSError, subprocess.SubprocessError) as exc:
+                lines.append(f"! {item.name}: 7z failed ({type(exc).__name__})")
+                return
+        elif kind in _NAMES_ONLY:
+            # RAR always; 7z only where the binary is missing (dev hosts).
+            # Stop before the stdlib paths, which would otherwise raise
+            # KeyError on the opener table -- the tail message explains.
             return
-        skipped.extend(sink.skipped)
+        else:
+            sink = _Sink(sub, budget)
+            try:
+                if kind == "zip":
+                    _from_zip(item, sink)
+                elif kind == "tar":
+                    _from_tar(item, sink)
+                else:
+                    _from_stream(item, kind, sink)
+            except (zipfile.BadZipFile, tarfile.TarError, OSError) as exc:
+                lines.append(f"! {item.name}: {kind} failed ({type(exc).__name__})")
+                return
+            skipped.extend(sink.skipped)
         for child in sorted(sub.rglob("*")):
             if not child.is_file():
                 continue
@@ -785,7 +849,7 @@ def unpack_archive(path: str = "", max_depth: int = 3, out_dir: str = "extracted
             "file_triage/hexpeek; a wrong extension is common and the magic "
             "bytes are the authority."
         )
-        if kind in _NAMES_ONLY:
+        if kind in _NAMES_ONLY and not (kind == "7z" and shutil.which("7z")):
             where = _signature_offset(source, kind)
             at = "this IS that archive" if where == 0 else "the archive starts there"
             body.append(
@@ -796,6 +860,13 @@ def unpack_archive(path: str = "", max_depth: int = 3, out_dir: str = "extracted
                 "the statement/strings already leaks the content. If it is encrypted, "
                 "the password has to come from the challenge -- brute force here is a "
                 "different, much more expensive problem."
+            )
+        elif kind == "7z" and shutil.which("7z"):
+            body.append(
+                "next: the 7z binary ran and produced nothing usable -- the "
+                "archive is empty, corrupt, truncated, or password-protected. "
+                "Do not retry unpack_archive; it will fail the same way. If it "
+                "is encrypted, the password has to come from the challenge."
             )
     else:
         body.append(

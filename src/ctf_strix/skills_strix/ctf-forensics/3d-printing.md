@@ -39,7 +39,10 @@ Blocks: [type(2) + compression(2) + uncompressed_size(4)
 **Parsing and extracting G-code:**
 ```python
 import struct, zlib
-import heatshrink2  # pip install heatshrink2
+# heatshrink2 (pip) is NOT in the offline image: Deflate blocks
+# (compression 1) decode in-image with zlib below; Heatshrink blocks
+# (2/3) need a hand-rolled decoder (window/lookahead bits from the
+# compression code) or an online host
 
 with open('file.g', 'rb') as f:
     data = f.read()
@@ -64,10 +67,14 @@ while pos < len(data) - 8:
     pos += compressed_size + 4  # data + CRC32
 
     if block_type == 1:  # GCode block
-        if compression == 3:  # Heatshrink 12/4
-            gcode = heatshrink2.decompress(block_data, window_sz2=12, lookahead_sz2=4)
+        if compression in (2, 3):  # Heatshrink 11/4 or 12/4 -- not decodable in-image
+            # (no heatshrink2): hand-roll the window/lookahead decoder or
+            # use an online host; skip the block and keep scanning
+            gcode = b''
         elif compression == 1:  # Deflate (zlib)
             gcode = zlib.decompress(block_data)
+        else:  # compression == 0: stored uncompressed
+            gcode = block_data
         # Search gcode for hidden comments/flags
 ```
 

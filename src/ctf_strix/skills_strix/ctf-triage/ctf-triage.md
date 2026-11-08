@@ -2,7 +2,7 @@
 name: ctf-triage
 description: 拿到一道还没有分类的 CTF 题时的第一站。Use when the challenge arrives as an unknown file, a remote host, an HTTP endpoint, or only a title — and you must decide which specialised skill to load before spending effort. Runs a fixed, cheap triage sequence and maps findings to the right category skill. Do not use it when the category is already known and the specialised skill is already loaded.
 license: MIT
-compatibility: Requires bash and Python 3 with file available; pwn checksec ships with pwntools; binwalk and exiftool are not in the offline image.
+compatibility: Requires bash and Python 3 with file available; pwn checksec ships with pwntools; binwalk and exiftool ship in the offline image.
 allowed-tools: Bash Read Glob Grep
 metadata:
   user-invocable: "false"
