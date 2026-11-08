@@ -296,3 +296,49 @@ def test_stage2_artifacts_are_digest_pinned() -> None:
     digests = re.findall(r"^ARG \w+_SHA256=([0-9a-f]{64})$", text, re.MULTILINE)
     assert len(digests) >= 2, f"expected ffuf + impacket digests, got {digests}"
     assert "sha256sum -c -" in text, "downloaded wheel is not integrity-checked"
+
+
+# --- Crypton 攻击模式卡片与信号路由表（索引增强包） -------------------------------
+
+PATTERNS_DIR = SKILLS / "ctf-crypto" / "patterns"
+ROUTER_HEADING = "## Attack Pattern Router (Signal-First)"
+CARD_BANNED = ("sage -c", "sage -python", "sage --", "apt install", "apt-get install", "pip install", "git clone",
+               "openssl ", "cado-nfs.py", "ghauri")
+# Router is signal-first navigation only: no tool invocation forms at all (commands live in cards).
+ROUTER_BANNED = CARD_BANNED + ("python3 ", "cado-nfs", "hashcat ", "flatter", "fpylll", "rsactftool")
+
+
+def _router_section() -> str:
+    text = (SKILLS / "ctf-crypto" / "ctf-crypto.md").read_text(encoding="utf-8")
+    _, _, tail = text.partition(ROUTER_HEADING)
+    assert tail, "router section missing from ctf-crypto.md"
+    return tail
+
+
+def test_pattern_cards_exist_and_router_is_bidirectional() -> None:
+    """52 cards on disk <-> exactly 52 router rows, no orphans in either direction."""
+    routed = re.findall(r"patterns/([A-Z0-9-]+)\.md", _router_section())
+    on_disk = {p.stem for p in PATTERNS_DIR.glob("*.md")}
+    assert len(routed) == 52 and len(set(routed)) == 52
+    assert on_disk == set(routed), f"cards vs router mismatch: {on_disk ^ set(routed)}"
+
+
+def test_pattern_cards_carry_tool_alignment_and_no_banned_invocations() -> None:
+    """Every card must state the in-image tool path; no unrunnable invocations."""
+    cards = sorted(PATTERNS_DIR.glob("*.md"))
+    assert len(cards) == 52
+    for card in cards:
+        text = card.read_text(encoding="utf-8")
+        assert "## 工具对齐（镜像真值）" in text, f"{card.name}: alignment section missing"
+        for token in CARD_BANNED:
+            assert token not in text.lower(), f"{card.name}: banned invocation {token!r}"
+
+
+def test_router_table_has_no_command_forms() -> None:
+    """Router stays pure navigation: commands live in the cards, never in the table."""
+    section = _router_section()
+    low = section.lower()
+    for form in COMMAND_FORMS:
+        assert form not in section, f"router leaks command form {form!r}"
+    for form in ROUTER_BANNED:
+        assert form not in low, f"router leaks invocation form {form!r}"
