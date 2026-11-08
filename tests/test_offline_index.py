@@ -47,6 +47,7 @@ BANNED = (
     "git clone",
     "webhook.site",
     "pip install",
+    "gem install",
 )
 
 #: Command-shaped invocations an index may print, and the tool each one runs.
@@ -77,6 +78,16 @@ BANNED_COMMANDS = tuple(
     form for form, tool in COMMAND_FORMS.items() if tool not in IMAGE_TOOLS
 )
 
+#: Every registered skill pack's ``SKILL.md``. ``skillpack`` stages only the
+#: direction index (``<pack>/<pack>.md``) for registration; strix serves the
+#: body via ``load_skill`` (frontmatter stripped) and the ``description`` in
+#: the skills listing; ``SKILL.md`` is
+#: maintainer documentation, kept honest here so the two surfaces cannot
+#: drift apart. Unlike a direction index, a pack body may name tools the
+#: image lacks in deferred one-liners, so only ``BANNED`` (not
+#: ``BANNED_COMMANDS``) governs it.
+SKILL_PACKS = sorted(p.parent.name for p in SKILLS.glob("*/SKILL.md"))
+
 
 def _read(name: str) -> str:
     """Read a file in ``ctf-web/`` (kept for the ladder tests)."""
@@ -104,6 +115,85 @@ def test_no_install_or_outbound_recipe(name: str) -> None:
     hits = [token for token in BANNED if token in low]
     hits += [token for token in BANNED_COMMANDS if token in low]
     assert not hits, f"{name} still tells the agent to run: {hits}"
+
+
+def _read_skill_pack(pack: str) -> str:
+    return (SKILLS / pack / "SKILL.md").read_text(encoding="utf-8")
+
+
+def _frontmatter(text: str) -> str:
+    """The frontmatter block between the leading ``---`` fences.
+
+    A regex (not ``split("---")``) so a literal ``---`` inside a
+    description cannot truncate the block early.
+    """
+    m = re.match(r"^---\r?\n(.*?)\r?\n---", text, re.DOTALL)
+    assert m, "file has no (or malformed) frontmatter block at the top"
+    return m.group(1)
+
+
+@pytest.mark.parametrize("pack", SKILL_PACKS)
+def test_skill_pack_has_no_install_recipe(pack: str) -> None:
+    low = _read_skill_pack(pack).lower()
+    hits = [token for token in BANNED if token in low]
+    assert not hits, f"{pack}/SKILL.md still tells the agent to run: {hits}"
+
+
+@pytest.mark.parametrize("pack", SKILL_PACKS)
+def test_skill_pack_frontmatter_is_offline(pack: str) -> None:
+    """The pack docs must not promise tools the offline task cannot answer.
+
+    The router loads only the direction index, not this file; keeping
+    ``SKILL.md`` honest anyway stops the two surfaces from drifting apart.
+    """
+    text = _read_skill_pack(pack)
+    head = _frontmatter(text)
+    assert "internet access" not in head.lower(), (
+        f"{pack}/SKILL.md frontmatter still promises internet access"
+    )
+    m = re.search(r"^allowed-tools:(.*)$", head, re.MULTILINE)
+    assert m, f"{pack}/SKILL.md frontmatter has no allowed-tools line"
+    granted = m.group(1).lower()
+    assert "webfetch" not in granted and "websearch" not in granted, (
+        f"{pack}/SKILL.md still grants web tools: {m.group(1).strip()}"
+    )
+
+
+@pytest.mark.parametrize("name", INDEXES)
+def test_index_frontmatter_is_offline(name: str) -> None:
+    """The direction index is what ``skillpack.index_skills`` registers.
+    Of its frontmatter, only ``description`` reaches the model (the strix
+    skills listing); ``load_skill`` serves the body with frontmatter
+    stripped, and ``compatibility``/``allowed-tools`` are consumed by no
+    code -- kept offline-honest anyway so the docs cannot drift back
+    into granting tools the runtime lacks.
+    """
+    head = _frontmatter(_read_index(name))
+    low = head.lower()
+    assert "internet access" not in low, (
+        f"{name} frontmatter still promises internet access"
+    )
+    assert "install on demand" not in low, (
+        f"{name} frontmatter still offers on-demand installs"
+    )
+    m = re.search(r"^allowed-tools:(.*)$", head, re.MULTILINE)
+    # An index with no allowed-tools line (ctf-agentic-ai,
+    # ctf-supply-chain) grants nothing, which is offline-safe, so
+    # absence passes by design (unlike the SKILL.md variant above).
+    if m:
+        granted = m.group(1).lower()
+        assert "webfetch" not in granted and "websearch" not in granted, (
+            f"{name} still grants web tools: {m.group(1).strip()}"
+        )
+
+
+def test_skill_pack_dirs_are_registered_or_excluded() -> None:
+    """A pack dir with a ``SKILL.md`` must be a registered index or the
+    one known exclusion; otherwise its docs rot unseen while the corpus
+    moves on.
+    """
+    registered = {rel.split("/")[0] for rel in INDEXES}
+    assert set(SKILL_PACKS) - registered == {"ctf-similar-search"}
 
 
 def test_command_forms_are_installed_in_image() -> None:

@@ -2,6 +2,7 @@
 
 > **Upstream:** [swisskyrepo/PayloadsAllTheThings](https://github.com/swisskyrepo/PayloadsAllTheThings) — MIT License, Copyright (c) 2019 Swissky.
 > Exemplar payloads below are copied with attribution under MIT. Bulk payloads require a clone (see Installation).
+> **Offline image:** no internet and no install script ships in this repo — the Installation and clone sections below are inert here; the inline exemplar payloads are the usable part.
 
 **Pinned version:** `3ac2790` (master @ 2026-08-27) — update with `bash scripts/install_ctf_tools.sh pat --verify` or `git -C ~/.ctf-tools/PayloadsAllTheThings rev-parse --short HEAD`.
 If the hash above is stale, the install script always fetches current `master`.
@@ -204,7 +205,7 @@ Use local files to understand *why* a class works; use PAT to enumerate *all* va
 
 ## Installation
 
-Preferred (installer handles clone + symlink + verify):
+Preferred (installer handles clone + symlink + verify; not runnable in the offline image):
 
 ```bash
 bash scripts/install_ctf_tools.sh pat        # clone/update PAT
@@ -246,7 +247,7 @@ All PAT paths are gitignored (`ctf-web/payloads/`, `PayloadsAllTheThings/`, `.ct
 
 ## Usage from agent (lazy on-demand clone)
 
-Minimal on-demand clone (required snippet):
+Minimal on-demand clone (not runnable in the offline image):
 
 ```bash
 PAT_DIR="ctf-web/payloads/PayloadsAllTheThings"

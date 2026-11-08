@@ -2,8 +2,8 @@
 name: ctf-misc
 description: Provides miscellaneous CTF challenge techniques for problems that do not cleanly fit the main categories. Use for encoding puzzles, pyjails, bash jails, RF/SDR, DNS oddities, unicode tricks, esoteric languages, QR or audio puzzles, constraint solving, game theory, unusual sandbox escapes, and hybrid logic puzzles. Prefer a more specific skill first when the challenge is mainly web, pwn, reverse, forensics, malware, OSINT, or crypto. Treat this as the fallback skill for genuine cross-category or edge-case challenges, not the default starting point.
 license: MIT
-compatibility: Requires filesystem-based agent (Claude Code or similar) with bash, Python 3, and internet access for tool installation.
-allowed-tools: Bash Read Write Edit Glob Grep Task WebFetch WebSearch Skill
+compatibility: Requires filesystem-based agent (Claude Code or similar) with bash and Python 3.
+allowed-tools: Bash Read Write Edit Glob Grep Task Skill
 metadata:
   user-invocable: "false"
   author: Lukasz Jagiello
@@ -16,21 +16,20 @@ Quick reference for miscellaneous CTF challenges. Each technique has a one-liner
 ## Prerequisites
 
 **Python packages:** the image already ships `pwntools` 4.15.0, `segno`
-1.6.6, `z3-solver`, `Pillow`, `numpy`, `requests`, and `dnslib` -- nothing to
-install.
+1.6.6, `z3-solver`, `Pillow`, `numpy`, `matplotlib`, `requests`, and
+`dnslib` -- nothing to install.
 
-**Linux (apt):**
-```bash
-apt install libzbar0 qrencode ffmpeg
-```
+**CLI tools on PATH:** binutils (`objdump`, `strings`), `file`, `xxd`,
+`unzip`/`zip`, `curl`, `jq`, `gdb`, `strace`, and `nc` are installed.
 
-**macOS (Homebrew):**
-```bash
-brew install ffmpeg qrencode
-```
-
-**Manual install:**
-- SageMath — Linux: `apt install sagemath`, macOS: `brew install --cask sage`
+**Not in the image:** `zbar`/`zbarimg` (QR *decode*), `qrencode`, `ffmpeg`,
+`sox`, SageMath, `binwalk`, `7z`, and the `magic` Python module are not
+available and cannot be fetched. `segno` generates QR codes but cannot
+decode them -- decode QR by hand with Pillow + numpy (find the three finder
+patterns, sample the module grid, unmask, then Reed-Solomon decode in
+Python); see [encodings.md](encodings.md) for QR reconstruction from
+partial data. Audio: read WAV with the stdlib `wave` module and analyze it
+with `numpy` FFT (spectrogram via `matplotlib`).
 
 ## Additional Resources
 
@@ -64,16 +63,15 @@ brew install ffmpeg qrencode
 # File identification
 file mystery_file
 xxd mystery_file | head -5
-python3 -c "import magic; print(magic.from_file('mystery_file'))"
+# python-magic is not in the image; the `file` and `xxd` lines cover it
 
 # Encoding detection
 python3 -c "import base64; print(base64.b64decode('<data>'))"
 echo '<data>' | base64 -d
 echo '<hex>' | xxd -r -p
 
-# QR code
-zbarimg qr.png
-python3 -c "from pyzbar.pyzbar import decode; from PIL import Image; print(decode(Image.open('qr.png')))"
+# QR code: segno generates; decoding is hand-rolled (see QR Codes below)
+python3 -c "import segno; segno.make('data').save('out.png')"
 
 # Z3 constraint solving
 python3 -c "from z3 import *; x=BitVec('x',32); s=Solver(); s.add(x^0xdead==0xbeef); s.check(); print(s.model())"
@@ -138,13 +136,13 @@ print(flag.decode())
 ```bash
 file unknown_file
 xxd unknown_file | head
-binwalk unknown_file
+# binwalk is not in the image: carve embedded files by magic bytes in Python
 ```
 
 ## Archive Extraction
 
 ```bash
-7z x archive.7z           # Universal
+unzip archive.zip          # 7z not in image; exotic formats: python3 zipfile/tarfile
 tar -xzf archive.tar.gz   # Gzip
 tar -xjf archive.tar.bz2  # Bzip2
 tar -xJf archive.tar.xz   # XZ
@@ -152,19 +150,20 @@ tar -xJf archive.tar.xz   # XZ
 
 ### Nested Archive Script
 ```bash
-while f=$(ls *.tar* *.gz *.bz2 *.xz *.zip *.7z 2>/dev/null|head -1) && [ -n "$f" ]; do
-    7z x -y "$f" && rm "$f"
+while f=$(ls *.tar* *.gz *.bz2 *.xz *.zip 2>/dev/null|head -1) && [ -n "$f" ]; do
+    python3 -c "import sys,zipfile,tarfile; p=sys.argv[1]; (zipfile.ZipFile(p) if zipfile.is_zipfile(p) else tarfile.open(p)).extractall()" "$f" && rm "$f"
 done
 ```
 
 ## QR Codes
 
 ```bash
-zbarimg qrcode.png       # Decode
-qrencode -o out.png "data"
+python3 -c "import segno; segno.make('data').save('out.png')"   # Generate (segno)
+# Decode: no zbarimg/pyzbar in the image -- hand-roll with Pillow+numpy
+# (finder patterns -> sample grid -> unmask -> Reed-Solomon); see encodings.md
 ```
 
-**MaxiCode barcode:** Hexagonal 2D barcode with bullseye center; decode with `zxing` (Java) since standard QR decoders fail. See [encodings-advanced.md](encodings-advanced.md#maxicode-2d-barcode-decoding-csaw-ctf-2016).
+**MaxiCode barcode:** Hexagonal 2D barcode with bullseye center; decode with `zxing` (Java; not in the offline image) since standard QR decoders fail. See [encodings-advanced.md](encodings-advanced.md#maxicode-2d-barcode-decoding-csaw-ctf-2016).
 
 **TOPKEK encoding:** CTF-specific binary encoding where `KEK=0`, `TOP=1`, `!` suffix = repeat count. See [encodings-advanced.md](encodings-advanced.md#topkek-binary-encoding-hack-the-vote-2016).
 
@@ -173,9 +172,9 @@ See [encodings.md](encodings.md) for QR structure, repair techniques, chunk reas
 ## Audio Challenges
 
 ```bash
-# Spectrogram (hidden text/images in frequency domain)
-sox audio.wav -n spectrogram -o spec.png
-sox audio.wav -n spectrogram -o spec.png -x 2048 -y 1025  # higher resolution
+# Spectrogram (hidden text/images in frequency domain) -- sox is not in the
+# image; plot it with numpy + matplotlib instead:
+python3 -c "import wave,numpy as np,matplotlib.pyplot as plt; w=wave.open('audio.wav'); d=np.frombuffer(w.readframes(w.getnframes()),dtype=np.int16); plt.specgram(d,Fs=w.getframerate()); plt.savefig('spec.png')"
 
 # Channel inspection (identify stereo vs mono, sample rate, bit depth)
 python3 -c "import wave; w=wave.open('audio.wav'); print(f'channels={w.getnchannels()}, rate={w.getframerate()}, width={w.getsampwidth()}')"

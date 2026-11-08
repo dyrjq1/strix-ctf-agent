@@ -2,8 +2,8 @@
 name: ctf-crypto
 description: Provides cryptography attack techniques for CTF challenges. Use when attacking encryption, hashing, signatures, ZKP, PRNG, or mathematical crypto problems involving RSA, AES, ECC, lattices, LWE, CVP, number theory, Coppersmith, Pollard, Wiener, padding oracle, GCM, key derivation, or stream/block cipher weaknesses.
 license: MIT
-compatibility: Requires filesystem-based agent (Claude Code or similar) with bash, Python 3, and internet access for tool installation.
-allowed-tools: Bash Read Write Edit Glob Grep Task WebFetch WebSearch
+compatibility: Requires filesystem-based agent (Claude Code or similar) with bash and Python 3.
+allowed-tools: Bash Read Write Edit Glob Grep Task
 metadata:
   user-invocable: "false"
   author: Lukasz Jagiello
@@ -18,25 +18,17 @@ Quick reference for crypto CTF challenges. Each technique has a one-liner here; 
 **Python packages:** the image already ships `pycryptodome`,
 `pycryptodomex`, `z3-solver`, `sympy`, and `gmpy2`. `hashpumpy`, `fpylll`,
 `py_ecc`, and the `coppersmith` / `crypto-attacks` helpers are **not
-available** (no pip, no git clone) -- implement those steps with `sympy`/`z3`
-or pure Python instead.
+available** -- implement those steps with `sympy`/`z3` or pure Python
+instead.
 
-**Linux (apt):**
-```bash
-apt install hashcat
-```
+**CLI tools on PATH:** `RsaCtfTool` (automated RSA attacks: `RsaCtfTool
+--publickey key.pem --attempt 20`), `flask-unsign`, and the impacket CLIs
+are installed.
 
-**macOS (Homebrew):**
-```bash
-brew install hashcat
-```
-
-**Manual install:**
-- SageMath (optional — only for legacy Sage fallback snippets (collapsed sections)) — Linux: `apt install sagemath`, macOS: `brew install --cask sage`
-- RsaCtfTool — `git clone https://github.com/RsaCtfTool/RsaCtfTool` (automated RSA attacks)
-- crypto-attacks (Coppersmith) — not available (no internet); use the `sympy`/`z3` Coppersmith snippets in [advanced-math.md](advanced-math.md) instead
-
-> **Note:** `gmpy2` requires libgmp — Linux: `apt install libgmp-dev`, macOS: `brew install gmp`.
+**Not in the image:** `hashcat`, `john`, and SageMath are not available (no
+internet); the Sage fallback snippets in the subfiles will not run --
+translate them to `sympy`/`gmpy2` (the notes flag which ones are Sage-only).
+`gmpy2` works out of the box; no system library is needed.
 
 ## Additional Resources
 

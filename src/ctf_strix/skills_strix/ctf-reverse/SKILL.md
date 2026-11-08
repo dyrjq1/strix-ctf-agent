@@ -2,8 +2,8 @@
 name: ctf-reverse
 description: Provides reverse engineering techniques for CTF challenges. Use when the main job is to understand how a compiled, obfuscated, packed, or virtualized target works before exploiting or solving it, including binaries, APKs, WASM, firmware, custom VMs, bytecode, game clients, malware-like loaders, and anti-debug or anti-analysis logic. Do not use it when the vulnerability is already understood and the remaining task is exploitation; use pwn instead. Do not use it for pure web workflows, log or disk forensics, or standalone crypto problems unless reversing the implementation is the real blocker.
 license: MIT
-compatibility: Requires filesystem-based agent (Claude Code or similar) with bash, Python 3, and internet access for tool installation.
-allowed-tools: Bash Read Write Edit Glob Grep Task WebFetch WebSearch
+compatibility: Requires filesystem-based agent (Claude Code or similar) with bash and Python 3.
+allowed-tools: Bash Read Write Edit Glob Grep Task
 metadata:
   user-invocable: "false"
   author: Lukasz Jagiello
@@ -15,33 +15,21 @@ Quick reference for RE challenges. For detailed techniques, see supporting files
 
 ## Prerequisites
 
-**Python packages:** the image already ships `capstone` and `z3-solver`.
-`frida-tools`, `angr`, `qiling`, `uncompyle6`, and `lief` are **not
-available** -- use `capstone`/`unicorn`/`z3` or plain Python instead.
-# For Python 3.9+ bytecode: build pycdc from source
-git clone https://github.com/zrax/pycdc && cd pycdc && cmake . && make
-```
+**Python packages:** the image already ships `capstone`, `unicorn`,
+`z3-solver`, `pefile`, and `pwntools`. `frida-tools`, `angr`, `qiling`,
+`uncompyle6`, `lief`, and `pycdc` are **not available** -- script the same
+jobs with capstone/unicorn or plain Python. For Python bytecode, load the
+code object with `marshal` and disassemble it with the stdlib `dis` module
+instead of pycdc.
 
-**Linux (apt):**
-```bash
-apt install gdb radare2 binutils strace ltrace apktool upx
-```
+**CLI tools on PATH:** `gdb`, binutils (`objdump`, `readelf`, `nm`,
+`strings`), `strace`, `ltrace`, `file`, and `xxd` are installed.
 
-**macOS (Homebrew):**
-```bash
-brew install gdb radare2 binutils apktool upx ghidra
-```
-
-**radare2 plugins:**
-```bash
-r2pm -ci r2ghidra   # Native Ghidra decompiler for radare2
-# The prebuilt r2ghidra zip is ABI-locked to one radare2 version (WARN: ABI mismatch: Expect 142 vs 152); r2pm -ci r2ghidra builds the plugin from source instead.
-```
-
-**Manual install:**
-- pwndbg — Linux: [GitHub](https://github.com/pwndbg/pwndbg), macOS: `brew install pwndbg/tap/pwndbg-gdb`
-
-**MCP servers (optional, agent-driven RE):** IDA Pro MCP ([mrexodia/ida-pro-mcp](https://github.com/mrexodia/ida-pro-mcp)), Ghidra MCP ([bethington/ghidra-mcp](https://github.com/bethington/ghidra-mcp) — has a headless server, no GUI needed), JADX MCP ([zinja-coder/jadx-ai-mcp](https://github.com/zinja-coder/jadx-ai-mcp)) — see [tools-mcp.md](tools-mcp.md) for setup and usage.
+**Not in the image:** `radare2`, `ghidra`, `IDA`, `apktool`, `upx`, and
+`pwndbg` are not available (no internet). Triage with `file`/`readelf`,
+disassemble with `objdump -d -M intel` or capstone; for packed binaries,
+detect the packer with `file`/`strings` and trace to the OEP with
+`gdb`/`strace` rather than `upx -d`.
 
 ## Additional Resources
 
@@ -174,17 +162,15 @@ Two patterns: (1) `transform(flag) == stored_target` — reverse the transform. 
 ## Quick Tool Reference
 
 ```bash
-# Radare2
-r2 -d ./binary     # Debug mode
-aaa                # Analyze
-afl                # List functions
-pdf @ main         # Disassemble main
+# Static triage (binutils)
+file ./binary
+readelf -h ./binary      # ELF header
+objdump -d -M intel ./binary | less   # Disassemble (Intel syntax)
+strings -n 6 ./binary | grep -i flag
 
-# Ghidra (headless)
-analyzeHeadless project/ tmp -import binary -postScript script.py
-
-# IDA
-ida64 binary       # Open in IDA64
+# Dynamic
+gdb ./binary            # then: break main / run / x/i $pc
+strace ./binary         # Syscall trace
 ```
 
 ## Deep-Dive Notes

@@ -2,8 +2,8 @@
 name: ctf-pwn
 description: Provides binary exploitation techniques for CTF challenges. Use when you already have a vulnerable native target or service and need to turn memory corruption or low-level primitives into code execution or privilege escalation, such as buffer overflows, format strings, heap bugs, ROP, ret2libc, shellcode, kernel exploitation, seccomp bypass, sandbox escape, or Windows/Linux exploit chains. Do not use it when the main blocker is understanding what the binary does; use reverse engineering first. Do not use it for pure web bugs, disk or packet forensics, or standalone crypto/math challenges.
 license: MIT
-compatibility: Requires filesystem-based agent (Claude Code or similar) with bash, Python 3, and internet access for tool installation.
-allowed-tools: Bash Read Write Edit Glob Grep Task WebFetch WebSearch
+compatibility: Requires filesystem-based agent (Claude Code or similar) with bash and Python 3.
+allowed-tools: Bash Read Write Edit Glob Grep Task
 metadata:
   user-invocable: "false"
   author: Lukasz Jagiello
@@ -16,37 +16,19 @@ Quick reference for binary exploitation (pwn) CTF challenges. Each technique has
 ## Prerequisites
 
 **Python packages:** the image already ships `pwntools` 4.15.0 and
-`ROPgadget` 7.7. `ropper` is **not available** -- use `ROPgadget` or
-`pwntools`' own ROP helpers instead.
+`ROPgadget` 7.7 (`checksec --file=binary` ships with pwntools). `ropper`,
+`one_gadget`, and `seccomp-tools` are **not available** -- enumerate gadgets
+with `ROPgadget`, infer the seccomp policy from `strace` (syscalls returning
+EPERM), and derive one-gadget constraints by hand from the libc disassembly.
 
-**uv alternative:** not available (no internet); the system `python3` already
-has `pwntools` and `ROPgadget`.
+**CLI tools on PATH:** `gdb`, binutils (`objdump`, `readelf`, `nm`),
+`strace`, `ltrace`, and `nc` are installed.
 
-**Linux (apt):**
-```bash
-apt install gdb binutils strace ltrace qemu-system-x86
-```
-
-**Optional cross-arch (ARM/MIPS — Debian/Ubuntu):**
-```bash
-apt install qemu-user qemu-user-static gdb-multiarch binutils-multiarch libc6-armhf-cross libc6-arm64-cross libc6-mips-cross
-```
-
-**macOS (Homebrew):**
-```bash
-brew install gdb binutils qemu
-```
-
-**Ruby gems (all platforms):**
-```bash
-gem install one_gadget seccomp-tools
-```
-
-**Manual install:**
-- pwndbg — Linux: [GitHub](https://github.com/pwndbg/pwndbg), macOS: `brew install pwndbg/tap/pwndbg-gdb`
-- checksec — included with pwntools (`checksec --file=binary`)
-
-**MCP servers (optional):** WinDbg MCP ([svnscha/mcp-windbg](https://github.com/svnscha/mcp-windbg)) for Windows crash dumps, live breakpoint-driven exploitation, and kernel/driver debugging; IDA Pro MCP / Ghidra MCP for decompiling the vulnerable function — see [tools-mcp.md](tools-mcp.md).
+**Not in the image:** `qemu-user`/`qemu-system` (and cross-arch sysroots),
+`gdb-multiarch`, and `pwndbg` are not available (no internet). Emulate
+cross-arch targets with `unicorn` scripts and disassemble them with
+`capstone` (both are multi-arch); plain `objdump` only covers the host
+architecture.
 
 ## Additional Resources
 

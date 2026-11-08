@@ -2,8 +2,8 @@
 name: ctf-ai-ml
 description: Provides AI and machine learning techniques for CTF challenges. Use when attacking ML models, crafting adversarial examples, performing model extraction, prompt injection, membership inference, training data poisoning, fine-tuning manipulation, neural network analysis, LoRA adapter exploitation, LLM jailbreaking, or solving AI-related puzzles.
 license: MIT
-compatibility: Requires filesystem-based agent (Claude Code or similar) with bash, Python 3, and internet access for tool installation.
-allowed-tools: Bash Read Write Edit Glob Grep Task WebFetch WebSearch
+compatibility: Requires filesystem-based agent (Claude Code or similar) with bash and Python 3.
+allowed-tools: Bash Read Write Edit Glob Grep Task
 metadata:
   user-invocable: "false"
   author: Lukasz Jagiello
@@ -15,19 +15,12 @@ Quick reference for AI/ML CTF challenges. Each technique has a one-liner here; s
 
 ## Prerequisites
 
-**Python packages:** the image already ships `numpy`, `scipy`, and `Pillow`
-(`PIL`). `torch`, `transformers`, `safetensors`, and `scikit-learn` are **not
-available** -- use the installed libraries or plain Python instead.
-
-**Linux (apt):**
-```bash
-apt install python3-dev
-```
-
-**macOS (Homebrew):**
-```bash
-brew install python@3
-```
+**Python packages:** the image already ships `numpy`, `scipy`, `matplotlib`,
+and `Pillow` (`PIL`). `torch`, `transformers`, `safetensors`, and
+`scikit-learn` are **not available** -- implement model attacks with numpy
+math: manual forward passes for extracted weight matrices, hand-rolled
+FGSM/PGD gradients where the loss is differentiable, and
+nearest-neighbor/search loops instead of sklearn.
 
 ## Additional Resources
 

@@ -2,8 +2,8 @@
 name: ctf-osint
 description: Provides open source intelligence techniques for CTF challenges. Use when gathering information from public sources, social media, geolocation, DNS records, username enumeration, reverse image search, Google dorking, Wayback Machine, Tor relays, FEC filings, or identifying unknown data like hashes and coordinates.
 license: MIT
-compatibility: Requires filesystem-based agent (Claude Code or similar) with bash, Python 3, and internet access for OSINT lookups.
-allowed-tools: Bash Read Write Edit Glob Grep Task WebFetch WebSearch
+compatibility: Requires filesystem-based agent (Claude Code or similar) with bash and Python 3.
+allowed-tools: Bash Read Write Edit Glob Grep Task
 metadata:
   user-invocable: "false"
   author: Lukasz Jagiello
@@ -15,21 +15,19 @@ Quick reference for OSINT CTF challenges. Each technique has a one-liner here; s
 
 ## Prerequisites
 
-**Python packages:** the image already ships `Pillow`. `shodan` is **not
-available** (and there is no internet) -- work on local artifacts with
-`requests` or plain Python instead.
+**Python packages:** the image already ships `Pillow`, `numpy`, `requests`,
+and `httpx`. `shodan` is **not available**, and there is no internet for
+live OSINT -- work on local artifacts (captures, exports, zone files) that
+ship with the challenge, using `requests` or plain Python.
 
-**Linux (apt):**
-```bash
-apt install whois dnsutils nmap libimage-exiftool-perl imagemagick curl
-```
+**CLI tools on PATH:** `dig` (dnsutils), `nmap`, `curl`, `jq`, and `file`
+are installed -- useful when the task mounts a local target or hands you a
+capture instead of a live lookup.
 
-**macOS (Homebrew):**
-```bash
-brew install whois bind nmap exiftool imagemagick curl
-```
-
-**MCP servers (optional):** Playwright MCP ([microsoft/playwright-mcp](https://github.com/microsoft/playwright-mcp)) for browser-driven OSINT (JS-rendered pages, reverse-image/map flows) — see [tools-mcp.md](tools-mcp.md).
+**Not in the image:** `whois`, `exiftool`, and `imagemagick` are not
+available -- extract EXIF with a small Python struct parser (JPEG APP1 is
+plain TIFF) or `Pillow` where supported, and do image conversions in
+`Pillow` instead of `convert`/`magick`.
 
 ## Additional Resources
 
@@ -64,9 +62,8 @@ identify -verbose image.jpg | head -30
 # Web archive
 curl "https://web.archive.org/web/20230101*/target.com"
 
-# Username lookup (site is browser-only — no JSON API; curl returns 403)
-git clone https://github.com/WebBreacher/WhatsMyName
-cd WhatsMyName/scripts/checker && python3 wmn_check.py --help  # needs requests + playwright
+# Username lookup: WhatsMyName needs a repo clone + playwright; neither is
+# available offline -- search the challenge's own exports/zone files instead
 
 # Shodan
 shodan search "hostname:target.com"

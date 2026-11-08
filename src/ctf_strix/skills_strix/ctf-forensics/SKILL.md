@@ -2,8 +2,8 @@
 name: ctf-forensics
 description: Provides digital forensics and signal analysis techniques for CTF challenges. Use when analyzing disk images, memory dumps, event logs, network captures, cryptocurrency transactions, steganography, PDF analysis, Windows registry, Volatility, PCAP, Docker images, coredumps, side-channel power traces, DTMF audio spectrograms, packet timing analysis, CD audio disc images, or recovering deleted files and credentials.
 license: MIT
-compatibility: Requires filesystem-based agent (Claude Code or similar) with bash, Python 3, and internet access for tool installation.
-allowed-tools: Bash Read Write Edit Glob Grep Task WebFetch WebSearch
+compatibility: Requires filesystem-based agent (Claude Code or similar) with bash and Python 3.
+allowed-tools: Bash Read Write Edit Glob Grep Task
 metadata:
   user-invocable: "false"
   author: Lukasz Jagiello
@@ -16,27 +16,22 @@ Quick reference for forensics CTF challenges. Each technique has a one-liner her
 ## Prerequisites
 
 **Python packages:** the image already ships `Pillow`, `numpy`, `matplotlib`,
-and `scipy`. `volatility3`, `librosa`, `scikit-learn`,
-`opencv-python-headless`, `pymongo`, `impacket`, `brotli`, `exrex`, `stegano`,
-and `heatshrink2` are **not available** -- use the installed libraries or
-plain Python instead.
+`scipy`, `pycryptodome`, and `yara-python`. `volatility3`, `librosa`,
+`scikit-learn`, `opencv-python-headless`, `pymongo`, `brotli`, `exrex`,
+`stegano`, and `heatshrink2` are **not available** -- use the installed
+libraries or plain Python instead. (impacket is installed as CLI tools, not
+as a Python package.)
 
-**Linux (apt):**
-```bash
-apt install binwalk foremost libimage-exiftool-perl tshark sleuthkit \
-  ffmpeg steghide testdisk john pcapfix
-```
+**CLI tools on PATH:** binutils (`objdump`, `strings`), `file`, `xxd`,
+`unzip`, `curl`, `gdb`, `strace`, `nc`, `nmap`, and the impacket CLIs
+(`secretsdump.py`, ...) are installed.
 
-**macOS (Homebrew):**
-```bash
-brew install binwalk exiftool wireshark sleuthkit ffmpeg \
-  testdisk john-jumbo
-```
-
-**Ruby gems (all platforms):**
-```bash
-gem install zsteg
-```
+**Not in the image:** `binwalk`, `foremost`, `exiftool`, `tshark`,
+`sleuthkit`, `ffmpeg`, `steghide`, `testdisk`, `john`, `pcapfix`, and
+`zsteg` are not available (no internet). Carve files by scanning for magic
+bytes in Python, parse pcaps with pure-Python struct unpacking (pcap/pcapng
+headers are simple), and read metadata with a small struct parser or
+`Pillow` where the format supports it.
 
 ## Additional Resources
 
