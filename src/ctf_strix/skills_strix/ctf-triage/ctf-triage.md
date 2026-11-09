@@ -2,7 +2,7 @@
 name: ctf-triage
 description: 拿到一道还没有分类的 CTF 题时的第一站。Use when the challenge arrives as an unknown file, a remote host, an HTTP endpoint, or only a title — and you must decide which specialised skill to load before spending effort. Runs a fixed, cheap triage sequence and maps findings to the right category skill. Do not use it when the category is already known and the specialised skill is already loaded.
 license: MIT
-compatibility: Requires bash and Python 3 with file/binwalk/exiftool/checksec available (or install on demand).
+compatibility: Requires bash and Python 3 with file/xxd/strings/readelf/objdump/Pillow available (binutils and Pillow are bundled in the image).
 allowed-tools: Bash Read Glob Grep
 metadata:
   user-invocable: "false"
@@ -19,6 +19,8 @@ metadata:
 TARGET="$1"
 [ -e "$TARGET" ] && file "$TARGET" && head -c 64 "$TARGET" | xxd | head -4
 ```
+
+定型时的工具分工：十六进制看内容用 `xxd`；二进制结构分析用 `readelf` / `objdump` / `r2`；文件类型与清单用 `file` / `ls`。
 
 按 `file` 输出直接路由：
 
@@ -68,8 +70,8 @@ curl -s "http://HOST:PORT/" | grep -oiE '(gradio|dify|comfyui|ollama|open-webui|
 ## 二进制题的 30 秒体检
 
 ```bash
-checksec --file=./chall 2>/dev/null || pwn checksec ./chall 2>/dev/null
-readelf -h ./chall | grep -E 'Type|Machine'
+readelf -h ./chall                        # checksec 已移除，改用 readelf 看 ELF 头
+readelf -lW ./chall | head -30            # 看段权限（R E / R W -> NX / RELRO）
 strings -n 6 ./chall | grep -iE 'flag|/bin/sh|system|win|seccomp' | head
 ```
 
@@ -97,7 +99,8 @@ nm -C ./chall 2>/dev/null | head -5     # 没 strip 的话这一步就结束了
 
 ## 别做的事
 
-- **不要对未知文件跑 `binwalk -e`** 就以为在做题——先看 `file`，很多题根本不是嵌入文件
+- **不要对未知文件一上来就想着解包**——先 `file` 判断类型，再按类型选工具，很多题根本不是嵌入文件
+- **不要依赖 checksec / binwalk / exiftool 等已移除的专用工具**——shell 等价命令（readelf / objdump / file / strings / xxd）才是正路
 - **不要一开始就上网搜题面**。同名题很多，抄错方向比不做更浪费时间；先本地定型
 - **不要在未定型时加载重型技能**。`ctf-crypto` 索引 10.5k token，加载错了就是纯浪费
 - **不要相信题目分类标签**。写着 Misc 的经常是 pwn，写着 Web 的经常是 AI 栈
@@ -112,3 +115,16 @@ nm -C ./chall 2>/dev/null | head -5     # 没 strip 的话这一步就结束了
 ```
 
 **这句话本身就值得写**——后面卡住回看时，你会知道自己当初是不是定错型了。
+
+## 工具说明：专用 file 族工具已移除
+
+`checksec`、`binwalk`、`exiftool` 等专用 file 族工具已在 toolkit rework 中移除，不要依赖它们。
+改用镜像自带的等价命令：
+
+| 原用途 | 现用 |
+|---|---|
+| `checksec`（查 PIE / NX / RELRO / Canary） | `readelf -h` / `readelf -lW`、`objdump -x` |
+| `binwalk -e`（查嵌入文件） | 先 `file` 判断类型，再按类型选工具 |
+| `exiftool`（查图片元数据） | `strings` 或 `python3 -c "from PIL import Image; ..."` |
+
+镜像自带 `file` / `xxd` / `strings` / `readelf` / `objdump`（binutils）与 `Pillow`。

@@ -2321,7 +2321,7 @@ def install_toolset(task: dict[str, Any], kind: str) -> tuple[str, list[str]]:
     # 附件题（rev/pwn/misc/crypto）才装文件入口原语；web 题不为它付 schema token。
     if kind in ("file", "tcp"):
         try:
-            # file_triage removed in 1.2.2.5; use file/binwalk/r2 directly
+            # file inspection primitives removed in 1.2.2.5; use shell tools directly
             added = []
             print(f"[file] registered {len(added)} tools: {', '.join(added) or '(already present)'}", flush=True)
         except Exception as exc:  # noqa: BLE001
@@ -2330,7 +2330,7 @@ def install_toolset(task: dict[str, Any], kind: str) -> tuple[str, list[str]]:
         # Non-web primitives (decode chain / safe unpack / hex view / raw TCP /
         # batched TCP / ELF peek).  Split by kind: an attachment challenge must
         # not pay for socket schemas and a remote-service challenge must not pay
-        # for archive ones.  Kept separate from file_triage on purpose --
+        # for archive ones.  Kept separate from the inspection primitives on purpose --
         # Inspect tools answer "what does it say?".
         try:
             from ctf_strix import nonweb

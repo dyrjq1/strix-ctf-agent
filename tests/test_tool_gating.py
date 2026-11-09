@@ -90,6 +90,20 @@ def test_entrypoint_registers_web_primitives_only_for_web_kinds():
     assert 'kind in ("web", "checker", "engagement")' in window
 
 
+@pytest.mark.parametrize(
+    "metadata,expected,why",
+    [
+        ({"description": "create a storage you are operating here"}, False, "rag inside storage"),
+        ({"tags": ["benchmark_c2o", "api_operation"]}, False, "no AI signal at all"),
+        ({"tags": ["osint", "llm_reasoning"]}, False, "llm_reasoning is an OSINT tag"),
+        ({"description": "a chat bot backed by an llm"}, True, "real llm"),
+        ({"tags": ["rag"]}, True, "rag on its own"),
+        ({"tags": ["storage", "rag"]}, True, "rag alongside a word containing it"),
+        ({"tags": ["agent_defense"]}, True, "agent_defense"),
+        ({"tags": ["agent_task"]}, True, "agent_task"),
+        ({"tags": ["owasp_2026_asi01"]}, True, "asi01"),
+    ],
+)
 def test_aisec_hint_requires_a_whole_token(monkeypatch, metadata, expected, why):
     """Substring matching turned three schemas on for a plain storage challenge.
 

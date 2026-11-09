@@ -41,6 +41,9 @@ B_TIER_ROOTS = {
     "yara-python": "4.5.4",
     "segno": "1.6.6",
     "dnslib": "0.9.26",
+    "scapy": "2.8.0",
+    "r2pipe": "2.1.0",
+    "reedsolo": "1.7.0",
 }
 
 #: New transitive deps pulled in by the B-tier roots.  ``packaging``,
@@ -314,7 +317,7 @@ def test_next_hints_only_import_stdlib_or_locked_modules() -> None:
     这条管 ``python3 -c "from PIL import ..."`` 这类导入。新增提示若引用了
     lock 里没有的模块，测试会先红，而不是等模型在比赛里拿到 ImportError。
     """
-    from ctf_strix import unpack_archive as ft
+    from ctf_strix import nonweb as ft
 
     pins = _pins()
     stdlib = set(sys.stdlib_module_names)
@@ -334,7 +337,7 @@ def test_next_hints_only_import_stdlib_or_locked_modules() -> None:
 
 def test_image_families_offer_the_locked_image_library() -> None:
     """Pillow is the new image primitive; the two image families must name it."""
-    from ctf_strix import unpack_archive as ft
+    from ctf_strix import nonweb as ft
 
     assert "pillow" in _pins()
     for family in ("png", "jpeg"):

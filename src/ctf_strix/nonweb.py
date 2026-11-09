@@ -97,6 +97,107 @@ _ENGLISH_RE: Final = re.compile(
 )
 
 
+#: family → 决策表。每个家族直接给可执行动作，技能只作深读引用。
+#:
+#: ⚠️ 每一条命令都必须能在**本镜像里直接跑通**。旧版本给的是
+#: ``checksec`` / ``r2`` / ``binwalk`` / ``zsteg`` / ``exiftool`` / ``tshark``——这六个
+#: 在 ``docker/Dockerfile`` 里一个都没装。模型第一次调用就拿到一条
+#: 跑不通的命令，这是 Misc 题的第一个致命断点（docs/27 C2）。
+#:
+#: 现在的写法分两类：
+#:   * 镜像里有的工具（file / strings / xxd / unzip / binutils / python3）——直接给命令；
+#:   * 镜像里没有 CLI 的能力（图片隐写/pcap 重组/专用反编译器）——优先用
+#:     lock 里已有的 Python 库（Pillow）或 python3 手写入口，绝不给不存在的命令。
+#: 模型拿到 ``next:`` 就按 1→2→3 执行，不必先加载技能再决定方向；
+#: 末尾的 ``深读`` 只是需要更多手法时的索引，不是第一步。
+_NEXT: Final = {
+    "elf": (
+        "1) `readelf -h {p}` + `readelf -lW {p} | head -30` 看类型/段/入口；\n"
+        "2) `elfpeek('{p}', view='info')` 拿 NX/PIE/canary，`elfpeek('{p}', view='symbols')` 找 main/win/system；\n"
+        "3) 写利用前 `elffind('{p}', symbol='system')`、`elffind('{p}', search='/bin/sh')` 定位偏移；只有动态分析才 `gdb -batch -ex 'info functions' {p}`。别一上来跑它。\n"
+        "深读: ctf-reverse/ctf-reverse；利用链再看 ctf-pwn/ctf-pwn。"
+    ),
+    "pe": (
+        "1) `objdump -x {p} | head -60` 看节/导入表；`strings -n 8 {p} | grep -iE 'flag|http|password'` 找线索；\n"
+        "2) `objdump -h {p}` 看节权限，`objdump -d {p} | head -40` 从入口反汇编；\n"
+        "3) 镜像没有 PE 反编译器，控制流用 objdump 加 `hexpeek('{p}', length=512)` 手读。\n"
+        "深读: ctf-reverse/ctf-reverse。"
+    ),
+    "macho": (
+        "1) `hexpeek('{p}', length=64)` 认 0xfeedface/0xfeedfacf 与 CPU 类型；\n"
+        "2) `strings -n 8 {p} | head -40` 找 ObjC 类名/URL/flag；\n"
+        "3) 镜像没有 Mach-O 反编译器，用 `hexpeek('{p}', length=512)` 读头部后手切 load command。\n"
+        "深读: ctf-reverse/ctf-reverse。"
+    ),
+    "zip": (
+        "1) `unzip -l {p}` 先看清单与加密标记，别急着解；\n"
+        "2) `unpack_archive('{p}')` 递归进嵌套，越界条目会被拒绝；\n"
+        "3) 解出的最大文件再用 `file -b <name>` 确定下一个家族，不要逐个猜。\n"
+        "深读: ctf-forensics/ctf-forensics；编码层看 ctf-misc/encodings。"
+    ),
+    "gzip": (
+        "1) `python3 -c \"import gzip;d=gzip.open('{p}','rb').read();print(len(d),d[:64])\"` 看解压头；\n"
+        "2) `unpack_archive('{p}')` 直接进嵌套层；\n"
+        "3) `grep -arE 'FLAG|CTF|flag|ctf' extracted | head -20` 先扫文本。\n"
+        "深读: ctf-misc/encodings。"
+    ),
+    "png": (
+        "1) `hexpeek('{p}', length=64)` 认签名/IHDR；`python3 -c \"from PIL import Image;im=Image.open('{p}');print(im.size,im.mode,im.info)\"`；\n"
+        "2) 像素/位平面用 Pillow，别手解 zlib：`python3 -c \"from PIL import Image;im=Image.open('{p}').convert('RGB');print(list(im.getdata())[:8])\"`\n"
+        "3) 仍无头绪再 `python3 -c \"d=open('{p}','rb').read();print(d[8:33].hex())\"` 看宽高/位深，查 alpha 低位与 tEXt。\n"
+        "深读: ctf-forensics/stego-image。"
+    ),
+    "jpeg": (
+        "1) `hexpeek('{p}', length=64)` 看 SOI/APP 段；`python3 -c \"from PIL import Image;im=Image.open('{p}');print(im.size,im.mode)\"`\n"
+        "2) `strings -n 8 {p} | head -40` 找 EXIF/注释/URL；像素用 Pillow：`python3 -c \"from PIL import Image;im=Image.open('{p}');print(list(im.getdata())[:8])\"`\n"
+        "3) `python3 -c \"d=open('{p}','rb').read();i=d.rfind(b'\\xff\\xd9');print(len(d),i,d[i+2:i+66])\"` 看 EOI 后附加数据。\n"
+        "深读: ctf-forensics/stego-image。"
+    ),
+    "pdf": (
+        "1) `strings -n 8 {p} | head -60` 找 /URI /JS /OpenAction /Flag；\n"
+        "2) `grep -aE '/URI|/JS|/OpenAction|/FlateDecode' {p} | head -20` 列对象；\n"
+        "3) `python3 -c \"import zlib;d=open('{p}','rb').read();i=d.find(b'stream')+7;print(zlib.decompressobj().decompress(d[i:d.find(b'endstream')])[:200])\"` 解第一条流。\n"
+        "深读: ctf-forensics/ctf-forensics。"
+    ),
+    "pcap": (
+        "1) `hexpeek('{p}', length=32)` 认 d4c3b2a1（小端）或 a1b2c3d4（大端）与链路类型；\n"
+        "2) `python3 -c \"import struct;d=open('{p}','rb').read();print(len(d),struct.unpack('<IHHIIII',d[:24]))\"` 读全局头并反推包记录；\n"
+        "3) 逐条切 16B 记录 + payload；`strings -n 6 {p} | grep -iE 'GET|POST|flag|http'` 常直接见明文。\n"
+        "深读: ctf-forensics/network。"
+    ),
+    "pyc": (
+        "1) `xxd {p} | head -4` 读 magic，对照 `python3 -c \"import importlib.util;print(importlib.util.MAGIC_NUMBER.hex())\"`；\n"
+        "2) 版本一致时 `python3 -c \"import marshal,dis;f=open('{p}','rb');f.read(16);dis.dis(marshal.load(f))\"`；\n"
+        "3) 版本不同先找对应解释器；镜像没有反编译器，`strings -n 6 {p} | head -40` 常直接见常量。\n"
+        "深读: ctf-reverse/ctf-reverse。"
+    ),
+    "text": (
+        "1) `cat {p} | head -80` 先读原文，`grep -aoE 'FLAG|CTF|flag|ctf' {p} | head` 找标记；\n"
+        "2) 像 base64/hex/URL 的串用 `decode_blob('<粘贴该串>')`，不要手写解码器；\n"
+        "3) 认不出编码再 `file -bi {p}` 看字符集。\n"
+        "深读: ctf-misc/encodings；纯谜题看 ctf-misc/ctf-misc。"
+    ),
+    "unknown": (
+        "1) `hexpeek('{p}', length=64)` 先读前 64 字节魔数，别猜；\n"
+        "2) `strings -n 6 {p} | head -40` 找容器/版本/路径特征；\n"
+        "3) 仍认不出就只回报前两步结果，不要套用别的家族命令；`file -b {p}` 已是权威类型。\n"
+        "深读: ctf-triage/ctf-triage。"
+    ),
+    "rar": (
+        "1) `unar -l {p}` 看清单；若未装 unar，`xxd {p} | head -4` 认 Rar! 签名；\n"
+        "2) `unar {p}` 或 `unpack_archive('{p}')` 解出内容；\n"
+        "3) 解出后对最大文件用 `file -b <name>` 定方向。\n"
+        "深读: ctf-forensics/ctf-forensics。"
+    ),
+    "7z": (
+        "1) `7z l {p}` 看清单；若未装 7z，`xxd {p} | head -4` 认 7z 签名；\n"
+        "2) `7z x {p}` 或 `unpack_archive('{p}')` 解出内容；\n"
+        "3) 解出后对最大文件用 `file -b <name>` 定方向。\n"
+        "深读: ctf-forensics/ctf-forensics。"
+    ),
+}
+
+
 class _NonWebError(Exception):
     """An error a model can act on; never surfaced as a traceback."""
 
