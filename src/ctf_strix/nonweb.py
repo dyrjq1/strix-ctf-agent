@@ -113,20 +113,20 @@ _ENGLISH_RE: Final = re.compile(
 _NEXT: Final = {
     "elf": (
         "1) `readelf -h {p}` + `readelf -lW {p} | head -30` 看类型/段/入口；\n"
-        "2) `elfpeek('{p}', view='info')` 拿 NX/PIE/canary，`elfpeek('{p}', view='symbols')` 找 main/win/system；\n"
-        "3) 写利用前 `elffind('{p}', symbol='system')`、`elffind('{p}', search='/bin/sh')` 定位偏移；只有动态分析才 `gdb -batch -ex 'info functions' {p}`。别一上来跑它。\n"
+        "2) `readelf -h {p}` + `readelf -W -l {p} | grep GNU_STACK` 看 NX（GNU_STACK 无 RWE → NX），`readelf -sW {p} | grep __stack_chk_fail` 看 canary，`readelf -sW {p} | grep -E 'main|win|system'` 找符号；\n"
+        "3) 写利用前 `readelf -sW {p}`、`strings -a -t x {p} | grep '/bin/sh'` 定位偏移；只有动态分析才 `gdb -batch -ex 'info functions' {p}`。别一上来跑它。\n"
         "深读: ctf-reverse/ctf-reverse；利用链再看 ctf-pwn/ctf-pwn。"
     ),
     "pe": (
         "1) `objdump -x {p} | head -60` 看节/导入表；`strings -n 8 {p} | grep -iE 'flag|http|password'` 找线索；\n"
         "2) `objdump -h {p}` 看节权限，`objdump -d {p} | head -40` 从入口反汇编；\n"
-        "3) 镜像没有 PE 反编译器，控制流用 objdump 加 `hexpeek('{p}', length=512)` 手读。\n"
+        "3) 镜像没有 PE 反编译器，控制流用 objdump 加 `xxd -l 512 {p}` 手读。\n"
         "深读: ctf-reverse/ctf-reverse。"
     ),
     "macho": (
-        "1) `hexpeek('{p}', length=64)` 认 0xfeedface/0xfeedfacf 与 CPU 类型；\n"
+        "1) `xxd -l 64 {p}` 认 0xfeedface/0xfeedfacf 与 CPU 类型；\n"
         "2) `strings -n 8 {p} | head -40` 找 ObjC 类名/URL/flag；\n"
-        "3) 镜像没有 Mach-O 反编译器，用 `hexpeek('{p}', length=512)` 读头部后手切 load command。\n"
+        "3) 镜像没有 Mach-O 反编译器，用 `xxd -l 512 {p}` 读头部后手切 load command。\n"
         "深读: ctf-reverse/ctf-reverse。"
     ),
     "zip": (
@@ -142,13 +142,13 @@ _NEXT: Final = {
         "深读: ctf-misc/encodings。"
     ),
     "png": (
-        "1) `hexpeek('{p}', length=64)` 认签名/IHDR；`python3 -c \"from PIL import Image;im=Image.open('{p}');print(im.size,im.mode,im.info)\"`；\n"
+        "1) `xxd -l 64 {p}` 认签名/IHDR；`python3 -c \"from PIL import Image;im=Image.open('{p}');print(im.size,im.mode,im.info)\"`；\n"
         "2) 像素/位平面用 Pillow，别手解 zlib：`python3 -c \"from PIL import Image;im=Image.open('{p}').convert('RGB');print(list(im.getdata())[:8])\"`\n"
         "3) 仍无头绪再 `python3 -c \"d=open('{p}','rb').read();print(d[8:33].hex())\"` 看宽高/位深，查 alpha 低位与 tEXt。\n"
         "深读: ctf-forensics/stego-image。"
     ),
     "jpeg": (
-        "1) `hexpeek('{p}', length=64)` 看 SOI/APP 段；`python3 -c \"from PIL import Image;im=Image.open('{p}');print(im.size,im.mode)\"`\n"
+        "1) `xxd -l 64 {p}` 看 SOI/APP 段；`python3 -c \"from PIL import Image;im=Image.open('{p}');print(im.size,im.mode)\"`\n"
         "2) `strings -n 8 {p} | head -40` 找 EXIF/注释/URL；像素用 Pillow：`python3 -c \"from PIL import Image;im=Image.open('{p}');print(list(im.getdata())[:8])\"`\n"
         "3) `python3 -c \"d=open('{p}','rb').read();i=d.rfind(b'\\xff\\xd9');print(len(d),i,d[i+2:i+66])\"` 看 EOI 后附加数据。\n"
         "深读: ctf-forensics/stego-image。"
@@ -160,7 +160,7 @@ _NEXT: Final = {
         "深读: ctf-forensics/ctf-forensics。"
     ),
     "pcap": (
-        "1) `hexpeek('{p}', length=32)` 认 d4c3b2a1（小端）或 a1b2c3d4（大端）与链路类型；\n"
+        "1) `xxd -l 32 {p}` 认 d4c3b2a1（小端）或 a1b2c3d4（大端）与链路类型；\n"
         "2) `python3 -c \"import struct;d=open('{p}','rb').read();print(len(d),struct.unpack('<IHHIIII',d[:24]))\"` 读全局头并反推包记录；\n"
         "3) 逐条切 16B 记录 + payload；`strings -n 6 {p} | grep -iE 'GET|POST|flag|http'` 常直接见明文。\n"
         "深读: ctf-forensics/network。"
@@ -173,12 +173,12 @@ _NEXT: Final = {
     ),
     "text": (
         "1) `cat {p} | head -80` 先读原文，`grep -aoE 'FLAG|CTF|flag|ctf' {p} | head` 找标记；\n"
-        "2) 像 base64/hex/URL 的串用 `decode_blob('<粘贴该串>')`，不要手写解码器；\n"
+        "2) 像 base64/hex/URL 的串用 `echo '<粘贴该串>' | base64 -d`，hex 用 `python3 -c \"print(bytes.fromhex('<粘贴该串>').decode())\"`，URL 用 `python3 -c \"import urllib.parse;print(urllib.parse.unquote('<粘贴该串>'))\"`，不要手写解码器；\n"
         "3) 认不出编码再 `file -bi {p}` 看字符集。\n"
         "深读: ctf-misc/encodings；纯谜题看 ctf-misc/ctf-misc。"
     ),
     "unknown": (
-        "1) `hexpeek('{p}', length=64)` 先读前 64 字节魔数，别猜；\n"
+        "1) `xxd -l 64 {p}` 先读前 64 字节魔数，别猜；\n"
         "2) `strings -n 6 {p} | head -40` 找容器/版本/路径特征；\n"
         "3) 仍认不出就只回报前两步结果，不要套用别的家族命令；`file -b {p}` 已是权威类型。\n"
         "深读: ctf-triage/ctf-triage。"
