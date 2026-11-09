@@ -116,7 +116,7 @@ def test_every_registered_tool_is_described_in_the_catalogue():
 
 
 def test_catalogue_does_not_promise_tools_nobody_registers():
-    from ctf_strix import catalogue, file_triage, nonweb
+    from ctf_strix import catalogue, file_triage, nonweb, skill_router
     from ctf_strix.aisec import tools as aisec_tools
 
     from ctf_strix import discovery, http_probe, variants
@@ -130,6 +130,9 @@ def test_catalogue_does_not_promise_tools_nobody_registers():
     registered |= {"http_probe", "route_map", "method_sweep", "path_variants"}
     # Traffic memory: two read-only primitives that replay the ledger.
     registered |= {"traffic_list", "traffic_view"}
+    # skill_route: env-gated via CTF_SKILL_ROUTE; the same flag also removes
+    # the catalogue row, so promise and registration stay in agreement.
+    registered |= {fn.__name__ for fn in skill_router.TOOLS}
     # The base four are vendor tools; they are asserted separately below.
     base = {"exec_command", "load_skill", "think"}
 

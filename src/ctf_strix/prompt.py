@@ -120,9 +120,10 @@ execution/file/DB read, and did I actually read the secret — or only a schema?
 #: ``How to spend turns`` differs by challenge kind.  A file challenge has no
 #: root page to probe and no accounts to register; telling it to do both burns
 #: two turns before it opens the attachment.  The file text points at the
-#: per-family ``next:`` table inside ``file_triage``: the model should run
-#: that table instead of loading a skill just to decide the direction.
-#: The web text is the original one, unchanged, so the measured web
+#: per-family ``next:`` table inside ``file_triage``: the model runs that
+#: table first; ``load_skill`` of the family index is the established second
+#: step for method notes, skipped when the triage output already fixed the
+#: route.  The web text is the original one, unchanged, so the measured web
 #: behaviour does not move.
 _TURNS_WEB = """\
 ## How to spend turns
@@ -141,8 +142,10 @@ _TURNS_FILE = """\
 1. `file_triage` the attachment once. Do not run `file` and `strings` by hand
    first: the triage answer already contains both, plus the family guess.
 2. Run its `next:` table in order (1 then 2 then 3). The table is per family and
-   every command is installed in this image; a deep-read skill line is a last
-   resort, not the first step. Do not substitute a command from another family.
+   every command is installed in this image. When you need the family's method
+   notes, `load_skill` that one direction index first (an 8KB route table); if
+   the triage output already fixed the route, skip the load and keep executing.
+   Do not substitute a command from another family.
 3. When the trail is a string rather than a file, `decode_blob` before writing
    your own decoder — it reports which layer was which. An archive goes through
    `unpack_archive`; a binary stays static in `elfpeek` until you have a reason
@@ -331,6 +334,20 @@ def _route_hint(description: str) -> str:
     return text
 
 
+#: D-2 短名单：生产 ``activate()`` 传入实测注册名后，只展开本题型短名单的
+#: 完整触发描述；其余方向压成一行纯可加载名单（注册面不动，跨方向仍可
+#: load，名字就是 ``分类/分类``）。名单与 routing 的 kind 过滤同源（triage
+#: 恒在）；file 含 pwn——ELF 附件题在建立连接前 kind=file，下一步就是 pwn
+#: 方法。web 族三个 kind 共用同一张 web 短名单。
+_SKILL_SHORTLIST: dict[str, tuple[str, ...]] = {
+    "web": ("ctf-web", "ctf-supply-chain", "ctf-agentic-ai", "ctf-ai-infra", "ctf-triage"),
+    "checker": ("ctf-web", "ctf-supply-chain", "ctf-agentic-ai", "ctf-ai-infra", "ctf-triage"),
+    "engagement": ("ctf-web", "ctf-supply-chain", "ctf-agentic-ai", "ctf-ai-infra", "ctf-triage"),
+    "file": ("ctf-reverse", "ctf-pwn", "ctf-crypto", "ctf-forensics", "ctf-misc", "ctf-malware", "ctf-triage"),
+    "tcp": ("ctf-pwn", "ctf-reverse", "ctf-triage"),
+}
+
+
 def _skills_block() -> str:
     """按已注册技能生成**带触发条件**的方向索引。
 
@@ -346,7 +363,7 @@ def _skills_block() -> str:
     except Exception:  # noqa: BLE001 - 技能索引失败不该阻止跑题
         return ""
 
-    lines: list[str] = []
+    entries: dict[str, str] = {}
     for category in sorted(available):
         if not category.startswith(_SKILL_PREFIX):
             continue
@@ -361,9 +378,28 @@ def _skills_block() -> str:
             hint = _route_hint(str(entry.get("description") or ""))
             if category == "ctf-osint":
                 hint = "local artifacts only (EXIF, metadata, logs, files); there is no internet"
-            lines.append(f"- `{category}/{name}`" + (f" \u2014 {hint}" if hint else ""))
-    if not lines:
+            entries[category] = f"- `{category}/{name}`" + (f" \u2014 {hint}" if hint else "")
+    if not entries:
         return ""
+
+    # 短名单门控在 names 上：生产链路 agent.install_toolset 传实测注册名，
+    # kind 过滤在实战生效；默认态（不传 names）保持全量块，既有测试锁死的
+    # 就是那份全量文本。未知 kind 回落全量块。
+    shortlist = _SKILL_SHORTLIST.get(_ACTIVE_KIND) if _ACTIVE_NAMES else None
+    if shortlist is None:
+        lines = [entries[c] for c in sorted(entries)]
+    else:
+        lines = [entries[c] for c in sorted(entries) if c in shortlist]
+        rest = [c for c in sorted(entries) if c not in shortlist]
+        if rest:
+            parts = []
+            for c in rest:
+                item = f"`{c}/{c}`"
+                if c == "ctf-osint":
+                    # 断网护栏不许随压缩丢失：osint 只读本地产物。
+                    item += " (local-only, no internet)"
+                parts.append(item)
+            lines.append("- Other directions: " + ", ".join(parts))
     return (
         "## Skill indexes\n\n"
         "Load at most one. Each line says **when**; subfiles: `exec_command`\n"

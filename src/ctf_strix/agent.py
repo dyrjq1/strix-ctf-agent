@@ -2209,7 +2209,14 @@ def _measured_groups(kind: str) -> list[str]:
         for info in catalogue.for_kind(kind)
         if info.group != "base" and info.name in present
     }
-    return [group for group in ("web", "file", "tcp", "aisec") if group in found]
+    # ``skills`` only appears when skill_route really registered: the
+    # rollback env and a failed registration must both remove the prompt
+    # promise together with the tool, not leave one behind.
+    return [
+        group
+        for group in ("web", "file", "tcp", "aisec", "skills")
+        if group in found
+    ]
 
 
 def _autosubmit_target(task: dict[str, Any]) -> tuple[str, str, str] | None:
@@ -2363,6 +2370,12 @@ def install_toolset(task: dict[str, Any], kind: str) -> tuple[str, list[str]]:
             print(f"[ctfy] skills registered={len(names)} ref={skillpack.ref_root()}", flush=True)
         else:
             print("[ctfy] skills pack missing, routing hint not installed", flush=True)
+        # skill_route：把观测文本变成确定性方向排名（与 routing 表同一信号
+        # 词表、同一优先序），注册失败只少一个工具，不影响解题。
+        from ctf_strix import skill_router
+
+        routed = skill_router.register()
+        print(f"[ctfy] skill_route registered={len(routed)}", flush=True)
     except Exception as exc:  # noqa: BLE001 — 技能装不上也要能把题跑完
         print(f"[ctfy] skills registration failed: {type(exc).__name__}: {exc}", flush=True)
 
@@ -3126,7 +3139,7 @@ def _run_agent(
             oldest = next(iter(pending_calls))
             pair = pending_calls.pop(oldest)
         if pair is None and attempt_pairs and len(attempt_outputs) < len(attempt_pairs):
-            # Last resort: the previous output was never paired.  Reuse its
+            # Fallback: the previous output was never paired.  Reuse its
             # call in order rather than dropping the output from the digest.
             pair = attempt_pairs[len(attempt_outputs)]
         # Only the root's calls feed the retry digest; child probes are a

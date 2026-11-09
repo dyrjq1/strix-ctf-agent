@@ -180,6 +180,52 @@ def render(path: Path, ref: str, category: str) -> str:
     return head + _hint(ref, category) + mask_flags(body)
 
 
+#: 单个索引（渲染后、落盘前）的字节上限。超过即在 stage() 里截断并追加显式
+#: 标记行——绝不 raise：比赛一局定生死，索引超限不该弄崩一道题。
+#: 单测/CI 里另有一条 strict 闸（源索引原始字节 ≤ 此值，见 tests/test_skillpack.py），
+#: 把超标挡在进仓库之前；这里是运行时兜底。
+INDEX_MAX_BYTES: int = 8192
+
+
+def _index_cap() -> int:
+    """读 ``CTF_INDEX_CAP``（调试放宽/收紧用），未设或非法时回默认值。"""
+    import os
+
+    raw = os.environ.get("CTF_INDEX_CAP")
+    if not raw:
+        return INDEX_MAX_BYTES
+    try:
+        return int(raw)
+    except ValueError:
+        return INDEX_MAX_BYTES
+
+
+def _cap_index(body: str, ref: str, category: str, cap: int) -> str:
+    """运行时闸：渲染后的索引超 *cap* 字节就截断，尾部追加显式标记行。
+
+    标记行带 L3 子文件路径提示：被截掉的章节本来就有子文件兜着，渐进披露
+    （L2 索引 → L3 子文件）不因截断而断链。不是静默截断。
+
+    Returns:
+        截断后的文本；不超限时原样返回。结果总字节数 ≤ *cap*。
+    """
+    marker = (
+        f"\n\n> [INDEX TRUNCATED at {cap}B: remaining sections live in subfiles "
+        f"under `{ref}/{category}/`; read them with exec_command (`cat`/`sed -n`).]\n"
+    )
+    budget = max(cap - len(marker.encode("utf-8")), 0)
+    encoded = body.encode("utf-8")
+    if len(encoded) <= budget:
+        return body
+    cut = encoded[:budget]
+    nl = cut.rfind(b"\n")
+    if nl > 0:
+        cut = cut[: nl + 1]
+    # 按整行切（UTF-8 续字节不含 0x0A，行边界即字符边界）；ignore 只是兜底。
+    text = cut.decode("utf-8", errors="ignore").rstrip("\n")
+    return text + marker
+
+
 def stage(ref: str | None = None, pack: Path | None = None) -> Path:
     """生成只含索引的临时注册目录。
 
@@ -190,7 +236,9 @@ def stage(ref: str | None = None, pack: Path | None = None) -> Path:
 
     Returns:
         注册目录（``<tmp>/<分类>/<分类>.md``）。技能包缺失时返回一个空目录——
-        调用方据此判断"要不要注册"，而不是拿到异常。
+        调用方据此判断"要不要注册"，而不是拿到异常。索引渲染后超过
+        :data:`INDEX_MAX_BYTES`（``CTF_INDEX_CAP`` 可覆盖）按 :func:`_cap_index`
+        截断并追加标记行，绝不 raise。
 
     Raises:
         OSError: 临时目录不可写。
@@ -206,7 +254,10 @@ def stage(ref: str | None = None, pack: Path | None = None) -> Path:
         except OSError:
             # 单个索引读不到不该让整题跑不动：少一个方向，其余照常。
             continue
-        (out_dir / f"{name}.md").write_text(body, encoding="utf-8")
+        body = _cap_index(body, ref_path, category, _index_cap())
+        # 二进制落盘：字节闸算的就是落盘字节；文本模式在 Windows 会把 \n 翻译成
+        # \r\n，闸口就形同虚设。顺带保证 staged 副本恒为 LF。
+        (out_dir / f"{name}.md").write_bytes(body.encode("utf-8"))
     return dst
 
 

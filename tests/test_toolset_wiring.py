@@ -134,3 +134,26 @@ def test_a_tool_that_failed_to_register_is_not_promised(monkeypatch):
     finally:
         factory._EXTRA_TOOLS[:] = saved
         prompt.activate("web", ("base", "web"), None)
+
+
+def test_skill_route_registers_and_is_described_for_every_kind(registry):
+    """The deterministic router ships on all kinds, in registry and prompt."""
+    for kind in ("web", "file", "tcp"):
+        names, groups, text = registry(kind)
+        assert "skill_route" in names, f"{kind}: skill_route not in registry"
+        assert "skills" in groups, f"{kind}: skills group not measured"
+        assert "`skill_route`" in text, f"{kind}: prompt does not describe skill_route"
+
+
+def test_skill_route_rollback_env_removes_tool_and_promise(registry, monkeypatch):
+    """CTF_SKILL_ROUTE=0 must remove the tool *and* its prompt line together.
+
+    The rollback is one env var; a rollback that left the schema in the tool
+    surface or the description in the prompt would drift the measured prompt
+    from the shipped one -- the exact failure class this file exists for.
+    """
+    monkeypatch.setenv("CTF_SKILL_ROUTE", "0")
+    names, groups, text = registry("web")
+    assert "skill_route" not in names
+    assert "skills" not in groups
+    assert "`skill_route`" not in text

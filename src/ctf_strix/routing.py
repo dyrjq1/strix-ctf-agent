@@ -189,7 +189,8 @@ def render(
         + step_two
         + "2b. **Prefer the enumerator.** If `route_map`, `path_variants`, "
         "`method_sweep`, `tcp_batch`, `decode_blob` or `file_triage` covers it, "
-        "call it once instead of looping by hand.\n"
+        "call it once instead of looping by hand. Enumerators map the surface; "
+        "the index names the mechanism -- load it first.\n"
         "3. **Write the falsifier before the first payload**: \"If mechanism M holds, "
         "check C returns X; if Y, M is closed.\" Two identical responses from "
         "one family = wrong mechanism: change the attack class, not the payload.\n"

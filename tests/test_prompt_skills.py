@@ -162,19 +162,48 @@ def test_hypothesis_block_is_within_its_character_budget() -> None:
 
 
 def test_file_turn_plan_runs_the_triage_table_before_loading_a_skill() -> None:
-    """The file branch must point at the tool's own table, not at a skill.
+    """The triage table stays the authority on direction; the index adds method.
 
-    The decision table ships inside ``file_triage``'s return value; telling the
-    model to load a discipline index first adds a round trip that carries no
-    information about the file it is already holding.
+    ``file_triage``'s decision table ships in the tool's return value and is
+    run first; ``load_skill`` of the one direction index is the established
+    second step for method notes, and is skipped outright when the triage
+    output already fixed the route.
     """
     from ctf_strix import prompt
 
     text = prompt._TURNS_FILE
     assert "`next:`" in text
     assert "1 then 2 then 3" in text
-    assert "last resort" in " ".join(text.split())
-    assert "load_skill" not in text
+    assert "resort" not in " ".join(text.split())
+    assert "load_skill" in text
+
+
+def test_kind_shortlist_keeps_other_directions_loadable_but_undescribed() -> None:
+    """With measured names, kind=web must not carry other families' full hints.
+
+    The registration surface is untouched: every registered category stays
+    loadable from the compressed one-line list; only the per-line trigger
+    descriptions are filtered to the kind's shortlist.  The osint offline
+    guard must survive compression.
+    """
+    from ctf_strix import prompt
+
+    before = prompt.active()
+    try:
+        prompt.activate("web", ("base", "web"), frozenset({"ctf-web/ctf-web"}))
+        index = prompt.build({}).partition("## Skill indexes")[2]
+        assert "`ctf-web/ctf-web` —" in index, "shortlist row lost its hint"
+        assert "`ctf-crypto/ctf-crypto` —" not in index, "foreign family still fully described"
+        assert "`ctf-crypto/ctf-crypto`" in index, "foreign family must stay loadable"
+        assert "no internet" in index, "osint offline guard lost in compression"
+        assert "- Other directions: " in index, "compressed list line missing"
+
+        prompt.activate("file", ("base", "file"), frozenset({"ctf-crypto/ctf-crypto"}))
+        index = prompt.build({}).partition("## Skill indexes")[2]
+        assert "`ctf-pwn/ctf-pwn` —" in index, "file shortlist must include pwn"
+        assert "`ctf-web/ctf-web` —" not in index, "web family fully described for file kind"
+    finally:
+        prompt.activate(*before)
 
 
 def test_skill_index_teaches_registered_read_channels_only() -> None:

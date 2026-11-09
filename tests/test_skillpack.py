@@ -72,6 +72,62 @@ def test_stage_writes_only_indexes(tmp_path: Path) -> None:
     assert "/var/ctf/jail/skills/ctf-web/" in body
 
 
+def test_index_sources_fit_the_gate() -> None:
+    """strict 闸（单测/CI 专用）：源索引原始字节必须 ≤ INDEX_MAX_BYTES。
+
+    运行时 stage() 有截断兜底，但 CI 在这里 fail-loud：超标的索引该先下沉
+    子文件再进仓库，不能靠运行期截断续命。
+    """
+    for category, _name, path in skillpack.index_skills():
+        size = len(path.read_bytes())
+        assert size <= skillpack.INDEX_MAX_BYTES, (
+            f"{category} 索引 {size}B > {skillpack.INDEX_MAX_BYTES}B：先下沉再进仓库"
+        )
+
+
+def test_stage_truncates_oversize_index_and_marks_it(tmp_path: Path) -> None:
+    """运行时闸：超限截断到上限 + 尾部标记行带 L3 子文件路径，绝不 raise。"""
+    pack = tmp_path / "ctf-fat"
+    pack.mkdir()
+    (pack / "ctf-fat.md").write_text(
+        "# fat\n\n" + ("filler line\n" * 2000), encoding="utf-8"
+    )
+    reg = skillpack.stage(ref="/var/ctf/jail/skills", pack=tmp_path)
+    out = (reg / "ctf-fat" / "ctf-fat.md").read_bytes()
+    assert len(out) <= skillpack.INDEX_MAX_BYTES, f"截断后仍 {len(out)}B > 上限"
+    text = out.decode("utf-8")
+    assert "INDEX TRUNCATED" in text
+    assert "/var/ctf/jail/skills/ctf-fat/" in text
+    assert "exec_command" in text
+
+
+def test_stage_leaves_small_index_untouched(tmp_path: Path) -> None:
+    """不超限的索引必须原样通过，不能被闸误伤。"""
+    pack = tmp_path / "ctf-thin"
+    pack.mkdir()
+    (pack / "ctf-thin.md").write_text("# thin\n\nok\n", encoding="utf-8")
+    reg = skillpack.stage(ref="/p", pack=tmp_path)
+    text = (reg / "ctf-thin" / "ctf-thin.md").read_text(encoding="utf-8")
+    assert "INDEX TRUNCATED" not in text
+    assert "ok" in text
+
+
+def test_index_cap_env_relaxes_the_gate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``CTF_INDEX_CAP`` 覆盖上限：设小值时同样截断且结果 ≤ 该值。"""
+    pack = tmp_path / "ctf-mid"
+    pack.mkdir()
+    (pack / "ctf-mid.md").write_text(
+        "# mid\n\n" + ("x" * 4000) + "\n", encoding="utf-8"
+    )
+    monkeypatch.setenv("CTF_INDEX_CAP", "2048")
+    reg = skillpack.stage(ref="/p", pack=tmp_path)
+    out = (reg / "ctf-mid" / "ctf-mid.md").read_bytes()
+    assert len(out) <= 2048, f"CTF_INDEX_CAP=2048 未生效，产物 {len(out)}B"
+    assert "INDEX TRUNCATED" in out.decode("utf-8")
+
+
 def test_similar_search_is_not_staged_or_registered() -> None:
     """A category that needs pip + api.tavily.com cannot be offered.
 

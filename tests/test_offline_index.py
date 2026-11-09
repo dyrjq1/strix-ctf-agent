@@ -321,7 +321,12 @@ def _router_section() -> str:
     text = (SKILLS / "ctf-crypto" / "ctf-crypto.md").read_text(encoding="utf-8")
     _, _, tail = text.partition(ROUTER_HEADING)
     assert tail, "router section missing from ctf-crypto.md"
-    return tail
+    # The 8KB index gate moved the per-family signal tables verbatim into
+    # ``router-tables.md``; the index keeps the protocol and global warnings.
+    # The bidirectional contract spans both files: wherever a table row lives,
+    # its ``patterns/<ID>.md`` link must exist on disk and vice versa.
+    tables = (SKILLS / "ctf-crypto" / "router-tables.md").read_text(encoding="utf-8")
+    return tail + "\n" + tables
 
 
 def test_pattern_cards_exist_and_router_is_bidirectional() -> None:

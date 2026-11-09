@@ -80,6 +80,14 @@ CATALOGUE: Final[tuple[ToolInfo, ...]] = (
         "base",
     ),
     ToolInfo(
+        "skill_route",
+        "paste raw observations (tool output, banner, error text); keyword "
+        "match ranks top disciplines with a start card and masked preview; "
+        "no hit says so — do not load on a guess",
+        ALL_KINDS,
+        "skills",
+    ),
+    ToolInfo(
         "think",
         "reasoning scratchpad. It does not touch the target and yields no new "
         "information",
