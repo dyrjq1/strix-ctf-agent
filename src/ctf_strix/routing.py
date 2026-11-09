@@ -71,7 +71,7 @@ ROUTES: tuple[tuple[str, str, tuple[str, ...], str], ...] = (
         "pcap / disk / memory / image / audio / document",
         "ctf-forensics",
         ("file",),
-        "file_triage once, then its family table; no hand-rolled strings",
+        "inspect the file, then its family table; no hand-rolled strings",
     ),
     (
         "big integers / curves / keys / nonces / ciphertext",
@@ -83,7 +83,7 @@ ROUTES: tuple[tuple[str, str, tuple[str, ...], str], ...] = (
         "encoding chains / pyjail / bashjail / esolang / puzzle",
         "ctf-misc",
         ("file", "tcp"),
-        "decode_blob once, then decide what to hand-write",
+        "inspect the encoding, then decide what to hand-write",
     ),
     (
         "sample / C2 / obfuscated script / macro document",
@@ -183,12 +183,12 @@ def render(
         "your priors. Four moves:\n"
         "1. **Observe before naming.** Classify with one cheap, unfakeable "
         "observation: HTTP root status/length/fingerprint; a file goes to "
-        "`file_triage`.\n"
+        "`file` and `binwalk`.\n"
         "   Liveness gate: same body on every path, or only a framework 404 "
         "with no app marker = dead instance. Say so and stop; do not enumerate.\n"
         + step_two
         + "2b. **Prefer the enumerator.** If `route_map`, `path_variants`, "
-        "`method_sweep`, `tcp_batch`, `decode_blob` or `file_triage` covers it, "
+        "`method_sweep` or `tcp_batch` covers it, "
         "call it once instead of looping by hand.\n"
         "3. **Write the falsifier before the first payload**: \"If mechanism M holds, "
         "check C returns X; if Y, M is closed.\" Two identical responses from "

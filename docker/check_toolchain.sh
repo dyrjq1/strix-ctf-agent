@@ -154,7 +154,7 @@ import struct
 import sys
 
 MODULES = ("numpy", "sympy", "gmpy2", "scipy", "matplotlib", "pefile",
-           "yara", "segno", "dnslib")
+           "yara", "segno", "dnslib", "scapy", "reedsolo", "r2pipe")
 missing = [name for name in MODULES if importlib.util.find_spec(name) is None]
 if missing:
     sys.exit("missing namespaces: " + ", ".join(missing))
@@ -165,9 +165,13 @@ import sympy
 import gmpy2
 import pefile
 import segno
+import r2pipe  # noqa: F401 -- the r2 binaries are probed below
+import scapy
 import yara
 from dnslib import DNSRecord
+from reedsolo import RSCodec
 from scipy import fft
+from scapy.all import IP, TCP
 
 assert (np.array([[1, 2], [3, 4]]) @ np.array([[1, 0], [0, 1]])).tolist() == [[1, 2], [3, 4]]
 
@@ -209,11 +213,18 @@ qr = io.BytesIO()
 segno.make("ctf").save(qr, kind="png")
 assert qr.getvalue()[:8] == b"\x89PNG\r\n\x1a\n"
 
+packet = IP(src="127.0.0.1") / TCP(dport=80)
+assert len(bytes(packet)) >= 40
+
+codeword = bytearray(RSCodec(10).encode(b"ctfy"))
+codeword[3] ^= 0xFF
+assert bytes(RSCodec(10).decode(bytes(codeword))[0]) == b"ctfy"
+
 print("[toolchain] imports: numpy=%s sympy=%s gmpy2=%s scipy=%s matplotlib=%s "
-      "pefile=%s yara=%s segno=%s dnslib=ok" % (
+      "pefile=%s yara=%s segno=%s dnslib=ok scapy=%s reedsolo=ok r2pipe=ok" % (
           np.__version__, sympy.__version__, gmpy2.version(),
           scipy.__version__, matplotlib.__version__, pefile.__version__,
-          yara.__version__, segno.__version__,
+          yara.__version__, segno.__version__, scapy.__version__,
       ))
 PY
 
@@ -245,6 +256,21 @@ PROBES = {
     "impacket": ("secretsdump.py", "-h"),
     "flask-unsign": ("flask-unsign", "--help"),
     "RsaCtfTool": ("RsaCtfTool", "--help"),
+    "binwalk": ("binwalk", "--help"),
+    "exiftool": ("exiftool", "-ver"),
+    "7z": ("7z",),
+    "upx": ("upx", "--version"),
+    "sox": ("sox", "--version"),
+    "pngcheck": ("pngcheck",),
+    "tcpdump": ("tcpdump", "--version"),
+    "steghide": ("steghide", "version"),
+    "tshark": ("tshark", "-v"),
+    "fls": ("fls", "-V"),
+    "pdftotext": ("pdftotext", "-v"),
+    "zbarimg": ("zbarimg", "--version"),
+    "radare2": ("r2", "-v"),
+    "rabin2": ("rabin2", "-v"),
+    "unar": ("unar", "-v"),
 }
 for label, argv in PROBES.items():
     exe = shutil.which(argv[0])

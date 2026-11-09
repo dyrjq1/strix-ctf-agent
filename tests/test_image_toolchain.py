@@ -310,11 +310,11 @@ def test_image_namespaces_import_and_work() -> None:
 def test_next_hints_only_import_stdlib_or_locked_modules() -> None:
     """``_NEXT`` 里的 Python 片段也必须能在镜像里跑。
 
-    这条和 ``test_file_triage.py`` 的二进制白名单互补：那条管 shell 命令，
+    这条和 ``test_unpack_archive.py`` 的二进制白名单互补：那条管 shell 命令，
     这条管 ``python3 -c "from PIL import ..."`` 这类导入。新增提示若引用了
     lock 里没有的模块，测试会先红，而不是等模型在比赛里拿到 ImportError。
     """
-    from ctf_strix import file_triage as ft
+    from ctf_strix import unpack_archive as ft
 
     pins = _pins()
     stdlib = set(sys.stdlib_module_names)
@@ -334,7 +334,7 @@ def test_next_hints_only_import_stdlib_or_locked_modules() -> None:
 
 def test_image_families_offer_the_locked_image_library() -> None:
     """Pillow is the new image primitive; the two image families must name it."""
-    from ctf_strix import file_triage as ft
+    from ctf_strix import unpack_archive as ft
 
     assert "pillow" in _pins()
     for family in ("png", "jpeg"):

@@ -44,7 +44,7 @@ strix 建造 agent 时走三条不同的路：
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Any, Callable
+from typing import TYPE_CHECKING, Any, Callable, Final
 
 if TYPE_CHECKING:
     from agents.tool import FunctionTool
@@ -53,6 +53,52 @@ logger = logging.getLogger(__name__)
 
 #: 施加过守卫的工具会带上这个标记，避免三重挂钩互相套娃。
 _MARK = "_ctf_mounted"
+
+
+
+#: Character ceiling for any single tool output.  Strix's own
+#: ``_with_bounded_result`` caps at 50 KB bytes; this is a narrower
+#: character-level safety net that applies to every path (regular /
+#: Shell / filesystem).  The value is borrowed from strix's 50 KB
+#: byte budget (one UTF-8 char 鈮?4 bytes = ~12.5k chars, doubled
+#: for non-ASCII headroom).  This is a wiring fix, not a budget
+#: tuning knob -- the ceiling already existed; it just was not
+#: universally enforced.
+_TOOL_OUTPUT_MAX_CHARS: Final = 32_000
+
+
+def _clip_output(text: str) -> str:
+    """Return *text* unchanged when under the ceiling, else head + tail."""
+    limit = _TOOL_OUTPUT_MAX_CHARS
+    if len(text) <= limit:
+        return text
+    head = limit * 3 // 4
+    tail = limit - head - 40
+    return text[:head] + f"\n...[truncated {len(text)} chars total]\n" + text[-tail:]
+
+
+def _wrap_for_truncation(tool: "FunctionTool") -> "FunctionTool":
+    """Wrap *tool* so every output string is clipped to the ceiling.
+
+    Idempotent; does nothing when the tool already carries the mark.
+    Runs *outside* the strix byte-level cap so it catches anything
+    that escapes that layer, including structured returns that the
+    byte cap skips.
+    """
+    if getattr(tool, "_ctf_output_clipped", False):
+        return tool
+
+    invoke_tool = tool.on_invoke_tool
+
+    async def invoke(ctx: Any, raw_input: str) -> Any:
+        result = await invoke_tool(ctx, raw_input)
+        if isinstance(result, str):
+            result = _clip_output(result)
+        return result
+
+    tool.on_invoke_tool = invoke
+    tool._ctf_output_clipped = True
+    return tool
 
 
 def _apply_to_toolset(toolset: Any, mount: Callable[["FunctionTool"], "FunctionTool"]) -> None:
@@ -102,6 +148,18 @@ def install_mount_hook() -> None:
     def fs_hook(toolset: Any, **kwargs: Any) -> None:
         original_fs(toolset, **kwargs)
         _apply_to_toolset(toolset, factory._with_bounded_result)
+
+    # Layer the output truncation *outside* the guards so it runs
+    # after every guard has recorded its counters but before the
+    # result enters history.  This is the narrowest character-level
+    # ceiling and catches any path that the strix byte-level cap
+    # misses (structured returns, sub-agent channels, etc.).
+    _original_bounded = factory._with_bounded_result
+
+    def _bounded_with_truncation(tool: Any) -> Any:
+        return _wrap_for_truncation(_original_bounded(tool))
+
+    factory._with_bounded_result = _bounded_with_truncation  # type: ignore[assignment]
 
     factory._configure_shell_tools = shell_hook  # type: ignore[assignment]
     factory._configure_filesystem_tools = fs_hook  # type: ignore[assignment]

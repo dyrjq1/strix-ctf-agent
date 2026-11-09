@@ -29,45 +29,6 @@ from ctf_strix import nonweb  # noqa: E402
 
 
 # --------------------------------------------------------------------------
-# decode_blob
-# --------------------------------------------------------------------------
-
-
-def test_decode_blob_single_layer_reports_flag() -> None:
-    out = nonweb.decode_blob("ZmxhZ3tiNjRfc2luZ2xlX2xheWVyfQ==")
-    assert "flag{b64_single_layer}" in out
-    assert "base64" in out
-
-
-def test_decode_blob_walks_a_chain() -> None:
-    inner = "flag{two_layers}".encode().hex()
-    outer = inner.encode().hex()
-    out = nonweb.decode_blob(outer)
-    assert "flag{two_layers}" in out
-    assert out.count("->") >= 2
-
-
-def test_decode_blob_refuses_to_dig_on_plain_prose() -> None:
-    """Without the printable/English gate every sentence decodes to noise.
-
-    The failure is not cosmetic: a bogus layer hides the real one behind a
-    wrong ``cur`` value on the next iteration.
-    """
-    out = nonweb.decode_blob("the quick brown fox jumps over the lazy dog")
-    assert "no decoding chain" in out
-
-
-def test_decode_blob_empty_input_is_a_hint() -> None:
-    assert "empty" in nonweb.decode_blob("")
-
-
-def test_decode_blob_oversized_input_points_at_hexpeek() -> None:
-    out = nonweb.decode_blob("A" * (nonweb._BLOB_MAX_CHARS + 10))
-    assert "hexpeek" in out
-
-
-# --------------------------------------------------------------------------
-# unpack_archive
 # --------------------------------------------------------------------------
 
 
@@ -136,35 +97,6 @@ def test_unpack_archive_missing_file_suggests_ls(tmp_path: Path) -> None:
 
 
 # --------------------------------------------------------------------------
-# hexpeek
-# --------------------------------------------------------------------------
-
-
-def test_hexpeek_shows_header_and_continuation(tmp_path: Path) -> None:
-    target = tmp_path / "blob.bin"
-    target.write_bytes(bytes(range(64)))
-    out = nonweb.hexpeek(str(target), 0, 16)
-    assert "00000000" in out
-    assert "|" in out
-    assert "continue with offset=16" in out
-
-
-def test_hexpeek_accepts_hex_offset(tmp_path: Path) -> None:
-    target = tmp_path / "blob.bin"
-    target.write_bytes(b"A" * 32)
-    out = nonweb.hexpeek(str(target), "0x10", 8)
-    assert "range [16, 24)" in out
-
-
-def test_hexpeek_past_end_is_explained(tmp_path: Path) -> None:
-    target = tmp_path / "small.bin"
-    target.write_bytes(b"A")
-    out = nonweb.hexpeek(str(target), 100, 16)
-    assert "past the end" in out
-
-
-# --------------------------------------------------------------------------
-# tcp / tcp_batch
 # --------------------------------------------------------------------------
 
 
@@ -237,7 +169,6 @@ def test_tcp_batch_caps_the_candidate_list() -> None:
 
 
 # --------------------------------------------------------------------------
-# elfpeek
 # --------------------------------------------------------------------------
 
 
@@ -261,36 +192,6 @@ def _tiny_elf() -> bytes:
     struct.pack_into("<QQQQ", data, 72, 0, 0x400000, 0x400000, size)
     code = b"\x5f\xc3" + b"/bin/sh\x00"
     return bytes(data[: 0x78] + code + data[0x78 + len(code) :])
-
-
-def test_elfpeek_info_names_mitigations_and_next_step(tmp_path: Path) -> None:
-    target = tmp_path / "tiny.elf"
-    target.write_bytes(_tiny_elf())
-    out = nonweb.elfpeek(str(target))
-    assert "PIE=False" in out
-    assert "entry segment" in out
-    assert "next:" in out
-
-
-def test_elfpeek_gadgets_finds_patterns(tmp_path: Path) -> None:
-    """Gadget search must work whether or not a decoder is installed."""
-    target = tmp_path / "tiny.elf"
-    target.write_bytes(_tiny_elf())
-    out = nonweb.elfpeek(str(target), view="gadgets")
-    assert "pop rdi; ret" in out
-    assert "/bin/sh" in out
-
-
-def test_gadgets_fall_back_to_byte_patterns_without_a_decoder(
-    tmp_path: Path, monkeypatch
-) -> None:
-    """The delivery image may ship without capstone; the fixed patterns must hold."""
-    monkeypatch.setattr(nonweb, "_capstone", lambda _elf: None)
-    target = tmp_path / "tiny.elf"
-    target.write_bytes(_tiny_elf())
-    out = nonweb.elfpeek(str(target), view="gadgets")
-    assert "pop rdi; ret" in out
-    assert "/bin/sh" in out
 
 
 def _elf_with_symtab() -> bytes:
@@ -358,133 +259,6 @@ def _elf_with_symtab() -> bytes:
     return bytes(data)
 
 
-def test_symbol_table_is_read_from_the_linked_string_table(tmp_path: Path) -> None:
-    """``sh_link`` names the string table; ``sh_name`` is only a name offset.
-
-    Reading ``sh_name`` as a section index made every symbol lookup return
-    nothing, so ``elfpeek view=symbols`` claimed "stripped" for binaries that
-    had a full symbol table, and ``elffind symbol=`` never resolved anything.
-    """
-    target = tmp_path / "sym.elf"
-    target.write_bytes(_elf_with_symtab())
-    out = nonweb.elfpeek(str(target), view="symbols")
-    assert "check" in out and "main" in out, out
-    assert "stripped" not in out, out
-
-
-def test_symbol_type_is_the_low_nibble_of_st_info(tmp_path: Path) -> None:
-    """``st_info`` packs type low and binding high; FUNC must not read OBJECT."""
-    target = tmp_path / "sym.elf"
-    target.write_bytes(_elf_with_symtab())
-    out = nonweb.elfpeek(str(target), view="symbols")
-    assert "FUNC" in out, out
-    assert "OBJECT" not in out, out
-
-
-def test_disasm_by_symbol_returns_the_whole_function(tmp_path: Path) -> None:
-    """One call must give one function, not an arbitrary byte window."""
-    target = tmp_path / "sym.elf"
-    target.write_bytes(_elf_with_symtab())
-    out = nonweb.elfpeek(str(target), view="disasm", symbol="check")
-    assert "symbol check" in out, out
-    if "no disassembler" in out:
-        return
-    # Every instruction of check(), ending at its ret -- and nothing from main.
-    assert "push" in out and "ret" in out, out
-    assert "main" not in out.replace("symbol check", ""), out
-
-
-def test_elffind_reports_offsets(tmp_path: Path) -> None:
-    target = tmp_path / "tiny.elf"
-    target.write_bytes(_tiny_elf())
-    out = nonweb.elffind(str(target), search="/bin/sh")
-    assert "/bin/sh" in out
-    assert "file 0x" in out
-
-
-def test_elfpeek_rejects_non_elf(tmp_path: Path) -> None:
-    target = tmp_path / "not.elf"
-    target.write_text("hello")
-    out = nonweb.elfpeek(str(target))
-    assert "not an ELF" in out
-
-
-def test_elfpeek_unknown_view_lists_choices(tmp_path: Path) -> None:
-    target = tmp_path / "tiny.elf"
-    target.write_bytes(_tiny_elf())
-    out = nonweb.elfpeek(str(target), view="nope")
-    assert "unknown view" in out
-    assert "elffind" in out
-
-
-def test_elfpeek_schema_does_not_carry_lookup_parameters(tmp_path: Path) -> None:
-    """Lookup parameters belong to the view that uses them.
-
-    Measured: the combined schema was 1,576 chars -- larger than the whole
-    ``file_triage`` tool.  Splitting keeps the per-call surface honest.
-
-    ``symbol`` is the one exception and it is deliberate: ``disasm`` without it
-    can only read "128 bytes from some offset", which is not how a check
-    function gets read.  ``search`` stays on ``elffind`` because resolving a
-    byte string to an address is a different question from reading code.
-    """
-    seen: list = []
-
-    def collect(*tools) -> None:
-        seen.extend(tools)
-
-    nonweb.register(register_fn=collect, kind="file")
-    schemas = {
-        tool.name: set(tool.params_json_schema["properties"]) for tool in seen
-    }
-    assert "symbol" in schemas["elfpeek"]
-    assert "search" not in schemas["elfpeek"]
-    assert "utf16" not in schemas["elfpeek"]
-    assert {"symbol", "search"} <= schemas["elffind"]
-
-
-def test_disasm_reports_where_it_stopped(tmp_path: Path) -> None:
-    """A truncated disassembly must say so and name the resume offset.
-
-    Silently ending at the row cap reads like "the function ends here"; that
-    is how a run concludes the wrong thing about a long check function.
-    """
-    target = tmp_path / "tiny.elf"
-    target.write_bytes(_tiny_elf())
-    if nonweb._capstone(nonweb._Elf(target.read_bytes())) is None:
-        # Truncation can only be reported by a real decoder. The image installs
-        # capstone; this branch is a developer box without it.
-        return
-    out = nonweb.elfpeek(str(target), view="disasm", offset=0x100, length=256, limit=3)
-    assert "truncated" in out, out
-    assert "continue with offset=" in out, out
-
-
-def test_disasm_by_symbol_names_the_symbol(tmp_path: Path) -> None:
-    """``symbol=`` resolves through the symbol table instead of guessing."""
-    target = tmp_path / "tiny.elf"
-    target.write_bytes(_tiny_elf())
-    out = nonweb.elfpeek(str(target), view="disasm", symbol="not_a_symbol_here")
-    assert "no function symbol" in out, out
-
-
-def test_disasm_without_a_decoder_names_a_working_command(
-    tmp_path: Path, monkeypatch
-) -> None:
-    """No decoder must degrade to bytes plus a command the image really has."""
-    monkeypatch.setattr(nonweb, "_capstone", lambda _elf: None)
-    target = tmp_path / "tiny.elf"
-    target.write_bytes(_tiny_elf())
-    out = nonweb.elfpeek(str(target), view="disasm", offset=0, length=16)
-    assert "[elfpeek]" in out
-    assert "objdump -d" in out, out
-
-
-# --------------------------------------------------------------------------
-# registration split
-# --------------------------------------------------------------------------
-
-
 def test_register_splits_by_kind() -> None:
     seen: list = []
 
@@ -493,7 +267,7 @@ def test_register_splits_by_kind() -> None:
 
     file_names = nonweb.register(register_fn=collector, kind="file")
     assert set(file_names) == {
-        "decode_blob", "unpack_archive", "hexpeek", "elfpeek", "elffind",
+        "unpack_archive",
     }
 
     seen.clear()
@@ -562,35 +336,3 @@ def test_unpack_archive_handles_data_appended_after_eocd(tmp_path: Path) -> None
     out = nonweb.unpack_archive(str(archive), out_dir=str(tmp_path / "out"))
     assert "end-of-central-directory" in out
     assert (tmp_path / "out" / "inner.bin").read_bytes() == b"payload"
-
-def test_decode_blob_handles_per_line_base64() -> None:
-    """A real misc attachment: 81 lines, each its own base64 string.
-
-    The whole file is not one base64 stream (per-line padding breaks the
-    round-trip), so a whole-text decoder reports "no chain" on a file that
-    decodes cleanly.  This was the difference between "looks encrypted" and
-    "here is the plain text".
-    """
-    lines = ["aGVsbG8gd29ybGQ=", "dGhpcyBpcyBhIHRlc3Q=", "b2YgbGluZSB3aXNlIGRlY29kaW5n"]
-    out = nonweb.decode_blob("\n".join(lines))
-    assert "per-line" in out or "separately encoded" in out
-    assert "hello world" in out
-
-
-def test_decode_blob_recovers_base64_padding_stego() -> None:
-    """Payload hidden in the low bits of each line's final character.
-
-    Canonical base64 zeroes those bits; a stego encoder rewrites them, so the
-    decoded text is ordinary English and every "decode the base64" attempt
-    looks like a dead end.  Two pads = 4 payload bits, one pad = 2.
-    """
-    alpha = nonweb._B64_ALPHA
-    bits = "".join(format(byte, "08b") for byte in b"flag{padding}")
-    lines_out = []
-    for index in range(0, len(bits), 4):
-        value = int(bits[index : index + 4].ljust(4, "0"), 2)
-        lines_out.append("YQ" + alpha[0x10 | value] + "==")
-
-    out = nonweb.decode_blob("\n".join(lines_out))
-    assert "flag{padding}" in out
-    assert "steganography" in out

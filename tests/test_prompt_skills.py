@@ -164,7 +164,7 @@ def test_hypothesis_block_is_within_its_character_budget() -> None:
 def test_file_turn_plan_runs_the_triage_table_before_loading_a_skill() -> None:
     """The file branch must point at the tool's own table, not at a skill.
 
-    The decision table ships inside ``file_triage``'s return value; telling the
+    The decision table ships inside ``unpack_archive``'s return value; telling the
     model to load a discipline index first adds a round trip that carries no
     information about the file it is already holding.
     """

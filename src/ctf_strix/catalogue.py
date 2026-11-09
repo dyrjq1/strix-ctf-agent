@@ -137,49 +137,12 @@ CATALOGUE: Final[tuple[ToolInfo, ...]] = (
     ),
     # -- attachment --------------------------------------------------------
     ToolInfo(
-        "file_triage",
-        "identify a file or directory: family, size, entropy, flag-like "
-        "strings, and the one command to run next",
-        FILE_KINDS | TCP_KINDS,
-        "file",
-    ),
-    ToolInfo(
-        "decode_blob",
-        "decode a multi-layer encoded string (base64/hex/url/rot) and report "
-        "the chain that worked",
-        FILE_KINDS | TCP_KINDS,
-        "file",
-    ),
-    ToolInfo(
         "unpack_archive",
         "extract an archive safely and keep going into nested archives; "
         "refuses entries that escape the output directory",
         FILE_KINDS | TCP_KINDS,
         "file",
     ),
-    ToolInfo(
-        "hexpeek",
-        "bytes as hex and ASCII with offsets, for reading a header without "
-        "guessing at `xxd` flags",
-        FILE_KINDS | TCP_KINDS,
-        "file",
-    ),
-    ToolInfo(
-        "elfpeek",
-        "inspect an ELF: info/sections/symbols/strings/gadgets/disasm. Static "
-        "first, never run an unknown binary; disasm symbol='name' reads one "
-        "whole function",
-        FILE_KINDS | TCP_KINDS,
-        "file",
-    ),
-    ToolInfo(
-        "elffind",
-        "resolve an ELF symbol or byte string to both file offset and vaddr, "
-        "which is what a ret2* chain needs",
-        FILE_KINDS | TCP_KINDS,
-        "file",
-    ),
-    # -- remote service ----------------------------------------------------
     ToolInfo(
         "tcp",
         "connect once, optionally send a payload, show the banner and the "

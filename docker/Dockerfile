@@ -33,6 +33,10 @@ RUN set -eux; \
         nmap sqlmap smbclient \
         vim-tiny less procps \
         libssl-dev libffi-dev \
+        binwalk libimage-exiftool-perl p7zip-full xz-utils zbar-tools \
+        sox libsox-fmt-all pngcheck steghide poppler-utils \
+        tcpdump tshark sleuthkit \
+        unar \
     && rm -rf /var/lib/apt/lists/*
 
 # ffuf：Debian bookworm 的 apt 只有 1.1.0；按派单取上游静态二进制并锁版本。
@@ -46,6 +50,31 @@ RUN set -eux; \
     tar -xzf /tmp/ffuf.tar.gz -C /usr/local/bin ffuf; \
     chmod +x /usr/local/bin/ffuf; \
     rm -f /tmp/ffuf.tar.gz
+
+# upx：bookworm 无 upx-ucl 包；取上游静态二进制并锁 sha256（同 ffuf 模式）。
+ARG UPX_VERSION=5.3.0
+ARG UPX_SHA256=79cea8a50b6fa102d10c7b79a419cd77dead3cc2d78661de2dc5e5815dc505c1
+RUN set -eux; \
+    wget -q -O /tmp/upx.tar.xz \
+        "https://github.com/upx/upx/releases/download/v${UPX_VERSION}/upx-${UPX_VERSION}-amd64_linux.tar.xz"; \
+    echo "${UPX_SHA256}  /tmp/upx.tar.xz" | sha256sum -c -; \
+    tar -xJf /tmp/upx.tar.xz -C /tmp; \
+    cp "/tmp/upx-${UPX_VERSION}-amd64_linux/upx" /usr/local/bin/upx; \
+    chmod +x /usr/local/bin/upx; \
+    rm -rf /tmp/upx.tar.xz "/tmp/upx-${UPX_VERSION}-amd64_linux"
+
+# radare2：bookworm 无 radare2 包；取上游 deb 并锁 sha256（EnIGMA 同版本 5.9.4）。
+# deb Depends 实测仅 libc6（ctfwork/plan-packc.md §10）；本层自带 apt-get update，
+# 因为上层已清 /var/lib/apt/lists。
+ARG R2_VERSION=5.9.4
+ARG R2_SHA256=ba3713e6676fae44506ab0a984268a3439b7bf7a140b3c5460be2d082cad8468
+RUN set -eux; \
+    wget -q -O /tmp/radare2.deb \
+        "https://github.com/radareorg/radare2/releases/download/${R2_VERSION}/radare2_${R2_VERSION}_amd64.deb"; \
+    echo "${R2_SHA256}  /tmp/radare2.deb" | sha256sum -c -; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends /tmp/radare2.deb; \
+    rm -rf /var/lib/apt/lists/* /tmp/radare2.deb
 
 WORKDIR /app
 

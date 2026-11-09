@@ -52,14 +52,13 @@ def registry():
 
 def test_file_challenge_registers_attachment_tools_but_no_http(registry):
     names, groups, text = registry("file")
-    assert "file_triage" in names
-    assert {"decode_blob", "unpack_archive", "elfpeek"} <= names
+    assert "unpack_archive" in names
     for web_tool in ("http_probe", "route_map", "method_sweep", "path_variants"):
         assert web_tool not in names, f"file challenge registered {web_tool}"
         assert f"`{web_tool}`" not in text, f"file challenge is told about {web_tool}"
     assert "web_cve_lookup" not in names
     assert "`web_cve_lookup`" not in text
-    assert "`decode_blob`" in text
+    assert "`unpack_archive`" in text
 
 
 def test_web_challenge_registers_http_and_not_attachment_tools(registry):
@@ -71,7 +70,7 @@ def test_web_challenge_registers_http_and_not_attachment_tools(registry):
     # back an exchange after its body scrolled out of the context.
     assert {"traffic_list", "traffic_view"} <= names
     assert "`traffic_list`" in text
-    for file_tool in ("file_triage", "decode_blob", "unpack_archive"):
+    for file_tool in ("unpack_archive",):
         assert file_tool not in names
         assert f"`{file_tool}`" not in text
 

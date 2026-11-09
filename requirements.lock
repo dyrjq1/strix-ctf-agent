@@ -122,6 +122,8 @@ python-dateutil==2.9.0.post0
 python-dotenv==1.2.4
 python-multipart==0.0.32
 pyyaml==6.0.3
+r2pipe==2.1.0
+reedsolo==1.7.0
 referencing==0.37.0
 regex==2026.9.29
 requests==2.34.2
@@ -131,6 +133,7 @@ ropgadget==7.7
 rpds-py==2026.9.1
 rpyc==6.0.2
 s3transfer==0.19.3
+scapy==2.8.0
 scipy==1.16.3
 segno==1.6.6
 semver==3.1.0

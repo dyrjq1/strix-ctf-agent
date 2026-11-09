@@ -69,7 +69,7 @@ def test_file_and_tcp_are_told_about_their_own_primitives():
     from ctf_strix import catalogue
 
     file_names = catalogue.registered_names("file")
-    for tool in ("file_triage", "decode_blob", "unpack_archive", "hexpeek", "elfpeek", "elffind"):
+    for tool in ("unpack_archive",):
         assert tool in file_names, f"file challenge is not told about {tool}"
 
     tcp_names = catalogue.registered_names("tcp")
@@ -93,7 +93,7 @@ def test_groups_limit_the_block_to_what_actually_registered():
 
     block = catalogue.prompt_block("file", groups=("base",))
     assert "`exec_command`" in block
-    assert "`file_triage`" not in block
+    assert "`unpack_archive`" not in block
 
 
 def test_prompt_renders_the_block_for_the_active_kind():
@@ -101,13 +101,13 @@ def test_prompt_renders_the_block_for_the_active_kind():
 
     prompt.activate("file", ("base", "file"))
     text = prompt.build({})
-    assert "`decode_blob`" in text
+    assert "`unpack_archive`" in text
     assert "`route_map`" not in text
 
     prompt.activate("web", ("base", "web"))
     text = prompt.build({})
     assert "`route_map`" in text
-    assert "`decode_blob`" not in text
+    assert "`unpack_archive`" not in text
 
 
 def test_turn_plan_follows_the_kind():
@@ -116,7 +116,7 @@ def test_turn_plan_follows_the_kind():
 
     prompt.activate("file", ("base", "file"))
     file_text = prompt.build({})
-    assert "`file_triage` the attachment once" in file_text
+    assert "Inspect the attachment once" in file_text
     assert "register and log in" not in file_text
 
     prompt.activate("web", ("base", "web"))

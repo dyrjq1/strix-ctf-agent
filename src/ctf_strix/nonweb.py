@@ -12,12 +12,9 @@ must stay small and every call must return a decision, not a log dump.
 
 So: one entry point per *question* the agent actually asks.
 
-  * "what is this blob?"           -> decode_blob   (a chain, not one layer)
   * "what is inside this file?"    -> unpack_archive (recursive, budgeted)
-  * "what are these bytes?"        -> hexpeek       (replaces xxd)
   * "what does this service say?"  -> tcp           (banner + one round trip)
   * "which of these inputs differ?"-> tcp_batch
-  * "what is this binary?"         -> elfpeek
 
 ## Provenance (read before "improving" this by copying)
 
@@ -46,8 +43,10 @@ import html
 import io
 import lzma
 import re
+import shutil
 import socket
 import struct
+import subprocess
 import tarfile
 import time
 import zipfile
@@ -66,8 +65,11 @@ _BLOB_MAX_CHARS: Final = 256 * 1024
 #: chasing its own tail.
 _BLOB_MAX_LAYERS: Final = 8
 
-#: Formats ``_sniff`` can name but cannot read.  Used only to turn "nothing
-#: extracted" into an actionable message; extraction is never attempted.
+#: Formats ``_sniff`` can name but this module has no stdlib reader for.
+#: 7z is extracted with the system binary when present (``_from_7z``) and
+#: falls back to this set only when that binary is missing; RAR always
+#: stays here (p7zip cannot read RAR).  Either way "nothing extracted"
+#: must become an actionable message instead of silence.
 _NAMES_ONLY: Final = frozenset({"7z", "rar"})
 
 #: Extraction budget, shared across recursion depth.  Without sharing, five
@@ -143,8 +145,6 @@ def _to_int(value: object, default: int, low: int, high: int) -> int:
     return max(low, min(number, high))
 
 
-# ---------------------------------------------------------------------------
-# 1. decode_blob -- a chain, not a single guess
 # ---------------------------------------------------------------------------
 
 
@@ -380,109 +380,6 @@ def _decode_linewise(text: str) -> tuple[str, int, int] | None:
     return "\n".join(item for item in decoded if item), count, len(lines)
 
 
-def decode_blob(text: str = "", max_layers: int = 5) -> str:
-    """Decode a multi-layer encoded string and report the chain that worked.
-
-    Handles base64 / base32 / hex / binary, plus rot13 / urlencode / html
-    entities between layers.  It walks greedily: at each layer it takes the
-    best-scoring candidate above 0.85 printable, the only gate that reliably
-    separates "a real next layer" from "noise that happened to decode".
-
-    Args:
-        text: The blob or encoded string (file content, pasted token, etc.).
-        max_layers: How many nested encodings to peel, 1-8, default 5.
-
-    Returns:
-        The chain (``base64 -> hex``), the flag if one appeared, the first 200
-        chars of the result, and one line per layer so a wrong turn is visible.
-    """
-    if not isinstance(text, str) or not text.strip():
-        return (
-            "[decode_blob] text is empty. Paste the blob, or for a file run "
-            "hexpeek(path) first to confirm the bytes are what you think."
-        )
-    if len(text) > _BLOB_MAX_CHARS:
-        return _clip(
-            f"[decode_blob] input is {len(text)} chars, over the {_BLOB_MAX_CHARS} "
-            "limit. This is a file, not a blob: read its header with hexpeek, "
-            "or decode only the relevant segment."
-        )
-
-    layers = _to_int(max_layers, 5, 1, _BLOB_MAX_LAYERS)
-    current = text.strip()
-    chain: list[str] = []
-    steps: list[str] = []
-    hit = ""
-
-    for _ in range(layers):
-        candidates = _decode_candidates(current)
-        if not candidates:
-            break
-        candidates.sort(key=lambda item: item[2], reverse=True)
-        name, decoded, score = candidates[0]
-        if score < 0.85:
-            break
-        chain.append(name)
-        steps.append(f"L{len(chain)} {name} -> {decoded[:80]!r}")
-        current = decoded.strip()
-        match = _FLAG_RE.search(current)
-        if match:
-            hit = match.group(0)
-            break
-
-    if not chain:
-        stego = _b64_stego_bits([line for line in text.strip().splitlines() if line.strip()])
-        if stego is not None:
-            payload_text, used = stego
-            parts = [
-                f"[decode_blob] base64 padding steganography: {used} payload bits "
-                "recovered from the padding characters of the last group",
-                f"result (first 200 chars):\n{payload_text[:200]}",
-            ]
-            hit = _FLAG_RE.search(payload_text)
-            if hit:
-                parts.insert(0, f"[decode_blob] flag: {hit.group(0)}")
-            return _clip("\n\n".join(parts))
-
-        blocks = _decode_linewise(current)
-        if blocks is not None:
-            joined, decoded_count, total = blocks
-            parts = [
-                f"[decode_blob] the blob is {total} separately encoded lines "
-                f"({decoded_count} decoded); whole-text decoding fails because "
-                "the layers are per-line, not one stream",
-                f"result (first 200 chars):\n{joined[:200]}",
-            ]
-            hit = _FLAG_RE.search(joined)
-            if hit:
-                parts.insert(0, f"[decode_blob] flag: {hit.group(0)}")
-            else:
-                parts.append(
-                    "next: the lines decode but the answer is not in the plain "
-                    "text -- compare the lines against each other (the "
-                    "difference between near-identical lines is the payload)."
-                )
-            return _clip("\n\n".join(parts))
-
-        return _clip(
-            "[decode_blob] no decoding chain recognised.\n"
-            "next: confirm the blob was not truncated (copy the whole token), "
-            "then check the raw bytes with hexpeek -- if entropy is high and "
-            "nothing decodes, it is compressed or encrypted, not encoded."
-        )
-
-    parts = [f"[decode_blob] chain: {' -> '.join(chain)} ({len(chain)} layer(s))"]
-    if hit:
-        parts.append(f"flag: {hit}")
-    parts.append(f"result (first 200 chars):\n{current[:200]}")
-    parts.append("per-layer:\n" + "\n".join(steps))
-    if not hit:
-        parts.append(
-            "next: no flag yet -- if the result is short and unreadable, raise "
-            "max_layers; if it is text but wrong, try the runner-up candidate "
-            "(a wrong first pick is the usual failure)."
-        )
-    return _clip("\n\n".join(parts))
 
 # ---------------------------------------------------------------------------
 # 2. unpack_archive -- magic sniffing + a shared budget
@@ -509,12 +406,14 @@ def _sniff(path: Path) -> str:
         return "xz"
     if len(head) >= 262 and head[257:262] == b"ustar":
         return "tar"
-    # 7z and RAR are *named* but deliberately not extracted: Python's stdlib
-    # has no reader for either and this image ships no 7z/rar binary.  Naming
-    # them matters because "detected unknown, nothing extracted" reads exactly
-    # like a corrupt file -- the model then retries unpack_archive instead of
-    # changing method.  A RAR self-extracting stub can precede the signature by
-    # up to 64 KB (rarlab technote), so search that window rather than byte 0.
+    # 7z and RAR are *named* before any extraction attempt: Python's stdlib
+    # has no reader for either.  The system 7z binary (when present) handles
+    # real 7z archives in walk(); RAR never extracts -- p7zip cannot read it.
+    # Naming matters because "detected unknown, nothing extracted" reads
+    # exactly like a corrupt file -- the model then retries unpack_archive
+    # instead of changing method.  A RAR self-extracting stub can precede the
+    # signature by up to 64 KB (rarlab technote), so search that window
+    # rather than byte 0.
     window = head[: 64 * 1024]
     if window.find(b"\x37\x7a\xbc\xaf\x27\x1c") >= 0:
         return "7z"
@@ -676,6 +575,99 @@ def _from_stream(path: Path, kind: str, sink: _Sink) -> None:
     sink.write(target, data)
 
 
+def _from_7z(path: Path, sub: Path, budget: dict[str, int]) -> list[str]:
+    """Extract with the system 7z binary, then enforce the same gates.
+
+    The binary writes files itself, so the pre-write checks in ``_Sink``
+    cannot apply; instead everything it produced is validated post hoc and
+    rule-breakers are deleted and reported, mirroring ``_Sink``'s refusals.
+    ``-p`` pins an empty password so an encrypted archive fails fast instead
+    of blocking on an interactive prompt.
+    """
+    sub.mkdir(parents=True, exist_ok=True)
+    proc = subprocess.run(
+        ["7z", "x", "-y", "-bd", "-p", f"-o{sub}", str(path.resolve())],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    if proc.returncode != 0:
+        tail = (proc.stderr or proc.stdout or "").strip().splitlines()
+        detail = tail[-1][:120] if tail else f"exit code {proc.returncode}"
+        raise OSError(detail)
+    skipped: list[str] = []
+    for child in sorted(sub.rglob("*")):
+        if child.is_symlink():
+            child.unlink()
+            skipped.append(f"{child.relative_to(sub).as_posix()}: symlink")
+            continue
+        if not child.is_file():
+            continue
+        rel = child.relative_to(sub).as_posix()
+        if budget["files"] >= _UNPACK_MAX_FILES:
+            child.unlink()
+            skipped.append(f"{rel}: over file budget")
+            continue
+        size = child.stat().st_size
+        if size > _UNPACK_MEMBER_MAX:
+            child.unlink()
+            skipped.append(f"{rel}: over member limit")
+            continue
+        if budget["bytes"] + size > _UNPACK_MAX_BYTES:
+            child.unlink()
+            skipped.append(f"{rel}: over byte budget")
+            continue
+        budget["files"] += 1
+        budget["bytes"] += size
+    return skipped
+
+
+
+def _from_unar(path: Path, sub: Path, budget: dict[str, int]) -> list[str]:
+    """Extract with the system unar binary, then enforce the same gates.
+
+    unar handles RAR/RAR5/NSIS/ISO/CAB and other formats that neither
+    the stdlib nor 7z can read.  The same post-hoc validation as
+    ``_from_7z`` applies.
+    """
+    sub.mkdir(parents=True, exist_ok=True)
+    proc = subprocess.run(
+        ["unar", "-no-questions", "-output-directory", str(sub.resolve()),
+         str(path.resolve())],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    if proc.returncode != 0:
+        tail = (proc.stderr or proc.stdout or "").strip().splitlines()
+        detail = tail[-1][:120] if tail else f"exit code {proc.returncode}"
+        raise OSError(detail)
+    skipped: list[str] = []
+    for child in sorted(sub.rglob("*")):
+        if child.is_symlink():
+            child.unlink()
+            skipped.append(f"{child.relative_to(sub).as_posix()}: symlink")
+            continue
+        if not child.is_file():
+            continue
+        rel = child.relative_to(sub).as_posix()
+        if budget["files"] >= _UNPACK_MAX_FILES:
+            child.unlink()
+            skipped.append(f"{rel}: over file budget")
+            continue
+        size = child.stat().st_size
+        if size > _UNPACK_MEMBER_MAX:
+            child.unlink()
+            skipped.append(f"{rel}: over member limit")
+            continue
+        if budget["bytes"] + size > _UNPACK_MAX_BYTES:
+            child.unlink()
+            skipped.append(f"{rel}: over byte budget")
+            continue
+        budget["files"] += 1
+        budget["bytes"] += size
+    return skipped
+
 def _unique_dir(base: Path) -> Path:
     """Never mix this extraction into a previous run's output."""
     if not base.exists():
@@ -740,23 +732,41 @@ def unpack_archive(path: str = "", max_depth: int = 3, out_dir: str = "extracted
             kind = _sniff(item)
         if not kind or depth > depth_cap:
             return
-        if kind in _NAMES_ONLY:
-            # Recognized but unreadable here.  Stop before _from_stream, which
-            # would otherwise raise KeyError on the opener table.
-            return
         sub = root if depth == 1 else root / f"_d{depth}"
-        sink = _Sink(sub, budget)
-        try:
-            if kind == "zip":
-                _from_zip(item, sink)
-            elif kind == "tar":
-                _from_tar(item, sink)
-            else:
-                _from_stream(item, kind, sink)
-        except (zipfile.BadZipFile, tarfile.TarError, OSError) as exc:
-            lines.append(f"! {item.name}: {kind} failed ({type(exc).__name__})")
+        if kind == "7z" and shutil.which("7z"):
+            # The system binary reads formats the stdlib cannot; _from_7z
+            # validates its output against the same gates as _Sink.
+            try:
+                skipped.extend(_from_7z(item, sub, budget))
+            except (OSError, subprocess.SubprocessError) as exc:
+                lines.append(f"! {item.name}: 7z failed ({type(exc).__name__})")
+                return
+        elif kind in _NAMES_ONLY and shutil.which("unar"):
+            # unar reads formats the stdlib and 7z cannot: RAR/RAR5/NSIS/
+            # ISO/CAB.  Validates output against the same gates as _Sink.
+            try:
+                skipped.extend(_from_unar(item, sub, budget))
+            except (OSError, subprocess.SubprocessError) as exc:
+                lines.append(f"! {item.name}: unar failed ({type(exc).__name__})")
+                return
+        elif kind in _NAMES_ONLY:
+            # Neither 7z nor unar available for this format on this host.
+            # Stop before the stdlib paths, which would otherwise raise
+            # KeyError on the opener table -- the tail message explains.
             return
-        skipped.extend(sink.skipped)
+        else:
+            sink = _Sink(sub, budget)
+            try:
+                if kind == "zip":
+                    _from_zip(item, sink)
+                elif kind == "tar":
+                    _from_tar(item, sink)
+                else:
+                    _from_stream(item, kind, sink)
+            except (zipfile.BadZipFile, tarfile.TarError, OSError) as exc:
+                lines.append(f"! {item.name}: {kind} failed ({type(exc).__name__})")
+                return
+            skipped.extend(sink.skipped)
         for child in sorted(sub.rglob("*")):
             if not child.is_file():
                 continue
@@ -782,72 +792,44 @@ def unpack_archive(path: str = "", max_depth: int = 3, out_dir: str = "extracted
     if not produced:
         body.append(
             "next: nothing came out -- check what the file really is with "
-            "file_triage/hexpeek; a wrong extension is common and the magic "
+            "file/binwalk; a wrong extension is common and the magic "
             "bytes are the authority."
         )
-        if kind in _NAMES_ONLY:
+        if kind in _NAMES_ONLY and not (kind == "7z" and shutil.which("7z")):
             where = _signature_offset(source, kind)
             at = "this IS that archive" if where == 0 else "the archive starts there"
             body.append(
                 f"matched a {kind} signature at offset 0x{where:x} -- {at}, and this "
                 f"image ships no {kind} reader. Do not retry unpack_archive; it will "
                 "return the same line. Next: carve from that offset and read the "
-                "container by hand (hexpeek + the struct module), or check whether "
+                "container by hand (xxd + the struct module), or check whether "
                 "the statement/strings already leaks the content. If it is encrypted, "
                 "the password has to come from the challenge -- brute force here is a "
                 "different, much more expensive problem."
             )
+        elif kind == "7z" and shutil.which("7z"):
+            body.append(
+                "next: the 7z binary ran and produced nothing usable -- the "
+                "archive is empty, corrupt, truncated, or password-protected. "
+                "Do not retry unpack_archive; it will fail the same way. If it "
+                "is encrypted, the password has to come from the challenge."
+            )
+        elif kind in _NAMES_ONLY and shutil.which("unar"):
+            body.append(
+                "next: unar ran and produced nothing usable -- the archive "
+                "is empty, corrupt, truncated, or password-protected. Do not "
+                "retry unpack_archive; it will fail the same way. If it is "
+                "encrypted, the password has to come from the challenge."
+            )
     else:
         body.append(
-            "next: run file_triage on the largest extracted file; for text "
+            "next: inspect the largest extracted file with file/binwalk; for text "
             "files grep is cheaper than opening each one."
         )
     return _clip("\n".join(body))
 
 # ---------------------------------------------------------------------------
-# 3. hexpeek -- xxd for a container that has no xxd
-# ---------------------------------------------------------------------------
 
-
-def hexpeek(path: str = "", offset: int = 0, length: int = 256) -> str:
-    """Show bytes as hex + ASCII, so a header can be read without xxd.
-
-    Args:
-        path: File path.
-        offset: Start byte, accepts 0x-prefixed values.
-        length: Bytes to show, 1-1024, default 256.
-
-    Returns:
-        One line per 16 bytes with the file offset, plus a note when more data
-        follows (and at which offset).
-    """
-    target = Path(path).expanduser()
-    if not target.is_file():
-        return (
-            f"[hexpeek] not a file: {path!r}\n"
-            "next: `ls -la` in the working directory to get the real name."
-        )
-    size = target.stat().st_size
-    start = _to_int(offset, 0, 0, 1 << 40)
-    span = _to_int(length, 256, 1, _HEX_MAX)
-    if start > size:
-        return f"[hexpeek] offset {start} is past the end (file is {size} B)."
-    with target.open("rb") as handle:
-        handle.seek(start)
-        data = handle.read(span)
-
-    rows = [f"[hexpeek] {target.name}  {size} B  range [{start}, {start + len(data)})"]
-    for index in range(0, len(data), _HEX_WIDTH):
-        chunk = data[index : index + _HEX_WIDTH]
-        hex_part = " ".join(f"{byte:02x}" for byte in chunk).ljust(_HEX_WIDTH * 3 - 1)
-        text_part = "".join(chr(byte) if 0x20 <= byte < 0x7F else "." for byte in chunk)
-        rows.append(f"{start + index:08x}  {hex_part}  |{text_part}|")
-    if start + len(data) < size:
-        rows.append(
-            f"... {size - start - len(data)} B not shown -- continue with "
-            f"offset={start + len(data)}"
-        )
-    return _clip("\n".join(rows))
 
 
 # ---------------------------------------------------------------------------
@@ -1132,227 +1114,7 @@ def tcp_batch(
     return _clip("\n".join([head] + rows + [tail]))
 
 # ---------------------------------------------------------------------------
-# 6. elfpeek -- enough ELF to decide the next move
-# ---------------------------------------------------------------------------
 
-
-class _Elf:
-    """Minimal ELF reader: header, sections, symbols, program headers.
-
-    Only the fields a CTF needs.  Deliberately not a general-purpose parser:
-    every extra field is code to maintain and bytes of context the model reads.
-    """
-
-    def __init__(self, data: bytes) -> None:
-        if len(data) < 52 or data[:4] != b"\x7fELF":
-            raise _NonWebError("[elfpeek] not an ELF file (bad magic). Use file_triage first.")
-        self.data = data
-        self.is64 = data[4] == 2
-        self.endian = "<" if data[5] == 1 else ">"
-        self.e_type = struct.unpack_from(self.endian + "H", data, 16)[0]
-        self.e_machine = struct.unpack_from(self.endian + "H", data, 18)[0]
-        if self.is64:
-            self.e_entry, self.e_phoff, self.e_shoff = struct.unpack_from(
-                self.endian + "QQQ", data, 24
-            )
-            (self.e_phentsize, self.e_phnum, self.e_shentsize,
-             self.e_shnum, self.e_shstrndx) = struct.unpack_from(self.endian + "HHHHH", data, 54)
-        else:
-            self.e_entry, self.e_phoff, self.e_shoff = struct.unpack_from(
-                self.endian + "III", data, 24
-            )
-            (self.e_phentsize, self.e_phnum, self.e_shentsize,
-             self.e_shnum, self.e_shstrndx) = struct.unpack_from(self.endian + "HHHHH", data, 42)
-
-    def program_headers(self) -> list[tuple[int, int, int, int, int]]:
-        rows: list[tuple[int, int, int, int, int]] = []
-        for index in range(min(self.e_phnum, 512)):
-            offset = self.e_phoff + index * self.e_phentsize
-            if offset + self.e_phentsize > len(self.data):
-                break
-            if self.is64:
-                p_type, p_flags = struct.unpack_from(self.endian + "II", self.data, offset)
-                p_offset, p_vaddr, _paddr, p_filesz = struct.unpack_from(
-                    self.endian + "QQQQ", self.data, offset + 8
-                )
-            else:
-                (p_type, p_offset, p_vaddr, _paddr,
-                 p_filesz, _memsz, p_flags, _align) = struct.unpack_from(
-                    self.endian + "IIIIIIII", self.data, offset
-                )
-            rows.append((p_type, p_flags, p_offset, p_vaddr, p_filesz))
-        return rows
-
-    def _section_rows(self) -> list[tuple[int, int, int, int, int, int]]:
-        rows = []
-        for index in range(min(self.e_shnum, 1024)):
-            offset = self.e_shoff + index * self.e_shentsize
-            if offset + self.e_shentsize > len(self.data):
-                break
-            if self.is64:
-                name, sh_type, flags, addr, sh_offset, size = struct.unpack_from(
-                    self.endian + "IIQQQQ", self.data, offset
-                )
-            else:
-                name, sh_type, flags, addr, sh_offset, size = struct.unpack_from(
-                    self.endian + "IIIIII", self.data, offset
-                )
-            rows.append((name, sh_type, flags, addr, sh_offset, size))
-        return rows
-
-    def _section_rows_linked(self) -> list[tuple[int, int, int, int, int, int, int]]:
-        """Section rows including ``sh_link``: the index of the string table.
-
-        ``sh_name`` is an *offset into the section-name string table*, not a
-        section index.  Reading it as an index is why every symbol lookup used
-        to come back empty on a normal linked binary: ``sh_name`` is usually in
-        the hundreds, so ``sh_name >= len(rows)`` skipped every symbol table.
-        """
-        rows = []
-        for index in range(min(self.e_shnum, 1024)):
-            offset = self.e_shoff + index * self.e_shentsize
-            if offset + self.e_shentsize > len(self.data):
-                break
-            if self.is64:
-                (name, sh_type, flags, addr, sh_offset, size,
-                 link) = struct.unpack_from(
-                    self.endian + "IIQQQQI", self.data, offset
-                )
-            else:
-                (name, sh_type, flags, addr, sh_offset, size,
-                 link) = struct.unpack_from(
-                    self.endian + "IIIIIII", self.data, offset
-                )
-            rows.append((name, sh_type, flags, addr, sh_offset, size, link))
-        return rows
-
-    def sections(self) -> list[tuple[str, int, int, int]]:
-        rows = self._section_rows()
-        if not rows:
-            return []
-        string_offset = 0
-        if self.e_shstrndx < len(rows):
-            string_offset = rows[self.e_shstrndx][4]
-        out = []
-        for name, _typ, _flags, addr, offset, sec_size in rows:
-            label = ""
-            if string_offset and string_offset + name < len(self.data):
-                end = self.data.find(b"\0", string_offset + name)
-                stop = end if end > 0 else string_offset + name + 64
-                label = self.data[string_offset + name : stop].decode("latin-1", "replace")
-            out.append((label, addr, offset, sec_size))
-        return out
-
-    def symbols(self) -> list[tuple[str, int, int]]:
-        """Return ``(name, value, type)`` for every .symtab/.dynsym entry.
-
-        Two header fields are easy to swap, and both were wrong here:
-
-        * the string table is the symbol section's ``sh_link``; ``sh_name`` is
-          only that section's own name offset;
-        * ``st_info`` packs *type* in the low nibble and *binding* in the high
-          one, so ``info >> 4`` reports GLOBAL as a type and turns every FUNC
-          into OBJECT.
-
-        Neither bug was visible with the old fixture: it had no section header
-        table at all, so this path never ran.
-        """
-        rows = self._section_rows_linked()
-        out: list[tuple[str, int, int]] = []
-        for _name, sh_type, _flags, _addr, offset, size, link in rows:
-            if sh_type not in (2, 11):  # SHT_SYMTAB / SHT_DYNSYM
-                continue
-            if not 0 <= link < len(rows):
-                continue
-            string_offset = rows[link][4]
-            entry_size = 24 if self.is64 else 16
-            for position in range(offset, min(offset + size, len(self.data)), entry_size):
-                if position + entry_size > len(self.data):
-                    break
-                if self.is64:
-                    str_name, info, _other, _shndx, value, _sz = struct.unpack_from(
-                        self.endian + "IBBHQQ", self.data, position
-                    )
-                else:
-                    str_name, value, _sz, info, _other, _shndx = struct.unpack_from(
-                        self.endian + "IIIBBH", self.data, position
-                    )
-                if not str_name:
-                    continue
-                base = string_offset + str_name
-                if base >= len(self.data):
-                    continue
-                end_byte = self.data.find(b"\0", base)
-                stop = end_byte if end_byte > 0 else base + 64
-                label = self.data[base:stop].decode("latin-1", "replace")
-                out.append((label, value, info & 0xF))
-        return out
-
-    def strings(self, min_len: int = 4, limit: int = 80, utf16: bool = False) -> list[str]:
-        if utf16:
-            pattern = re.compile(rb"(?:[\x20-\x7e]\x00){%d,}" % max(2, min_len))
-            wide = [match.decode("utf-16-le", "replace") for match in pattern.findall(self.data)]
-            pattern_be = re.compile(rb"(?:\x00[\x20-\x7e]){%d,}" % max(2, min_len))
-            wide += [match.decode("utf-16-be", "replace") for match in pattern_be.findall(self.data)]
-            return wide[:limit]
-        found: list[str] = []
-        current = b""
-        for byte in self.data:
-            if 32 <= byte < 127:
-                current += bytes([byte])
-            else:
-                if len(current) >= min_len:
-                    found.append(current.decode("latin-1"))
-                current = b""
-                if len(found) >= limit * 20:
-                    break
-        if len(current) >= min_len:
-            found.append(current.decode("latin-1"))
-        keys = ("flag", "FLAG", "pass", "admin", "secret", "key", "token", "/bin/sh", "debug")
-        # Keyword hit first, then length: a 200-char help string is rarely the
-        # answer, and the list is capped at ``limit``.
-        found.sort(key=lambda text: (not any(key in text for key in keys), -len(text)))
-        return found[:limit]
-
-    def security(self) -> dict[str, object]:
-        info: dict[str, object] = {
-            "PIE": self.e_type == 3,
-            "type": {1: "ET_REL", 2: "ET_EXEC", 3: "ET_DYN"}.get(self.e_type, str(self.e_type)),
-            "NX": None,
-            "canary": False,
-            "RELRO": False,
-        }
-        for p_type, p_flags, _offset, _vaddr, _filesz in self.program_headers():
-            if p_type == 0x6474E551:  # PT_GNU_STACK
-                info["NX"] = not (p_flags & 1)
-            if p_type == 0x6474E552:  # PT_GNU_RELRO
-                info["RELRO"] = True
-        names = {name for name, _value, _typ in self.symbols()}
-        info["canary"] = "__stack_chk_fail" in names or "__stack_chk_guard" in names
-        return info
-
-    def off_to_vaddr(self, offset: int) -> int | None:
-        for p_type, _flags, p_offset, p_vaddr, p_filesz in self.program_headers():
-            if p_type == 1 and p_offset <= offset < p_offset + max(p_filesz, 1):
-                return p_vaddr + (offset - p_offset)
-        return None
-
-    def vaddr_to_off(self, vaddr: int) -> int | None:
-        for p_type, _flags, p_offset, p_vaddr, p_filesz in self.program_headers():
-            if p_type == 1 and p_vaddr <= vaddr < p_vaddr + max(p_filesz, 1):
-                return p_offset + (vaddr - p_vaddr)
-        return None
-
-
-_GADGET_PATTERNS: Final = {
-    "pop rdi; ret": b"\x5f\xc3",
-    "pop rsi; ret": b"\x5e\xc3",
-    "pop rdx; ret": b"\x5a\xc3",
-    "pop rax; ret": b"\x58\xc3",
-    "syscall; ret": b"\x0f\x05\xc3",
-    "leave; ret": b"\xc9\xc3",
-    "/bin/sh": b"/bin/sh\x00",
-}
 
 
 def _capstone(elf: "_Elf"):
@@ -1464,310 +1226,6 @@ def _gadgets_capstone(elf: "_Elf", filt: str, limit: int) -> list[str]:
     return rows[: max(limit, 8)]
 
 
-def elffind(path: str = "", symbol: str = "", search: str = "") -> str:
-    """Resolve an ELF symbol or byte string to both file offset and vaddr.
-
-    Split out of ``elfpeek`` on purpose: these three parameters serve one
-    question ("where is system / where is /bin/sh"), and the other six views
-    should not carry them in their schema on every call.
-
-    Args:
-        path: Binary path.
-        symbol: Exact symbol name (e.g. ``system``, ``puts``).
-        search: Byte string to locate (e.g. ``/bin/sh``).
-
-    Returns:
-        Address/offset pairs, the libc version when one is embedded, and a
-        ret2libc readiness note when both ingredients are present.
-    """
-    target = Path(path).expanduser()
-    if not target.is_file():
-        return f"[elffind] not a file: {path!r}."
-    data = target.read_bytes()
-    try:
-        elf = _Elf(data)
-    except _NonWebError as exc:
-        return str(exc)
-    lines: list[str] = []
-    if symbol:
-        hits = [
-            (label, value)
-            for label, value, _kind in elf.symbols()
-            if label == symbol.strip()
-        ]
-        if hits:
-            for label, value in hits:
-                file_offset = elf.vaddr_to_off(value)
-                lines.append(
-                    f"symbol {label} vaddr 0x{value:x} "
-                    + (f"file 0x{file_offset:x}" if file_offset is not None
-                       else "(imported: resolved at runtime)")
-                )
-        else:
-            near = [
-                label for label, _value, _kind in elf.symbols()
-                if symbol.lower() in label.lower()
-            ][:10]
-            lines.append(
-                f"symbol {symbol} not found"
-                + (f"; near: {', '.join(near)}" if near
-                   else " (symbol table empty or stripped)")
-            )
-    if search:
-        needle = search.encode("latin-1", "replace")
-        position = 0
-        found: list[str] = []
-        while len(found) < 10:
-            position = data.find(needle, position)
-            if position < 0:
-                break
-            vaddr = elf.off_to_vaddr(position)
-            found.append(
-                f"file 0x{position:x}"
-                + (f"/vaddr 0x{vaddr:x}" if vaddr is not None else "")
-            )
-            position += 1
-        lines.append(f"string {search!r}: " + (", ".join(found) if found else "not found"))
-    if not symbol and not search:
-        lines.append("lookup needs symbol=<name> and/or search=<bytes>.")
-    version_at = data.find(b"GNU C Library")
-    if version_at >= 0:
-        head = max(data.rfind(b"\n", 0, version_at), data.rfind(b"\x00", 0, version_at)) + 1
-        ends = [
-            pos for pos in (data.find(b"\n", version_at), data.find(b"\x00", version_at))
-            if pos >= 0
-        ]
-        tail = min(ends) if ends else len(data)
-        lines.append(
-            f"libc version: {data[head:tail].decode('latin-1', 'replace').strip()[:120]}"
-        )
-    names = {label for label, _value, _kind in elf.symbols()}
-    if "system" in names and data.find(b"/bin/sh") >= 0:
-        lines.append(
-            "ret2libc ingredients present: system and /bin/sh are both here -- "
-            "leak the base, then compute both from these offsets."
-        )
-    return _clip("\n".join(lines))
-
-
-def elfpeek(
-    path: str = "",
-    view: str = "info",
-    limit: int = 60,
-    offset: int = 0,
-    length: int = 128,
-    filt: str = "",
-    symbol: str = "",
-) -> str:
-    """Inspect an ELF binary: info, sections, symbols, strings, gadgets, disasm.
-
-    Args:
-        path: Binary path.
-        view: info (default) / sections / symbols / strings / gadgets / disasm
-            / wide (UTF-16 strings).
-        limit: Row cap.
-        offset: File start byte for the disasm view.
-        length: Byte window for the disasm view.
-        filt: Gadget filter, '|'-separated (rdi|syscall|binsh ...).
-        symbol: Disasm only -- start at this symbol and stop at the next one.
-
-    Returns:
-        A compact table plus a ``next:`` line; when tooling is missing it says
-        what to do instead of raising.
-
-    Note:
-        Address-to-offset lookups live in ``elffind`` rather than here.  Every
-        parameter used by only one view would otherwise be paid for by every
-        call of every other view -- the same argument that keeps socket
-        schemas off attachment challenges.  ``symbol`` is the deliberate
-        exception: ``disasm`` without it cannot read a function at all.
-    """
-    target = Path(path).expanduser()
-    if not target.is_file():
-        return f"[elfpeek] not a file: {path!r}. Run file_triage on the directory first."
-    data = target.read_bytes()
-    name = (view or "info").strip().lower()
-
-    if name == "wide":
-        wide = _Elf.__new__(_Elf)
-        wide.data = data
-        rows = _Elf.strings(wide, 4, _to_int(limit, 60, 1, 500), True)
-        return _clip(
-            f"[elfpeek] wide strings: {len(rows)}\n" + ("\n".join(rows) if rows else "(none)")
-        )
-
-    try:
-        elf = _Elf(data)
-    except _NonWebError as exc:
-        return str(exc)
-
-    if name == "info":
-        security = elf.security()
-        entry_segment = "not inside any PT_LOAD (packed or hand-built?)"
-        for p_type, p_flags, p_offset, p_vaddr, p_filesz in elf.program_headers():
-            if p_type == 1 and p_vaddr <= elf.e_entry < p_vaddr + max(p_filesz, 1):
-                entry_segment = (
-                    f"PT_LOAD vaddr 0x{p_vaddr:x}..0x{p_vaddr + p_filesz:x} "
-                    f"(file 0x{p_offset:x}..0x{p_offset + p_filesz:x}, "
-                    f"{'executable' if p_flags & 1 else 'NOT executable -- UPX/packer?'})"
-                )
-                break
-        sections = [row[0] for row in elf.sections() if row[0]]
-        names = [row[0] for row in elf.symbols() if row[0] and not row[0].startswith("_")]
-        lines = [
-            f"[elfpeek] {'64' if elf.is64 else '32'}-bit "
-            f"{'LE' if elf.endian == '<' else 'BE'} machine=0x{elf.e_machine:x} "
-            f"entry=0x{elf.e_entry:x} size={len(data)} B",
-            f"type: {security['type']}, PIE={security['PIE']}",
-            f"mitigations: NX={security['NX']} canary={security['canary']} "
-            f"RELRO={security['RELRO']}",
-            f"entry segment: {entry_segment}",
-            f"sections: {', '.join(sections[:24]) or '(none)'}",
-            f"symbols (first 30): {', '.join(names[:30]) or '(stripped)'}",
-        ]
-        if not names:
-            lines.append("next: symbol table is empty -- view='strings', then view='gadgets'.")
-        elif security["PIE"]:
-            lines.append(
-                "next: PIE is on, so every address needs the runtime base; look "
-                "for a leak first (puts/write@plt on a GOT entry is the usual one)."
-            )
-        else:
-            lines.append(
-                "next: no PIE, addresses are fixed -- view='lookup' for "
-                "symbol='system' and search='/bin/sh'."
-            )
-        return _clip("\n".join(lines))
-
-    if name == "sections":
-        rows = [f"{'name':<20}{'addr':>12}{'offset':>12}{'size':>12}"]
-        for label, addr, sec_offset, sec_size in elf.sections():
-            if label:
-                rows.append(f"{label:<20}{hex(addr):>12}{hex(sec_offset):>12}{sec_size:>12}")
-        return _clip("\n".join(rows))
-
-    if name == "symbols":
-        kinds = {0: "NOTYPE", 1: "OBJECT", 2: "FUNC"}
-        rows = [f"{'name':<40}{'value':>12}  type"]
-        for label, value, kind in elf.symbols()[: _to_int(limit, 60, 1, 500)]:
-            rows.append(f"{label[:40]:<40}{hex(value):>12}  {kinds.get(kind, kind)}")
-        if len(rows) == 1:
-            rows.append("(symbol table empty -- stripped; use strings/gadgets)")
-        return _clip("\n".join(rows))
-
-    if name == "strings":
-        rows = elf.strings(4, _to_int(limit, 60, 1, 500))
-        return _clip(f"[elfpeek] strings: {len(rows)}\n" + ("\n".join(rows) if rows else "(none)"))
-
-    if name == "gadgets":
-        rows = _gadgets_capstone(elf, filt, _to_int(limit, 60, 1, 200))
-        header = "[elfpeek] gadgets (capstone instruction boundaries, depth<=5)"
-        if not rows:
-            header = (
-                "[elfpeek] gadget/constant scan (no capstone or non-x86: fixed "
-                "pattern, first occurrence only)"
-            )
-            rows = _gadget_offsets(elf, filt, _to_int(limit, 60, 1, 200))
-        if elf.security()["PIE"]:
-            rows.append("(PIE: vaddr is the link-time address; add the runtime base)")
-        return _clip("\n".join([header] + (rows or ["(nothing found)"])))
-
-    if name == "disasm":
-        start = _to_int(offset, 0, 0, max(0, len(data) - 1))
-        span = _to_int(length, 128, 16, 4096)
-        row_cap = _to_int(limit, 120, 1, 600)
-
-        # ``symbol=`` answers the question people actually ask: "show me
-        # check()".  Without it a call can only say "128 bytes from some
-        # offset", which is not how a function gets read -- and the row cap
-        # then silently ends mid-function, which reads like "the function ends
-        # here".  Resolve first, then bound the window by the *next* symbol.
-        symbols = elf.symbols()
-        wanted = (symbol or "").strip()
-        header = ""
-        if wanted:
-            starts = sorted(
-                (value, label) for label, value, kind in symbols
-                if label == wanted and value and kind in (0, 2, 10)
-            )
-            if not starts:
-                names = [label for label, value, _kind in symbols if value and label]
-                hint = ", ".join(names[:12]) or "(symbol table is empty)"
-                return (
-                    f"[elfpeek] no function symbol {wanted!r} in this ELF. "
-                    f"Known: {hint}\n"
-                    "next: view='symbols' for the full table, or elffind search= "
-                    "for a byte string, or disasm with a raw offset."
-                )
-            base, label = starts[0]
-            following = [value for value, other in
-                         ((v, l) for l, v, _k in symbols if v and l != label)
-                         if value > base]
-            stop_vaddr = min(following) if following else base + span
-            start = elf.vaddr_to_off(base)
-            if start is None:
-                return f"[elfpeek] symbol {label!r} is at 0x{base:x}, outside every PT_LOAD"
-            span = max(1, min(stop_vaddr - base, 0x4000))
-            header = f"symbol {label} at vaddr 0x{base:x}, {span} B (bounded by the next symbol)"
-
-        chunk = data[start : start + span]
-        vaddr = elf.off_to_vaddr(start)
-        engine = _capstone(elf)
-        if engine is None:
-            return _clip(
-                "[elfpeek] no disassembler available (capstone missing), so this is "
-                "a byte view. Run the instruction decoder the image does have:\n"
-                f"  objdump -d -M intel --start-address=0x{(vaddr or start):x} "
-                f"--stop-address=0x{((vaddr or start) + len(chunk)):x} <file>\n"
-                + (header + "\n" if header else "")
-                + f"file offset 0x{start:x}, {len(chunk)} B, vaddr "
-                + (f"0x{vaddr:x}" if vaddr is not None else "?")
-                + f":\n{chunk[:256].hex()}"
-            )
-
-        vaddr = vaddr if vaddr is not None else start
-        rows = [
-            f"[elfpeek] disasm "
-            + (header if header else f"file offset 0x{start:x}, {span} B")
-            + f", vaddr 0x{vaddr:x}"
-            + (" (PIE: add runtime base)" if elf.security()["PIE"] else "")
-        ]
-        emitted = 0
-        stopped_at = None
-        for instruction in engine.disasm(chunk, vaddr):
-            nearest = ""
-            best = None
-            for label, value, _kind in symbols:
-                if value <= instruction.address and (best is None or value > best):
-                    best, nearest = value, label
-            if best is not None and instruction.address - best < 0x10000:
-                nearest = f"  ; <{nearest}+0x{instruction.address - best:x}>"
-            rows.append(
-                f"{instruction.address:08x}  {instruction.bytes.hex()[:20]:<20}"
-                f"{instruction.mnemonic:<8}{instruction.op_str}{nearest}"
-            )
-            emitted += 1
-            if emitted >= row_cap:
-                stopped_at = instruction.address + instruction.size
-                break
-        if emitted == 0:
-            rows.append("(0 decodable instructions: offset lands in data; check sections)")
-        elif stopped_at is not None and stopped_at < vaddr + len(chunk):
-            # Say where to resume.  Ending at the cap without a word is read as
-            # "function ends here", and that is how a run concludes the wrong
-            # thing about a long check function.
-            resume = elf.vaddr_to_off(stopped_at)
-            rows.append(
-                f"... truncated at {emitted} instructions; continue with "
-                f"offset=0x{(resume if resume is not None else stopped_at):x} "
-                f"or raise limit (max 600)"
-            )
-        return _clip("\n".join(rows))
-
-    return (
-        f"[elfpeek] unknown view {view!r}. Choose info / sections / symbols / "
-        "strings / gadgets / disasm / wide; for addresses use elffind."
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -1798,7 +1256,7 @@ def _as_async(func):
 
 
 #: Answers an attachment question.  Registered on ``kind == "file"``.
-FILE_TOOLS: Final = (decode_blob, unpack_archive, hexpeek, elfpeek, elffind)
+FILE_TOOLS: Final = (unpack_archive,)
 #: Answers a remote-service question.  Registered on ``kind == "tcp"``.
 TCP_TOOLS: Final = (tcp, tcp_batch)
 

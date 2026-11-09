@@ -2321,9 +2321,8 @@ def install_toolset(task: dict[str, Any], kind: str) -> tuple[str, list[str]]:
     # 附件题（rev/pwn/misc/crypto）才装文件入口原语；web 题不为它付 schema token。
     if kind in ("file", "tcp"):
         try:
-            from ctf_strix import file_triage
-
-            added = file_triage.register()
+            # file_triage removed in 1.2.2.5; use file/binwalk/r2 directly
+            added = []
             print(f"[file] registered {len(added)} tools: {', '.join(added) or '(already present)'}", flush=True)
         except Exception as exc:  # noqa: BLE001
             print(f"[file] registration failed: {type(exc).__name__}: {exc}", flush=True)
@@ -2332,7 +2331,7 @@ def install_toolset(task: dict[str, Any], kind: str) -> tuple[str, list[str]]:
         # batched TCP / ELF peek).  Split by kind: an attachment challenge must
         # not pay for socket schemas and a remote-service challenge must not pay
         # for archive ones.  Kept separate from file_triage on purpose --
-        # file_triage answers "what is this?", these answer "what does it say?".
+        # Inspect tools answer "what does it say?".
         try:
             from ctf_strix import nonweb
 
@@ -2403,7 +2402,7 @@ def install_toolset(task: dict[str, Any], kind: str) -> tuple[str, list[str]]:
 
         # Tell the prompt which kind is running *before* the first render, so
         # the Tools section describes what was actually registered: a file
-        # challenge is not told about route_map, and is told about decode_blob.
+        # challenge is not told about route_map.
         groups = ["base", *_measured_groups(kind)]
         ctf_prompt.activate(kind, tuple(groups), _registered_names())
         ctf_prompt.install()

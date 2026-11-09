@@ -120,7 +120,7 @@ execution/file/DB read, and did I actually read the secret — or only a schema?
 #: ``How to spend turns`` differs by challenge kind.  A file challenge has no
 #: root page to probe and no accounts to register; telling it to do both burns
 #: two turns before it opens the attachment.  The file text points at the
-#: per-family ``next:`` table inside ``file_triage``: the model should run
+#: per-family analysis table: the model should run
 #: that table instead of loading a skill just to decide the direction.
 #: The web text is the original one, unchanged, so the measured web
 #: behaviour does not move.
@@ -138,14 +138,14 @@ _TURNS_WEB = """\
 _TURNS_FILE = """\
 ## How to spend turns
 
-1. `file_triage` the attachment once. Do not run `file` and `strings` by hand
+1. Inspect the attachment once with `file` and `binwalk`. Do not run `strings` by hand
    first: the triage answer already contains both, plus the family guess.
 2. Run its `next:` table in order (1 then 2 then 3). The table is per family and
    every command is installed in this image; a deep-read skill line is a last
    resort, not the first step. Do not substitute a command from another family.
-3. When the trail is a string rather than a file, `decode_blob` before writing
+3. When the trail is a string rather than a file, decode the encoding before writing
    your own decoder — it reports which layer was which. An archive goes through
-   `unpack_archive`; a binary stays static in `elfpeek` until you have a reason
+   `unpack_archive`; a binary stays static until you have a reason
    to run it.
 4. Name the mechanism before each step: "the flag is in the PNG IDAT after the
    LSB plane", "the second gzip member holds the key".
@@ -154,9 +154,9 @@ _TURNS_FILE = """\
 _TURNS_TCP = """\
 ## How to spend turns
 
-1. `file_triage` the attachment first when there is one, then `tcp` once to read
+1. Inspect the attachment first when there is one, then `tcp` once to read
    the banner. The banner usually names the binary and its protections.
-2. `elfpeek` the binary before connecting again: checksec-style results, symbols
+2. Inspect the binary before connecting again: checksec-style results, symbols
    and gadgets come from the file, not from the service.
 3. Probe with `tcp_batch`, not a hand-written loop. One call, many payloads,
    one line per response — that is how an offset is found.
