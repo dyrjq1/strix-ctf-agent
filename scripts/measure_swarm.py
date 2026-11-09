@@ -90,6 +90,9 @@ WORK_TOOLS = frozenset(
         "load_skill",
         "think",
         "finish_scan",
+        "unpack_archive",
+        "tcp",
+        "tcp_batch",
     }
 )
 

@@ -14,7 +14,6 @@ part that actually breaks.
 
 from __future__ import annotations
 
-import io
 import socket
 import sys
 import tarfile
@@ -168,42 +167,56 @@ def test_tcp_batch_caps_the_candidate_list() -> None:
     assert "payloads is empty" not in out
 
 
+def test_unpack_archive_next_hint_uses_produced_family(tmp_path: Path) -> None:
+    """_NEXT wiring must sniff the largest *produced* file, not the outer archive.
 
-def test_unpack_archive_appends_next_hint_for_known_family(tmp_path: Path) -> None:
-    """When unpacking a known family (zip), the output must include the _NEXT hint."""
-    archive = tmp_path / "a.zip"
+    Outer is a tar and inner is a zip: the outer family (tar) has no _NEXT entry,
+    so a hint can only appear if the wiring sniffs the produced zip file.
+    """
+    inner = tmp_path / "inner.zip"
+    with zipfile.ZipFile(inner, "w") as handle:
+        handle.writestr("deep.txt", "hello deep")
+    outer = tmp_path / "outer.tar"
+    with tarfile.open(outer, "w") as handle:
+        handle.add(inner, arcname="inner.zip")
+    out = nonweb.unpack_archive(str(outer), out_dir=str(tmp_path / "out"))
+    hint_lines = [line for line in out.splitlines() if "unzip -l" in line]
+    assert hint_lines, "expected zip-specific _NEXT hint (unzip -l) in output"
+    assert "inner.zip" in hint_lines[0], "hint must target the produced zip file"
+    assert "deep.txt" in out
+
+
+def test_unpack_archive_no_next_hint_when_produced_family_not_in_next(tmp_path: Path) -> None:
+    """A family _sniff can name but _NEXT lacks must not grow a structured hint.
+
+    Outer and inner are both tar: _sniff(largest produced) == "tar" and "tar" is
+    not in _NEXT.  The static "next: inspect" line is allowed, so the assertion
+    looks specifically for the structured ``next: 1)`` block.
+    """
+    note = tmp_path / "note.txt"
+    note.write_text("hello", encoding="utf-8")
+    inner = tmp_path / "inner.tar"
+    with tarfile.open(inner, "w") as handle:
+        handle.add(note, arcname="note.txt")
+    outer = tmp_path / "outer.tar"
+    with tarfile.open(outer, "w") as handle:
+        handle.add(inner, arcname="inner.tar")
+    out = nonweb.unpack_archive(str(outer), out_dir=str(tmp_path / "out"))
+    assert "next: 1)" not in out, "structured hint leaked for family absent from _NEXT"
+    assert "next: inspect the largest extracted file with file" in out
+    assert "note.txt" in out
+
+
+def test_unpack_archive_no_next_hint_for_unknown_produced_family(tmp_path: Path) -> None:
+    """When the largest produced file is unknown (``""`` from _sniff), do not guess."""
+    archive = tmp_path / "data.zip"
     with zipfile.ZipFile(archive, "w") as handle:
-        handle.writestr("hello.txt", "hello world")
+        handle.writestr("readme.txt", "content")
     out = nonweb.unpack_archive(str(archive), out_dir=str(tmp_path / "out"))
-    # Known family "zip" is in _NEXT, so the next: line must appear
-    assert "next:" in out
-    assert "unpack_archive" in out
-    assert "hello.txt" in out
+    assert "readme.txt" in out
+    assert "next: 1)" not in out, "structured hint leaked for an unknown family"
+    assert "next: inspect the largest extracted file with file" in out
 
-
-def test_unpack_archive_no_next_hint_for_unknown_family(tmp_path: Path) -> None:
-    """When unpacking an unknown family, no spurious next: hint must be appended."""
-    # Create a file with a known magic that _sniff would not classify as any
-    # _NEXT family.  A plain text file with a .zip extension will be detected
-    # as "unknown" by _sniff (magic bytes are not ZIP), and unpack_archive
-    # will report nothing extracted.
-    not_zip = tmp_path / "fake.zip"
-    not_zip.write_bytes(b"this is not a zip file at all")
-    out = nonweb.unpack_archive(str(not_zip), out_dir=str(tmp_path / "out"))
-    # The "next:" in the "nothing extracted"
-    # branch is from the NOT-produced path, not from _NEXT.  The key invariant:
-    # the _NEXT["unknown"] entry is a generic triage hint, not a per-family
-    # walkthrough, so it should NOT be appended here.
-    # Since nothing was produced, the fallback "next: nothing came out" message
-    # fires -- but that is from the "not produced" branch, not M3 wiring.
-    # The M3 wiring only fires when produced is non-empty.  So for unknown
-    # family with no extraction, the M3 path is never reached.
-    #
-    # The real counter-example: create a file that _sniff recognizes but
-    # _NEXT does not have an entry for.  Since _NEXT covers all sniff-able
-    # families, we verify the negative case through the code path: when
-    # produced is empty, the M3 branch is skipped entirely.
-    assert "unpack_archive" in out
 
 def test_register_splits_by_kind() -> None:
     seen: list = []

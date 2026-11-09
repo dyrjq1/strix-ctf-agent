@@ -37,15 +37,28 @@ def test_clip_output_passes_short_text_unchanged():
     assert "truncated" not in result
 
 
-def test_clip_output_truncates_long_text():
-    text = "x" * 50_000
-    result = _clip_output(text)
+@pytest.mark.asyncio
+async def test_clip_output_truncates_long_text():
+    """End-to-end truncation keeps exclusive head/tail markers, drops the middle.
+
+    Goes through ``_wrap_for_truncation`` -> ``on_invoke_tool`` (the same path
+    the shell/filesystem hooks use), not ``_clip_output`` directly.
+    """
+    head_mark = "HEADMARK"
+    mid_mark = "MIDMARK"
+    tail_mark = "TAILMARK"
+    long_text = head_mark + "a" * _TOOL_OUTPUT_MAX_CHARS + mid_mark + "b" * _TOOL_OUTPUT_MAX_CHARS + tail_mark
+
+    async def on_invoke(ctx, inp):
+        return long_text
+
+    wrapped = _wrap_for_truncation(_tool(on_invoke=on_invoke))
+    result = await wrapped.on_invoke_tool(None, "")
     assert len(result) <= _TOOL_OUTPUT_MAX_CHARS
     assert "truncated" in result
-    assert "50000" in result
-    # End-to-end: output must contain both head and tail of original
-    assert result.startswith("x" * 20), "truncated output missing head of original"
-    assert "x" * 10 in result[-50:], "truncated output missing tail of original"
+    assert head_mark in result, "head marker must be visible after truncation"
+    assert tail_mark in result, "tail marker must be visible after truncation"
+    assert mid_mark not in result, "middle marker must be clipped away"
 
 
 async def _echo(ctx, raw_input: str):
@@ -165,13 +178,18 @@ def test_filesystem_tools_path_gets_truncation():
 
 
 def test_install_mount_hook_is_idempotent():
-    """Calling install_mount_hook twice must not raise and must be a no-op."""
-    # First call: must succeed (no exception)
-    install_mount_hook()
-    # Second call: must be idempotent (no exception, early return)
-    install_mount_hook()
-    # Verify the mark was set, confirming the hook installed
+    """Calling install_mount_hook twice must not raise; the wrapper is the same object.
+
+    The second call must return the *same* ``_with_bounded_result`` callable
+    as the first -- idempotence is a wiring property, not a marker property.
+    """
     from strix.agents import factory
-    assert getattr(factory, "_ctf_mounted", False), (
-        "install_mount_hook did not set _ctf_mounted mark"
+
+    install_mount_hook()
+    first = factory._with_bounded_result
+    install_mount_hook()
+    second = factory._with_bounded_result
+    assert first is second, (
+        "install_mount_hook is not idempotent: _with_bounded_result changed "
+        "across calls"
     )

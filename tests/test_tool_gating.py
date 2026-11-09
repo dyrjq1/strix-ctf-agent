@@ -138,6 +138,37 @@ def test_next_hints_do_not_mention_removed_binaries():
         )
 
 
+def test_unpack_archive_static_prompts_do_not_mention_removed_binaries():
+    """Static prompt lines and wiring segments in unpack_archive output
+    must not reference binaries the image does not ship.
+
+    This covers the "not produced" static hints, the "else" static hints,
+    and any other string literal that unpack_archive emits -- not just
+    the _NEXT decision table.
+    """
+    import ast
+    from pathlib import Path
+
+    src = Path(__file__).resolve().parent.parent / "src" / "ctf_strix" / "nonweb.py"
+    tree = ast.parse(src.read_text(encoding="utf-8"))
+
+    # Walk the unpack_archive function body and collect all string constants.
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef) and node.name == "unpack_archive":
+            strings: list[str] = []
+            for sub in ast.walk(node):
+                if isinstance(sub, ast.Constant) and isinstance(sub.value, str):
+                    strings.append(sub.value)
+            all_text = "\n".join(strings)
+            for name in BANNED_BINARIES:
+                assert name not in all_text, (
+                    f"unpack_archive output contains removed binary '{name}' -- "
+                    f"the image does not ship it, so the prompt is a dead end"
+                )
+            return
+    pytest.fail("unpack_archive function not found in nonweb.py AST")
+
+
 # ---------------------------------------------------------------------------
 # Catalogue cross-check: nonweb registration vs catalogue.py declarations
 # ---------------------------------------------------------------------------

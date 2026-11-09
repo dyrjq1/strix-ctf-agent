@@ -54,13 +54,11 @@ logger = logging.getLogger(__name__)
 #: 施加过守卫的工具会带上这个标记，避免三重挂钩互相套娃。
 _MARK = "_ctf_mounted"
 
-
-
 #: Character ceiling for any single tool output.  Strix's own
 #: ``_with_bounded_result`` caps at 50 KB bytes; this is a narrower
 #: character-level safety net that applies to every path (regular /
 #: Shell / filesystem).  The value is borrowed from strix's 50 KB
-#: byte budget (one UTF-8 char ≤?4 bytes = ~12.5k chars, doubled
+#: byte budget (one UTF-8 char ≤ 4 bytes = ~12.5k chars, doubled
 #: for non-ASCII headroom).  This is a wiring fix, not a budget
 #: tuning knob -- the ceiling already existed; it just was not
 #: universally enforced.

@@ -1,6 +1,6 @@
-"""Non-web primitives: decode chains, safe unpacking, hex view, raw TCP, ELF peek.
+"""Non-web primitives: safe unpacking, raw TCP, batch comparison.
 
-## Why these six and nothing else
+## Why these three and nothing else
 
 The v2/v3 web surface answers "which request do I send next".  A rev/pwn/misc
 challenge fails at a different place: the agent cannot see what it is holding.
@@ -29,37 +29,30 @@ pack in here.
 
 ``FILE_TOOLS`` and ``TCP_TOOLS`` register separately, because a file-only
 challenge should not pay schema tokens for a socket tool and vice versa.  The
-six schemas are ~2.5k chars; paying them on a web challenge is pure waste
+three schemas are ~2.5k chars; paying them on a web challenge is pure waste
 (measured: 17 bookkeeping schemas cost 4.2k chars for zero calls).
 """
 
 from __future__ import annotations
 
-import base64
 import bz2
-import codecs
 import gzip
-import html
 import io
 import lzma
 import re
 import shutil
 import socket
-import struct
 import subprocess
 import tarfile
 import time
 import zipfile
 from pathlib import Path
 from typing import Final
-from urllib.parse import unquote
 
 #: Same flag shape as ``flag_extract.FLAG_RE``.  Kept as a literal so this
 #: module has no import cycle and can be unit-tested alone.
 _FLAG_RE: Final = re.compile(r"(?:FLAG|flag|CTF|ctf|CTFY|ctfy)\{[0-9a-zA-Z_\-]{2,}\}")
 
-#: A 10MB "blob" is a file, not a blob.  Saying so costs one line instead of
-#: 256k characters of garbage in the context.
 
 #: Formats ``_sniff`` can name but this module has no stdlib reader for.
 #: 7z is extracted with the system binary when present (``_from_7z``) and
@@ -76,20 +69,10 @@ _UNPACK_MAX_FILES: Final = 2000
 #: Uncompressed-size gate for one member, checked before reading.
 _UNPACK_MEMBER_MAX: Final = 64 * 1024 * 1024
 
-#: One screen is enough to recognise a header; more is a file.
 
 #: tcp_batch is a one-shot comparison, not a fuzzer.  200 candidates covers
 #: padding-oracle work and stays inside one tool timeout.
 _BATCH_MAX: Final = 200
-
-_PRINTABLE: Final = frozenset(range(0x20, 0x7F)) | {0x09, 0x0A, 0x0D}
-
-_ENGLISH_RE: Final = re.compile(
-    r"\b(the|and|you|this|that|with|login|admin|password|username|token|flag|ctf"
-    r"|http|select|database|secret|encrypt|decrypt|script|query|session|cookie"
-    r"|config|function|return|error|success|welcome|system|bash|hello|world"
-    r"|answer|message|plain|cipher|layer|content|value|name|file|text)\b"
-)
 
 
 #: family → 决策表。每个家族直接给可执行动作，技能只作深读引用。
@@ -214,18 +197,6 @@ def _clip(text: str, limit: int = 4000) -> str:
     return text[: limit - 60] + f"\n...[truncated {len(text)} chars total]"
 
 
-def _ratio(data: bytes) -> float:
-    """Share of bytes that are printable ASCII (incl. CR/LF/TAB)."""
-    if not data:
-        return 0.0
-    return sum(1 for byte in data if byte in _PRINTABLE) / len(data)
-
-
-def _english_hint(text: str) -> int:
-    """Count of distinct English-ish words; used to judge a rot13 candidate."""
-    return len(set(_ENGLISH_RE.findall(text.lower())))
-
-
 def _to_int(value: object, default: int, low: int, high: int) -> int:
     """Parse an int argument from a model, clamped; garbage falls back.
 
@@ -241,9 +212,8 @@ def _to_int(value: object, default: int, low: int, high: int) -> int:
     return max(low, min(number, high))
 
 
-
 # ---------------------------------------------------------------------------
-# 2. unpack_archive -- magic sniffing + a shared budget
+# 1. unpack_archive -- magic sniffing + a shared budget
 # ---------------------------------------------------------------------------
 
 
@@ -269,7 +239,7 @@ def _sniff(path: Path) -> str:
         return "tar"
     # 7z and RAR are *named* before any extraction attempt: Python's stdlib
     # has no reader for either.  The system 7z binary (when present) handles
-    # real 7z archives in walk(); RAR never extracts -- p7zip cannot read it.
+    # real 7z archives in walk(); RAR extracts via _from_unar when the system
     # Naming matters because "detected unknown, nothing extracted" reads
     # exactly like a corrupt file -- the model then retries unpack_archive
     # instead of changing method.  A RAR self-extracting stub can precede the
@@ -483,7 +453,6 @@ def _from_7z(path: Path, sub: Path, budget: dict[str, int]) -> list[str]:
     return skipped
 
 
-
 def _from_unar(path: Path, sub: Path, budget: dict[str, int]) -> list[str]:
     """Extract with the system unar binary, then enforce the same gates.
 
@@ -653,7 +622,7 @@ def unpack_archive(path: str = "", max_depth: int = 3, out_dir: str = "extracted
     if not produced:
         body.append(
             "next: nothing came out -- check what the file really is with "
-            "file/binwalk; a wrong extension is common and the magic "
+            "file; a wrong extension is common and the magic "
             "bytes are the authority."
         )
         if kind in _NAMES_ONLY and not (kind == "7z" and shutil.which("7z")):
@@ -684,24 +653,33 @@ def unpack_archive(path: str = "", max_depth: int = 3, out_dir: str = "extracted
             )
     else:
         body.append(
-            "next: inspect the largest extracted file with file/binwalk; for text "
+            "next: inspect the largest extracted file with file; for text "
             "files grep is cheaper than opening each one."
         )
-        # Wire _NEXT: if the detected family has a decision-table entry,
-        # append it so the model gets the next step without guessing.
-        if kind and kind in _NEXT:
+        # Wire _NEXT: sniff the largest produced file to decide
+        # the next-step family, not the outer archive kind.
+        if produced:
             largest = max(produced, key=lambda p: p.stat().st_size, default=None)
             if largest is not None:
-                hint = _NEXT[kind].format(p=largest.as_posix())
-                body.append(f"next:\n{hint}")
-    return _clip("\n".join(body))
+                snif = _sniff(largest)
+                if snif and snif in _NEXT:
+                    hint = _NEXT[snif].format(p=largest.as_posix())
+                    body.append("next: " + hint)
+    # Separate next: hints from the file list so they survive _clip.
+    next_hints = []
+    body_without_next = []
+    for line in body:
+        if line.startswith("next:"):
+            next_hints.append(line)
+        else:
+            body_without_next.append(line)
+    result = _clip("\n".join(body_without_next))
+    if next_hints:
+        result += "\n" + "\n".join(next_hints)
+    return result
 
 # ---------------------------------------------------------------------------
-
-
-
-# ---------------------------------------------------------------------------
-# 4/5. tcp -- one round trip, and a batch that shares one connection
+# 2. tcp -- one round trip, and a batch that shares one connection
 # ---------------------------------------------------------------------------
 
 
@@ -980,8 +958,6 @@ def tcp_batch(
         "the hypothesis is wrong -- change the question, not the payload."
     )
     return _clip("\n".join([head] + rows + [tail]))
-
-# ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
 # registration
