@@ -190,7 +190,7 @@ def test_unpack_archive_no_next_hint_for_unknown_family(tmp_path: Path) -> None:
     not_zip = tmp_path / "fake.zip"
     not_zip.write_bytes(b"this is not a zip file at all")
     out = nonweb.unpack_archive(str(not_zip), out_dir=str(tmp_path / "out"))
-    # After deletion of decode_blob, the "next:" in the "nothing extracted"
+    # The "next:" in the "nothing extracted"
     # branch is from the NOT-produced path, not from _NEXT.  The key invariant:
     # the _NEXT["unknown"] entry is a generic triage hint, not a per-family
     # walkthrough, so it should NOT be appended here.
