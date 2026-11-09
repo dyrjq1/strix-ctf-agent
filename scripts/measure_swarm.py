@@ -84,7 +84,6 @@ WORK_TOOLS = frozenset(
         "route_map",
         "method_sweep",
         "path_variants",
-        "file_triage",
         "apply_patch",
         "read_file",
         "write_file",

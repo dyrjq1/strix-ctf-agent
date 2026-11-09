@@ -15,6 +15,7 @@ import pytest
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "src"))
+sys.path.insert(0, str(ROOT / "vendor" / "src"))
 
 
 def _task(description: str = "", tags: list[str] | None = None) -> dict:
@@ -116,3 +117,68 @@ def test_aisec_hint_requires_a_whole_token(monkeypatch, metadata, expected, why)
     monkeypatch.delenv("CTF_AISEC", raising=False)
     enabled, _ = capabilities.wants_aisec("web", {"challenge": metadata})
     assert enabled is expected, why
+
+
+# ---------------------------------------------------------------------------
+# Binary disable: _NEXT hints must not reference removed external binaries
+# ---------------------------------------------------------------------------
+
+BANNED_BINARIES = ["checksec", "zsteg", "exiftool", "tshark", "tcpdump", "binwalk"]
+
+
+def test_next_hints_do_not_mention_removed_binaries():
+    """_NEXT decision-table hints must only reference tools the image ships."""
+    from ctf_strix.nonweb import _NEXT
+
+    all_hints = "\n".join(_NEXT.values())
+    for name in BANNED_BINARIES:
+        assert name not in all_hints, (
+            f"_NEXT hints contain removed binary '{name}' -- "
+            f"the image does not ship it, so the hint is a dead end"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Catalogue cross-check: nonweb registration vs catalogue.py declarations
+# ---------------------------------------------------------------------------
+
+def test_nonweb_file_tools_match_catalogue():
+    """Every FILE_TOOLS name must have a catalogue row, and vice versa."""
+    from ctf_strix import nonweb as nw
+    from ctf_strix import catalogue
+
+    registered = {tool.__name__ for tool in nw.FILE_TOOLS}
+    declared = {
+        info.name for info in catalogue.CATALOGUE
+        if info.group == "file"
+    }
+    # All file-group catalogue entries must be in FILE_TOOLS
+    extra_in_catalogue = declared - registered
+    assert not extra_in_catalogue, (
+        f"catalogue declares file tools not in nonweb.FILE_TOOLS: {extra_in_catalogue}"
+    )
+    # All FILE_TOOLS must have a catalogue entry
+    missing_from_catalogue = registered - declared
+    assert not missing_from_catalogue, (
+        f"nonweb.FILE_TOOLS has tools missing from catalogue: {missing_from_catalogue}"
+    )
+
+
+def test_nonweb_tcp_tools_match_catalogue():
+    """Every TCP_TOOLS name must have a catalogue row, and vice versa."""
+    from ctf_strix import nonweb as nw
+    from ctf_strix import catalogue
+
+    registered = {tool.__name__ for tool in nw.TCP_TOOLS}
+    declared = {
+        info.name for info in catalogue.CATALOGUE
+        if info.group == "tcp"
+    }
+    extra_in_catalogue = declared - registered
+    assert not extra_in_catalogue, (
+        f"catalogue declares tcp tools not in nonweb.TCP_TOOLS: {extra_in_catalogue}"
+    )
+    missing_from_catalogue = registered - declared
+    assert not missing_from_catalogue, (
+        f"nonweb.TCP_TOOLS has tools missing from catalogue: {missing_from_catalogue}"
+    )

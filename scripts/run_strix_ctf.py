@@ -308,21 +308,7 @@ async def main() -> int:
             print(f"[capability] registration failed: {message}")
     else:
         print(f"[web] skipped (kind={args.target_kind})")
-
-    # 文件类题（rev/pwn/misc/crypto 的附件题）才装入口原语。
-    #
-    # 只在 target_kind == file 时注册，是因为它会往 system prompt 里多塞一段
-    # schema；web 题每一轮都要为这段付 token，收益却是零。
     if args.target_kind in ("file", "tcp"):
-        try:
-            from ctf_strix import file_triage
-
-            added = file_triage.register()
-            groups.append("file")
-            print(f"[file] registered {len(added)} tools: {', '.join(added) or '(already present)'}")
-        except Exception as e:  # noqa: BLE001
-            print(f"[file] registration failed: {type(e).__name__}: {e}")
-
         # Same split as the official entrypoint: attachment primitives only on
         # file challenges, socket primitives only on tcp ones.  Registering both
         # would put ~2.5k chars of unused schema in front of the model on every
@@ -335,6 +321,7 @@ async def main() -> int:
             print(f"[nonweb] registered {len(added)} tools: {', '.join(added) or '(already present)'}")
         except Exception as e:  # noqa: BLE001
             print(f"[nonweb] registration failed: {type(e).__name__}: {e}")
+
 
     # CTF 技能包：12 个方向索引，走 strix 自带的 load_skill。
     #

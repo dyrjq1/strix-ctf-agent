@@ -43,6 +43,9 @@ def test_clip_output_truncates_long_text():
     assert len(result) <= _TOOL_OUTPUT_MAX_CHARS
     assert "truncated" in result
     assert "50000" in result
+    # End-to-end: output must contain both head and tail of original
+    assert result.startswith("x" * 20), "truncated output missing head of original"
+    assert "x" * 10 in result[-50:], "truncated output missing tail of original"
 
 
 async def _echo(ctx, raw_input: str):
@@ -162,5 +165,13 @@ def test_filesystem_tools_path_gets_truncation():
 
 
 def test_install_mount_hook_is_idempotent():
+    """Calling install_mount_hook twice must not raise and must be a no-op."""
+    # First call: must succeed (no exception)
     install_mount_hook()
+    # Second call: must be idempotent (no exception, early return)
     install_mount_hook()
+    # Verify the mark was set, confirming the hook installed
+    from strix.agents import factory
+    assert getattr(factory, "_ctf_mounted", False), (
+        "install_mount_hook did not set _ctf_mounted mark"
+    )

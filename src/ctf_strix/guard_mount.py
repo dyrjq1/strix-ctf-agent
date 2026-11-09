@@ -60,7 +60,7 @@ _MARK = "_ctf_mounted"
 #: ``_with_bounded_result`` caps at 50 KB bytes; this is a narrower
 #: character-level safety net that applies to every path (regular /
 #: Shell / filesystem).  The value is borrowed from strix's 50 KB
-#: byte budget (one UTF-8 char 鈮?4 bytes = ~12.5k chars, doubled
+#: byte budget (one UTF-8 char ≤?4 bytes = ~12.5k chars, doubled
 #: for non-ASCII headroom).  This is a wiring fix, not a budget
 #: tuning knob -- the ceiling already existed; it just was not
 #: universally enforced.

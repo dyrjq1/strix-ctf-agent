@@ -60,16 +60,13 @@ _FLAG_RE: Final = re.compile(r"(?:FLAG|flag|CTF|ctf|CTFY|ctfy)\{[0-9a-zA-Z_\-]{2
 
 #: A 10MB "blob" is a file, not a blob.  Saying so costs one line instead of
 #: 256k characters of garbage in the context.
-_BLOB_MAX_CHARS: Final = 256 * 1024
-#: Five independent encodings is already unusual; more means the scoring is
-#: chasing its own tail.
-_BLOB_MAX_LAYERS: Final = 8
 
 #: Formats ``_sniff`` can name but this module has no stdlib reader for.
 #: 7z is extracted with the system binary when present (``_from_7z``) and
-#: falls back to this set only when that binary is missing; RAR always
-#: stays here (p7zip cannot read RAR).  Either way "nothing extracted"
-#: must become an actionable message instead of silence.
+#: falls back to this set only when that binary is missing; RAR is handled
+#: by ``_from_unar`` when the system ``unar`` binary is present.
+#: Either way "nothing extracted" must become an actionable message
+#: instead of silence.
 _NAMES_ONLY: Final = frozenset({"7z", "rar"})
 
 #: Extraction budget, shared across recursion depth.  Without sharing, five
@@ -80,8 +77,6 @@ _UNPACK_MAX_FILES: Final = 2000
 _UNPACK_MEMBER_MAX: Final = 64 * 1024 * 1024
 
 #: One screen is enough to recognise a header; more is a file.
-_HEX_MAX: Final = 1024
-_HEX_WIDTH: Final = 16
 
 #: tcp_batch is a one-shot comparison, not a fuzzer.  200 candidates covers
 #: padding-oracle work and stays inside one tool timeout.
@@ -216,7 +211,7 @@ def _clip(text: str, limit: int = 4000) -> str:
         limit = min(match.end() + 64, len(text))
     if len(text) <= limit:
         return text
-    return text[: limit - 60] + f"\n...[truncated, {len(text)} chars total]"
+    return text[: limit - 60] + f"\n...[truncated {len(text)} chars total]"
 
 
 def _ratio(data: bytes) -> float:
@@ -244,241 +239,6 @@ def _to_int(value: object, default: int, low: int, high: int) -> int:
     except (TypeError, ValueError):
         return default
     return max(low, min(number, high))
-
-
-# ---------------------------------------------------------------------------
-
-
-def _as_b64(text: str) -> bytes | None:
-    compact = re.sub(r"\s+", "", text).replace("-", "+").replace("_", "/")
-    if len(compact) < 8:
-        return None
-    compact += "=" * (-len(compact) % 4)
-    try:
-        raw = base64.b64decode(compact, validate=False)
-    except (ValueError, TypeError):
-        return None
-    # Round-trip check: with sloppy padding almost any input decodes to
-    # *something*, and that something poisons the next layer.
-    if base64.b64encode(raw).decode().rstrip("=") != compact.rstrip("="):
-        return None
-    return raw
-
-
-def _as_b32(text: str) -> bytes | None:
-    compact = re.sub(r"\s+", "", text).upper()
-    if len(compact) < 8:
-        return None
-    compact += "=" * (-len(compact) % 8)
-    try:
-        raw = base64.b32decode(compact, casefold=True)
-    except (ValueError, TypeError):
-        return None
-    if base64.b32encode(raw).decode().rstrip("=") != compact.rstrip("="):
-        return None
-    return raw
-
-
-def _as_hex(text: str) -> bytes | None:
-    stripped = re.sub(r"0x", "", text, flags=re.I)
-    stripped = re.sub(r"\\x", "", stripped, flags=re.I)
-    stripped = re.sub(r"[\s,;:\-]", "", stripped)
-    if len(stripped) < 8 or len(stripped) % 2 or not re.fullmatch(r"[0-9a-fA-F]+", stripped):
-        return None
-    try:
-        return bytes.fromhex(stripped)
-    except ValueError:
-        return None
-
-
-def _as_binary(text: str) -> bytes | None:
-    bare = re.sub(r"\s", "", text)
-    bits = re.sub(r"[^01]", "", text)
-    if len(bits) < 16 or len(bits) % 8:
-        return None
-    # Reject prose that merely contains 0/1 characters.
-    if len(bits) / max(1, len(bare)) < 0.9:
-        return None
-    return bytes(int(bits[index : index + 8], 2) for index in range(0, len(bits), 8))
-
-
-def _text_variants(text: str) -> list[tuple[str, str]]:
-    """Transforms that keep text as text (no encoding layer)."""
-    out: list[tuple[str, str]] = []
-    rot = codecs.encode(text, "rot13")
-    # rot13 is a bijection on ASCII letters, so it always "succeeds"; accept
-    # it only when it produces a flag or more English than the input.  Without
-    # this gate a plain sentence gets "decoded" into nonsense and the chain
-    # records a step that made the text worse.
-    if rot != text and (_FLAG_RE.search(rot) or _english_hint(rot) > _english_hint(text)):
-        out.append(("rot13", rot))
-    url = unquote(text)
-    if url != text:
-        out.append(("urlencode", url))
-    entity = html.unescape(text)
-    if entity != text:
-        out.append(("html-entity", entity))
-    return out
-
-
-def _decode_candidates(text: str) -> list[tuple[str, str, float]]:
-    """Return ``(step name, decoded text, score)`` for plausible decodings.
-
-    Score = printable ratio plus 0.5 for containing a flag.  The 0.85 gate at
-    the call site is what stops the chain from "decoding" arbitrary prose.
-    """
-    found: list[tuple[str, str, float]] = []
-    for name, func in (
-        ("base64", _as_b64),
-        ("base32", _as_b32),
-        ("hex", _as_hex),
-        ("binary", _as_binary),
-    ):
-        raw = func(text)
-        if raw is None:
-            continue
-        ratio = _ratio(raw)
-        try:
-            decoded = raw.decode("utf-8")
-        except UnicodeDecodeError:
-            decoded = raw.decode("latin-1")
-        hit = bool(_FLAG_RE.search(decoded))
-        if ratio >= 0.85 or hit:
-            found.append((name, decoded, ratio + (0.5 if hit else 0.0)))
-    for name, decoded in _text_variants(text):
-        hit = bool(_FLAG_RE.search(decoded))
-        found.append((
-            name,
-            decoded,
-            _ratio(decoded.encode("utf-8", "replace")) + (0.5 if hit else 0.0),
-        ))
-    return found
-
-
-def _as_b64_lenient(text: str) -> bytes | None:
-    """Base64 decode that tolerates a mangled final character.
-
-    The strict decoder round-trips the input because "almost any bytes decode
-    to something".  That gate is right for a *chain*: a bogus layer poisons
-    every later step.  It is wrong for base64 **steganography**, where the
-    last character of each line is deliberately non-canonical -- the payload
-    lives exactly in those bits.  Measured on a real misc attachment: 60 of 81
-    lines were rejected by the strict decoder, all of them differing only at
-    index -1.
-
-    Only the final partial group is allowed to differ; a mismatch anywhere
-    earlier means the line is genuinely not base64.
-    """
-    compact = re.sub(r"\s+", "", text).replace("-", "+").replace("_", "/")
-    if len(compact) < 8 or not re.fullmatch(r"[A-Za-z0-9+/=]+", compact):
-        return None
-    padded = compact + "=" * (-len(compact) % 4)
-    try:
-        raw = base64.b64decode(padded, validate=False)
-    except (ValueError, TypeError):
-        return None
-    reencoded = base64.b64encode(raw).decode().rstrip("=")
-    target = padded.rstrip("=")
-    if reencoded == target:
-        return raw
-    # Tolerate a difference confined to the last character (the last 6-bit
-    # group covers only the high bits of the final byte; the low bits are
-    # padding and are what stego rewrites).
-    if len(reencoded) == len(target) and reencoded[:-1] == target[:-1]:
-        return raw
-    return None
-
-
-_B64_ALPHA: Final = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
-
-
-def _b64_stego_bits(lines: list[str]) -> tuple[str, int] | None:
-    """Recover payload bits hidden in base64 padding characters.
-
-    In base64 steganography the canonical encoder fills the unused low bits of
-    the final group with zeros; a stego encoder instead puts payload bits
-    there.  Each trailing ``=`` marks how many bits are spare: two pads = 4
-    free bits, one pad = 2.
-
-    Measured on a real challenge (``encode__base64-stego``): decoding the last
-    character of every line yields ``n35...`` and the answer is one ASCII
-    character per four bits, MSB first.  Because the padding is the *only*
-    thing that changes, this is invisible to any plain "decode the base64"
-    approach -- the decoded text looks like ordinary English.
-
-    Returns:
-        ``(decoded payload text, bits consumed)`` or None when the file does
-        not look like padded base64 lines.
-    """
-    padded = [line.rstrip() for line in lines if line.rstrip().endswith("=")]
-    if len(padded) < 4 or len(padded) / len(lines) < 0.5:
-        return None
-    bits: list[str] = []
-    for line in padded:
-        pad = len(line) - len(line.rstrip("="))
-        if pad not in (1, 2):
-            continue
-        last = line.rstrip("=")[-1:]
-        if not last or last not in _B64_ALPHA:
-            continue
-        value = _B64_ALPHA.index(last)
-        if pad == 2:
-            # 4 spare bits: the low 4 of the 6-bit group
-            bits.append(format(value & 0x0F, "04b"))
-        else:
-            # 2 spare bits: the low 2
-            bits.append(format(value & 0x03, "02b"))
-    joined = "".join(bits)
-    if len(joined) < 8:
-        return None
-    payload = bytes(
-        int(joined[index : index + 8], 2) for index in range(0, len(joined) - 7, 8)
-    )
-    text = payload.decode("latin-1", "replace")
-    if _FLAG_RE.search(text) or _ratio(payload) >= 0.9:
-        return text, len(joined)
-    return None
-
-
-def _decode_linewise(text: str) -> tuple[str, int, int] | None:
-    """Decode a blob whose *lines* are separately encoded.
-
-    Measured on a real misc attachment: 81 lines, each a complete base64
-    string, so the whole file is not a valid base64 stream (the newlines and
-    per-line padding break the round-trip check).  Treating the file as one
-    blob therefore reports "no chain" on a file that decodes cleanly line by
-    line -- the model then concludes the file is encrypted.
-
-    Only used as a fallback after whole-text decoding fails, and only when at
-    least two lines decode to mostly printable text; otherwise ordinary prose
-    would be "decoded" one sentence at a time.
-
-    Returns:
-        ``(joined text, decoded line count, total non-empty lines)`` or None.
-    """
-    lines = [line.strip() for line in text.splitlines() if line.strip()]
-    if len(lines) < 2:
-        return None
-    decoded: list[str] = []
-    for line in lines:
-        candidates = _decode_candidates(line)
-        best = max(candidates, key=lambda item: item[2], default=None)
-        if best is None or best[2] < 0.85:
-            raw = _as_b64_lenient(line)
-            if raw is None:
-                decoded.append("")
-                continue
-            text_value = raw.decode("latin-1", "replace")
-            if _ratio(raw) < 0.85:
-                decoded.append("")
-                continue
-            decoded.append(text_value)
-            continue
-        decoded.append(best[1])
-    count = sum(1 for item in decoded if item)
-    if count < 2 or count / len(lines) < 0.6:
-        return None
-    return "\n".join(item for item in decoded if item), count, len(lines)
 
 
 
@@ -927,6 +687,13 @@ def unpack_archive(path: str = "", max_depth: int = 3, out_dir: str = "extracted
             "next: inspect the largest extracted file with file/binwalk; for text "
             "files grep is cheaper than opening each one."
         )
+        # Wire _NEXT: if the detected family has a decision-table entry,
+        # append it so the model gets the next step without guessing.
+        if kind and kind in _NEXT:
+            largest = max(produced, key=lambda p: p.stat().st_size, default=None)
+            if largest is not None:
+                hint = _NEXT[kind].format(p=largest.as_posix())
+                body.append(f"next:\n{hint}")
     return _clip("\n".join(body))
 
 # ---------------------------------------------------------------------------
@@ -1215,119 +982,6 @@ def tcp_batch(
     return _clip("\n".join([head] + rows + [tail]))
 
 # ---------------------------------------------------------------------------
-
-
-
-def _capstone(elf: "_Elf"):
-    """Load capstone when present; ``None`` means the caller degrades.
-
-    A static import would break the stdlib-only image, so this is dynamic.  The
-    degraded path still answers "which offsets do I need", just without
-    instruction text.
-    """
-    try:
-        import capstone  # type: ignore
-    except Exception:  # noqa: BLE001
-        return None
-    try:
-        mode = capstone.CS_MODE_64 if elf.is64 else capstone.CS_MODE_32
-        return capstone.Cs(capstone.CS_ARCH_X86, mode)
-    except Exception:  # noqa: BLE001
-        return None
-
-
-def _gadget_offsets(elf: "_Elf", filt: str, limit: int) -> list[str]:
-    """Fixed-pattern scan: answers "where is pop rdi", not "list every gadget"."""
-    wanted = [token.strip().lower() for token in (filt or "").split("|") if token.strip()]
-    # ``binsh`` names the /bin/sh constant, not a gadget: filtering on it would
-    # drop every "pop rdi" row the caller also asked for, and the decoder path
-    # already treats it as a constant instead of a needle.
-    wanted = [token for token in wanted if token not in ("binsh", "/bin/sh")]
-    rows: list[str] = []
-    for label, pattern in _GADGET_PATTERNS.items():
-        if wanted and not any(token in label for token in wanted):
-            continue
-        position = elf.data.find(pattern)
-        if position < 0:
-            rows.append(f"{label:<16} not found")
-            continue
-        vaddr = elf.off_to_vaddr(position)
-        rows.append(
-            f"{label:<16} file 0x{position:x}"
-            + (f"  vaddr 0x{vaddr:x}" if vaddr is not None else "")
-        )
-        if len(rows) >= limit:
-            break
-    return rows
-
-
-def _gadgets_capstone(elf: "_Elf", filt: str, limit: int) -> list[str]:
-    """Enumerate real instruction boundaries ending in ``ret``, depth <= 5."""
-    engine = _capstone(elf)
-    if engine is None or elf.e_machine not in (3, 62):
-        return []
-    tokens = [token.strip().lower() for token in (filt or "").split("|") if token.strip()]
-    # ``/bin/sh`` is a constant, not an instruction: the decoder path can never
-    # produce it, so keeping it in ``needles`` made the same binary report
-    # "pop rdi found" without a decoder and "not found" with one.  It is always
-    # listed below, from the byte scan, whatever the filter says.
-    wanted = [token for token in tokens if token not in ("binsh", "/bin/sh")]
-    needles = wanted or ["rdi", "rsi", "rdx", "syscall"]
-    deadline = time.monotonic() + 4.0
-    rows: list[str] = []
-    counts = {token: 0 for token in needles}
-
-    for p_type, p_flags, seg_offset, seg_vaddr, seg_size in elf.program_headers():
-        if not (p_type == 1 and p_flags & 1):
-            continue
-        blob = elf.data[seg_offset : seg_offset + seg_size]
-        rets = [index for index, byte in enumerate(blob) if byte == 0xC3][:2000]
-        for ret in rets:
-            if time.monotonic() > deadline:
-                break
-            for start in range(max(0, ret - 20), ret):
-                try:
-                    chain = list(engine.disasm(blob[start : ret + 1], seg_vaddr + start))
-                except Exception:  # noqa: BLE001
-                    continue
-                if not chain or len(chain) > 5:
-                    continue
-                if sum(item.size for item in chain) != ret + 1 - start:
-                    continue
-                if chain[-1].mnemonic != "ret":
-                    continue
-                # Same separator as the fixed-pattern path, so "pop rdi; ret"
-                # matches what the model was told to grep for.
-                text = "; ".join(
-                    item.mnemonic + (" " + item.op_str if item.op_str else "") for item in chain
-                )
-                for token in needles:
-                    if token in text and counts[token] < 5:
-                        counts[token] += 1
-                        rows.append(f"{text[:60]:<60} file 0x{seg_offset + start:x}  "
-                                    f"vaddr 0x{seg_vaddr + start:x}")
-            if all(counts[token] >= 5 for token in needles):
-                break
-        if all(counts[token] >= 5 for token in needles) or time.monotonic() > deadline:
-            break
-
-    for token in needles:
-        if counts[token] == 0:
-            rows.append(f"{('pop ' + token) if token in ('rdi', 'rsi', 'rdx', 'rax') else token:<60} not found")
-    # Always answer the one question a ROP chain asks first, whether or not a
-    # decoder is installed.
-    position = elf.data.find(b"/bin/sh\x00")
-    if position >= 0:
-        vaddr = elf.off_to_vaddr(position)
-        rows.append(
-            "/bin/sh  file 0x%x%s" % (position, f"  vaddr 0x{vaddr:x}" if vaddr is not None else "")
-        )
-    else:
-        rows.append("/bin/sh  not found")
-    return rows[: max(limit, 8)]
-
-
-
 
 # ---------------------------------------------------------------------------
 # registration
