@@ -108,10 +108,10 @@ See [network.md](network.md) for SMB3 decryption, credential extraction, and [li
 - **Docker image forensics:** Config JSON preserves ALL `RUN` commands even after cleanup. `tar xf app.tar` then inspect config blob. See [linux-forensics.md](linux-forensics.md).
 - **Linux attack chains:** Check `auth.log`, `.bash_history`, recent binaries, PCAP. See [linux-forensics.md](linux-forensics.md).
 - **RAID 5 XOR recovery:** Two disks of a 3-disk RAID 5 → XOR byte-by-byte to recover the third: `bytes(a ^ b for a, b in zip(disk1, disk3))`. See [disk-advanced.md](disk-advanced.md#raid-5-disk-recovery-via-xor-crypto-cat).
-- **GIMP raw memory dump visual inspection:** When Volatility fails, open `.dmp` in GIMP as raw RGB data at monitor width (~1920); scroll to find framebuffer screenshots of user's desktop. See [disk-and-memory.md](disk-and-memory.md#gimp-raw-memory-dump-visual-inspection-inshack-2018).
+- **GIMP raw memory dump visual inspection:** `volatility3` is not installed in this image, so open `.dmp` in GIMP as raw RGB data at monitor width (~1920); scroll to find framebuffer screenshots of user's desktop. See [disk-and-memory.md](disk-and-memory.md#gimp-raw-memory-dump-visual-inspection-inshack-2018).
 - **Kyoto Cabinet hash DB forensics:** Recover key ordering from KC hash database with zeroed keys by inserting sequential probe keys and binary-diffing to find which hash slot each overwrites. See [disk-advanced.md](disk-advanced.md#kyoto-cabinet-hash-database-forensics-via-incremental-key-insertion-asis-ctf-2018).
 - **PowerShell ransomware:** Extract scripts from minidump, find AES key, decrypt SMTP attachment. See [disk-and-memory.md](disk-and-memory.md).
-- **Linux ransomware + memory dump:** If Volatility is unreliable, recover AES key via raw-memory candidate scanning and magic-byte validation; re-extract zip cleanly to avoid missing files/false negatives. See [disk-advanced.md](disk-advanced.md).
+- **Linux ransomware + memory dump:** `volatility3` is not installed; if it is unavailable or unreliable, recover AES key via raw-memory candidate scanning and magic-byte validation; re-extract zip cleanly to avoid missing files/false negatives. See [disk-advanced.md](disk-advanced.md).
 - **Deleted partitions:** `testdisk` or `kpartx -av`. See [disk-advanced.md](disk-advanced.md).
 - **ZFS forensics:** Reconstruct labels, Fletcher4 checksums, PBKDF2 cracking. See [disk-advanced.md](disk-advanced.md).
 - **BSON reconstruction:** Reassemble BSON (Binary JSON) documents from raw bytes; parse with `bson` Python library. See [disk-and-memory.md](disk-and-memory.md#bson-binary-json-format-reconstruction-icectf-2016).
@@ -195,3 +195,15 @@ candidate offline with `hashlib.hmac`; the parsing details are in
 
 See [network-advanced.md](network-advanced.md#timeroasting--ms-sntp-hash-extraction-midnight-2026) for payload parsing script and full attack chain.
 
+## Competition Notes (moved from the index under the 8KB gate)
+
+- **PDF steganography (Nullcon 2026 rdctd):** six techniques -- invisible text
+  separators, URI annotations with escaped braces, Wiener deconvolution on
+  blurred images, vector rectangle QR codes, compressed object streams
+  (`mutool clean -d`) and document metadata fields. Code in
+  [steganography.md](steganography.md).
+- **HTTP upload exfiltration in PCAP (MetaCTF 2026):** `tshark --export-objects
+  http,/tmp/objects` extracts the uploaded files; check multipart POSTs, odd
+  User-Agent strings, and images carrying flag text. Filters and the full walk
+  are in
+  [network.md](network.md#http-file-upload-exfiltration-in-pcap-metactf-2026).

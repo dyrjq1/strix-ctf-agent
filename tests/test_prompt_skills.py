@@ -172,10 +172,14 @@ def test_file_turn_plan_runs_the_triage_table_before_loading_a_skill() -> None:
     from ctf_strix import prompt
 
     text = prompt._TURNS_FILE
+    flat = " ".join(text.split())
     assert "`next:`" in text
     assert "1 then 2 then 3" in text
-    assert "resort" not in " ".join(text.split())
+    assert "resort" not in flat
     assert "load_skill" in text
+    # The escape hatch is load-bearing: routing.py qualifies "load it first"
+    # with it. If this sentence is dropped, the two blocks disagree.
+    assert "skip the load" in flat
 
 
 def test_kind_shortlist_keeps_other_directions_loadable_but_undescribed() -> None:

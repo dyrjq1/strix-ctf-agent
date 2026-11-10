@@ -99,8 +99,12 @@ def test_non_ref_commands_do_not_count() -> None:
     assert analyze_log(text, None)["skill_ref_reads"] == 0
 
 
-def test_inject_bytes_are_offline_staged_sizes(tmp_path: Path) -> None:
-    """③ 按 load 的技能名取 staged 索引尺寸；缺失如实记 missing。"""
+def test_inject_bytes_are_offline_source_pack_sizes(tmp_path: Path) -> None:
+    """③ 按 load 的技能名取**源包**索引尺寸；缺失如实记 missing。
+
+    口径是源包（``skills_root/<name>.md``），不是 render 后的注入产物：
+    比真实注入少约 190B 的路径提示。名字与口径一致，不叫 staged。
+    """
     web = tmp_path / "ctf-web"
     web.mkdir()
     (web / "ctf-web.md").write_bytes(b"x" * 1000)
@@ -112,12 +116,34 @@ def test_inject_bytes_are_offline_staged_sizes(tmp_path: Path) -> None:
     result = analyze_log(text, tmp_path)
     assert result["skill_inject_bytes"] == 3000
     assert result["skill_inject_missing"] == 1
+    assert result["skill_inject_calls"] == 2
     assert result["skill_first"] == "ctf-triage"
+
+
+def test_one_load_call_with_a_missing_name_counts_once(tmp_path: Path) -> None:
+    """L-4：一次 ``load_skill([a, b])`` 缺 b，仍是**一次**调用、只算 a 的字节。
+
+    旧口径分子按名字累加、分母用 ``loads - missing`` 相减：一次两名字的调用
+    缺一个就退化成 ``1000 / 0 = n/a``。
+    """
+    web = tmp_path / "ctf-web"
+    web.mkdir()
+    (web / "ctf-web.md").write_bytes(b"x" * 1000)
+    text = _log(
+        ("load_skill", json.dumps({"skills": ["ctf-web/ctf-web", "ctf-nope/ctf-nope"]}))
+    )
+    result = analyze_log(text, tmp_path)
+    assert result["skill_inject_bytes"] == 1000
+    assert result["skill_inject_missing"] == 1
+    assert result["skill_inject_calls"] == 1
+    summary = summarize_runs([dict(result, has_log=True)])
+    assert summary["metric_3_inject_bytes_per_load"] == 1000
 
 
 def test_missing_skills_root_degrades_to_unknown() -> None:
     """没有 staged 技能包时 ③ 无法计算：只报 missing，不报负数不抛错。"""
     result = analyze_log(_log(_load("ctf-web/ctf-web")), None)
+    assert result["skill_inject_calls"] == 0
     assert result["skill_inject_bytes"] == 0
     assert result["skill_inject_missing"] == 1
 
@@ -157,25 +183,25 @@ def test_summarize_runs_computes_all_four_metrics() -> None:
             "id": "A", "kind": "web", "has_log": True,
             "skill_loads": 1, "skill_first": "ctf-triage",
             "skill_ref_reads": 1, "skill_inject_bytes": 5000,
-            "skill_inject_missing": 0,
+            "skill_inject_missing": 0, "skill_inject_calls": 1,
         },
         {  # 有日志、有 load、没读子文件、方向错
             "id": "B", "kind": "tcp", "has_log": True,
             "skill_loads": 2, "skill_first": "ctf-osint",
             "skill_ref_reads": 0, "skill_inject_bytes": 6000,
-            "skill_inject_missing": 0,
+            "skill_inject_missing": 0, "skill_inject_calls": 2,
         },
         {  # 没有日志：只进分母不进分子（has_log=False 整行排除）
             "id": "C", "kind": "web", "has_log": False,
             "skill_loads": 0, "skill_first": None,
             "skill_ref_reads": 0, "skill_inject_bytes": None,
-            "skill_inject_missing": 0,
+            "skill_inject_missing": 0, "skill_inject_calls": 0,
         },
         {  # 有日志、没 load
             "id": "D", "kind": "web", "has_log": True,
             "skill_loads": 0, "skill_first": None,
             "skill_ref_reads": 0, "skill_inject_bytes": 0,
-            "skill_inject_missing": 0,
+            "skill_inject_missing": 0, "skill_inject_calls": 0,
         },
     ]
     s = summarize_runs(runs)

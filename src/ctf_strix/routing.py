@@ -29,7 +29,7 @@ ROUTES: tuple[tuple[str, str, tuple[str, ...], str], ...] = (
         "HTTP app: forms / login / API / upload / sessions",
         "ctf-web",
         ("web", "checker", "engagement"),
-        "root once + one route map; create two accounts before attacking",
+        "root once, one route map; two accounts before attacking",
     ),
     (
         "install / build / publish / deploy / package names / registry",
@@ -178,19 +178,18 @@ def render(
         step_two = triage_line + table + "\n"
 
     return (
-        "[Skill routing] You are the dispatcher of a skill library, not an expert "
-        "answering from memory. The method lives in the index you load, not in "
-        "your priors. Four moves:\n"
-        "1. **Observe before naming.** Classify with one cheap, unfakeable "
-        "observation: HTTP root status/length/fingerprint; a file goes to "
-        "`file_triage`.\n"
-        "   Liveness gate: same body on every path, or only a framework 404 "
-        "with no app marker = dead instance. Say so and stop; do not enumerate.\n"
+        "[Skill routing] Dispatch a skill library; do not answer from memory. "
+        "The method lives in the index you load, not in your priors. Four moves:\n"
+        "1. **Observe before naming.** Classify with one cheap observation: "
+        "HTTP root status/length/fingerprint; a file goes to `file_triage`.\n"
+        "   Liveness gate: same body on every path, or framework-404-only = dead. "
+        "Say so and stop; do not enumerate.\n"
         + step_two
         + "2b. **Prefer the enumerator.** If `route_map`, `path_variants`, "
         "`method_sweep`, `tcp_batch`, `decode_blob` or `file_triage` covers it, "
-        "call it once instead of looping by hand. Enumerators map the surface; "
-        "the index names the mechanism -- load it first.\n"
+        "call it once, not in a loop. Enumerators map the surface; the index "
+        "names the mechanism -- load it first unless the triage output already "
+        "fixed the route.\n"
         "3. **Write the falsifier before the first payload**: \"If mechanism M holds, "
         "check C returns X; if Y, M is closed.\" Two identical responses from "
         "one family = wrong mechanism: change the attack class, not the payload.\n"

@@ -72,16 +72,109 @@ def test_stage_writes_only_indexes(tmp_path: Path) -> None:
     assert "/var/ctf/jail/skills/ctf-web/" in body
 
 
-def test_index_sources_fit_the_gate() -> None:
-    """strict 闸（单测/CI 专用）：源索引原始字节必须 ≤ INDEX_MAX_BYTES。
+def _render_of_size(pack: Path, target: int) -> tuple[Path, str]:
+    """造一个 ``render()`` 后**恰好** *target* 字节的索引（全 ASCII）。"""
+    name = pack.name
+    ref = "/var/ctf/jail/skills"
+    hint = skillpack._hint(ref, name)
+    head = "# t\n\n"
+    fill = "x" * (target - len(hint.encode("utf-8")) - len(head.encode("utf-8")))
+    pack.mkdir(parents=True, exist_ok=True)
+    path = pack / f"{name}.md"
+    path.write_text(head + fill, encoding="utf-8")
+    body = skillpack.render(path, ref, name)
+    assert len(body.encode("utf-8")) == target, len(body.encode("utf-8"))
+    return path, body
 
-    运行时 stage() 有截断兜底，但 CI 在这里 fail-loud：超标的索引该先下沉
-    子文件再进仓库，不能靠运行期截断续命。
+
+def test_index_sources_fit_the_gate() -> None:
+    """strict 闸（单测/CI 专用）：**渲染后**字节必须 ≤ INDEX_MAX_BYTES。
+
+    闸门量的是运行时真正落盘的那一份：``render()`` 会插入路径提示、抹掉
+    flag 形态，产物比源文件大 ~190B。只量源文件的旧闸漏掉了 H-1——
+    ctf-supply-chain 渲染 8172B，却被 ``cap - len(marker)`` 的旧预算误截。
     """
+    ref = "/var/ctf/jail/skills"
     for category, _name, path in skillpack.index_skills():
-        size = len(path.read_bytes())
+        body = skillpack.render(path, ref, category)
+        size = len(body.encode("utf-8"))
         assert size <= skillpack.INDEX_MAX_BYTES, (
-            f"{category} 索引 {size}B > {skillpack.INDEX_MAX_BYTES}B：先下沉再进仓库"
+            f"{category} 渲染后 {size}B > {skillpack.INDEX_MAX_BYTES}B：先下沉再进仓库"
+        )
+        assert "INDEX TRUNCATED" not in body, f"{category} 的 render() 不该带截断标记"
+
+
+def test_render_just_under_the_cap_passes_byte_for_byte(tmp_path: Path) -> None:
+    """边界：渲染 8100B（< 8192）必须原样落盘，一个字节都不改。
+
+    旧语义按 ``cap - len(marker)`` 预扣预算，8063 < 8100 ≤ 8192 会被误截；
+    这条用例就是那个回归的探针。
+    """
+    ref = "/var/ctf/jail/skills"
+    _path, body = _render_of_size(tmp_path / "ctf-8100", 8100)
+    reg = skillpack.stage(ref=ref, pack=tmp_path)
+    out = (reg / "ctf-8100" / "ctf-8100.md").read_bytes()
+    assert out == body.encode("utf-8"), "未超 cap 的索引被改动了"
+    assert "INDEX TRUNCATED" not in out.decode("utf-8")
+
+
+def test_render_just_over_the_cap_truncates_and_reports_real_size(
+    tmp_path: Path,
+) -> None:
+    """边界：渲染 8200B 才截断；总长 ≤ 8192，标记写**实际**尺寸。"""
+    ref = "/var/ctf/jail/skills"
+    _path, _body = _render_of_size(tmp_path / "ctf-8200", 8200)
+    reg = skillpack.stage(ref=ref, pack=tmp_path)
+    out = (reg / "ctf-8200" / "ctf-8200.md").read_bytes()
+    assert len(out) <= skillpack.INDEX_MAX_BYTES, f"截断后仍 {len(out)}B > 上限"
+    text = out.decode("utf-8")
+    assert "INDEX TRUNCATED" in text
+    assert "rendered 8200B" in text, "标记里必须是实际渲染尺寸，不是写死的上限"
+    assert "rendered 8192B" not in text
+
+
+def test_truncation_marker_names_deep_dive_only_when_it_exists(tmp_path: Path) -> None:
+    """M-2：有子文件才点名路径，没有就只给 ``ls`` 指引，不说谎。"""
+    ref = "/ref/skills"
+    deep_path, deep_body = _render_of_size(tmp_path / "ctf-deep", 8200)
+    (deep_path.parent / "archive-deep-dive.md").write_text("x", encoding="utf-8")
+    shallow_path, shallow_body = _render_of_size(tmp_path / "ctf-shallow", 8200)
+
+    deep = skillpack._cap_index(deep_body, ref, "ctf-deep", 8192, deep_path)
+    shallow = skillpack._cap_index(shallow_body, ref, "ctf-shallow", 8192, shallow_path)
+    assert f"{ref}/ctf-deep/archive-deep-dive.md" in deep
+    assert "archive-deep-dive.md" not in shallow
+    assert f"ls {ref}/ctf-shallow/" in shallow
+    assert "live in subfiles" not in shallow
+
+
+def test_tiny_cap_degrades_to_markerless_truncation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """L-1：cap 小于标记长度时不许超 cap——退化为纯内容截断（无标记）。"""
+    monkeypatch.setenv("CTF_INDEX_CAP", "50")
+    _path, _body = _render_of_size(tmp_path / "ctf-tiny", 4000)
+    reg = skillpack.stage(ref="/p", pack=tmp_path)
+    out = (reg / "ctf-tiny" / "ctf-tiny.md").read_bytes()
+    assert len(out) <= 50, f"cap=50 却写出 {len(out)}B"
+    assert "INDEX TRUNCATED" not in out.decode("utf-8")
+
+
+def test_no_real_index_is_truncated_at_runtime() -> None:
+    """零截断验收：13 个真实类别逐类 stage，无标记且 ≤ 8192B。
+
+    这不是抽查：任何一类超限都说明源索引该先下沉子文件，而不是调大闸。
+    """
+    reg = skillpack.stage(ref="/var/ctf/jail/skills")
+    files = sorted(reg.rglob("*.md"))
+    assert len(files) == len(skillpack.index_skills())
+    for path in files:
+        out = path.read_bytes()
+        assert len(out) <= skillpack.INDEX_MAX_BYTES, (
+            f"{path.parent.name} 落盘 {len(out)}B > 上限"
+        )
+        assert "INDEX TRUNCATED" not in out.decode("utf-8"), (
+            f"{path.parent.name} 的真实索引被运行时截断了"
         )
 
 

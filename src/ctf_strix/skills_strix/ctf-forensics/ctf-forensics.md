@@ -90,7 +90,7 @@ strings document.pdf | grep -i flag
 binwalk document.pdf         # Embedded files
 ```
 
-**Advanced PDF stego (Nullcon 2026 rdctd):** Six techniques -- invisible text separators, URI annotations with escaped braces, Wiener deconvolution on blurred images, vector rectangle QR codes, compressed object streams (`mutool clean -d`), document metadata fields.
+**Advanced PDF stego:** six techniques -- invisible text separators, URI annotations with escaped braces, Wiener deconvolution on blurred images, vector rectangle QR codes, compressed object streams (`mutool clean -d`), document metadata fields. Competition notes in [archive-deep-dive.md](archive-deep-dive.md).
 
 See [steganography.md](steganography.md) for full PDF steganography techniques and code.
 
@@ -157,7 +157,7 @@ See [linux-forensics.md](linux-forensics.md) for full browser credential decrypt
 
 ## HTTP Exfiltration in PCAP
 
-**Quick path:** `tshark --export-objects http,/tmp/objects` extracts uploaded files instantly. Check for multipart POST uploads, unusual User-Agent strings, and exfiltrated files (images with flag text). See [network.md](network.md#http-file-upload-exfiltration-in-pcap-metactf-2026).
+**Quick path:** `tshark --export-objects http,/tmp/objects` extracts uploaded files instantly. Check for multipart POST uploads, unusual User-Agent strings, and exfiltrated files (images with flag text). See [network.md](network.md) and [archive-deep-dive.md](archive-deep-dive.md) for the competition walk-through.
 
 ## Common Encodings
 

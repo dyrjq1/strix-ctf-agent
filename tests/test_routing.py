@@ -31,9 +31,17 @@ def test_render_is_empty_without_names() -> None:
 
 
 def test_render_fits_the_character_budget() -> None:
+    """Both ref lengths the contract runs under must fit the 3000-char budget.
+
+    ``/var/ctf/jail/skills`` is the 20-char jail path; ``ref_root()`` is the
+    57-char local debug path. Only checking the short one hid a 33-char overrun.
+    """
     names = [f"{c}/{c}" for c, _n, _p in skillpack.index_skills()]
-    text = routing.render(names, "/var/ctf/jail/skills")
-    assert len(text) <= routing.MAX_CHARS, f"routing block is {len(text)} chars"
+    for ref in ("/var/ctf/jail/skills", skillpack.ref_root()):
+        text = routing.render(names, ref)
+        assert len(text) <= routing.MAX_CHARS, (
+            f"{len(ref)}-char ref renders {len(text)} chars"
+        )
 
 
 def test_render_keeps_the_four_disciplines() -> None:
@@ -43,6 +51,18 @@ def test_render_keeps_the_four_disciplines() -> None:
     assert "falsifier" in text
     assert "40% and 70%" in text
     assert "do NOT `load_skill`" in text
+
+
+def test_load_first_is_qualified_by_the_triage_escape_hatch() -> None:
+    """L-2: "load it first" must not contradict prompt.py's skip-the-load exit.
+
+    ``_TURNS_FILE`` says a triage output that already fixed the route skips the
+    ``load_skill``. An unqualified imperative here would read as "always load",
+    so the qualifier is part of the contract, not decoration.
+    """
+    names = [f"{c}/{c}" for c, _n, _p in skillpack.index_skills()]
+    text = " ".join(routing.render(names, "/skills").split())
+    assert "load it first unless the triage output already fixed the route" in text
 
 
 def test_triage_line_dropped_when_not_registered() -> None:

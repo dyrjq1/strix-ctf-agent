@@ -12,8 +12,12 @@
 ② ``ref_read_rate``      每次 ``load_skill`` 之后 3 个 TOOL 调用内，出现
                           读技能包引用路径（``jail/skills`` / ``skills_strix``）
                           的 ``exec_command``/``read_file`` 的比例。
-③ ``inject_bytes``       单次注入字节：按 load 调用的技能名到 staged 索引
-                          文件离线取尺寸（D-1 的 8KB 闸保证这个数是确定性的）。
+③ ``inject_bytes``       单次注入字节：按 **load 调用**（不是按技能名）累加
+                          该调用点名的索引文件尺寸。口径是**源包**文件
+                          （``skills_root`` 下 ``<name>.md``），比真实注入少
+                          约 190B 的路径提示，故是下界近似，不是精确值。
+                          分母只数「至少解析出一个名字」的调用；缺失的名字
+                          不会把分母减成 0 或负数。
 ④ ``first_dir_rate``     首次 load 的方向与 run 的题型（``kind``）一致的比例；
                           ``ctf-triage`` 先行是批准的流程，恒视为一致。
 
@@ -119,18 +123,26 @@ def analyze_log(text: str, skills_root: Path | None) -> dict:
 
     inject_bytes = 0
     inject_missing = 0
+    inject_calls = 0
     first: str | None = None
     for group in names:
         if not group:
             continue
         if first is None:
             first = _category(group[0])
+        call_bytes = 0
+        resolved = False
         for name in group:
             index_file = None if skills_root is None else skills_root / f"{name}.md"
             if index_file is not None and index_file.is_file():
-                inject_bytes += index_file.stat().st_size
+                call_bytes += index_file.stat().st_size
+                resolved = True
             else:
                 inject_missing += 1
+        inject_bytes += call_bytes
+        if resolved:
+            # 分母按「调用」计：一次 load_skill([a, b]) 缺 b 仍是一次注入。
+            inject_calls += 1
 
     return {
         "skill_loads": len(loads),
@@ -138,6 +150,7 @@ def analyze_log(text: str, skills_root: Path | None) -> dict:
         "skill_ref_reads": ref_reads,
         "skill_inject_bytes": inject_bytes,
         "skill_inject_missing": inject_missing,
+        "skill_inject_calls": inject_calls,
     }
 
 
@@ -157,7 +170,7 @@ def summarize_runs(runs: list[dict]) -> dict:
     ref_reads = sum(r.get("skill_ref_reads", 0) for r in with_log)
     known_runs = [r for r in with_log if r.get("skill_inject_bytes") is not None]
     known_bytes = sum(r["skill_inject_bytes"] for r in known_runs)
-    known_loads = loads - sum(r.get("skill_inject_missing", 0) for r in with_log)
+    known_calls = sum(r.get("skill_inject_calls", 0) for r in known_runs)
     judged = [
         first_load_consistent(r.get("kind"), r.get("skill_first"))
         for r in with_log
@@ -173,7 +186,7 @@ def summarize_runs(runs: list[dict]) -> dict:
         ),
         "metric_2_ref_read_rate": (ref_reads / loads) if loads else None,
         "metric_3_inject_bytes_per_load": (
-            known_bytes / known_loads if known_loads > 0 else None
+            known_bytes / known_calls if known_calls > 0 else None
         ),
         "metric_4_first_dir_rate": (
             sum(1 for j in judged if j) / len(judged) if judged else None
@@ -228,6 +241,7 @@ def run_report(
                     "skill_ref_reads": 0,
                     "skill_inject_bytes": None,
                     "skill_inject_missing": 0,
+                    "skill_inject_calls": 0,
                 }
             )
         entry["has_log"] = has_log

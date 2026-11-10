@@ -200,30 +200,85 @@ def _index_cap() -> int:
         return INDEX_MAX_BYTES
 
 
-def _cap_index(body: str, ref: str, category: str, cap: int) -> str:
-    """运行时闸：渲染后的索引超 *cap* 字节就截断，尾部追加显式标记行。
-
-    标记行带 L3 子文件路径提示：被截掉的章节本来就有子文件兜着，渐进披露
-    （L2 索引 → L3 子文件）不因截断而断链。不是静默截断。
-
-    Returns:
-        截断后的文本；不超限时原样返回。结果总字节数 ≤ *cap*。
-    """
-    marker = (
-        f"\n\n> [INDEX TRUNCATED at {cap}B: remaining sections live in subfiles "
-        f"under `{ref}/{category}/`; read them with exec_command (`cat`/`sed -n`).]\n"
-    )
-    budget = max(cap - len(marker.encode("utf-8")), 0)
-    encoded = body.encode("utf-8")
-    if len(encoded) <= budget:
-        return body
+def _cut_lines(encoded: bytes, budget: int) -> str:
+    """把 UTF-8 字节串截到 *budget* 以内，尽量落在整行边界。"""
     cut = encoded[:budget]
     nl = cut.rfind(b"\n")
     if nl > 0:
         cut = cut[: nl + 1]
     # 按整行切（UTF-8 续字节不含 0x0A，行边界即字符边界）；ignore 只是兜底。
-    text = cut.decode("utf-8", errors="ignore").rstrip("\n")
-    return text + marker
+    return cut.decode("utf-8", errors="ignore").rstrip("\n")
+
+
+def _deep_dive_path(ref: str, category: str, source: Path | None) -> str | None:
+    """运行期判 ``archive-deep-dive.md`` 是否存在——判存在，不猜类别清单。
+
+    仓库侧（*source* 的兄弟文件）与运行期挂载点（``ref``）任一存在即算有：
+    前者是 stage() 时的真实来源，后者是 jail 里模型实际能读的路径。
+    """
+    candidates: list[Path] = []
+    if source is not None:
+        candidates.append(source.parent / "archive-deep-dive.md")
+    candidates.append(Path(ref) / category / "archive-deep-dive.md")
+    for candidate in candidates:
+        if candidate.is_file():
+            return f"{ref}/{category}/archive-deep-dive.md"
+    return None
+
+
+def _truncation_marker(
+    size: int, cap: int, ref: str, category: str, source: Path | None
+) -> str:
+    """截断标记：写**实际**触发尺寸，按存在与否给出真能读的下一步。"""
+    deep = _deep_dive_path(ref, category, source)
+    if deep is not None:
+        tail = (
+            f"remaining sections live in `{deep}`; read it with "
+            "exec_command (`cat`/`sed -n`)."
+        )
+    else:
+        tail = (
+            f"the remaining sections are omitted; `ls {ref}/{category}/` lists "
+            "the subfiles that actually exist."
+        )
+    return f"\n\n> [INDEX TRUNCATED: rendered {size}B > cap {cap}B; {tail}]\n"
+
+
+def _cap_index(
+    body: str,
+    ref: str,
+    category: str,
+    cap: int,
+    source: Path | None = None,
+) -> str:
+    """运行时闸：只有渲染后**超过** *cap* 字节才截断，尾部追加显式标记行。
+
+    未超过 *cap* 的输入**原样返回**（逐字节不变，零改动通过）。真正超限时才
+    按行边界切到 ``cap - len(marker)``，保证结果总字节数 ≤ *cap*；*cap* 小到
+    连标记都装不下时退化为纯内容截断（不带标记），仍然 ≤ *cap*。
+
+    标记行带 L3 子文件路径提示：被截掉的章节本来就有子文件兜着，渐进披露
+    （L2 索引 → L3 子文件）不因截断而断链。是否点名 ``archive-deep-dive.md``
+    由运行期 ``exists()`` 决定，不硬编码类别清单；不存在就只给 ``ls`` 指引。
+
+    Args:
+        body: :func:`render` 的产物。
+        ref: 技能包运行期根路径。
+        category: 分类名。
+        cap: 字节上限。
+        source: 索引源文件，用于在仓库侧判定子文件是否存在。
+
+    Returns:
+        截断后的文本；不超限时原样返回。结果总字节数 ≤ *cap*。
+    """
+    encoded = body.encode("utf-8")
+    if len(encoded) <= cap:
+        return body
+    marker = _truncation_marker(len(encoded), cap, ref, category, source)
+    budget = cap - len(marker.encode("utf-8"))
+    if budget <= 0:
+        return _cut_lines(encoded, cap)
+    return _cut_lines(encoded, budget) + marker
 
 
 def stage(ref: str | None = None, pack: Path | None = None) -> Path:
@@ -237,8 +292,9 @@ def stage(ref: str | None = None, pack: Path | None = None) -> Path:
     Returns:
         注册目录（``<tmp>/<分类>/<分类>.md``）。技能包缺失时返回一个空目录——
         调用方据此判断"要不要注册"，而不是拿到异常。索引渲染后超过
-        :data:`INDEX_MAX_BYTES`（``CTF_INDEX_CAP`` 可覆盖）按 :func:`_cap_index`
-        截断并追加标记行，绝不 raise。
+        :data:`INDEX_MAX_BYTES`（``CTF_INDEX_CAP`` 可覆盖）才按 :func:`_cap_index`
+        截断并追加标记行，绝不 raise；未超限的索引原样落盘（逐字节不变），
+        任何情况下落盘产物 ≤ cap。
 
     Raises:
         OSError: 临时目录不可写。
@@ -254,7 +310,7 @@ def stage(ref: str | None = None, pack: Path | None = None) -> Path:
         except OSError:
             # 单个索引读不到不该让整题跑不动：少一个方向，其余照常。
             continue
-        body = _cap_index(body, ref_path, category, _index_cap())
+        body = _cap_index(body, ref_path, category, _index_cap(), path)
         # 二进制落盘：字节闸算的就是落盘字节；文本模式在 Windows 会把 \n 翻译成
         # \r\n，闸口就形同虚设。顺带保证 staged 副本恒为 LF。
         (out_dir / f"{name}.md").write_bytes(body.encode("utf-8"))
