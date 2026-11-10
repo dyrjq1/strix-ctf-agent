@@ -135,6 +135,30 @@ CATALOGUE: Final[tuple[ToolInfo, ...]] = (
         WEB_KINDS,
         "web",
     ),
+    ToolInfo(
+        "jwt_forge",
+        "forge or resign a JWT: alg=none, HS256-512 HMAC, RS256 with built-in test key+jwk; rewrite claims from an existing token, delete fields; secret length only",
+        WEB_KINDS,
+        "web",
+    ),
+    ToolInfo(
+        "authdiff",
+        "privilege/auth comparison probe: send the same request under anon/bypass/path variants and compare status, length, body hash across them; every request recorded in traffic ledger",
+        WEB_KINDS,
+        "web",
+    ),
+    ToolInfo(
+        "jsrecon",
+        "static JS recon: fetch page + bundles, extract API paths, params, frontend routes, hard-coded key candidates, sourceMaps, comments; for SPA-shell challenges",
+        WEB_KINDS,
+        "web",
+    ),
+    ToolInfo(
+        "http_burst",
+        "concurrent/batch HTTP: values empty = race mode (Barrier synchronised); non-empty = batch mode with {v} substitution; cookie snapshot before, merge after; max 24 per call",
+        WEB_KINDS,
+        "web",
+    ),
     # -- attachment --------------------------------------------------------
     ToolInfo(
         "file_triage",

@@ -77,6 +77,21 @@ Modern CTF frontends often drift away from the backend's assumptions:
 
 ---
 
+## Read the bundle before guessing routes (`jsrecon`)
+
+For an SPA shell, an empty page, or an API that only the JavaScript knows,
+call `jsrecon` with the page URL. It fetches the page, the scripts it
+references (up to six bundles) and inline scripts, then extracts API paths,
+parameter names, frontend routes, hard-coded key candidates, sourceMap URLs and
+suspicious comments, ranked so auth/admin/upload-looking paths come first.
+
+- **Falsifier**: `api` and `calls` are empty while the page still needs a
+  backend -- the bundle is obfuscated, encrypted, or split behind a loader;
+  crawl with `route_map` instead of re-running the same extractor.
+- **Signal**: a path or parameter you have not tried appears, or a
+  `sourceMappingURL` exists -- pull the `.map`, then probe the ranked paths one
+  at a time with `http_probe`.
+
 ## XSS Payloads
 
 ### Basic

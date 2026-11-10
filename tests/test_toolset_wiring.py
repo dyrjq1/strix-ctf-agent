@@ -76,6 +76,24 @@ def test_web_challenge_registers_http_and_not_attachment_tools(registry):
         assert f"`{file_tool}`" not in text
 
 
+def test_web_challenge_registers_webprim_tools(registry):
+    """The four B-1 primitives are registered and named in the prompt."""
+    names, groups, text = registry("web", {"challenge": {"description": "a shop"}})
+    webprim = {"jwt_forge", "authdiff", "jsrecon", "http_burst"}
+    assert webprim <= names
+    assert "web" in groups
+    for tool in webprim:
+        assert f"`{tool}`" in text, f"prompt does not name {tool}"
+
+    # One table, one truth: every row whose name is registered must be in the
+    # web group, and no catalogue row may promise a name that failed to appear.
+    from ctf_strix import catalogue
+
+    described = {row.name for row in catalogue.CATALOGUE if row.group == "web"}
+    assert webprim <= described
+    assert described <= names
+
+
 def test_tcp_challenge_registers_socket_tools(registry):
     names, groups, text = registry("tcp")
     assert {"tcp", "tcp_batch"} <= names

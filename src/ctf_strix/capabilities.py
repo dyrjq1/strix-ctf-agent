@@ -163,6 +163,7 @@ def install_web_capabilities(
     variants_register: RegisterFn | None = None,
     traffic_register: RegisterFn | None = None,
     web_cve_register: RegisterFn | None = None,
+    webprim_register: RegisterFn | None = None,
 ) -> tuple[dict[str, list[str]], list[str]]:
     """Install the structured HTTP and route-discovery primitives.
 
@@ -189,6 +190,8 @@ def install_web_capabilities(
         from ctf_strix.traffic import register as traffic_register
     if web_cve_register is None:
         from ctf_strix.aisec.tools import register_web_cve as web_cve_register
+    if webprim_register is None:
+        from ctf_strix.webprim import register as webprim_register
 
     installed: dict[str, list[str]] = {}
     errors: list[str] = []
@@ -203,6 +206,7 @@ def install_web_capabilities(
     # Apache/WordPress box gets it too.  It is installed separately so a
     # missing snapshot cannot take the HTTP primitives down with it.
     _install("web_cve", web_cve_register, installed, errors)
+    _install("webprim", webprim_register, installed, errors)
     return installed, errors
 
 

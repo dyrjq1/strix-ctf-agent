@@ -2304,7 +2304,8 @@ def install_toolset(task: dict[str, Any], kind: str) -> tuple[str, list[str]]:
             f"[ctfy] web capabilities: "
             f"http_probe={len(installed.get('http_probe', []))} "
             f"discovery={len(installed.get('discovery', []))} "
-            f"variants={len(installed.get('variants', []))}",
+            f"variants={len(installed.get('variants', []))} "
+            f"webprim={len(installed.get('webprim', []))}",
             flush=True,
         )
         for message in cap_errors:

@@ -23,6 +23,7 @@ def test_installs_all_capabilities():
         variants_register=lambda: ["path_variants"],
         traffic_register=lambda: ["list_requests", "view_request"],
         web_cve_register=lambda: ["web_cve_lookup"],
+        webprim_register=lambda: ["jwt_forge", "authdiff", "jsrecon", "http_burst"],
     )
 
     assert errors == []
@@ -32,6 +33,7 @@ def test_installs_all_capabilities():
         "variants": ["path_variants"],
         "traffic": ["list_requests", "view_request"],
         "web_cve": ["web_cve_lookup"],
+        "webprim": ["jwt_forge", "authdiff", "jsrecon", "http_burst"],
     }
 
 

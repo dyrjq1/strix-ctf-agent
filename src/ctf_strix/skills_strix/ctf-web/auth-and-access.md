@@ -78,6 +78,26 @@ Some apps validate auth only on the initial socket upgrade and trust subsequent 
 
 ---
 
+## Compare identities in one call (`authdiff`)
+
+When a resource renders for you but should not, call `authdiff` with the
+request you already have (URL, method, body, and the `Cookie` header). It sends
+a baseline, then the selected variants -- `anon` (Cookie stripped), `bypass`
+(proxy-forwarding and admin-trust headers), `path` (traversal/parser shapes) --
+and returns status, length and body hash per row. Every row lands in the
+traffic ledger, so `traffic_view` can diff two bodies byte-by-byte.
+
+- **Falsifier**: every variant returns the baseline's exact status and hash.
+  The endpoint is genuinely public (or your jar has no session), so this is not
+  an access-control bug; move to IDOR on another object id.
+- **Signal**: `anon` differs from baseline, or one `bypass:`/`path:` row changes
+  the hash while keeping the same URL. Reproduce that exact shape with
+  `http_probe`, then read the response it unlocked.
+
+> `anon` only strips a `Cookie` you supplied. With no Cookie in `headers` the
+> row equals baseline by construction; the tool says so in `conclusions` --
+> log in first, then compare.
+
 ## Password/Secret Inference from Public Data
 
 **Pattern (0xClinic):** Registration uses structured identifier (e.g., National ID) as password. Profile endpoints expose enough to reconstruct most of it.

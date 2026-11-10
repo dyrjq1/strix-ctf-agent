@@ -144,7 +144,10 @@ def test_prompt_stays_inside_the_web_budget():
     # edit, but a tool section cannot slip in unnoticed.
     # L3b: 6,605 -> 6,680 (+75) for the stage-2 CLI names in the Environment
     # bullet and ctf-web Prerequisites (impacket/flask-unsign/RsaCtfTool).
-    assert size < 6700, f"web prompt grew to {size} chars"
+    # B-1: 6,700 -> 7,449 (+749) for four tool lines (jwt_forge/authdiff/
+    # jsrecon/http_burst, ~180 chars each).  The headroom stays ~150 chars:
+    # a capability row is a measured growth, not a silent one.
+    assert size < 7600, f"web prompt grew to {size} chars"
 
 
 def test_activate_defaults_to_web_so_unit_tests_keep_working():

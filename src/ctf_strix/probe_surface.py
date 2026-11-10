@@ -37,7 +37,7 @@ from typing import Final
 #: distinction is not visible from the name:
 #:
 #: * **always present** -- ``exec_command`` / ``write_stdin`` (Shell
-#:   capability) and the four primitives registered by ``capabilities``;
+#:   capability) and the web primitives registered by ``capabilities``;
 #: * **conditionally present** -- ``repeat_request`` is a Caido tool, and
 #:   ``tool_trim`` drops the six Caido tools by default because the image has
 #:   no ``caido-cli``.  Keeping it here is still correct: if an image ever
@@ -53,6 +53,8 @@ PROBE_TOOLS: Final[frozenset[str]] = frozenset(
         "route_map",
         "method_sweep",
         "path_variants",
+        "authdiff",
+        "jsrecon",
     }
 )
 
@@ -65,9 +67,16 @@ PROBE_TOOLS: Final[frozenset[str]] = frozenset(
 #: would make the guard scream at the correct use of the tool, and a hint that
 #: is always on is worse than no hint -- the model learns to ignore it.
 #:
+#: ``http_burst`` is the same shape one layer up: one call is up to 24
+#: requests that are *identical by design* (a race window) or one request per
+#: value.  ``sweep_guard`` fires at 24 distinct values, which is exactly the
+#: correct use of the tool, and ``enum_guard`` counts identical responses --
+#: a burst returns one summary, not one response.  It must still be known as
+#: a network tool so no guard mistakes it for a local read.
+#:
 #: The auth-wall and duplicate-response guards also key on HTTP shapes
 #: (``host:port`` paths, status codes); a raw socket has neither.
-NETWORK_TOOLS: Final[frozenset[str]] = frozenset({"tcp", "tcp_batch"})
+NETWORK_TOOLS: Final[frozenset[str]] = frozenset({"tcp", "tcp_batch", "http_burst"})
 
 #: Names that are legitimately absent from the default tool surface.
 #:

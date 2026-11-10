@@ -62,6 +62,24 @@ cannot be fetched and no `ctf-similar-search` skill is registered. Work from the
 local subfiles -- they index the techniques by bug class -- and from the
 challenge's own artifacts instead.
 
+## Built-in web tools (already registered in this image)
+
+These are tools the agent can call directly; the notes below only need to say
+*when*. Do not rebuild one in a shell loop.
+
+| Tool | Reach for it when |
+|---|---|
+| `http_probe` | one structured exchange (status, headers, body, timing); the way to send a header set or a body without writing a script |
+| `route_map` | crawl once to list API paths and `?` candidates taken from the page's own vocabulary |
+| `method_sweep` | one method across many paths in one call, to find which route answers at all |
+| `path_variants` | retry one protected path under case, encoding, dot/semi and prefix variants |
+| `authdiff` | same request under anon / proxy-header / path variants, comparing status, length and body hash |
+| `jsrecon` | fetch the page plus bundles and extract API paths, params, routes, keys, sourceMaps, comments |
+| `http_burst` | race windows (Barrier-synchronised) or a batch of values in one call, max 24 |
+| `jwt_forge` | forge or resign a JWT locally: `none`, HMAC, RSA test key, claim edit |
+| `traffic_list` / `traffic_view` | read back an exchange already made, without re-sending it |
+| `web_cve_lookup` | offline CVE index keyed by product/version from a banner |
+
 ## First-Pass Workflow
 
 1. Identify the real boundary: browser only, backend only, mixed app, or auth flow.

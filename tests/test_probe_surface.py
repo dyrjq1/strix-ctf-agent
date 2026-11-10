@@ -43,6 +43,14 @@ def test_primitives_are_recognised():
         assert probe_surface.is_probe_tool(name)
 
 
+def test_webprim_request_tools_are_recognised():
+    """authdiff / jsrecon carry a request; http_burst is a volume tool."""
+    for name in ("authdiff", "jsrecon"):
+        assert probe_surface.is_probe_tool(name)
+    assert not probe_surface.is_probe_tool("http_burst")
+    assert "http_burst" in probe_surface.NETWORK_TOOLS
+
+
 def test_journey_guard_counts_primitive_calls():
     """The concrete regression: a 401 through http_probe used to be invisible.
 

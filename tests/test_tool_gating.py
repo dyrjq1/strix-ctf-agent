@@ -130,6 +130,10 @@ def test_catalogue_does_not_promise_tools_nobody_registers():
     registered |= {"http_probe", "route_map", "method_sweep", "path_variants"}
     # Traffic memory: two read-only primitives that replay the ledger.
     registered |= {"traffic_list", "traffic_view"}
+    # B-1 web primitives: function names equal the catalogue names.
+    from ctf_strix import webprim
+
+    registered |= {fn.__name__ for fn in webprim.TOOLS}
     # The base four are vendor tools; they are asserted separately below.
     base = {"exec_command", "load_skill", "think"}
 

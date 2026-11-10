@@ -14,6 +14,21 @@
 
 For general auth bypass, access control, and session attacks, see [auth-and-access.md](auth-and-access.md). For OAuth/OIDC, SAML, CI/CD credential theft, and infrastructure auth attacks, see [auth-infra.md](auth-infra.md).
 
+## Forge in one call (`jwt_forge`)
+
+Call the image's own `jwt_forge` instead of hand-rolling base64url + HMAC.
+`alg=none` drops the signature; `HS256/384/512` signs with `secret` (pass the
+public-key PEM here for an `RS256 -> HS256` confusion); `RS256` signs with the
+built-in test key and embeds its public `jwk` header. Pass an existing token to
+keep its header/claims, then override or `remove` fields (`exp`, `nbf`). The
+secret is reported only as a length, never echoed.
+
+- **Falsifier**: `none` and re-signed tokens get the same 401 as the original,
+  and `jwk`/`kid` edits change nothing -- signature checking is real. Recover
+  the secret or switch bug class instead of retrying shapes.
+- **Signal**: the `none` token is accepted, or an `RS256` token carrying the
+  embedded `jwk` is accepted, or removing/overriding one claim changes the page.
+
 ## Modern JWT/JWE Additions (2025/2026)
 
 ### JWE public-key forgery when the public key is exposed

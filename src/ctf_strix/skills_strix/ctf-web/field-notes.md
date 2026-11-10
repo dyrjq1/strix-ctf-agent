@@ -258,6 +258,17 @@ Serialized Java objects (`rO0AB` / `aced0005`) + ysoserial gadget chains → RCE
 
 Concurrent requests bypass check-then-act patterns (balance, coupons, registration). Send 50 simultaneous requests — all see pre-modification state. See [server-side-deser.md](server-side-deser.md#race-conditions-time-of-check-to-time-of-use).
 
+Call `http_burst` with `values` empty: every worker connects first, then all
+release on one Barrier, so the requests land inside the same window. Cookie
+headers are snapshotted once and merged after the round, so concurrent writes
+cannot drop a session key; the merged value comes back in `cookie`. Use
+`values` (max 24) for a `{v}` batch instead of a shell loop.
+
+- **Falsifier**: every response is identical and the final state moved exactly
+  once -- check-then-act is atomic; stop adding requests.
+- **Signal**: two or more requests report success for a single-use action, or
+  `distinct_bodies`/`groups` shows a state that no single request produces.
+
 ## Node.js Quick Reference
 
 **Prototype pollution:** `{"__proto__": {"isAdmin": true}}` or flatnest circular ref bypass
