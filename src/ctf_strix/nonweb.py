@@ -29,8 +29,9 @@ pack in here.
 
 ``FILE_TOOLS`` and ``TCP_TOOLS`` register separately, because a file-only
 challenge should not pay schema tokens for a socket tool and vice versa.  The
-three schemas are ~2.5k chars; paying them on a web challenge is pure waste
-(measured: 17 bookkeeping schemas cost 4.2k chars for zero calls).
+three schemas are ~3.2k chars (measured 2026-11-10: 547 + 1323 + 1340); paying
+them on a web challenge is pure waste (measured: 17 bookkeeping schemas cost
+4.2k chars for zero calls).
 """
 
 from __future__ import annotations
@@ -78,9 +79,12 @@ _BATCH_MAX: Final = 200
 #: family → 决策表。每个家族直接给可执行动作，技能只作深读引用。
 #:
 #: ⚠️ 每一条命令都必须能在**本镜像里直接跑通**。旧版本给的是
-#: ``checksec`` / ``r2`` / ``binwalk`` / ``zsteg`` / ``exiftool`` / ``tshark``——这六个
-#: 在 ``docker/Dockerfile`` 里一个都没装。模型第一次调用就拿到一条
-#: 跑不通的命令，这是 Misc 题的第一个致命断点（docs/27 C2）。
+#: ``checksec`` / ``r2`` / ``binwalk`` / ``zsteg`` / ``exiftool`` / ``tshark``——其中
+#: ``binwalk`` / ``exiftool`` / ``tshark`` 与 ``r2`` 都在镜像里（``docker/Dockerfile``
+#: :36 装 binwalk + libimage-exiftool-perl，:38 装 tcpdump + tshark，:66-77 锁版本装
+#: radare2 5.9.4；``docker/check_toolchain.sh`` :259-273 构建期逐个探测，探测失败即红）。
+#: **六个里真正缺的只有 ``checksec`` 和 ``zsteg``**（zbar-tools 提供的是 zbarimg）。
+#: 模型第一次调用就拿到一条跑不通的命令，这是 Misc 题的第一个致命断点（docs/27 C2）。
 #:
 #: 现在的写法分两类：
 #:   * 镜像里有的工具（file / strings / xxd / unzip / binutils / python3）——直接给命令；
@@ -109,7 +113,7 @@ _NEXT: Final = {
     ),
     "zip": (
         "1) `unzip -l {p}` 先看清单与加密标记，别急着解；\n"
-        "2) `unpack_archive('{p}')` 递归进嵌套，越界条目会被拒绝；\n"
+        "2) 清单里的嵌套容器条目直接 `unpack_archive('<该条目>')` 下钻；\n"
         "3) 解出的最大文件再用 `file -b <name>` 确定下一个家族，不要逐个猜。\n"
         "深读: ctf-forensics/ctf-forensics；编码层看 ctf-misc/encodings。"
     ),
@@ -172,6 +176,24 @@ _NEXT: Final = {
         "2) `7z x {p}` 或 `unpack_archive('{p}')` 解出内容；\n"
         "3) 解出后对最大文件用 `file -b <name>` 定方向。\n"
         "深读: ctf-forensics/ctf-forensics。"
+    ),
+    "tar": (
+        "1) `tar -tf {p} | head -30` 看清单，注意成员类型（链接/设备节点常是切入点）；\n"
+        "2) `unpack_archive('{p}')` 递归进嵌套，越界/链接条目会被拒绝；\n"
+        "3) 解出的最大文件再用 `file -b <name>` 确定下一个家族。\n"
+        "深读: ctf-forensics/ctf-forensics。"
+    ),
+    "xz": (
+        "1) `xz -l {p}` 看解压后大小与完整性（xz-utils 在 Dockerfile:36）；\n"
+        "2) `unpack_archive('{p}')` 解出单流内容，再接下一层；\n"
+        "3) 解出后对最大文件用 `file -b <name>` 定方向。\n"
+        "深读: ctf-misc/encodings。"
+    ),
+    "bzip2": (
+        "1) `python3 -c \"import bz2;d=bz2.open('{p}','rb').read();print(len(d),d[:64])\"` 看解压头（bzip2 无 list 模式）；\n"
+        "2) `unpack_archive('{p}')` 解出单流内容，再接下一层；\n"
+        "3) 解出后对最大文件用 `file -b <name>` 定方向。\n"
+        "深读: ctf-misc/encodings。"
     ),
 }
 
@@ -251,6 +273,66 @@ def _sniff(path: Path) -> str:
     if window.find(b"Rar!\x1a\x07") >= 0:
         return "rar"
     return ""
+
+
+def _content_family(path: Path) -> str:
+    """Name a file's family from its bytes; "unknown" instead of a guess.
+
+    ``_sniff`` only names archive containers, and it must stay that narrow: it
+    also drives the extraction paths (walk member / outer source), where a
+    content-level answer would be wrong.  The ``next:`` wiring needs the
+    *produced* file's family, and "a zip holding one ELF" is the commonest
+    rev/misc attachment -- so this second layer is where ELF/PE/PNG/... live.
+
+    Order matters.  Container magic first (it is what the unpacker will do),
+    then content magic, then the ``.pyc`` suffix: its magic number changes on
+    every Python release, so the suffix is the stable signal.  A text fallback
+    comes last.  ``\xca\xfe\xba\xbe`` is deliberately *not* mapped: it is
+    Java class and fat Mach-O at the same time, and guessing costs a turn.
+    """
+    container = _sniff(path)
+    if container:
+        return container
+    try:
+        with path.open("rb") as handle:
+            head = handle.read(64 * 1024)
+    except OSError:
+        return "unknown"
+    if head.startswith(b"\x7fELF"):
+        return "elf"
+    if head.startswith(b"MZ"):
+        return "pe"
+    if head[:4] in {
+        b"\xfe\xed\xfa\xce",
+        b"\xfe\xed\xfa\xcf",
+        b"\xce\xfa\xed\xfe",
+        b"\xcf\xfa\xed\xfe",
+    }:
+        return "macho"
+    if head.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "png"
+    if head.startswith(b"\xff\xd8\xff"):
+        return "jpeg"
+    if head.startswith(b"%PDF-"):
+        return "pdf"
+    if head.startswith((b"\xd4\xc3\xb2\xa1", b"\xa1\xb2\xc3\xd4")):
+        return "pcap"
+    if head.startswith(b"\x0a\x0d\x0d\x0a"):
+        return "pcap"
+    if path.suffix.lower() == ".pyc":
+        return "pyc"
+    sample = head[:4096]
+    if sample.startswith((b"\xef\xbb\xbf", b"\xff\xfe", b"\xfe\xff")):
+        return "text"
+    if sample:
+        printable = sum(
+            1
+            for byte in sample
+            if 0x20 <= byte < 0x7F or byte in (0x09, 0x0A, 0x0D)
+        )
+        if 0x00 not in sample and printable / len(sample) >= 0.85:
+            return "text"
+    return "unknown"
 
 
 class _Sink:
@@ -498,6 +580,7 @@ def _from_unar(path: Path, sub: Path, budget: dict[str, int]) -> list[str]:
         budget["bytes"] += size
     return skipped
 
+
 def _unique_dir(base: Path) -> Path:
     """Never mix this extraction into a previous run's output."""
     if not base.exists():
@@ -620,51 +703,56 @@ def unpack_archive(path: str = "", max_depth: int = 3, out_dir: str = "extracted
         body.extend(f"  - {entry}" for entry in skipped[:20])
     body.append(f"total {len(produced)} file(s), {budget['bytes']} B")
     if not produced:
-        body.append(
+        # One "next:" block, in this order: what the file really is -> how to
+        # carve it (binwalk belongs here; it is in the image, Dockerfile:36) ->
+        # do not retry the same call.  Separate lines would be reordered by
+        # the next_hints hoist below, putting the generic advice last.
+        advice = [
             "next: nothing came out -- check what the file really is with "
-            "file; a wrong extension is common and the magic "
-            "bytes are the authority."
-        )
+            f"`file -b {source.as_posix()}`; a wrong extension is common and "
+            "the magic bytes are the authority."
+        ]
         if kind in _NAMES_ONLY and not (kind == "7z" and shutil.which("7z")):
             where = _signature_offset(source, kind)
             at = "this IS that archive" if where == 0 else "the archive starts there"
-            body.append(
-                f"matched a {kind} signature at offset 0x{where:x} -- {at}, and this "
-                f"image ships no {kind} reader. Do not retry unpack_archive; it will "
-                "return the same line. Next: carve from that offset and read the "
-                "container by hand (xxd + the struct module), or check whether "
-                "the statement/strings already leaks the content. If it is encrypted, "
-                "the password has to come from the challenge -- brute force here is a "
-                "different, much more expensive problem."
+            advice.append(
+                f"  matched a {kind} signature at offset 0x{where:x} -- {at}, and this "
+                f"image ships no {kind} reader. Carve from that offset and read the "
+                "container by hand "
+                f"(xxd + the struct module), or let `binwalk {source.as_posix()}` "
+                "scan the same bytes for embedded data. Do not retry "
+                "unpack_archive; it will return the same line. If it is "
+                "encrypted, the password has to come from the challenge -- "
+                "brute force here is a different, much more expensive problem."
             )
         elif kind == "7z" and shutil.which("7z"):
-            body.append(
-                "next: the 7z binary ran and produced nothing usable -- the "
-                "archive is empty, corrupt, truncated, or password-protected. "
-                "Do not retry unpack_archive; it will fail the same way. If it "
-                "is encrypted, the password has to come from the challenge."
-            )
-        elif kind in _NAMES_ONLY and shutil.which("unar"):
-            body.append(
-                "next: unar ran and produced nothing usable -- the archive "
+            advice.append(
+                "  the 7z binary ran and produced nothing usable -- the archive "
                 "is empty, corrupt, truncated, or password-protected. Do not "
                 "retry unpack_archive; it will fail the same way. If it is "
                 "encrypted, the password has to come from the challenge."
             )
+        elif kind in _NAMES_ONLY and shutil.which("unar"):
+            advice.append(
+                "  unar ran and produced nothing usable -- the archive is empty, "
+                "corrupt, truncated, or password-protected. Do not retry "
+                "unpack_archive; it will fail the same way. If it is encrypted, "
+                "the password has to come from the challenge."
+            )
+        body.append("\n".join(advice))
     else:
         body.append(
             "next: inspect the largest extracted file with file; for text "
             "files grep is cheaper than opening each one."
         )
-        # Wire _NEXT: sniff the largest produced file to decide
-        # the next-step family, not the outer archive kind.
-        if produced:
-            largest = max(produced, key=lambda p: p.stat().st_size, default=None)
-            if largest is not None:
-                snif = _sniff(largest)
-                if snif and snif in _NEXT:
-                    hint = _NEXT[snif].format(p=largest.as_posix())
-                    body.append("next: " + hint)
+        # Wire _NEXT: classify the largest produced *file*, not the outer
+        # archive.  _sniff only names containers; _content_family adds the
+        # content-level families.  "unknown" is a real investigation
+        # instruction (xxd/strings/report), so it is the fallback, not a guess.
+        largest = max(produced, key=lambda p: p.stat().st_size)
+        family = _content_family(largest)
+        hint = _NEXT.get(family, _NEXT["unknown"])
+        body.append("next: " + hint.format(p=largest.as_posix()))
     # Separate next: hints from the file list so they survive _clip.
     next_hints = []
     body_without_next = []

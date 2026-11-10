@@ -28,7 +28,6 @@ from ctf_strix import nonweb  # noqa: E402
 
 
 # --------------------------------------------------------------------------
-# --------------------------------------------------------------------------
 
 
 def test_unpack_archive_extracts_and_reports(tmp_path: Path) -> None:
@@ -95,7 +94,6 @@ def test_unpack_archive_missing_file_suggests_ls(tmp_path: Path) -> None:
     assert "ls -la" in out
 
 
-# --------------------------------------------------------------------------
 # --------------------------------------------------------------------------
 
 
@@ -186,12 +184,12 @@ def test_unpack_archive_next_hint_uses_produced_family(tmp_path: Path) -> None:
     assert "deep.txt" in out
 
 
-def test_unpack_archive_no_next_hint_when_produced_family_not_in_next(tmp_path: Path) -> None:
-    """A family _sniff can name but _NEXT lacks must not grow a structured hint.
+def test_unpack_archive_next_hint_covers_tar_family(tmp_path: Path) -> None:
+    """tar is in _NEXT now, so an all-tar chain must yield the tar hint.
 
-    Outer and inner are both tar: _sniff(largest produced) == "tar" and "tar" is
-    not in _NEXT.  The static "next: inspect" line is allowed, so the assertion
-    looks specifically for the structured ``next: 1)`` block.
+    This was a negative test while tar had no entry ("tar is not in _NEXT").
+    Every container _sniff can name has an entry, so the honest expectation is
+    that the hint appears and points at the *inner* archive.
     """
     note = tmp_path / "note.txt"
     note.write_text("hello", encoding="utf-8")
@@ -202,20 +200,99 @@ def test_unpack_archive_no_next_hint_when_produced_family_not_in_next(tmp_path: 
     with tarfile.open(outer, "w") as handle:
         handle.add(inner, arcname="inner.tar")
     out = nonweb.unpack_archive(str(outer), out_dir=str(tmp_path / "out"))
-    assert "next: 1)" not in out, "structured hint leaked for family absent from _NEXT"
-    assert "next: inspect the largest extracted file with file" in out
+    hint_lines = [line for line in out.splitlines() if "tar -tf" in line]
+    assert hint_lines, "expected tar-specific _NEXT hint (tar -tf) in output"
+    assert "inner.tar" in hint_lines[0], "hint must target the inner tar"
     assert "note.txt" in out
 
 
-def test_unpack_archive_no_next_hint_for_unknown_produced_family(tmp_path: Path) -> None:
-    """When the largest produced file is unknown (``""`` from _sniff), do not guess."""
+def test_unpack_archive_next_hint_for_text_produced_file(tmp_path: Path) -> None:
+    """A text member is _NEXT["text"], not "unknown".
+
+    The old test called readme.txt unknown because _sniff returned "".  That
+    encoded the H1 defect as an expectation; text is a family the table covers.
+    """
     archive = tmp_path / "data.zip"
     with zipfile.ZipFile(archive, "w") as handle:
         handle.writestr("readme.txt", "content")
     out = nonweb.unpack_archive(str(archive), out_dir=str(tmp_path / "out"))
     assert "readme.txt" in out
-    assert "next: 1)" not in out, "structured hint leaked for an unknown family"
-    assert "next: inspect the largest extracted file with file" in out
+    hint_lines = [line for line in out.splitlines() if "head -80" in line]
+    assert hint_lines, "expected text-family hint (head -80) in output"
+    assert "readme.txt" in hint_lines[0], "hint must target the produced file"
+    # The outer archive is a zip; a hint keyed on it would say unzip -l.
+    assert "unzip -l" not in out
+
+
+def test_unpack_archive_unknown_family_gets_investigation_instructions(
+    tmp_path: Path,
+) -> None:
+    """Truly unknown bytes get investigation steps, never a fabricated guess."""
+    archive = tmp_path / "blob.zip"
+    payload = bytes(range(256)) * 8
+    with zipfile.ZipFile(archive, "w") as handle:
+        handle.writestr("blob.bin", payload)
+    out = nonweb.unpack_archive(str(archive), out_dir=str(tmp_path / "out"))
+    assert "blob.bin" in out
+    hint_lines = [line for line in out.splitlines() if "xxd -l" in line]
+    assert hint_lines, "expected unknown-family investigation hint (xxd -l)"
+    assert "blob.bin" in hint_lines[0], "hint must target the produced file"
+    assert "unzip -l" not in out, "outer zip family leaked into the hint"
+    assert "readelf" not in out, "unknown bytes must not be guessed as ELF"
+
+
+def test_unpack_archive_next_hint_uses_content_family_for_elf(tmp_path: Path) -> None:
+    """H1: a zip holding one ELF must reach _NEXT["elf"].
+
+    The produced file carries no container magic, so only the content-level
+    branch of _content_family can name it -- this is the direct evidence that
+    the wiring reaches the ten families _sniff alone could never name.
+    """
+    payload = b"\x7fELF\x02\x01\x01" + bytes(64)
+    archive = tmp_path / "payload.zip"
+    with zipfile.ZipFile(archive, "w") as handle:
+        handle.writestr("payload", payload)
+    out = nonweb.unpack_archive(str(archive), out_dir=str(tmp_path / "out"))
+    assert "payload" in out
+    hint_lines = [line for line in out.splitlines() if "readelf" in line]
+    assert hint_lines, "expected elf-family hint (readelf) for an ELF inside a zip"
+    assert "payload" in hint_lines[0], "hint must target the produced ELF"
+
+
+def test_nothing_came_out_checks_type_before_carving(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """M2: file -b -> carve -> do-not-retry, in that order, in one block.
+
+    A 7z signature that produces nothing is where the generic line used to be
+    hoisted to the tail, after the carve advice.  ``which`` is pinned to None so
+    a host that ships the 7z binary cannot select the other branch.
+    """
+    monkeypatch.setattr(nonweb.shutil, "which", lambda name: None)
+    archive = tmp_path / "a.7z"
+    archive.write_bytes(b"7z\xbc\xaf\x27\x1c" + b"\x00" * 300)
+    out = nonweb.unpack_archive(str(archive), out_dir=str(tmp_path / "out"))
+    lines = out.splitlines()
+    type_index = next(i for i, line in enumerate(lines) if "file -b" in line)
+    carve_index = next(
+        i for i, line in enumerate(lines) if "Carve from that offset" in line
+    )
+    assert type_index < carve_index, "type check must precede carve advice"
+    assert "binwalk" in out, "carve advice must offer binwalk (it is in the image)"
+    assert "Do not retry unpack_archive" in out
+
+
+def test_next_hints_survive_output_truncation(tmp_path: Path) -> None:
+    """M3: the next: block is appended after _clip, so a long listing cannot eat it."""
+    archive = tmp_path / "many.zip"
+    with zipfile.ZipFile(archive, "w") as handle:
+        for index in range(200):
+            handle.writestr(f"file{index:03d}.txt", "x" * 40)
+    out = nonweb.unpack_archive(str(archive), out_dir=str(tmp_path / "out"))
+    assert out.startswith("[unpack_archive]"), "header line must survive"
+    assert "...[truncated" in out, "the listing must actually have been truncated"
+    tail = out[out.index("...[truncated") :]
+    assert "head -80" in tail, "family hint must be re-appended after truncation"
 
 
 def test_register_splits_by_kind() -> None:

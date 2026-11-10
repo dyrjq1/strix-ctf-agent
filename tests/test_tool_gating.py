@@ -120,10 +120,16 @@ def test_aisec_hint_requires_a_whole_token(monkeypatch, metadata, expected, why)
 
 
 # ---------------------------------------------------------------------------
-# Binary disable: _NEXT hints must not reference removed external binaries
+# Missing binaries: _NEXT hints must not reference tools the image lacks
 # ---------------------------------------------------------------------------
 
-BANNED_BINARIES = ["checksec", "zsteg", "exiftool", "tshark", "tcpdump", "binwalk"]
+# Only these two are absent.  binwalk / exiftool / tshark / tcpdump / radare2
+# are installed (docker/Dockerfile:36 installs binwalk + libimage-exiftool-perl,
+# :38 installs tcpdump + tshark, :66-77 installs radare2; docker/check_toolchain.sh
+# :259-273 probes each one at build time).  Banning them here would forbid
+# correct advice -- that was rework 4's H2 defect, kept as a comment so the list
+# does not grow back.
+BANNED_BINARIES = ["checksec", "zsteg"]
 
 
 def test_next_hints_do_not_mention_removed_binaries():
