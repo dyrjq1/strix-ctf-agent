@@ -267,3 +267,120 @@ def test_classifier_recognises_shapes_not_sample_values(v1):
     for sample in (SYNTH_FLAG, SYNTH_TOKEN, _big_fact_output()):
         assert not re.search(r"\b\d{1,3}(?:\.\d{1,3}){3}\b", sample)
         assert "CHAL-" not in sample
+
+
+# ------------------------------------------------------------------ h
+#: 中段 uuid 行：只有 evidence 形状、没有 fact 形状——``classify`` 仍是
+#: process，但 ``_evidence_block`` 非空。这是「stub 超 cap 后被二次降级」的
+#: 关键形态，不是某个样本的复刻。
+def _mid_evidence_process_output(rows: int = 130) -> str:
+    lines = [f"build-line-{index:04d} " + ("c" * 48) for index in range(rows)]
+    for offset in range(28):
+        position = rows // 2 + offset
+        lines[position] = "trace-%02d 7d3c1a90-2b4e-4f6a-9c8d-5e1f2a3b%04d" % (
+            offset,
+            offset,
+        )
+    return "\n".join(lines)
+
+
+def _many_hit_output(rows: int = 300) -> str:
+    lines = []
+    for index in range(rows):
+        if index % 2:
+            lines.append(f"row-{index:04d} " + ("d" * 40))
+        else:
+            lines.append(f"row-{index:04d} session_id=s{index:011d}")
+    return "\n".join(lines)
+
+
+def _summary_with_evidence_output(blocks: int = 90) -> str:
+    lines = []
+    for index in range(blocks):
+        lines.append(f"def worker_{index:03d}(argument_value):")
+        lines.append(f"    step_value = argument_value + {index}")
+        lines.append("    return step_value")
+        lines.append("")
+    for offset in range(18):
+        lines.insert(
+            2 + offset * 19,
+            "note-%02d 5b2d7c11-3a4f-4d2e-8b1c-6f0a9d8e%04d" % (offset, offset),
+        )
+    return "\n".join(lines)
+
+
+def _cap_rounds(output: str, rounds: int = 3) -> list[tuple[dict, int, dict]]:
+    """Treat one tool output as already-capped history and re-cap it N times."""
+    capper = _capper()
+    item: dict = {"type": "function_call_output", "call_id": "c1", "output": output}
+    seen: list[tuple[dict, int, dict]] = []
+    for _ in range(rounds):
+        item, saved, _added, info = ctx_mod._cap_item(
+            item,
+            cap=capper.cap_chars,
+            head=capper.head,
+            tail=capper.tail,
+            arg_cap=capper.arg_cap,
+            evidence=True,
+            tool_name="exec_command",
+        )
+        seen.append((item, saved, info))
+    return seen
+
+
+def test_stub_marker_matches_the_context_guard(v1):
+    assert obs_store._ELISION_MARK_TEXT in ctx_mod._ELISION_MARK
+
+
+def test_process_stub_with_mid_evidence_is_a_fixed_point(v1):
+    text = _mid_evidence_process_output()
+    cls, _meta, hits = obs_store.classify(text)
+    assert cls == "process"
+    assert hits == []
+    assert ctx_mod._evidence_block(text, max_chars=800, skip_head=1_200, skip_tail=600)
+
+    rounds = _cap_rounds(text)
+    stub = rounds[0][0]["output"]
+
+    assert len(stub) <= 2_000
+    assert ctx_mod._ELISION_MARK in stub
+    assert rounds[0][1] > 0
+    assert rounds[1][0]["output"] == stub
+    assert rounds[2][0]["output"] == stub
+    assert rounds[1][1] == 0 and rounds[2][1] == 0
+    assert rounds[1][2]["class"] == "" and rounds[2][2]["offloaded"] is False
+    assert obs_store.count_entries() == 1
+
+
+def test_fact_stub_honours_the_cap_and_is_a_fixed_point(v1):
+    text = _many_hit_output()
+    cls, _meta, hits = obs_store.classify(text)
+    assert cls == "fact"
+    assert len(hits) >= 100
+
+    rounds = _cap_rounds(text)
+    stub = rounds[0][0]["output"]
+
+    assert len(stub) <= 2_000
+    assert "session_id=" in stub  # 靠前的命中优先留住
+    assert ctx_mod._ELISION_MARK in stub
+    assert rounds[1][0]["output"] == stub
+    assert rounds[2][0]["output"] == stub
+    assert obs_store.count_entries() == 1
+
+
+def test_summary_stub_with_evidence_body_is_a_fixed_point(v1):
+    text = _summary_with_evidence_output()
+    cls, _meta, hits = obs_store.classify(text)
+    assert cls == "summary"
+    assert hits == []
+    assert ctx_mod._evidence_block(text, max_chars=800, skip_head=1_200, skip_tail=600)
+
+    rounds = _cap_rounds(text)
+    stub = rounds[0][0]["output"]
+
+    assert len(stub) <= 2_000
+    assert ctx_mod._ELISION_MARK in stub
+    assert rounds[1][0]["output"] == stub
+    assert rounds[2][0]["output"] == stub
+    assert obs_store.count_entries() == 1

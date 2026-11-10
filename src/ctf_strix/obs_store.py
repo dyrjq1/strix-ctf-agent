@@ -324,6 +324,16 @@ def _fmt_lines(numbers: list[int], limit: int = 20) -> str:
     return shown
 
 
+#: 折叠标记的正文。必须与 ``context._ELISION_MARK`` 是同一串文本：入口幂等
+#: 守卫靠它判断「这份文本已经压过」，所以 stub 无论预算多紧都要带上它。
+_ELISION_MARK_TEXT: Final = "chars capped by CTF context manager"
+
+
+def _stub_cost(parts: list[str]) -> int:
+    """若干行占用的预算（每行含自身换行）。"""
+    return sum(len(part) + 1 for part in parts)
+
+
 def build_stub(
     text: str,
     entry: dict[str, Any],
@@ -332,12 +342,18 @@ def build_stub(
     hit_lines: list[int],
     meta: dict[str, Any],
     body: str = "",
+    limit: int | None = None,
 ) -> str:
     """Structured replacement for one degraded output.
 
     Pure function of ``text`` (the id is its hash) plus the process-constant
     run path.  It always carries the same elision marker the ordinary cap uses,
     so a second pass sees it as already processed and returns it unchanged.
+
+    ``limit`` 是调用方的硬上限：返回串长度**恒不超**它。填充顺序即优先级
+    ——命中区间按靠前优先（区间内行数可截）、meta 列表按原顺序逐项收、
+    其后才是原文头部与 body——预算耗尽时后面整段丢弃或就地截断，先填的
+    字节不受影响。
     """
     lines = text.splitlines() or [text]
     parts = [
@@ -349,45 +365,102 @@ def build_stub(
     if entry.get("tool_name"):
         parts.append(f"tool: {entry['tool_name']}")
 
-    if cls == "fact":
-        parts.append(f"fact lines: {_fmt_lines(hit_lines)}")
-        parts.append("[ctf-obs hit context, whole lines]")
-        for start, end in _line_ranges(lines, hit_lines, HIT_CONTEXT):
-            parts.append(f"[lines {start}-{end}]")
-            parts.extend(lines[start - 1 : end])
-    elif cls == "summary":
-        functions = meta.get("functions") or []
-        keys = meta.get("json_keys") or []
-        imports = meta.get("imports") or []
-        strings = meta.get("strings") or []
-        if functions:
-            parts.append("functions: " + ", ".join(functions[:20]))
-        if keys:
-            parts.append("json keys: " + ", ".join(keys[:20]))
-        if imports:
-            parts.append("imports: " + " | ".join(imports[:8]))
-        if strings:
-            parts.append("strings: " + " | ".join(f'"{s[:60]}"' for s in strings[:8]))
-
-    if cls in ("fact", "summary"):
-        head = _head_of(text)
-        if head:
-            parts.append("[ctf-obs head]")
-            parts.append(head)
-        if body:
-            parts.append(body)
-        else:
-            parts.append(f"[... {len(text)} chars capped by CTF context manager ...]")
-    elif body:
-        parts.append(body)
-    else:
-        parts.append(f"[... {len(text)} chars capped by CTF context manager ...]")
-
-    parts.append(
+    footer = (
         '[ctf-obs] the complete output is on disk; read it with '
         f'obs_view(obs_id="{entry["id"]}", sel="hits"|"block"|"grep"). '
         "Line numbers are 1-based."
     )
+    marker = f"[... {len(text)} chars capped by CTF context manager ...]"
+
+    remaining: int | None = None
+    if limit is not None:
+        # 头部、页脚与折叠标记先记账，中段（命中区间 / meta / 头部 / body）
+        # 只能花剩下的部分。
+        remaining = limit - _stub_cost(parts) - _stub_cost([footer, marker])
+        if remaining < 0:
+            minimal = f"[ctf-obs stub] class: {cls} {marker}"
+            return minimal[: max(0, limit)]
+
+    def _fits(*candidates: str) -> bool:
+        return remaining is None or _stub_cost(list(candidates)) <= remaining
+
+    def _push(line: str) -> bool:
+        nonlocal remaining
+        if not _fits(line):
+            return False
+        if remaining is not None:
+            remaining -= len(line) + 1
+        parts.append(line)
+        return True
+
+    def _push_clipped(content: str) -> None:
+        nonlocal remaining
+        if not content:
+            return
+        if remaining is None:
+            parts.append(content)
+            return
+        if remaining <= 0:
+            return
+        clipped = content if len(content) + 1 <= remaining else content[: remaining - 1]
+        if clipped:
+            parts.append(clipped)
+            remaining -= len(clipped) + 1
+
+    if cls == "fact":
+        _push(f"fact lines: {_fmt_lines(hit_lines)}")
+        _push("[ctf-obs hit context, whole lines]")
+        for start, end in _line_ranges(lines, hit_lines, HIT_CONTEXT):
+            chunk = lines[start - 1 : end]
+            taken = 0
+            label = ""
+            for width in range(1, len(chunk) + 1):
+                candidate = (
+                    f"[lines {start}-{start + width - 1}]"
+                    if width == len(chunk)
+                    else f"[lines {start}-{start + width - 1} of {end}]"
+                )
+                if not _fits(candidate, *chunk[:width]):
+                    break
+                taken, label = width, candidate
+            if not taken:
+                break  # 预算见底：靠后的命中区间（及其行）整段丢弃
+            _push(label)
+            for line in chunk[:taken]:
+                _push(line)
+    elif cls == "summary":
+        def _push_list(label: str, values: list[str], separator: str) -> None:
+            kept: list[str] = []
+            for value in values:
+                trial = kept + [value]
+                if not _fits(f"{label}: " + separator.join(trial)):
+                    break
+                kept = trial
+            if kept:
+                _push(f"{label}: " + separator.join(kept))
+
+        functions = [str(name) for name in (meta.get("functions") or [])[:20]]
+        keys = [str(key) for key in (meta.get("json_keys") or [])[:20]]
+        imports = [str(line) for line in (meta.get("imports") or [])[:8]]
+        strings = [f'"{str(value)[:60]}"' for value in (meta.get("strings") or [])[:8]]
+        _push_list("functions", functions, ", ")
+        _push_list("json keys", keys, ", ")
+        _push_list("imports", imports, " | ")
+        _push_list("strings", strings, " | ")
+
+    if cls in ("fact", "summary"):
+        head = _head_of(text)
+        if head and _fits("[ctf-obs head]", head[:1]):
+            _push("[ctf-obs head]")
+            _push_clipped(head)
+        _push_clipped(body)
+    else:
+        _push_clipped(body)
+
+    # 折叠标记是入口幂等守卫的判据：预算已为它预留，这里只会补恰缺的那行。
+    if not any(_ELISION_MARK_TEXT in part for part in parts):
+        parts.append(marker)
+    parts.append(footer)
     return "\n".join(parts)
 
 

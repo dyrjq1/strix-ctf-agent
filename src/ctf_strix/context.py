@@ -443,6 +443,11 @@ def _cap_item(
     if kind == "function_call_output":
         output = item.get("output")
         if isinstance(output, str):
+            # 已降级的文本（含折叠标记）原样返回：再包一层会让 stub 逐轮
+            # 膨胀、字节必变、obs.jsonl 每轮多落一条。与 ``_cap_text_ex``
+            # 的守卫同口径 fail-open——不压，不是数据损坏。
+            if _ELISION_MARK in output:
+                return item, 0, False, info
             if len(output) > cap and _v1_enabled():
                 new, info = _degrade_text(
                     output,
@@ -471,6 +476,9 @@ def _cap_item(
                     blocks.append(block)  # images are governed by strix's own budget
                     continue
                 if isinstance(block, dict) and isinstance(block.get("text"), str):
+                    if _ELISION_MARK in block["text"]:
+                        blocks.append(block)  # 已降级：原样透传，见字符串路径
+                        continue
                     if len(block["text"]) > cap and _v1_enabled():
                         new, binfo = _degrade_text(
                             block["text"],
@@ -557,7 +565,7 @@ def _degrade_text(
         budget = min(_EVIDENCE_MAX_CHARS, max(0, (limit - 320) // 2))
         body = _evidence_block(text, max_chars=budget)
     stub = obs_store.build_stub(
-        text, entry, cls=cls, hit_lines=hits, meta=meta, body=body
+        text, entry, cls=cls, hit_lines=hits, meta=meta, body=body, limit=limit
     )
     return stub, info
 
