@@ -76,6 +76,19 @@ causes the wrong result, and what single check should expose it.
 
 """
 
+#: Appended only while the v1 triple is active; a closed A/B arm must render
+#: exactly the pre-change prompt.
+_FACT_RULE = """\
+## Facts and directions
+
+- Every direction you propose must cite at least one confirmed fact id (F#n)
+  from a `[ctf-fact-ledger]` block or from `obs_list`. If no fact supports the
+  direction, the next step is to obtain that evidence, not to act on it.
+- Facts are append-only. You may cite an existing F#n; do not assert a new
+  fact unless a tool output in this run contains it.
+
+"""
+
 _CORE = """\
 You are the solver for one CTF challenge on the CTFY platform. The only thing
 that scores is the answer string, graded exactly. There is no report to write.
@@ -406,8 +419,11 @@ def _render_core(
     # that received this section would be told to do something its runtime
     # guard refuses -- and on a long run it would burn turns trying.
     race = _RACE if (is_root and subagents_allowed()) else ""
+    from ctf_strix import obs_store
+
+    hypothesis = _HYPOTHESIS + (_FACT_RULE if obs_store.enabled() else "")
     return _CORE.format(
-        tools=tools, turns=turns, hypothesis=_HYPOTHESIS, race=race
+        tools=tools, turns=turns, hypothesis=hypothesis, race=race
     ).strip()
 
 

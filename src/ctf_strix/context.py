@@ -414,29 +414,53 @@ _ELISION_MARK = "chars capped by CTF context manager"
 
 
 def _cap_item(
-    item: Any, *, cap: int, head: int, tail: int, arg_cap: int, evidence: bool = False
-) -> tuple[Any, int, bool]:
-    """对单条 item 做内容封顶，返回 ``(新 item, 省下的字符数, 是否加证据块)``。
+    item: Any,
+    *,
+    cap: int,
+    head: int,
+    tail: int,
+    arg_cap: int,
+    evidence: bool = False,
+    tool_name: str = "",
+) -> tuple[Any, int, bool, dict[str, Any]]:
+    """Cap one item; return ``(item, saved, evidence_added, info)``.
 
-    只看内容、不看位置：调用方传入的 items 列表里，任何一条都走同一条路径。
-    结构（``type`` / ``call_id`` / ``name``）一律原样保留，只换文本字段。
-    第三个返回值来自 :func:`_cap_text_ex`——在输出里搜 ``_EVIDENCE_MARK`` 会
-    误计（输入本身就可能以该标记开头）。
+    ``info`` carries the classification result and observation id so the
+    caller can bind facts to the exact stored output.  Structure fields
+    (``type`` / ``call_id`` / ``name``) are always preserved.
     """
+    info: dict[str, Any] = {
+        "class": "",
+        "hit_lines": [],
+        "obs_id": "",
+        "offloaded": False,
+    }
     if not isinstance(item, dict):
-        return item, 0, False
+        return item, 0, False, info
 
     kind = item.get("type")
 
     if kind == "function_call_output":
         output = item.get("output")
         if isinstance(output, str):
+            if len(output) > cap and _v1_enabled():
+                new, info = _degrade_text(
+                    output,
+                    limit=cap,
+                    head=head,
+                    tail=tail,
+                    evidence=evidence,
+                    tool_name=tool_name,
+                )
+                if new != output:
+                    return {**item, "output": new}, max(0, len(output) - len(new)), False, info
+                return item, 0, False, info
             new, block_added = _cap_text_ex(
                 output, limit=cap, head=head, tail=tail, evidence=evidence
             )
             if new != output:
-                return {**item, "output": new}, len(output) - len(new), block_added
-            return item, 0, False
+                return {**item, "output": new}, len(output) - len(new), block_added, info
+            return item, 0, False, info
         if isinstance(output, list):
             blocks: list[Any] = []
             saved = 0
@@ -444,22 +468,33 @@ def _cap_item(
             block_added = False
             for block in output:
                 if isinstance(block, dict) and block.get("type") == "input_image":
-                    blocks.append(block)  # 图片由 strix 自己的 image budget 管
+                    blocks.append(block)  # images are governed by strix's own budget
                     continue
                 if isinstance(block, dict) and isinstance(block.get("text"), str):
-                    new, added = _cap_text_ex(
-                        block["text"], limit=cap, head=head, tail=tail, evidence=evidence
-                    )
-                    if new != block["text"]:
-                        saved += len(block["text"]) - len(new)
-                        changed = True
+                    if len(block["text"]) > cap and _v1_enabled():
+                        new, binfo = _degrade_text(
+                            block["text"],
+                            limit=cap,
+                            head=head,
+                            tail=tail,
+                            evidence=evidence,
+                            tool_name=tool_name,
+                        )
+                        info = binfo
+                    else:
+                        new, added = _cap_text_ex(
+                            block["text"], limit=cap, head=head, tail=tail, evidence=evidence
+                        )
                         block_added = block_added or added
+                    if new != block["text"]:
+                        saved += max(0, len(block["text"]) - len(new))
+                        changed = True
                         block = {**block, "text": new}
                 blocks.append(block)
             if changed:
-                return {**item, "output": blocks}, saved, block_added
-            return item, 0, False
-        return item, 0, False
+                return {**item, "output": blocks}, saved, block_added, info
+            return item, 0, False, info
+        return item, 0, False, info
 
     if kind == "function_call" and arg_cap > 0:
         args = item.get("arguments")
@@ -468,10 +503,63 @@ def _cap_item(
                 args, limit=arg_cap, head=arg_cap * 2 // 3, tail=arg_cap // 3
             )
             if new != args:
-                return {**item, "arguments": new}, len(args) - len(new), False
-        return item, 0, False
+                return {**item, "arguments": new}, len(args) - len(new), False, info
+        return item, 0, False, info
 
-    return item, 0, False
+    return item, 0, False, info
+
+
+
+
+def _text_hash(text: str) -> str:
+    """SHA-256 of the original output text (the observation key)."""
+    return hashlib.sha256(text.encode("utf-8", "replace")).hexdigest()
+
+
+def _v1_enabled() -> bool:
+    """Whether the v1 triple may run in this process."""
+    from ctf_strix import obs_store
+
+    return obs_store.enabled()
+
+
+def _degrade_text(
+    text: str,
+    *,
+    limit: int,
+    head: int,
+    tail: int,
+    evidence: bool,
+    tool_name: str,
+) -> tuple[str, dict[str, Any]]:
+    """Capture-time classification drop for one oversized output.
+
+    Returns the replacement text and an info dict (class / hit lines / obs id).
+    When the store cannot accept the output, the ordinary cap is the fallback.
+    """
+    from ctf_strix import obs_store
+
+    cls, meta, hits = obs_store.classify(text)
+    entry = obs_store.offload(text, tool_name=tool_name, cls=cls, hit_lines=hits)
+    info: dict[str, Any] = {
+        "class": cls,
+        "hit_lines": hits,
+        "obs_id": entry["id"] if entry else "",
+        "offloaded": entry is not None,
+    }
+    if entry is None:
+        new, _ = _cap_text_ex(text, limit=limit, head=head, tail=tail, evidence=evidence)
+        return new, info
+    body = ""
+    if cls == "process":
+        body, _ = _cap_text_ex(text, limit=limit, head=head, tail=tail, evidence=evidence)
+    elif cls == "summary":
+        budget = min(_EVIDENCE_MAX_CHARS, max(0, (limit - 320) // 2))
+        body = _evidence_block(text, max_chars=budget)
+    stub = obs_store.build_stub(
+        text, entry, cls=cls, hit_lines=hits, meta=meta, body=body
+    )
+    return stub, info
 
 
 def _item_hash(item: Any) -> str:
@@ -516,31 +604,95 @@ class HistoryCapper:
         self.requests += 1
         self.last_request_chars = sum(len(_text_of(item)) for item in items)
 
+        from ctf_strix import fact_ledger
+        from ctf_strix import obs_store
+
+        call_names: dict[str, str] = {}
+        for entry in items:
+            if isinstance(entry, dict) and entry.get("type") == "function_call":
+                call_id = entry.get("call_id")
+                name = entry.get("name")
+                if isinstance(call_id, str) and isinstance(name, str):
+                    call_names[call_id] = name
+
         out: list[Any] = []
         saved = 0
         capped_items = 0
         evidence_items = 0
+        offloaded_items = 0
+        virtual_items = 0
         first_capped_index = -1
         capped_hash = ""
-        for position, item in enumerate(items):
-            new_item, delta, block_added = _cap_item(
+        active = _v1_enabled()
+        index = 0
+        while index < len(items):
+            item = items[index]
+            if fact_ledger.is_virtual(item):
+                out.append(item)
+                index += 1
+                continue
+            tool_name = ""
+            if isinstance(item, dict) and item.get("type") == "function_call_output":
+                call_id = item.get("call_id")
+                if isinstance(call_id, str):
+                    tool_name = call_names.get(call_id, "")
+            new_item, delta, block_added, info = _cap_item(
                 item,
                 cap=self.cap_chars,
                 head=self.head,
                 tail=self.tail,
                 arg_cap=self.arg_cap,
                 evidence=self.evidence,
+                tool_name=tool_name,
             )
             out.append(new_item)
             saved += delta
+            if info.get("offloaded"):
+                offloaded_items += 1
             if delta:
                 capped_items += 1
                 if block_added:
                     evidence_items += 1
                 if first_capped_index < 0:
-                    first_capped_index = position
+                    first_capped_index = index
                     capped_hash = _item_hash(item)
 
+            next_is_block = index + 1 < len(items) and fact_ledger.is_virtual(items[index + 1])
+            if (
+                next_is_block
+                and isinstance(item, dict)
+                and item.get("type") == "function_call_output"
+            ):
+                out.append(items[index + 1])
+                index += 2
+                continue
+
+            if (
+                active
+                and isinstance(item, dict)
+                and item.get("type") == "function_call_output"
+            ):
+                text = _text_of(item)
+                if text and _ELISION_MARK not in text:
+                    preview = fact_ledger.scan(text)
+                    if preview:
+                        obs_id = str(info.get("obs_id") or "")
+                        if not obs_id:
+                            entry = obs_store.offload(
+                                text,
+                                tool_name=tool_name,
+                                cls="fact",
+                                hit_lines=sorted({row[0] for row in preview}),
+                            )
+                            obs_id = entry["id"] if entry else ""
+                        facts = fact_ledger.observe(text, _text_hash(text), obs_id=obs_id)
+                        if facts:
+                            out.append(fact_ledger.virtual_item(facts))
+                            virtual_items += 1
+            index += 1
+
+        obs_entries = obs_store.count_entries() if active else 0
+        fact_count = fact_ledger.count() if active else 0
         LAST_CAP_STATS.set(
             {
                 "seq": next(_CAP_SEQ),
@@ -550,6 +702,10 @@ class HistoryCapper:
                 "first_capped_index": first_capped_index,
                 "capped_hash": capped_hash,
                 "input_chars": self.last_request_chars,
+                "offloaded_items": offloaded_items,
+                "obs_entries": obs_entries,
+                "fact_count": fact_count,
+                "virtual_items": virtual_items,
             }
         )
         if saved:
@@ -557,6 +713,8 @@ class HistoryCapper:
             self.saved_chars += saved
             logger.debug("ctf-ctx: capped %d chars on request %d", saved, self.requests)
         return out, saved
+
+
 
 
 #: 兼容旧名（有测试/脚本按这个符号导入）。

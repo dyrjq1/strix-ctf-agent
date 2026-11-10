@@ -2209,7 +2209,7 @@ def _measured_groups(kind: str) -> list[str]:
         for info in catalogue.for_kind(kind)
         if info.group != "base" and info.name in present
     }
-    return [group for group in ("web", "file", "tcp", "aisec") if group in found]
+    return [group for group in ("obs", "web", "file", "tcp", "aisec") if group in found]
 
 
 def _autosubmit_target(task: dict[str, Any]) -> tuple[str, str, str] | None:
@@ -2311,6 +2311,19 @@ def install_toolset(task: dict[str, Any], kind: str) -> tuple[str, list[str]]:
             print(f"[ctfy] capability failed: {message}", flush=True)
     else:
         print(f"[ctfy] web capabilities skipped (kind={kind})", flush=True)
+
+    # Observation readback is kind-independent: every tool output can be
+    # offloaded by the context layer, so every kind may read it back.
+    try:
+        from ctf_strix import obs_store
+
+        added = obs_store.register()
+        print(
+            f"[obs] registered {len(added)} tools: {', '.join(added) or '(already present or off)'}",
+            flush=True,
+        )
+    except Exception as exc:  # noqa: BLE001
+        print(f"[obs] registration failed: {type(exc).__name__}: {exc}", flush=True)
 
     # Soft deadline is opt-in: the platform does not publish a per-challenge
     # wall clock, so inventing one would cut hard challenges short.

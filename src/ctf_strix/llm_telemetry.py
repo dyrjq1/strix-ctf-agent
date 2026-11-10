@@ -183,6 +183,10 @@ def _record(context: Any, agent: Any, response: Any) -> None:
         "evidence_items": 0,
         "first_capped_index": -1,
         "capped_hash": "",
+        "offloaded_items": 0,
+        "obs_entries": 0,
+        "fact_count": 0,
+        "virtual_items": 0,
     }
     if stats is not None:
         record["item_count"] = _int(stats.get("item_count")) or record["item_count"]
@@ -190,6 +194,10 @@ def _record(context: Any, agent: Any, response: Any) -> None:
         record["evidence_items"] = _int(stats.get("evidence_items"))
         record["first_capped_index"] = _int(stats.get("first_capped_index"), -1)
         record["capped_hash"] = str(stats.get("capped_hash") or "")
+        record["offloaded_items"] = _int(stats.get("offloaded_items"))
+        record["obs_entries"] = _int(stats.get("obs_entries"))
+        record["fact_count"] = _int(stats.get("fact_count"))
+        record["virtual_items"] = _int(stats.get("virtual_items"))
     _write(record)
 
 

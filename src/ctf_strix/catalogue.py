@@ -86,6 +86,20 @@ CATALOGUE: Final[tuple[ToolInfo, ...]] = (
         ALL_KINDS,
         "base",
     ),
+    ToolInfo(
+        "obs_list",
+        "list tool outputs this run offloaded to disk (id, class, size, hit "
+        "count); read-only, no network",
+        ALL_KINDS,
+        "obs",
+    ),
+    ToolInfo(
+        "obs_view",
+        "re-read one offloaded output by fact lines, function/JSON-key block "
+        "or regex, never a fixed line window; read-only",
+        ALL_KINDS,
+        "obs",
+    ),
     # -- web ---------------------------------------------------------------
     ToolInfo(
         "http_probe",
