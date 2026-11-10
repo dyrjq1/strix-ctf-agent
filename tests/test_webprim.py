@@ -125,6 +125,8 @@ class TestJwtForge:
 # -- authdiff ------------------------------------------------------------
 
 class _AuthHandler(BaseHTTPRequestHandler):
+    _seen = []
+
     def log_message(self, *args):
         pass
 
@@ -138,6 +140,12 @@ class _AuthHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self):
+        if self.path.startswith("/echo-auth"):
+            cookie = self.headers.get("Cookie") or ""
+            auth = self.headers.get("Authorization") or ""
+            _AuthHandler._seen.append({"cookie": cookie, "authorization": auth})
+            self._send(200, json.dumps({"cookie": cookie, "authorization": auth}).encode())
+            return
         if self.path == "/admin":
             if self.headers.get("Cookie") == "session=abc":
                 self._send(200, b'{"secret":"admin-data"}')
@@ -187,14 +195,61 @@ class TestAuthdiff:
             headers_json='{"Cookie":"session=abc"}',
         ))
         rows = {row["variant"]: row for row in result["rows"]}
-        assert result["cookie_supplied"] is True
+        assert result["credentials_supplied"] == ["Cookie"]
         assert rows["baseline"]["hash"] != rows["anon"]["hash"]
         assert any("differs" in text for text in result["conclusions"])
 
     def test_anon_without_cookie_says_it_is_uninformative(self, auth_server):
         result = json.loads(_call(authdiff, url=f"{auth_server}/admin", variants="anon"))
-        assert result["cookie_supplied"] is False
-        assert any("no Cookie header" in text for text in result["conclusions"])
+        assert result["credentials_supplied"] == []
+        assert any("no credentials supplied" in text for text in result["conclusions"])
+
+    def test_anon_strips_bearer_authorization_only(self, auth_server):
+        _AuthHandler._seen = []
+        result = json.loads(_call(
+            authdiff,
+            url=f"{auth_server}/echo-auth",
+            variants="anon",
+            headers_json='{"Authorization":"Bearer x"}',
+        ))
+        assert result["credentials_supplied"] == ["Authorization"]
+        baseline, anon = _AuthHandler._seen
+        assert baseline["authorization"] == "Bearer x"
+        assert anon["authorization"] == ""
+        assert any("differs" in text for text in result["conclusions"])
+
+    def test_anon_strips_cookie_and_bearer_together(self, auth_server):
+        _AuthHandler._seen = []
+        result = json.loads(_call(
+            authdiff,
+            url=f"{auth_server}/echo-auth",
+            variants="anon",
+            headers_json='{"Cookie":"a=1","Authorization":"Bearer x"}',
+        ))
+        assert result["credentials_supplied"] == ["Cookie", "Authorization"]
+        baseline, anon = _AuthHandler._seen
+        assert baseline["cookie"] == "a=1" and baseline["authorization"] == "Bearer x"
+        assert anon["cookie"] == "" and anon["authorization"] == ""
+
+    def test_path_loop_records_skipped_paths_when_budget_expires(self, monkeypatch):
+        class _FakeClock:
+            def __init__(self):
+                self.tick = 0
+
+            def time(self):
+                self.tick += 1
+                return float(self.tick)
+
+            def perf_counter(self):
+                return 0.0
+
+        monkeypatch.setattr(webprim, "time", _FakeClock())
+        monkeypatch.setattr(webprim, "AUTHDIFF_BUDGET", 3.0)
+        monkeypatch.setattr(webprim, "_safe_fetch", lambda *args, **kwargs: (200, "text/plain", "ok"))
+        result = json.loads(authdiff(url="http://example.test/admin", variants="path"))
+        assert result["stopped_early"] is True
+        assert result["skipped_paths"]
+        assert any("partial" in text for text in result["conclusions"])
 
     def test_rejects_non_http_scheme(self):
         with pytest.raises(Exception):
@@ -253,6 +308,8 @@ class _JSHandler(BaseHTTPRequestHandler):
             self._send(200, _JS_PAGE.encode(), "text/html")
         elif self.path == "/app.js":
             self._send(200, _APP_JS.encode(), "application/javascript")
+        elif self.path == "/big":
+            self._send(200, b"x" * 5000, "application/javascript")
         else:
             self._send(404, b"not found")
 
@@ -296,6 +353,45 @@ class TestJsrecon:
         with pytest.raises(Exception):
             _call(jsrecon, url=12345)
 
+    def test_skips_cross_origin_bundle(self, monkeypatch):
+        page = '<html><script src="//cdn.other.test/app.js"></script></html>'
+        calls = []
+
+        def fake_fetch(url, **kwargs):
+            calls.append(url)
+            return 200, "text/html", page
+
+        monkeypatch.setattr(webprim, "_safe_fetch", fake_fetch)
+        result = json.loads(_call(jsrecon, url="http://example.test/"))
+        assert calls == ["http://example.test/"]
+        assert result["bundles"][0]["skipped"] == "cross-origin"
+
+    def test_skips_non_http_script_scheme(self, monkeypatch):
+        page = (
+            '<html><script src="javascript:void(0)"></script>'
+            '<script src="data:text/javascript,void(0)"></script></html>'
+        )
+        calls = []
+
+        def fake_fetch(url, **kwargs):
+            calls.append(url)
+            return 200, "text/html", page
+
+        monkeypatch.setattr(webprim, "_safe_fetch", fake_fetch)
+        result = json.loads(_call(jsrecon, url="http://example.test/"))
+        assert calls == ["http://example.test/"]
+        assert [b["skipped"] for b in result["bundles"]] == ["scheme", "scheme"]
+
+    def test_safe_fetch_honours_byte_cap(self, js_server):
+        status, _ctype, text = webprim._safe_fetch(f"{js_server}/big", max_bytes=1024)
+        assert status == 200
+        assert len(text.encode()) <= 1024
+
+    def test_safe_fetch_reads_fully_by_default(self, js_server):
+        status, _ctype, text = webprim._safe_fetch(f"{js_server}/big")
+        assert status == 200
+        assert len(text) == 5000
+
 
 # -- http_burst ----------------------------------------------------------
 
@@ -327,6 +423,41 @@ class _BurstHandler(BaseHTTPRequestHandler):
 @pytest.fixture()
 def burst_server():
     server = ThreadingHTTPServer(("127.0.0.1", 0), _BurstHandler)
+    port = server.server_address[1]
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    yield f"http://127.0.0.1:{port}"
+    server.shutdown()
+    server.server_close()
+
+
+class _InspectBurstHandler(BaseHTTPRequestHandler):
+    def log_message(self, *args):
+        pass
+
+    def _handle(self):
+        length = int(self.headers.get("Content-Length") or 0)
+        body = self.rfile.read(length).decode("utf-8") if length else ""
+        payload = json.dumps({
+            "method": self.command,
+            "path": self.path,
+            "body": body,
+            "cookies": self.headers.get_all("Cookie") or [],
+        }).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Set-Cookie", "sid=xyz; Path=/")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+    do_GET = _handle
+    do_POST = _handle
+
+
+@pytest.fixture()
+def inspect_burst_server():
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _InspectBurstHandler)
     port = server.server_address[1]
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -384,6 +515,56 @@ class TestHttpBurst:
         errors = result.get("errors", [])
         error_texts = " ".join(str(e.get("error", "")) for e in errors).lower()
         assert any(word in error_texts for word in ["abort", "connect", "fail", "peer"])
+
+    def test_batch_substitutes_value_in_url_and_body(self, inspect_burst_server):
+        result = json.loads(_call(
+            http_burst,
+            url=f"{inspect_burst_server}/api/{{v}}",
+            method="POST",
+            body="user={v}",
+            values=["alice", "bob"],
+        ))
+        assert result["mode"] == "batch"
+        seen = {}
+        for group in result["groups"]:
+            assert len(group["v"]) == 1
+            seen[group["v"][0]] = json.loads(group["head"])
+        assert set(seen) == {"alice", "bob"}
+        for value, echo in seen.items():
+            assert value in echo["path"]
+            assert value in echo["body"]
+
+    def test_merges_set_cookie_into_cookie_snapshot(self, inspect_burst_server):
+        result = json.loads(_call(
+            http_burst, url=f"{inspect_burst_server}/x", method="GET", count=2
+        ))
+        assert "sid=xyz" in result.get("cookie", "")
+
+    def test_count_zero_is_rejected(self):
+        with pytest.raises(Exception):
+            _call(http_burst, url="http://127.0.0.1:1/test", count=0)
+
+    def test_count_out_of_range_is_rejected(self):
+        with pytest.raises(Exception):
+            _call(http_burst, url="http://127.0.0.1:1/test", count=MAX_BURST + 1)
+
+    def test_count_none_uses_default(self, inspect_burst_server):
+        result = json.loads(_call(
+            http_burst, url=f"{inspect_burst_server}/x", method="GET", count=None
+        ))
+        assert result["requested"] == MAX_BURST
+
+    def test_lowercase_cookie_header_does_not_duplicate(self, inspect_burst_server):
+        result = json.loads(_call(
+            http_burst,
+            url=f"{inspect_burst_server}/x",
+            method="GET",
+            count=2,
+            headers_json='{"cookie":"a=1"}',
+        ))
+        for group in result["groups"]:
+            echo = json.loads(group["head"])
+            assert echo["cookies"] == ["a=1"]
 
     def test_rejects_head_method(self):
         with pytest.raises(Exception):

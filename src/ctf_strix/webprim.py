@@ -29,7 +29,7 @@ import time
 from typing import Any, Final
 from urllib.parse import urljoin, urlparse
 
-from ctf_strix import traffic
+from ctf_strix import discovery, traffic
 
 import requests
 import urllib3
@@ -68,6 +68,13 @@ def _require_url(url: Any, tool: str) -> str:
     return cleaned
 
 
+def _set_cookie_header(headers: dict[str, str], value: str) -> None:
+    """Replace any existing cookie header (case-insensitive) with one entry."""
+    for name in [key for key in headers if key.lower() == "cookie"]:
+        del headers[name]
+    headers["Cookie"] = value
+
+
 def _headers_from_json(headers_json: str, limit: int) -> dict[str, str]:
     try:
         parsed = json.loads(headers_json) if headers_json.strip() else {}
@@ -93,6 +100,7 @@ def _safe_fetch(
     extra_headers: dict[str, str] | None = None,
     timeout_s: float = 20.0,
     source: str = "webprim",
+    max_bytes: int | None = None,
 ) -> tuple[int, str, str]:
     """Fetch one URL, record in traffic ledger, return (status, content_type, text)."""
     method = (method or "GET").strip().upper()
@@ -109,6 +117,7 @@ def _safe_fetch(
             timeout=timeout_s,
             allow_redirects=False,
             verify=False,
+            stream=max_bytes is not None,
         )
     except Exception as exc:
         elapsed = time.time() - started
@@ -125,7 +134,20 @@ def _safe_fetch(
         raise
 
     elapsed = time.time() - started
-    raw = resp.content or b""
+    if max_bytes is None:
+        raw = resp.content or b""
+    else:
+        chunks: list[bytes] = []
+        total = 0
+        for chunk in resp.iter_content(chunk_size=16384):
+            if not chunk:
+                continue
+            chunks.append(chunk)
+            total += len(chunk)
+            if total >= max_bytes:
+                break
+        raw = b"".join(chunks)[:max_bytes]
+        resp.close()
     text = raw.decode(resp.encoding or "utf-8", errors="replace")
     ctype = resp.headers.get("content-type", "?")
     traffic.record(
@@ -313,6 +335,7 @@ AUTHDIFF_BYPASS_HEADERS: Final = (
 )
 
 AUTHDIFF_VARIANTS: Final = ("anon", "bypass", "path")
+AUTHDIFF_CREDENTIAL_HEADERS: Final = ("Cookie", "Authorization", "Proxy-Authorization")
 _METHODS: Final = ("GET", "POST", "PUT", "PATCH", "DELETE")
 
 
@@ -329,7 +352,7 @@ def authdiff(
     status, length, and body hash across them.
 
     Variant sets (comma-separated, from anon,bypass,path):
-    - anon: strip cookies (anonymous view).
+    - anon: strip all credential headers (Cookie, Authorization, Proxy-Authorization).
     - bypass: add proxy-forwarding / admin-trust headers.
     - path: append path-traversal variants to test filter-vs-route mismatches.
 
@@ -346,10 +369,11 @@ def authdiff(
         _fail(f"unknown variant(s): {', '.join(sorted(unknown))}; available: {', '.join(AUTHDIFF_VARIANTS)}")
 
     extra_headers = _headers_from_json(headers_json, AUTHDIFF_MAX_HEADERS)
-    cookie_present = any(
-        name.lower() == "cookie" and value.strip()
-        for name, value in extra_headers.items()
-    )
+    credential_names = {name.lower() for name in AUTHDIFF_CREDENTIAL_HEADERS}
+    credentials_supplied = [
+        name for name, value in extra_headers.items()
+        if name.lower() in credential_names and value.strip()
+    ]
 
     rows: list[dict] = []
     budget_deadline = time.time() + AUTHDIFF_BUDGET
@@ -366,7 +390,9 @@ def authdiff(
 
     if "anon" in want:
         anon_headers = dict(extra_headers)
-        anon_headers["Cookie"] = ""
+        for name in list(anon_headers):
+            if name.lower() in credential_names:
+                anon_headers[name] = ""
         try:
             st, ct, txt = _safe_fetch(url, method, body, anon_headers, source="authdiff")
             rows.append({"variant": "anon", "status": st, "len": len(txt),
@@ -393,6 +419,8 @@ def authdiff(
     if time.time() > budget_deadline:
         return _clip(json.dumps({"tool": "authdiff", "rows": rows, "stopped_early": True}, ensure_ascii=False))
 
+    stopped_early = False
+    skipped_paths: list[str] = []
     if "path" in want:
         parsed = urlparse(url)
         path = parsed.path or "/"
@@ -401,8 +429,10 @@ def authdiff(
             "/../" + path.lstrip("/"), "/..;/" + path.lstrip("/"),
             "/%2e%2e/" + path.lstrip("/"),
         ]
-        for suffix in suffixes:
+        for index, suffix in enumerate(suffixes):
             if time.time() > budget_deadline:
+                stopped_early = True
+                skipped_paths = suffixes[index:]
                 break
             variant_url = parsed._replace(path=path.rstrip("/") + suffix).geturl()
             try:
@@ -425,12 +455,13 @@ def authdiff(
     conclusions: list[str] = []
     if anon_hash and baseline_hash:
         if anon_hash == baseline_hash:
-            if cookie_present:
+            if credentials_supplied:
                 conclusions.append("anonymous response identical to authenticated: access control may be missing")
             else:
                 conclusions.append(
-                    "no Cookie header supplied, so anon equals baseline by construction; "
-                    "capture a session first, then rerun for a meaningful privilege check"
+                    "no credentials supplied (Cookie / Authorization / Proxy-Authorization), "
+                    "so anon equals baseline by construction; capture a session first, "
+                    "then rerun for a meaningful privilege check"
                 )
         else:
             conclusions.append("anonymous response differs from authenticated")
@@ -440,9 +471,17 @@ def authdiff(
             if r.get("hash") != baseline_hash and baseline_hash:
                 conclusions.append(f"{r['variant']} changed the response (status {r['status']})")
 
+    if stopped_early:
+        conclusions.append(
+            f"path variants stopped early: {len(skipped_paths)} not run (budget); "
+            "results are partial"
+        )
+
     payload: dict[str, Any] = {
         "tool": "authdiff",
-        "cookie_supplied": cookie_present,
+        "credentials_supplied": credentials_supplied,
+        "stopped_early": stopped_early,
+        "skipped_paths": skipped_paths,
         "rows": rows,
     }
     if conclusions:
@@ -508,6 +547,10 @@ def jsrecon(url: str = "") -> str:
     extracts API paths, parameter names, frontend routes, hard-coded
     secrets, sourceMap URLs, and suspicious comments.
 
+    Only same-origin http(s) bundles are fetched; cross-origin or
+    non-http(s) script src entries are listed in ``bundles`` with a
+    ``skipped`` reason instead of being fetched.
+
     All fetches are recorded in the traffic ledger (source=jsrecon).
     """
     target = _require_url(url, "jsrecon")
@@ -530,14 +573,22 @@ def jsrecon(url: str = "") -> str:
             stopped_early = True
             break
         abs_url = urljoin(target, src)
+        if urlparse(abs_url).scheme.lower() not in ("http", "https"):
+            bundles.append({"url": abs_url, "skipped": "scheme"})
+            continue
+        if not discovery._same_origin(target, abs_url):
+            bundles.append({"url": abs_url, "skipped": "cross-origin"})
+            continue
         try:
-            bstatus, bctype, text = _safe_fetch(abs_url, source="jsrecon")
+            bstatus, bctype, text = _safe_fetch(
+                abs_url, source="jsrecon", max_bytes=JSRECON_MAX_BUNDLE_CHARS
+            )
         except Exception as exc:
             bundles.append({"url": abs_url, "error": f"{type(exc).__name__}: {exc}"})
             continue
         text = text or ""
-        truncated = len(text) > JSRECON_MAX_BUNDLE_CHARS
-        kept = text[:JSRECON_MAX_BUNDLE_CHARS]
+        truncated = len(text) >= JSRECON_MAX_BUNDLE_CHARS
+        kept = text
         if budget > 0:
             kept = kept[:budget]
             budget -= len(kept)
@@ -659,10 +710,15 @@ def http_burst(
             targets.append((u, b))
         mode = "batch"
     else:
-        try:
-            n = max(2, min(int(count or MAX_BURST), MAX_BURST))
-        except (TypeError, ValueError):
-            _fail(f"count must be an integer 2..{MAX_BURST}, got {count!r}")
+        if count is None:
+            n = MAX_BURST
+        else:
+            try:
+                n = int(count)
+            except (TypeError, ValueError):
+                _fail(f"count must be an integer 2..{MAX_BURST}, got {count!r}")
+            if not 2 <= n <= MAX_BURST:
+                _fail(f"count must be an integer 2..{MAX_BURST}, got {count!r}")
         targets = [(url, body)] * n
         mode = "race"
 
@@ -721,7 +777,7 @@ def http_burst(
             path += "?" + parsed.query
         req_hdrs = dict(hdrs)
         if cookie_snapshot and parsed.netloc == netloc:
-            req_hdrs["Cookie"] = cookie_snapshot
+            _set_cookie_header(req_hdrs, cookie_snapshot)
         t0 = time.perf_counter()
         try:
             body_bytes = b.encode("utf-8") if b else None
@@ -767,7 +823,7 @@ def http_burst(
                 jar[key] = value
     rec_hdrs = dict(hdrs)
     if cookie_snapshot:
-        rec_hdrs["Cookie"] = cookie_snapshot
+        _set_cookie_header(rec_hdrs, cookie_snapshot)
 
     for idx, (u, b) in enumerate(targets):
         r = results[idx] or {}

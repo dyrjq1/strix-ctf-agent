@@ -149,7 +149,7 @@ CATALOGUE: Final[tuple[ToolInfo, ...]] = (
     ),
     ToolInfo(
         "jsrecon",
-        "static JS recon: fetch page + bundles, extract API paths, params, frontend routes, hard-coded key candidates, sourceMaps, comments; for SPA-shell challenges",
+        "static JS recon: page + same-origin bundles only; extract api paths, params, routes, key candidates, sourceMaps, comments; cross-origin script src listed not fetched",
         WEB_KINDS,
         "web",
     ),
