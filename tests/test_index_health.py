@@ -6,7 +6,7 @@
    都必须能复算。这里的测试同样只构造日志文本，不启动任何 agent。
 2. **② 的窗口语义。** load 后 3 个 TOOL 调用内读到引用路径才算命中；
    第 4 个不算，非引用路径不算，别的工具名不算。
-3. **③ 是离线确定性。** 注入字节按 load 的技能名取 staged 索引文件尺寸
+3. **③ 是离线确定性。** 注入字节按 load 的技能名取源包索引文件尺寸
    （D-1 的 8KB 闸使然）；文件缺失如实记 missing，不猜。
 4. **④ 的判定规则。** triage 先行恒一致；方向集合按题型；题型未知不判。
 5. **降级路径。** 参数被日志截断时按形状抓取，抓不到就 None——但 load
@@ -103,7 +103,7 @@ def test_inject_bytes_are_offline_source_pack_sizes(tmp_path: Path) -> None:
     """③ 按 load 的技能名取**源包**索引尺寸；缺失如实记 missing。
 
     口径是源包（``skills_root/<name>.md``），不是 render 后的注入产物：
-    比真实注入少约 190B 的路径提示。名字与口径一致，不叫 staged。
+    比真实注入少 235B（20 字符 ref）的路径提示。名字与口径一致，不叫 staged。
     """
     web = tmp_path / "ctf-web"
     web.mkdir()

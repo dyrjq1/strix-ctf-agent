@@ -11,8 +11,7 @@ metadata:
 
 ## The one thing that matters
 
-In these challenges the entry point is almost never an HTTP route you have to guess.
-It is **an install / build / deploy action the application performs on your behalf**.
+The entry point is almost never an HTTP route you have to guess. It is **an install / build / deploy action the application performs on your behalf**.
 If the app has a button or endpoint that says install, add, publish, build, sync,
 update, upgrade, import, restore or deploy, that is the attack surface. Reading its
 dependency configuration is worth more than enumerating 200 paths.
@@ -32,8 +31,6 @@ dependency configuration is worth more than enumerating 200 paths.
    "what the app says it depends on" and "what the resolver will actually pick".
 
 ## The mechanism table
-
-Each row is a distinct bug. Pick the row that matches what you already saw.
 
 | Symptom you already have | Bug | Answer is usually |
 |---|---|---|
@@ -62,7 +59,7 @@ A 200 with a JSON body is the metadata. Read `description`, `homepage`, `author`
 `maintainers`, and any custom field - CTF authors put the flag or the next hop there
 far more often than in an exploit chain.
 
-﻿## The install is a shell command: read it, then look for the second index
+## The install is a shell command: read it, then look for the second index
 
 A redeploy / install endpoint usually returns the raw command it ran. That output is the
 single most valuable artefact in the whole challenge, because it tells you three things

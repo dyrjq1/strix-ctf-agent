@@ -195,9 +195,12 @@ def _index_cap() -> int:
     if not raw:
         return INDEX_MAX_BYTES
     try:
-        return int(raw)
+        value = int(raw)
     except ValueError:
         return INDEX_MAX_BYTES
+    # 非正数不是合法上限：放行会让 _cut_lines(encoded, -1) 退化成
+    # encoded[:-1]，等于把整篇索引砍掉最后一个字节。一律回默认值。
+    return value if value > 0 else INDEX_MAX_BYTES
 
 
 def _cut_lines(encoded: bytes, budget: int) -> str:

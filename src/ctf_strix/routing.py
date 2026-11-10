@@ -177,6 +177,16 @@ def render(
         )
         step_two = triage_line + table + "\n"
 
+    # L-9：没有方向索引时，"load it first" 与同段 "do not load_skill a
+    # direction" 自相矛盾，按有无方向表拼接这一句。
+    if table:
+        index_hint = (
+            " Enumerators map the surface; the index names the mechanism -- load "
+            "it first unless the triage output already fixed the route.\n"
+        )
+    else:
+        index_hint = " Enumerators map the surface.\n"
+
     return (
         "[Skill routing] Dispatch a skill library; do not answer from memory. "
         "The method lives in the index you load, not in your priors. Four moves:\n"
@@ -187,10 +197,9 @@ def render(
         + step_two
         + "2b. **Prefer the enumerator.** If `route_map`, `path_variants`, "
         "`method_sweep`, `tcp_batch`, `decode_blob` or `file_triage` covers it, "
-        "call it once, not in a loop. Enumerators map the surface; the index "
-        "names the mechanism -- load it first unless the triage output already "
-        "fixed the route.\n"
-        "3. **Write the falsifier before the first payload**: \"If mechanism M holds, "
+        "call it once, not in a loop."
+        + index_hint
+        + "3. **Write the falsifier before the first payload**: \"If mechanism M holds, "
         "check C returns X; if Y, M is closed.\" Two identical responses from "
         "one family = wrong mechanism: change the attack class, not the payload.\n"
         "4. **Re-plan at 40% and 70%.** Three lines: proven / assumed / "

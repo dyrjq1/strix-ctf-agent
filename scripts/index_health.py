@@ -13,10 +13,12 @@
                           读技能包引用路径（``jail/skills`` / ``skills_strix``）
                           的 ``exec_command``/``read_file`` 的比例。
 ③ ``inject_bytes``       单次注入字节：按 **load 调用**（不是按技能名）累加
-                          该调用点名的索引文件尺寸。口径是**源包**文件
-                          （``skills_root`` 下 ``<name>.md``），比真实注入少
-                          约 190B 的路径提示，故是下界近似，不是精确值。
-                          分母只数「至少解析出一个名字」的调用；缺失的名字
+                          该调用**实际命中**的索引文件尺寸（按命中文件计：
+                          缺失的名字不计字节，只记 ``inject_missing``）。口径
+                          是**源包**文件（``skills_root`` 下 ``<name>.md``），
+                          比真实注入少 235B（20 字符 ref）的路径提示，故是
+                          下界近似，不是精确值。
+                          分母只数「至少命中一个文件」的调用；缺失的名字
                           不会把分母减成 0 或负数。
 ④ ``first_dir_rate``     首次 load 的方向与 run 的题型（``kind``）一致的比例；
                           ``ctf-triage`` 先行是批准的流程，恒视为一致。
@@ -103,7 +105,8 @@ def analyze_log(text: str, skills_root: Path | None) -> dict:
     """一条 run 日志 -> 指标字段（全部可 json 序列化，只加不改）。
 
     返回字段是准备直接并入结果行的：``skill_loads``、``skill_first``、
-    ``skill_ref_reads``、``skill_inject_bytes``、``skill_inject_missing``。
+    ``skill_ref_reads``、``skill_inject_bytes``、``skill_inject_missing``、
+    ``skill_inject_calls``（③ 的分母：至少命中一个索引文件的 load 调用数）。
     """
     calls = parse_tool_calls(text)
     loads: list[int] = []  # 每个 load_skill 调用在 calls 里的下标
@@ -295,7 +298,7 @@ def main(argv: list[str] | None = None) -> int:
         / "src"
         / "ctf_strix"
         / "skills_strix",
-        help="staged 技能包根（③ 的离线尺寸来源；默认随仓库布局）",
+        help="技能包根（③ 的离线尺寸来源；默认随仓库布局）",
     )
     parser.add_argument("--json", type=Path, help="把逐行+汇总结果写成 JSON")
     _ARGS = parser.parse_args(argv)

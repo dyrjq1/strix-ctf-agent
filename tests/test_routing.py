@@ -33,11 +33,12 @@ def test_render_is_empty_without_names() -> None:
 def test_render_fits_the_character_budget() -> None:
     """Both ref lengths the contract runs under must fit the 3000-char budget.
 
-    ``/var/ctf/jail/skills`` is the 20-char jail path; ``ref_root()`` is the
-    57-char local debug path. Only checking the short one hid a 33-char overrun.
+    ``/var/ctf/jail/skills`` is the 20-char jail path; the 31-char image path
+    is the production default. Both are literals: a local worktree path drifts
+    with the checkout location and would make the number unreproducible.
     """
     names = [f"{c}/{c}" for c, _n, _p in skillpack.index_skills()]
-    for ref in ("/var/ctf/jail/skills", skillpack.ref_root()):
+    for ref in ("/var/ctf/jail/skills", "/app/src/ctf_strix/skills_strix"):
         text = routing.render(names, ref)
         assert len(text) <= routing.MAX_CHARS, (
             f"{len(ref)}-char ref renders {len(text)} chars"
@@ -119,6 +120,9 @@ def test_no_direction_registered_does_not_ask_for_a_direction_load() -> None:
     text = routing.render(["ctf-triage/ctf-triage"], "/skills")
     assert "No direction index is registered" in text
     assert "load one index" not in text
+    assert "load it first" not in text
+    assert "then load" not in text
+    assert "do not `load_skill` a direction" in text
 
 
 def test_full_table_covers_every_route_in_documented_order() -> None:

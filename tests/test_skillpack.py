@@ -87,21 +87,27 @@ def _render_of_size(pack: Path, target: int) -> tuple[Path, str]:
     return path, body
 
 
-def test_index_sources_fit_the_gate() -> None:
+GATE_REFS = (
+    "/var/ctf/jail/skills",
+    "/app/src/ctf_strix/skills_strix",
+    skillpack.ref_root(),
+)
+
+
+@pytest.mark.parametrize("ref", GATE_REFS)
+def test_index_sources_fit_the_gate(ref: str) -> None:
     """strict 闸（单测/CI 专用）：**渲染后**字节必须 ≤ INDEX_MAX_BYTES。
 
     闸门量的是运行时真正落盘的那一份：``render()`` 会插入路径提示、抹掉
-    flag 形态，产物比源文件大 ~190B。只量源文件的旧闸漏掉了 H-1——
+    flag 形态，产物比源文件大 235B（20 字符 ref）。只量源文件的旧闸漏掉了 H-1——
     ctf-supply-chain 渲染 8172B，却被 ``cap - len(marker)`` 的旧预算误截。
     """
-    ref = "/var/ctf/jail/skills"
     for category, _name, path in skillpack.index_skills():
         body = skillpack.render(path, ref, category)
         size = len(body.encode("utf-8"))
         assert size <= skillpack.INDEX_MAX_BYTES, (
             f"{category} 渲染后 {size}B > {skillpack.INDEX_MAX_BYTES}B：先下沉再进仓库"
         )
-        assert "INDEX TRUNCATED" not in body, f"{category} 的 render() 不该带截断标记"
 
 
 def test_render_just_under_the_cap_passes_byte_for_byte(tmp_path: Path) -> None:
@@ -160,12 +166,51 @@ def test_tiny_cap_degrades_to_markerless_truncation(
     assert "INDEX TRUNCATED" not in out.decode("utf-8")
 
 
-def test_no_real_index_is_truncated_at_runtime() -> None:
+def test_non_positive_cap_falls_back_to_the_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """L-1: ``CTF_INDEX_CAP=-1`` is invalid, not "tighter".
+
+    The old reader caught only ``ValueError``; a negative value reached
+    ``_cut_lines(encoded, cap)`` and became ``encoded[:-1]`` -- the whole index
+    minus its last byte. It must fall back to ``INDEX_MAX_BYTES`` instead.
+    """
+    monkeypatch.setenv("CTF_INDEX_CAP", "-1")
+    ref = "/var/ctf/jail/skills"
+    reg = skillpack.stage(ref=ref)
+    checked = 0
+    for category, _name, path in skillpack.index_skills():
+        out = (reg / category / f"{category}.md").read_bytes()
+        expected = skillpack.render(path, ref, category).encode("utf-8")
+        assert len(out) <= skillpack.INDEX_MAX_BYTES, f"{category} 落盘 {len(out)}B"
+        assert out == expected, f"{category} 被 cap=-1 近似整文截断"
+        assert "INDEX TRUNCATED" not in out.decode("utf-8")
+        checked += 1
+    assert checked >= 12
+
+
+def test_cut_lines_never_emits_a_half_character() -> None:
+    """L-2: a 3-byte CJK char straddling the cut must not leave a broken tail."""
+    text = "x" * 7 + "中" * 5
+    cut = skillpack._cut_lines(text.encode("utf-8"), 8)  # 7 + first byte of 「中」
+    assert len(cut.encode("utf-8")) <= 8
+    assert cut == "x" * 7
+    assert "\ufffd" not in cut
+
+    lined = "x" * 7 + "\n" + "中" * 5
+    cut2 = skillpack._cut_lines(lined.encode("utf-8"), 10)
+    assert len(cut2.encode("utf-8")) <= 10
+    assert cut2 == "x" * 7
+    assert "\ufffd" not in cut2
+
+
+@pytest.mark.parametrize("ref", GATE_REFS)
+def test_no_real_index_is_truncated_at_runtime(ref: str) -> None:
     """零截断验收：13 个真实类别逐类 stage，无标记且 ≤ 8192B。
 
     这不是抽查：任何一类超限都说明源索引该先下沉子文件，而不是调大闸。
     """
-    reg = skillpack.stage(ref="/var/ctf/jail/skills")
+    reg = skillpack.stage(ref=ref)
     files = sorted(reg.rglob("*.md"))
     assert len(files) == len(skillpack.index_skills())
     for path in files:
