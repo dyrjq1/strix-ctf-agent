@@ -168,8 +168,10 @@ def test_tcp_batch_caps_the_candidate_list() -> None:
 def test_unpack_archive_next_hint_uses_produced_family(tmp_path: Path) -> None:
     """_NEXT wiring must sniff the largest *produced* file, not the outer archive.
 
-    Outer is a tar and inner is a zip: the outer family (tar) has no _NEXT entry,
-    so a hint can only appear if the wiring sniffs the produced zip file.
+    Outer is a tar and inner is a zip.  Both families have _NEXT entries now, so
+    the hint's *target* discriminates: the produced zip yields an ``unzip -l``
+    line pointing at inner.zip, while wiring that sniffed the outer tar would
+    emit ``tar -tf outer.tar`` and fail the assertions below.
     """
     inner = tmp_path / "inner.zip"
     with zipfile.ZipFile(inner, "w") as handle:
@@ -328,13 +330,20 @@ def test_network_tools_are_not_probe_tools() -> None:
     for name in probe_surface.NETWORK_TOOLS:
         assert not probe_surface.is_probe_tool(name)
 
-def test_unpack_names_7z_instead_of_calling_it_unknown(tmp_path: Path) -> None:
+def test_unpack_names_7z_instead_of_calling_it_unknown(
+    tmp_path: Path, monkeypatch
+) -> None:
     """A 7z that cannot be read must not look like a corrupt file.
 
     "detected unknown, nothing extracted" invites a retry of the same tool.
     The magic bytes are conclusive, so say what it is and that this image has
     no reader -- that is the observation that changes the next action.
+
+    ``which`` is pinned to None: the image ships 7z (Dockerfile:36), so on a
+    host that has it the walk would take the real extraction branch and never
+    print the names-only verdict.
     """
+    monkeypatch.setattr(nonweb.shutil, "which", lambda name: None)
     archive = tmp_path / "a.7z"
     archive.write_bytes(b"7z\xbc\xaf\x27\x1c" + b"\x00" * 300)
     out = nonweb.unpack_archive(str(archive), out_dir=str(tmp_path / "out"))
@@ -344,8 +353,16 @@ def test_unpack_names_7z_instead_of_calling_it_unknown(tmp_path: Path) -> None:
     assert "unknown" not in out, out
 
 
-def test_unpack_finds_a_rar_signature_behind_an_sfx_stub(tmp_path: Path) -> None:
-    """RAR self-extracting stubs put up to 64KB before the signature."""
+def test_unpack_finds_a_rar_signature_behind_an_sfx_stub(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """RAR self-extracting stubs put up to 64KB before the signature.
+
+    ``which`` is pinned to None so a host that has unar (the image does,
+    Dockerfile:39) cannot take the real extraction branch instead of the
+    names-only verdict this test is about.
+    """
+    monkeypatch.setattr(nonweb.shutil, "which", lambda name: None)
     archive = tmp_path / "sfx.rar"
     archive.write_bytes(b"MZ" + b"\x00" * 4096 + b"Rar!\x1a\x07\x00" + b"\x00" * 128)
     out = nonweb.unpack_archive(str(archive), out_dir=str(tmp_path / "out"))
@@ -353,6 +370,28 @@ def test_unpack_finds_a_rar_signature_behind_an_sfx_stub(tmp_path: Path) -> None
     assert "no rar reader" in out, out
     # The message must not pretend the file *is* a bare RAR: it is an SFX stub.
     assert "offset 0x1002" in out, out
+
+
+def test_unpack_rar_with_unar_does_not_claim_no_reader(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The image has unar, so a RAR must not be reported as having no reader.
+
+    The old guard ``not (kind == "7z" and which("7z"))`` is always true for
+    rar, so it claimed "no rar reader" even with unar installed.  ``which``
+    returns a present-but-bogus path for unar, so the walk attempts unar, it
+    fails (the path does not exist), and the tail must report the attempt
+    rather than denying the reader exists.
+    """
+    monkeypatch.setattr(
+        nonweb.shutil, "which", lambda name: "/usr/bin/unar" if name == "unar" else None
+    )
+    archive = tmp_path / "real.rar"
+    archive.write_bytes(b"Rar!\x1a\x07\x00" + b"\x00" * 128)
+    out = nonweb.unpack_archive(str(archive), out_dir=str(tmp_path / "out"))
+    assert "detected rar" in out, out
+    assert "no rar reader" not in out, out
+    assert "unar failed" in out or "unar ran" in out, out
 
 
 def test_unpack_archive_handles_data_appended_after_eocd(tmp_path: Path) -> None:

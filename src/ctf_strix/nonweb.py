@@ -83,7 +83,11 @@ _BATCH_MAX: Final = 200
 #: ``binwalk`` / ``exiftool`` / ``tshark`` 与 ``r2`` 都在镜像里（``docker/Dockerfile``
 #: :36 装 binwalk + libimage-exiftool-perl，:38 装 tcpdump + tshark，:66-77 锁版本装
 #: radare2 5.9.4；``docker/check_toolchain.sh`` :259-273 构建期逐个探测，探测失败即红）。
-#: **六个里真正缺的只有 ``checksec`` 和 ``zsteg``**（zbar-tools 提供的是 zbarimg）。
+#: **六个里真正缺的只有 ``zsteg``**：``checksec`` 随 ``pwntools==4.15.0`` 的
+#: console_scripts 一起装进镜像（requirements.lock:102；该版本 wheel 的
+#: entry_points.txt 声明 ``checksec = pwnlib.commandline.common:main``；仓库
+#: ``ctf-pwn`` 技能文档同述），镜像内 ``which checksec`` 以 CI 构建日志为准。
+#: ``zbar-tools`` 只提供 zbarimg。
 #: 模型第一次调用就拿到一条跑不通的命令，这是 Misc 题的第一个致命断点（docs/27 C2）。
 #:
 #: 现在的写法分两类：
@@ -262,6 +266,7 @@ def _sniff(path: Path) -> str:
     # 7z and RAR are *named* before any extraction attempt: Python's stdlib
     # has no reader for either.  The system 7z binary (when present) handles
     # real 7z archives in walk(); RAR extracts via _from_unar when the system
+    # unar binary is present.
     # Naming matters because "detected unknown, nothing extracted" reads
     # exactly like a corrupt file -- the model then retries unpack_archive
     # instead of changing method.  A RAR self-extracting stub can precede the
@@ -712,33 +717,40 @@ def unpack_archive(path: str = "", max_depth: int = 3, out_dir: str = "extracted
             f"`file -b {source.as_posix()}`; a wrong extension is common and "
             "the magic bytes are the authority."
         ]
-        if kind in _NAMES_ONLY and not (kind == "7z" and shutil.which("7z")):
-            where = _signature_offset(source, kind)
-            at = "this IS that archive" if where == 0 else "the archive starts there"
-            advice.append(
-                f"  matched a {kind} signature at offset 0x{where:x} -- {at}, and this "
-                f"image ships no {kind} reader. Carve from that offset and read the "
-                "container by hand "
-                f"(xxd + the struct module), or let `binwalk {source.as_posix()}` "
-                "scan the same bytes for embedded data. Do not retry "
-                "unpack_archive; it will return the same line. If it is "
-                "encrypted, the password has to come from the challenge -- "
-                "brute force here is a different, much more expensive problem."
-            )
-        elif kind == "7z" and shutil.which("7z"):
-            advice.append(
-                "  the 7z binary ran and produced nothing usable -- the archive "
-                "is empty, corrupt, truncated, or password-protected. Do not "
-                "retry unpack_archive; it will fail the same way. If it is "
-                "encrypted, the password has to come from the challenge."
-            )
-        elif kind in _NAMES_ONLY and shutil.which("unar"):
-            advice.append(
-                "  unar ran and produced nothing usable -- the archive is empty, "
-                "corrupt, truncated, or password-protected. Do not retry "
-                "unpack_archive; it will fail the same way. If it is encrypted, "
-                "the password has to come from the challenge."
-            )
+        if kind in _NAMES_ONLY:
+            reader = shutil.which("7z" if kind == "7z" else "unar")
+            if not reader:
+                where = _signature_offset(source, kind)
+                at = "this IS that archive" if where == 0 else "the archive starts there"
+                missing = (
+                    "this image ships no rar reader (unar is not on PATH)"
+                    if kind == "rar"
+                    else "this image ships no 7z reader"
+                )
+                advice.append(
+                    f"  matched a {kind} signature at offset 0x{where:x} -- {at}, and "
+                    f"{missing}. Carve from that offset and read the "
+                    "container by hand "
+                    f"(xxd + the struct module), or let `binwalk {source.as_posix()}` "
+                    "scan the same bytes for embedded data. Do not retry "
+                    "unpack_archive; it will return the same line. If it is "
+                    "encrypted, the password has to come from the challenge -- "
+                    "brute force here is a different, much more expensive problem."
+                )
+            elif kind == "7z":
+                advice.append(
+                    "  the 7z binary ran and produced nothing usable -- the archive "
+                    "is empty, corrupt, truncated, or password-protected. Do not "
+                    "retry unpack_archive; it will fail the same way. If it is "
+                    "encrypted, the password has to come from the challenge."
+                )
+            else:
+                advice.append(
+                    "  unar ran and produced nothing usable -- the archive is empty, "
+                    "corrupt, truncated, or password-protected. Do not retry "
+                    "unpack_archive; it will fail the same way. If it is encrypted, "
+                    "the password has to come from the challenge."
+                )
         body.append("\n".join(advice))
     else:
         body.append(

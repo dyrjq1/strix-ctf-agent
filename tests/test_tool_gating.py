@@ -123,13 +123,17 @@ def test_aisec_hint_requires_a_whole_token(monkeypatch, metadata, expected, why)
 # Missing binaries: _NEXT hints must not reference tools the image lacks
 # ---------------------------------------------------------------------------
 
-# Only these two are absent.  binwalk / exiftool / tshark / tcpdump / radare2
-# are installed (docker/Dockerfile:36 installs binwalk + libimage-exiftool-perl,
+# Only zsteg is absent.  checksec ships with pwntools==4.15.0 (requirements.lock:102;
+# that wheel's entry_points.txt declares `checksec = pwnlib.commandline.common:main`)
+# and the repo's ctf-pwn skill documents it as bundled, so banning it would forbid
+# correct advice.  The in-image `which checksec` is confirmed by the CI build log.
+# binwalk / exiftool / tshark / tcpdump / radare2 are installed
+# (docker/Dockerfile:36 installs binwalk + libimage-exiftool-perl,
 # :38 installs tcpdump + tshark, :66-77 installs radare2; docker/check_toolchain.sh
 # :259-273 probes each one at build time).  Banning them here would forbid
 # correct advice -- that was rework 4's H2 defect, kept as a comment so the list
 # does not grow back.
-BANNED_BINARIES = ["checksec", "zsteg"]
+BANNED_BINARIES = ["zsteg"]
 
 
 def test_next_hints_do_not_mention_removed_binaries():
