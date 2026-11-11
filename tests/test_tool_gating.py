@@ -76,6 +76,22 @@ def test_harness_and_entrypoint_share_the_gate():
         assert 'os.environ.get("CTF_AISEC"' not in code_lines(source)
 
 
+def test_harness_registers_the_observation_pair_like_the_entrypoint():
+    """The fact rule promises obs_list/obs_view whenever the triple is on.
+
+    The harness measured a whole evaluation run whose prompt promised the
+    readback pair while the registry held neither -- the fourth drift of the
+    shape this file exists to bury.  Both entrypoints must make the same
+    register() call, and the harness must gate its "obs" prompt group on the
+    measured registry instead of a hand-maintained list.
+    """
+    entry = (ROOT / "src" / "ctf_strix" / "agent.py").read_text(encoding="utf-8")
+    harness = (ROOT / "scripts" / "run_strix_ctf.py").read_text(encoding="utf-8")
+    assert "obs_store.register()" in entry
+    assert "obs_store.register()" in harness
+    assert '"obs_list" in present' in harness
+
+
 def test_harness_registers_web_primitives_only_for_web_kinds():
     harness = (ROOT / "scripts" / "run_strix_ctf.py").read_text(encoding="utf-8")
     index = harness.index("install_web_capabilities()")

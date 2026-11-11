@@ -358,6 +358,22 @@ async def main() -> int:
     except Exception as e:  # noqa: BLE001 — 技能装不上也要能把题跑完
         print(f"[skills] registration failed: {type(e).__name__}: {e}")
 
+    # Observation readback is kind-independent: the context layer can offload
+    # any tool output, so every kind may read it back.  The official
+    # entrypoint (ctf_strix.agent.install_toolset) registers this pair; the
+    # harness used to skip it, which left the prompt's fact rule promising
+    # obs_list/obs_view while the registry held neither -- the same
+    # measured-under-one-configuration drift the gates below exist to remove.
+    try:
+        from ctf_strix import obs_store
+
+        added = obs_store.register()
+        print(
+            f"[obs] registered {len(added)} tools: {', '.join(added) or '(already present or off)'}"
+        )
+    except Exception as e:  # noqa: BLE001 — 读回原语装不上也要能把题跑完
+        print(f"[obs] registration failed: {type(e).__name__}: {e}")
+
     # ── 上下文管理（2026-11-01）────────────────────────────────────────────
     # 与官方入口 ctf_strix.agent 共用同一实现，避免"评测跑的是新提示、
     # 提交镜像跑的是旧提示"那种测量/实现分裂（capabilities.py 就是为此存在）。
@@ -376,6 +392,12 @@ async def main() -> int:
             present = frozenset(getattr(tool, "name", "") for tool in factory.registered_agent_tools())
         except Exception as e:  # noqa: BLE001
             print(f"[ctx] registry probe failed: {type(e).__name__}: {e}")
+
+        # The "obs" group rides on the measured registry, not on the group
+        # list: register() is a no-op when the triple is off, and a prompt
+        # group whose tools are absent is a promise the run cannot keep.
+        if "obs_list" in present and "obs" not in groups:
+            groups.append("obs")
 
         ctf_prompt.activate(args.target_kind, tuple(groups), present)
         ctf_prompt.install()

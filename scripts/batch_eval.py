@@ -1163,6 +1163,12 @@ def run_agent(
         # 每次 LLM 调用后原子落盘。进程被墙钟 SIGKILL 时，run_strix_ctf 末尾那行
         # `[usage]` 永远不会打印——两条 A/B 臂就这么丢了 token 数（只能记 n/a）。
         "CTF_USAGE_PATH": str(box / "usage.json"),
+        # ctx-v1 臂变量必须显式透传：这份 env 是白名单，子进程看不到父 shell
+        # 的 export。漏传时 ON/OFF 两臂会静默同臂（obs_store/enabled 读的是
+        # 子进程环境，空串按未设置处理）。接线修复，不改任何行为默认值。
+        "CTFY_WORK_DIR": os.environ.get("CTFY_WORK_DIR", ""),
+        "CTF_OBS_OFF": os.environ.get("CTF_OBS_OFF", ""),
+        "CTF_CTX_OFF": os.environ.get("CTF_CTX_OFF", ""),
         "PATH": "/usr/local/bin:/usr/bin:/bin",
     }
     # 软截止：墙钟的 75% 处。父进程到点会 SIGKILL 整组，被杀的那次 run

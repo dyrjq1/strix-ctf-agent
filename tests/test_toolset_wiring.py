@@ -99,6 +99,36 @@ def test_aisec_is_registered_when_the_task_says_it_is_an_agent(registry, monkeyp
     assert "ai_fingerprint" in names
     assert "`ai_fingerprint`" in text
 
+def test_observation_readback_registers_when_the_triple_is_on(registry, monkeypatch, tmp_path):
+    """With a work dir and no off-switch, the pair must be callable *and* promised.
+
+    The eval harness used to skip ``obs_store.register()`` while the fact rule
+    still told the model to use ``obs_view`` -- a promised tool that could not
+    be called.  This pins the official path; the harness is pinned by source
+    text in ``test_tool_gating``.
+    """
+    monkeypatch.setenv("CTFY_WORK_DIR", str(tmp_path))
+    monkeypatch.delenv("CTF_OBS_OFF", raising=False)
+    monkeypatch.delenv("CTF_CTX_OFF", raising=False)
+    names, groups, text = registry("web", {"challenge": {"description": "a login page"}})
+    assert {"obs_list", "obs_view"} <= names
+    assert "obs" in groups
+    assert "`obs_list`" in text
+    assert "`obs_view`" in text
+
+
+def test_observation_readback_stays_off_when_disabled(registry, monkeypatch, tmp_path):
+    """CTF_OBS_OFF must unregister the pair *and* the prompt's promise."""
+    monkeypatch.setenv("CTFY_WORK_DIR", str(tmp_path))
+    monkeypatch.setenv("CTF_OBS_OFF", "1")
+    names, groups, text = registry("web", {"challenge": {"description": "a login page"}})
+    assert "obs_list" not in names
+    assert "obs_view" not in names
+    assert "obs" not in groups
+    assert "`obs_list`" not in text
+    assert "`obs_view`" not in text
+
+
 def test_a_tool_that_failed_to_register_is_not_promised(monkeypatch):
     """A partial installer must not leave a promise in the prompt.
 
