@@ -17,6 +17,7 @@ Use this skill as a routing and execution guide for web-heavy challenges. Keep t
 
 **Offline image: no installs and no internet.** `python3` already ships `requests`,
 `httpx`, `PIL` and `Crypto`, and `curl` works; `sqlmap`, `ffuf`, `impacket` and `flask-unsign` are installed;
+wordlists ship in the image: `/opt/wordlists/common.txt` (4.7k paths) and `/opt/wordlists/small.txt` (43k words) for directory fuzzing, `/opt/wordlists/params.txt` (6.4k names) for parameter fuzzing, default-credential lists under `/usr/share/wordlists/metasploit/`, English words at `/usr/share/dict/words` (`rockyou.txt` is NOT in the image);
 `nuclei` and templates are **not available** -- write the request in Python or with `curl`.
 
 ## Additional Resources
