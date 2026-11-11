@@ -42,7 +42,7 @@ def atomic_write_json(path: str | Path, payload: Mapping[str, Any]) -> bool:
         tmp.write_text(json.dumps(dict(payload), ensure_ascii=False), encoding="utf-8")
         os.replace(tmp, target)
         return True
-    except OSError:
+    except (OSError, TypeError, ValueError):
         # Telemetry must never take the run down; worst case the parent falls
         # back to the summary line (or to "no data", which is honest).
         logger.warning("Failed to persist guard state to %s", target, exc_info=True)

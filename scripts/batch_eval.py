@@ -827,6 +827,23 @@ def _fresh_box(name: str, root: str | Path = _BOX_ROOT) -> tuple[Path, Path]:
     return box, box / "run.log"
 
 
+def _guard_state_path(name: str, root: str | Path | None = None) -> Path:
+    """守卫遥测文件路径，与 :func:`_fresh_box` 的沙箱规则一致。
+
+    子进程通过 ``--guard-state`` 拿到这个路径并逐次落盘；父进程在结果行里
+    从同一个文件回收计数。两边各拼一次路径最容易漂移，所以只留这一处定义。
+
+    Args:
+        name: 运行名（唯一），与传给 ``run_agent`` 的 ``name`` 相同。
+        root: 沙箱根目录；``None`` 表示用与 ``_fresh_box`` 相同的默认值。
+
+    Returns:
+        ``<root>/<name>/guard_state.json``。
+    """
+    base = Path(root) if root is not None else Path(_BOX_ROOT)
+    return base / name / "guard_state.json"
+
+
 def _git_commit(root: Path) -> str:
     """取当前提交号，写进结果行。
 
@@ -1230,7 +1247,7 @@ def run_agent(
         "--instruction", instruction,
         # 守卫遥测的落盘路径必须由启动方显式给：子进程 stdout 被重定向到
         # run.log，它自己无从知道父进程把这次 run 的目录放在哪里。
-        "--guard-state", str(box / "guard_state.json"),
+        "--guard-state", str(_guard_state_path(name)),
         *_deadline_args(timeout_s),
     ]
     started = time.time()
@@ -1494,7 +1511,7 @@ def main() -> int:
             # 守卫是否真的介入了，必须进数据。上一轮枚举守卫装在代码里、
             # 单测通过、真实日志重放也通过，但真实运行里一次都没触发——
             # 如果不记录，这种"装了等于没装"在结果表里完全看不出来。
-            rec["guard"] = _parse_guard(log, box / "guard_state.json")
+            rec["guard"] = _parse_guard(log, _guard_state_path(run_id))
 
             own = host_of(target)
             flag = best_flag(log, own)

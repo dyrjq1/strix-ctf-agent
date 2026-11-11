@@ -69,26 +69,20 @@ _AUTH_OK_RE = re.compile(
 _SHELL_CURL_WGET_RE = re.compile(r"(?:[^\s;&|]*/)?(?:curl|wget)(?:\.exe)?(?=\s|$)", re.IGNORECASE)
 
 #: curl 的 cookie 选项：``-b/--cookie`` 表示"带会话去请求"，``-c/--cookie-jar``
-#: 表示"把响应里的会话存下来"。cookie jar 是 curl 的通用机制，不是某道题的
-#: 路径特征；命令行里出现它，说明模型已经在按"登录后保持会话"的方式工作。
-_CURL_COOKIE_ARG_RE = re.compile(
-    r"(?<![\w-])(?:-b|--cookie|-c|--cookie-jar)(?:\s+|=)(?:\"[^\"]+\"|'[^']+'|[^\s\"'-]\S*)",
-    re.IGNORECASE,
-)
+#: 表示"把响应里的会话存下来"。**只在 curl 段内判定**：``-c`` 在 wget 里是
+#: 断点续传，在 grep 里是计数，全文扫描会把它们误当成会话证据。
+_CURL_COOKIE_OPTIONS = frozenset({"-b", "--cookie", "-c", "--cookie-jar"})
 
 #: wget 的 cookie 选项：``--load-cookies`` / ``--save-cookies`` 需要文件名，
-#: ``--keep-session-cookies`` 是独立开关。三者都是 wget 的通用会话机制。
-_WGET_COOKIE_ARG_RE = re.compile(
-    r"(?<![\w-])(?:--load-cookies|--save-cookies)(?:\s+|=)(?:\"[^\"]+\"|'[^']+'|[^\s\"'-]\S*)"
-    r"|(?<![\w-])--keep-session-cookies\b",
-    re.IGNORECASE,
+#: ``--keep-session-cookies`` 是独立开关。wget 的 ``-c`` 不属于这一类。
+_WGET_COOKIE_OPTIONS = frozenset(
+    {"--load-cookies", "--save-cookies", "--keep-session-cookies"}
 )
 
-#: 任意工具里显式的 Cookie 请求头：``-H 'Cookie: sid=abc'`` /
-#: ``--header "Cookie: a=b"``。主动把 Cookie 塞进请求头，是"我已经持有会话"
-#: 的机制级证据；与框架、题目都无关。JSON 转义后的 ``\"`` 也要能吃下。
-_HEADER_COOKIE_ARG_RE = re.compile(
-    r"(?<![\w-])(?:-H|--header)(?:\s+|=)\\?[\"']?Cookie:\s*[^\\\"'\s=;]+=\S+",
+#: 显式 Cookie 请求头：``-H 'Cookie: sid=abc'`` / ``--header "Cookie: a=b"``。
+#: 只认 curl/wget 段里的 ``-H``：别条命令里的同名字符串不是会话证据。
+_HEADER_COOKIE_VALUE_RE = re.compile(
+    r"\\?[\"']?Cookie:\s*[^\\\"'\s=;]+=\S+",
     re.IGNORECASE,
 )
 
@@ -103,11 +97,114 @@ def _command_text(args: str) -> str:
     return _shared_command_text(args)
 
 
-def _has_shell_cookie_client(text: str) -> bool:
-    """是否至少有一条命令以 curl / wget 开头。"""
-    for tokens in _command_segments(text):
-        if _SHELL_CURL_WGET_RE.match(tokens[0]):
+def _shell_client(token: str) -> str | None:
+    """Return ``curl``/``wget`` when ``token`` is that executable, else None."""
+    if not _SHELL_CURL_WGET_RE.match(token):
+        return None
+    base = token.rsplit("/", 1)[-1].lower()
+    if base.endswith(".exe"):
+        base = base[:-4]
+    return base if base in ("curl", "wget") else None
+
+
+def _heredoc_delimiter(line: str) -> str | None:
+    """Delimiter of a here-document opened on this line, if any.
+
+    The body of a here-document is data, not a command: a line inside it that
+    starts with ``curl`` must not release the guard.  Only an unquoted ``<<``
+    followed by a word opens a document; ``$((1<<2))`` and here-strings are
+    ignored.
+    """
+    quote: str | None = None
+    index = 0
+    while index < len(line):
+        char = line[index]
+        if quote is not None:
+            if char == quote:
+                quote = None
+            index += 1
+            continue
+        if char in "\"'":
+            quote = char
+            index += 1
+            continue
+        if char == "\\":
+            index += 2
+            continue
+        if line.startswith("<<", index):
+            cursor = index + 2
+            if cursor < len(line) and line[cursor] == "-":
+                cursor += 1
+            while cursor < len(line) and line[cursor] in " \t":
+                cursor += 1
+            if cursor < len(line) and line[cursor] in "\"'":
+                mark = line[cursor]
+                cursor += 1
+                end = line.find(mark, cursor)
+                word = line[cursor:end] if end >= 0 else ""
+                if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", word):
+                    return word
+                index = cursor
+                continue
+            match = re.match(r"[A-Za-z_][A-Za-z0-9_]*", line[cursor:])
+            if match:
+                return match.group(0)
+        index += 1
+    return None
+
+
+def _strip_heredoc_bodies(text: str) -> str:
+    """Drop here-document bodies so their text is never read as a command."""
+    lines = text.split("\n")
+    kept: list[str] = []
+    index = 0
+    while index < len(lines):
+        line = lines[index]
+        kept.append(line)
+        delimiter = _heredoc_delimiter(line)
+        index += 1
+        if delimiter is None:
+            continue
+        while index < len(lines) and lines[index].strip() != delimiter:
+            index += 1
+        index += 1
+    return "\n".join(kept)
+
+
+def _cookie_option_in_segment(tokens: list[str], client: str) -> bool:
+    """Does this curl/wget segment carry a cookie-jar style option?"""
+    options = _CURL_COOKIE_OPTIONS if client == "curl" else _WGET_COOKIE_OPTIONS
+    for token in tokens[1:]:
+        name, _, _ = token.partition("=")
+        if name in options:
             return True
+        if (
+            client == "curl"
+            and not token.startswith("--")
+            and len(token) > 2
+            and token[:2] in ("-b", "-c")
+        ):
+            return True
+    return False
+
+
+def _header_cookie_in_segment(tokens: list[str]) -> bool:
+    """Does this curl/wget segment set a literal Cookie request header?"""
+    for index, token in enumerate(tokens[1:], 1):
+        if token in ("-H", "--header"):
+            if index + 1 < len(tokens) and _HEADER_COOKIE_VALUE_RE.match(tokens[index + 1]):
+                return True
+            continue
+        if token.startswith("--header="):
+            if _HEADER_COOKIE_VALUE_RE.match(token[len("--header="):]):
+                return True
+            continue
+        if token.startswith("-H") and len(token) > 2:
+            candidate = token[2:]
+            if candidate.startswith("="):
+                candidate = candidate[1:]
+            if _HEADER_COOKIE_VALUE_RE.match(candidate):
+                return True
     return False
 
 
@@ -120,12 +217,14 @@ def _args_session_signal(args: str) -> bool:
     """
     if not args:
         return False
-    text = _command_text(args)
-    if _HEADER_COOKIE_ARG_RE.search(text):
-        return True
-    if not _has_shell_cookie_client(text):
-        return False
-    return bool(_CURL_COOKIE_ARG_RE.search(text) or _WGET_COOKIE_ARG_RE.search(text))
+    text = _strip_heredoc_bodies(_command_text(args))
+    for tokens in _command_segments(text):
+        client = _shell_client(tokens[0])
+        if client is None:
+            continue
+        if _cookie_option_in_segment(tokens, client) or _header_cookie_in_segment(tokens):
+            return True
+    return False
 
 
 #: 表示"成功写入/创建"的线索。匹配响应体里的自增 id 或 201。

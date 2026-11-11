@@ -70,6 +70,37 @@ def test_unrelated_commands_do_not_count_as_authenticated(args: str) -> None:
 
 
 @pytest.mark.parametrize(
+    "args",
+    [
+        "wget -c http://target/big.bin",
+        "curl -s http://target/ ; grep -c 404 access.log",
+        "curl -s http://target/ | sort -b",
+        "curl -s http://target/ ; awk -b '{print}'",
+        "echo 'curl -H \"Cookie: sid=1\" http://target/'",
+        "printf '%s\\n' 'curl -H \"Cookie: sid=1\"' > notes.txt",
+        "cat > notes.sh <<'EOF'\ncurl -H 'Cookie: a=b' http://target/\nEOF",
+        "bash <<EOF\ncurl -b jar.txt http://target/\nEOF",
+    ],
+)
+def test_short_flags_and_printed_text_are_not_session_signals(args: str) -> None:
+    """Cookie flags count only inside the curl/wget segment that owns them."""
+    assert _args_session_signal(args) is False
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        "curl -b cj.txt http://target/profile",
+        "curl -H 'Cookie: a=b' http://target/profile",
+        "wget --save-cookies cj.txt http://target/login",
+    ],
+)
+def test_cookie_flags_inside_client_segments_still_count(args: str) -> None:
+    """The narrowed gate must not lose the genuine session workflows."""
+    assert _args_session_signal(args) is True
+
+
+@pytest.mark.parametrize(
     "output",
     [
         "HTTP/1.1 200 OK\r\nSet-Cookie: sid=abc; path=/",

@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import json
 import shutil
 import sys
 import tempfile
@@ -15,10 +16,12 @@ import pytest
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "scripts"))
 
+import batch_eval  # noqa: E402
 from batch_eval import (  # noqa: E402
     _answer_values,
     _archive_run,
     _fresh_box,
+    _guard_state_path,
     _new_run_id,
     _proxy_blackhole,
 )
@@ -99,6 +102,91 @@ def test_run_id_is_unique_and_carries_challenge() -> None:
     assert len(ids) == 200, "同秒内的重复会让两次运行撞同一个 session"
     assert all("CTFARENA-009" in i for i in ids), "回看日志时要能一眼认出是哪道题"
     assert all(len(i.split("-")) >= 4 for i in ids)
+
+
+def test_guard_state_path_agrees_with_fresh_box(workdir: Path) -> None:
+    """The sidecar path is derived once, so parent and child cannot drift."""
+    box, _ = _fresh_box("run-name", root=workdir)
+
+    assert _guard_state_path("run-name", root=workdir) == box / "guard_state.json"
+
+
+def test_main_records_guard_without_name_error(workdir: Path, monkeypatch) -> None:
+    """A result row must carry guard counters read from the run's own box."""
+    plan = workdir / "plan.json"
+    plan.write_text(
+        json.dumps([{"id": "SMOKE-001", "difficulty": "easy"}]), encoding="utf-8"
+    )
+    out = workdir / "results.jsonl"
+    monkeypatch.setattr(batch_eval, "_BOX_ROOT", str(workdir / "boxes"))
+
+    class FakeClient:
+        def __init__(self, token: str) -> None:
+            self.token = token
+
+        def launch(self, cid: str, attempts: int = 5) -> str:
+            return "iid-1"
+
+        def wait_ready(self, iid: str, timeout: int = 180) -> str:
+            return "http://127.0.0.1:8080/"
+
+        def probe_reachable(self, url: str, attempts: int = 3) -> tuple[bool, str]:
+            return True, "ok"
+
+        def detail(self, cid: str) -> dict:
+            return {}
+
+        def teardown(self, iid: str) -> None:
+            return None
+
+    def fake_run_agent(target, turns, timeout_s, name, **kwargs):
+        state_path = _guard_state_path(name)
+        state_path.parent.mkdir(parents=True, exist_ok=True)
+        state_path.write_text(
+            json.dumps(
+                {
+                    "schema": 1,
+                    "reach": 7,
+                    "enum_keys": 2,
+                    "journey": {
+                        "wall": 1,
+                        "authed": True,
+                        "created": False,
+                        "payloads": 3,
+                        "prompts": 0,
+                    },
+                    "finish": {"refused": 1, "allowed": 2},
+                    "mount_verified": True,
+                }
+            ),
+            encoding="utf-8",
+        )
+        return "[sandbox] fake run\n", 1.0
+
+    monkeypatch.setattr(batch_eval, "Client", FakeClient)
+    monkeypatch.setattr(batch_eval, "run_agent", fake_run_agent)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "batch_eval.py",
+            "--plan",
+            str(plan),
+            "--out",
+            str(out),
+            "--token",
+            "t",
+            "--no-archive",
+        ],
+    )
+
+    assert batch_eval.main() == 0
+
+    rows = [json.loads(line) for line in out.read_text(encoding="utf-8").splitlines()]
+    assert len(rows) == 1
+    assert "guard" in rows[0]
+    assert rows[0]["guard"]["reach"] == 7
+    assert rows[0]["guard"]["mount_broken"] is False
 
 
 @pytest.mark.parametrize("missing", ["agents.db"])

@@ -66,6 +66,16 @@ def test_killed_run_reads_counters_from_the_state_file(tmp_path: Path) -> None:
     assert parsed["mount_broken"] is False
 
 
+def test_atomic_write_reports_false_for_unserializable_payload(tmp_path: Path) -> None:
+    """A telemetry payload that cannot be encoded must not raise out of persist."""
+    from ctf_strix.guard_state import atomic_write_json
+
+    target = tmp_path / "guard_state.json"
+
+    assert atomic_write_json(target, {"bad": object()}) is False
+    assert not target.exists()
+
+
 def test_missing_state_file_keeps_the_untrusted_default(tmp_path: Path) -> None:
     """No summary line and no file: the old "cannot trust reach=0" rule stays."""
     parsed = batch_eval._parse_guard("nothing here\n", tmp_path / "absent.json")
