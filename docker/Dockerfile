@@ -30,6 +30,7 @@ RUN set -eux; \
         file xxd binutils unzip zip \
         gdb strace ltrace \
         netcat-openbsd iproute2 dnsutils \
+        openssh-client sshpass \
         nmap sqlmap smbclient \
         vim-tiny less procps \
         libssl-dev libffi-dev \
@@ -37,6 +38,9 @@ RUN set -eux; \
         sox libsox-fmt-all pngcheck steghide poppler-utils \
         tcpdump tshark sleuthkit \
     && rm -rf /var/lib/apt/lists/*
+
+# openssh-client + sshpass：CTFY-0001 v3 合规硬缺口（awd 模式 ssh 横向移动），
+# 1.3.1 起补装。仅客户端，不装 sshd，不给容器开监听面。
 
 # ffuf：Debian bookworm 的 apt 只有 1.1.0；按派单取上游静态二进制并锁版本。
 # 构建期下载 + sha256 校验，运行期离线，不引入外网依赖。
