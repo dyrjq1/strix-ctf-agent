@@ -31,7 +31,7 @@ RUN set -eux; \
         gdb strace ltrace \
         netcat-openbsd iproute2 dnsutils \
         openssh-client sshpass \
-        nmap sqlmap smbclient \
+        nmap smbclient \
         vim-tiny less procps \
         libssl-dev libffi-dev \
         binwalk libimage-exiftool-perl p7zip-full xz-utils zbar-tools \
@@ -78,6 +78,19 @@ RUN set -eux; \
     apt-get update; \
     apt-get install -y --no-install-recommends /tmp/radare2.deb; \
     rm -rf /var/lib/apt/lists/* /tmp/radare2.deb
+
+# sqlmap：bookworm apt 包的 sqlmap 落后上游约三年；按参考队口径升到上游固定版本
+# 1.10.10（sqlmapproject/sqlmap tag 归档）。构建期下载 + sha256 校验，解压到
+# /opt/sqlmap 并 symlink 到 /usr/local/bin；运行期离线，不引入外网依赖。
+RUN set -eux; \
+    wget -q -O /tmp/sqlmap.zip "https://github.com/sqlmapproject/sqlmap/archive/refs/tags/1.10.10.zip"; \
+    echo "8abca327b603358d25a45b6e305f504df0a77380a892886b4891d0e77667d7e1  /tmp/sqlmap.zip" | sha256sum -c -; \
+    unzip -q /tmp/sqlmap.zip -d /opt; \
+    mv /opt/sqlmap-1.10.10 /opt/sqlmap; \
+    chmod +x /opt/sqlmap/sqlmap.py; \
+    ln -sf /opt/sqlmap/sqlmap.py /usr/local/bin/sqlmap; \
+    sqlmap --version </dev/null; \
+    rm -f /tmp/sqlmap.zip
 
 # 字典层（1.3.2）：技能卡硬引用的字典此前镜像里并不存在，是空承诺。
 # 全部钉上游 commit + sha256，构建期校验，错一个字节构建即失败。
