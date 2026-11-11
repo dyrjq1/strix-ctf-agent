@@ -90,6 +90,18 @@ def install_mount_hook() -> None:
     if getattr(factory, _MARK, False):
         return
 
+    # Regular tool lists pass through ``_with_bounded_result`` directly.  Add
+    # the restart guard here too so probe primitives such as http_probe feed
+    # the same mechanism/endpoint windows as the shell path.
+    original_bounded = factory._with_bounded_result
+
+    def bounded_with_restart(tool: Any) -> Any:
+        from ctf_strix.restart_guard import attach as attach_restart_guard
+
+        return attach_restart_guard(original_bounded(tool))
+
+    factory._with_bounded_result = bounded_with_restart  # type: ignore[assignment]
+
     original_shell = factory._configure_shell_tools
     original_fs = factory._configure_filesystem_tools
 
