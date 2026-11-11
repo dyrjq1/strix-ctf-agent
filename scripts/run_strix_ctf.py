@@ -110,6 +110,15 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--platform", default="", help="Platform base URL, e.g. https://ctfy.tsinghua.edu.cn")
     p.add_argument("--instance", default="", help="Instance id to submit against")
+    p.add_argument(
+        "--guard-state",
+        default=None,
+        help=(
+            "Where to persist the guard counters as JSON. The launcher passes an "
+            "explicit per-run path; standalone runs default to guard_state.json "
+            "in the current working directory (which is the run's own box)."
+        ),
+    )
     return p.parse_args()
 
 
@@ -136,6 +145,36 @@ def _guard_summary(guard: object, journey_state: object, finisher: object, reach
         f"| finish: refused={finisher.refusals} allowed={finisher.allowed} "
         f"| mechanisms: {mechanisms}"
     )
+
+
+def _guard_state_payload(
+    guard: object, journey_state: object, finisher: object, mount_verified: bool
+) -> dict[str, object]:
+    """State needed to rebuild the summary line after a SIGKILL.
+
+    Keys mirror ``_parse_guard`` in ``batch_eval`` so the fallback produces the
+    same fields as the log line.  ``mount_verified`` is recorded explicitly:
+    a killed run has ``reach=0`` only if the guards really never ran, so
+    "missing summary line" must no longer be read as "guard not mounted".
+    """
+    counts = guard.mechanism_counts()
+    return {
+        "reach": guard.observe_calls + journey_state.observe_calls,
+        "enum_keys": len(guard.counts),
+        "journey": {
+            "wall": journey_state.wall_hit,
+            "authed": bool(journey_state.authed),
+            "created": bool(journey_state.created),
+            "payloads": journey_state.payloads,
+            "prompts": journey_state.prompts,
+        },
+        "finish": {
+            "refused": finisher.refusals,
+            "allowed": finisher.allowed,
+        },
+        "mechanisms": {name: int(count) for name, count in counts.items()},
+        "mount_verified": bool(mount_verified),
+    }
 
 
 async def main() -> int:
@@ -245,6 +284,20 @@ async def main() -> int:
 
     wired = verify_mount(("_ctf_guarded", "_ctf_journey_guarded", "_ctf_sweep_guarded"))
     print(f"[guard] mount verified={wired} (exec_command reaches guards)")
+
+    # 遥测也必须能在墙钟 SIGKILL 下存活：汇总行只在正常收尾时打印，被杀的那次
+    # run 会把 reach 读成 0，看上去像守卫没装。照 usage_meter 的老办法——每次
+    # LLM 调用后原子落盘（临时文件 + os.replace），父进程再从文件回退解析。
+    from ctf_strix import guard_state as guard_state_mod
+
+    guard_state_path = (
+        Path(args.guard_state) if args.guard_state else Path.cwd() / "guard_state.json"
+    )
+    guard_writer = guard_state_mod.install(
+        guard_state_path,
+        lambda: _guard_state_payload(guard, journey.state, finisher, wired),
+    )
+    print(f"[guard] state file {guard_state_path}")
 
     # Caido 工具必须无条件摘掉：本机没有 caido-cli，这 6 个调用必然报错。
     # 记账工具只在 --trim-tools 时摘，默认保留——评测与正赛要用同一工具面，
@@ -522,6 +575,7 @@ async def main() -> int:
     # 光看计数器还不够，必须能看出**守卫到底有没有被调用过**。
     js = journey.state
     reached = guard.observe_calls + js.observe_calls
+    guard_writer.persist()
     print(_guard_summary(guard, js, finisher, reached))
     if reached == 0:
         print(

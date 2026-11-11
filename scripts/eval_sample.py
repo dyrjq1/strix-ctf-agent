@@ -718,6 +718,9 @@ def run_agent(
         "--instruction", instruction,
         "--soft-deadline", str(int(soft)),
         "--wall-deadline", str(int(wall)),
+        # 守卫遥测落盘路径：命名空间内 box 的挂载点。被 SIGKILL 时汇总行
+        # 不会打印，父进程只能靠这个每次 LLM 调用后原子更新的文件回退。
+        "--guard-state", "/var/ctf/jail/box/guard_state.json",
     ]
     if endpoint:
         cmd += ["--target", endpoint]
@@ -937,7 +940,15 @@ def parse_usage(log: str) -> dict[str, int]:
     }
 
 
-def parse_guard(log: str) -> dict[str, Any]:
+def parse_guard(log: str, guard_state: Path | None = None) -> dict[str, Any]:
+    """Extract guard counters from the run log, falling back to the sidecar.
+
+    A run killed at the wall clock never prints the summary line, so the log
+    alone would report ``reach=0`` on a run whose guards were mounted and
+    counting.  ``guard_state`` is written after every LLM call and holds the
+    same numbers; when the line is absent the keys are filled from it, and the
+    result keys do not change.
+    """
     out: dict[str, Any] = {"reach": 0, "journey_prompts": 0, "enum_hits": 0}
     m = re.search(
         r"\[guard\] reach=(\d+) \(calls into guards\) \| enum keys=\d+ "
@@ -950,6 +961,23 @@ def parse_guard(log: str) -> dict[str, Any]:
             reach=int(m.group(1)), journey_wall=int(m.group(2)),
             journey_payloads=int(m.group(5)), journey_prompts=int(m.group(6)),
         )
+    else:
+        from ctf_strix.guard_state import read_state
+
+        state = read_state(guard_state)
+        if state is not None:
+            journey = state.get("journey") or {}
+            if not isinstance(journey, dict):
+                journey = {}
+            try:
+                out.update(
+                    reach=int(state.get("reach", 0) or 0),
+                    journey_wall=int(journey.get("wall", 0) or 0),
+                    journey_payloads=int(journey.get("payloads", 0) or 0),
+                    journey_prompts=int(journey.get("prompts", 0) or 0),
+                )
+            except (TypeError, ValueError):
+                pass
     out["enum_hits"] = log.count("ENUMERATION GUARD")
     return out
 
@@ -1322,7 +1350,7 @@ def eval_one(
         # 分开记。评测报告里"解题时间"通常指整题，而预算控制看的是 agent 段。
         rec["elapsed"] = round(wall_elapsed, 1)
         rec["usage"] = parse_usage(log)
-        rec["guard"] = parse_guard(log)
+        rec["guard"] = parse_guard(log, BOX_ROOT / name / "guard_state.json")
         rec["tool_calls"] = len(re.findall(r"\] TOOL ", log))
         rec["wallclock_hit"] = "KILLED for=" in log
 

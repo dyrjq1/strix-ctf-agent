@@ -27,6 +27,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
@@ -55,10 +56,86 @@ _DENIED_RE = re.compile(
 )
 
 #: 表示"认证成功"的线索，出现在输出里。Set-Cookie 是最硬的信号。
+#: output 侧五模式保持原样：它们盯的是"服务端把会话发回来了"。
 _AUTH_OK_RE = re.compile(
     r"set-cookie:|access_token|\"token\"\s*:|session=|Bearer\s+[A-Za-z0-9._\-]{10,}",
     re.IGNORECASE,
 )
+
+#: curl / wget 必须是**一条 shell 命令的第一个词**（允许带路径与 ``.exe``）。
+#: 这样 ``pycurl``、``python -c 'print("curl -b jar")'`` 都不会被当成发起了
+#: HTTP 请求——参数里出现字符串不等于执行了那个命令。args 侧信号先过这道闸。
+_SHELL_CURL_WGET_RE = re.compile(r"(?:[^\s;&|]*/)?(?:curl|wget)(?:\.exe)?(?=\s|$)", re.IGNORECASE)
+
+#: curl 的 cookie 选项：``-b/--cookie`` 表示"带会话去请求"，``-c/--cookie-jar``
+#: 表示"把响应里的会话存下来"。cookie jar 是 curl 的通用机制，不是某道题的
+#: 路径特征；命令行里出现它，说明模型已经在按"登录后保持会话"的方式工作。
+_CURL_COOKIE_ARG_RE = re.compile(
+    r"(?<![\w-])(?:-b|--cookie|-c|--cookie-jar)(?:\s+|=)(?:\"[^\"]+\"|'[^']+'|[^\s\"'-]\S*)",
+    re.IGNORECASE,
+)
+
+#: wget 的 cookie 选项：``--load-cookies`` / ``--save-cookies`` 需要文件名，
+#: ``--keep-session-cookies`` 是独立开关。三者都是 wget 的通用会话机制。
+_WGET_COOKIE_ARG_RE = re.compile(
+    r"(?<![\w-])(?:--load-cookies|--save-cookies)(?:\s+|=)(?:\"[^\"]+\"|'[^']+'|[^\s\"'-]\S*)"
+    r"|(?<![\w-])--keep-session-cookies\b",
+    re.IGNORECASE,
+)
+
+#: 任意工具里显式的 Cookie 请求头：``-H 'Cookie: sid=abc'`` /
+#: ``--header "Cookie: a=b"``。主动把 Cookie 塞进请求头，是"我已经持有会话"
+#: 的机制级证据；与框架、题目都无关。JSON 转义后的 ``\"`` 也要能吃下。
+_HEADER_COOKIE_ARG_RE = re.compile(
+    r"(?<![\w-])(?:-H|--header)(?:\s+|=)\\?[\"']?Cookie:\s*[^\\\"'\s=;]+=\S+",
+    re.IGNORECASE,
+)
+
+
+def _command_text(args: str) -> str:
+    """从工具参数里取出真正会被 shell 执行的文本。
+
+    工具参数是 JSON（``{"command": "curl ..."}``）。先解码再判断，才能区分
+    "执行了 curl" 和 "在 python 脚本里打印了字符串 curl"，也能把 JSON 转义
+    的引号还原成正常引号供 Cookie 头匹配。
+    """
+    try:
+        data = json.loads(args)
+    except (TypeError, ValueError):
+        return args
+    if isinstance(data, dict):
+        for key in ("command", "cmd", "script", "chars"):
+            value = data.get(key)
+            if isinstance(value, str):
+                return value
+    return args
+
+
+def _has_shell_cookie_client(text: str) -> bool:
+    """是否至少有一条命令以 curl / wget 开头。"""
+    for segment in re.split(r"[;&|\n]+", text):
+        candidate = segment.strip().lstrip("(`")
+        if _SHELL_CURL_WGET_RE.match(candidate):
+            return True
+    return False
+
+
+def _args_session_signal(args: str) -> bool:
+    """参数里是否出现"正在使用会话"的通用信号。
+
+    只有命令确实是 curl/wget 时才看它们的 cookie 选项：``-b`` / ``-c`` 这类
+    短选项在别的命令里也有别的含义，token 级门控是为了防 ``python -c`` 误中。
+    显式 Cookie 头不限工具——它本身就是"带着会话发请求"的硬证据。
+    """
+    if not args:
+        return False
+    text = _command_text(args)
+    if _HEADER_COOKIE_ARG_RE.search(text):
+        return True
+    if not _has_shell_cookie_client(text):
+        return False
+    return bool(_CURL_COOKIE_ARG_RE.search(text) or _WGET_COOKIE_ARG_RE.search(text))
+
 
 #: 表示"成功写入/创建"的线索。匹配响应体里的自增 id 或 201。
 _CREATE_OK_RE = re.compile(r"\b201\b|\"id\"\s*:\s*\d+|\"id\"\s*:\s*\"[^\"]{4,}\"")
@@ -178,7 +255,10 @@ class JourneyGuard:
         st.observe_calls += 1
 
         # ① 先看解除条件。Set-Cookie / token 是硬信号，看到就永久放行。
-        if _AUTH_OK_RE.search(output):
+        # 输出侧看不到会话时，再看**参数侧**的 curl/wget cookie jar 与 Cookie 头：
+        # `curl -b jar -c jar ...` 登录成功后，output 往往只有一行菜品列表，
+        # 一个认证标记都不出现，而命令本身已经证明会话在工作流里流转。
+        if _AUTH_OK_RE.search(output) or _args_session_signal(args):
             st.authed = True
         if _WRITE_RE.search(args) and _CREATE_OK_RE.search(output):
             st.created = True

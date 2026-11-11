@@ -557,18 +557,43 @@ def _known_flags() -> set[str]:
     return seen
 
 
-def _parse_guard(log: str) -> dict[str, object]:
+#: 守卫汇总行的格式。``run_strix_ctf._guard_summary`` 按这个格式打印，
+#: 两个解析器（这里与 ``eval_sample.parse_guard``）都锚定同一串字段。
+_GUARD_LINE_RE = re.compile(
+    r"\[guard\] reach=(\d+) \(calls into guards\) \| enum keys=(\d+) "
+    r"\| journey: wall=(\d+) authed=(\w+) created=(\w+) payloads=(\d+) "
+    r"prompts=(\d+) \| finish: refused=(\d+)"
+)
+
+
+def _int_field(value: object) -> int:
+    """把 JSON 里的计数安全转成 int（缺失/None/坏值都记 0）。"""
+    try:
+        return int(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return 0
+
+
+def _parse_guard(
+    log: str, guard_state: str | Path | None = None
+) -> dict[str, object]:
     """从运行日志里抠出三个守卫的实际介入情况。
 
     守卫的价值全在"它有没有真的介入"。只写代码不观测，就会重演上一轮的
     错误：枚举守卫单测通过、真实日志重放通过，真实运行里却一次都没触发，
     而结果表上看不出区别。
 
+    墙钟 SIGKILL 的那条路径上，汇总行永远不会出现。此时从子进程每次 LLM
+    调用后原子落盘的 ``guard_state`` 文件回退，字段键与日志路径完全一致；
+    ``mount_broken`` 只由该文件的 ``mount_verified`` 标记判定，不再用
+    ``reach == 0`` 推断（被杀死的 run 本来就有可能是 0 次调用）。
+
     Args:
         log: `run_strix_ctf.py` 的完整标准输出。
+        guard_state: 本次 run 的 guard-state 文件；不存在时保留旧语义。
 
     Returns:
-        含 enum/journey/finish 三组计数的字典；日志缺失时给零值。
+        含 enum/journey/finish 三组计数的字典；两条来源都缺失时给零值。
     """
     out: dict[str, object] = {
         "reach": 0,
@@ -578,16 +603,12 @@ def _parse_guard(log: str) -> dict[str, object]:
         "journey_authed": False,
         "journey_created": False,
         "journey_payloads": 0,
+        "journey_prompts": 0,
         "journey_hits": log.count("USER JOURNEY GUARD"),
         "finish_refused": 0,
         "finish_hits": log.count("REFUSED: this summary"),
     }
-    m = re.search(
-        r"\[guard\] reach=(\d+) \(calls into guards\) \| enum keys=(\d+) "
-        r"\| journey: wall=(\d+) authed=(\w+) created=(\w+) payloads=(\d+) "
-        r"prompts=(\d+) \| finish: refused=(\d+)",
-        log,
-    )
+    m = _GUARD_LINE_RE.search(log)
     if m:
         out.update(
             reach=int(m.group(1)),
@@ -602,6 +623,35 @@ def _parse_guard(log: str) -> dict[str, object]:
         # reach=0 说明守卫一次都没被调用过——这一题的守卫数据全是废的，
         # 不能当成"行为良好"的证据。标出来，免得又被读成"今天没触发"。
         out["mount_broken"] = out["reach"] == 0
+        return out
+
+    from ctf_strix.guard_state import read_state
+
+    state = read_state(guard_state)
+    if state is None:
+        # 文件根本不存在：旧语义保留——没有遥测就不能把 reach=0 当成
+        # "守卫装好了但没触发"，一律标成不可信。
+        out["mount_broken"] = True
+        return out
+
+    journey = state.get("journey") or {}
+    finish = state.get("finish") or {}
+    if not isinstance(journey, dict):
+        journey = {}
+    if not isinstance(finish, dict):
+        finish = {}
+    out.update(
+        reach=_int_field(state.get("reach")),
+        enum_keys=_int_field(state.get("enum_keys")),
+        journey_wall=_int_field(journey.get("wall")),
+        journey_authed=bool(journey.get("authed")),
+        journey_created=bool(journey.get("created")),
+        journey_payloads=_int_field(journey.get("payloads")),
+        journey_prompts=_int_field(journey.get("prompts")),
+        finish_refused=_int_field(finish.get("refused")),
+    )
+    # 文件存在时只看启动时 verify_mount 的结果：True→装好了；False→没装上。
+    out["mount_broken"] = not bool(state.get("mount_verified"))
     return out
 
 
@@ -1174,6 +1224,9 @@ def run_agent(
         "--target", target, "--turns", str(turns), "--name", name,
         "--target-kind", target_kind,
         "--instruction", instruction,
+        # 守卫遥测的落盘路径必须由启动方显式给：子进程 stdout 被重定向到
+        # run.log，它自己无从知道父进程把这次 run 的目录放在哪里。
+        "--guard-state", str(box / "guard_state.json"),
         *_deadline_args(timeout_s),
     ]
     started = time.time()
@@ -1437,7 +1490,7 @@ def main() -> int:
             # 守卫是否真的介入了，必须进数据。上一轮枚举守卫装在代码里、
             # 单测通过、真实日志重放也通过，但真实运行里一次都没触发——
             # 如果不记录，这种"装了等于没装"在结果表里完全看不出来。
-            rec["guard"] = _parse_guard(log)
+            rec["guard"] = _parse_guard(log, box / "guard_state.json")
 
             own = host_of(target)
             flag = best_flag(log, own)
