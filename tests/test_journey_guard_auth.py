@@ -101,6 +101,34 @@ def test_cookie_flags_inside_client_segments_still_count(args: str) -> None:
 
 
 @pytest.mark.parametrize(
+    "args",
+    [
+        "cat > notes.sh <<'EOF'\n  EOF\ncurl -H 'Cookie: a=b' http://target/\nEOF",
+        "bash <<EOF\n\tEOF\ncurl -H 'Cookie: a=b' http://target/\nEOF",
+    ],
+)
+def test_indented_terminator_does_not_end_a_plain_heredoc(args: str) -> None:
+    """A space- or tab-indented ``EOF`` is body text for plain ``<<``.
+
+    Ending the body there would expose the following ``curl -H 'Cookie: ...'``
+    line as a command and re-open the authentication false positive.
+    """
+    assert _args_session_signal(args) is False
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        "bash <<-EOF\n\tbody\n\tEOF\ncurl -H 'Cookie: a=b' http://target/",
+        "bash <<-'EOF'\n\tbody\n\tEOF\ncurl -H 'Cookie: a=b' http://target/",
+    ],
+)
+def test_tab_indented_terminator_ends_a_dash_heredoc(args: str) -> None:
+    """``<<-`` strips leading tabs, so its tab-indented terminator is real."""
+    assert _args_session_signal(args) is True
+
+
+@pytest.mark.parametrize(
     "output",
     [
         "HTTP/1.1 200 OK\r\nSet-Cookie: sid=abc; path=/",

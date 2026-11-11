@@ -107,13 +107,17 @@ def _shell_client(token: str) -> str | None:
     return base if base in ("curl", "wget") else None
 
 
-def _heredoc_delimiter(line: str) -> str | None:
-    """Delimiter of a here-document opened on this line, if any.
+def _heredoc_delimiter(line: str) -> tuple[str, bool] | None:
+    """Delimiter of a here-document opened on this line, plus its ``<<-`` flag.
 
     The body of a here-document is data, not a command: a line inside it that
     starts with ``curl`` must not release the guard.  Only an unquoted ``<<``
     followed by a word opens a document; ``$((1<<2))`` and here-strings are
     ignored.
+
+    Returns:
+        ``(delimiter, strip_tabs)``.  ``strip_tabs`` is true for ``<<-``, the
+        only form whose terminator bash accepts with leading tabs.
     """
     quote: str | None = None
     index = 0
@@ -133,7 +137,8 @@ def _heredoc_delimiter(line: str) -> str | None:
             continue
         if line.startswith("<<", index):
             cursor = index + 2
-            if cursor < len(line) and line[cursor] == "-":
+            strip_tabs = cursor < len(line) and line[cursor] == "-"
+            if strip_tabs:
                 cursor += 1
             while cursor < len(line) and line[cursor] in " \t":
                 cursor += 1
@@ -143,14 +148,31 @@ def _heredoc_delimiter(line: str) -> str | None:
                 end = line.find(mark, cursor)
                 word = line[cursor:end] if end >= 0 else ""
                 if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", word):
-                    return word
+                    return word, strip_tabs
                 index = cursor
                 continue
             match = re.match(r"[A-Za-z_][A-Za-z0-9_]*", line[cursor:])
             if match:
-                return match.group(0)
+                return match.group(0), strip_tabs
         index += 1
     return None
+
+
+def _is_heredoc_terminator(line: str, delimiter: str, strip_tabs: bool) -> bool:
+    """Is ``line`` the terminator that closes this here-document?
+
+    The terminator must match the whole line, allowing only the trailing ``\r``
+    of CRLF input.  A space-indented ``  EOF`` is *not* a terminator: bash keeps
+    it as body text, so accepting it would hand the remaining lines to the
+    command scanner——and a following ``curl -H 'Cookie: ...'`` would re-open
+    the authentication false positive this guard exists to prevent.  ``<<-``
+    additionally allows leading tabs (POSIX), which is the only indentation
+    bash accepts for a terminator.
+    """
+    candidate = line[:-1] if line.endswith("\r") else line
+    if strip_tabs:
+        candidate = candidate.lstrip("\t")
+    return candidate == delimiter
 
 
 def _strip_heredoc_bodies(text: str) -> str:
@@ -161,11 +183,14 @@ def _strip_heredoc_bodies(text: str) -> str:
     while index < len(lines):
         line = lines[index]
         kept.append(line)
-        delimiter = _heredoc_delimiter(line)
+        opened = _heredoc_delimiter(line)
         index += 1
-        if delimiter is None:
+        if opened is None:
             continue
-        while index < len(lines) and lines[index].strip() != delimiter:
+        delimiter, strip_tabs = opened
+        while index < len(lines) and not _is_heredoc_terminator(
+            lines[index], delimiter, strip_tabs
+        ):
             index += 1
         index += 1
     return "\n".join(kept)
@@ -211,9 +236,15 @@ def _header_cookie_in_segment(tokens: list[str]) -> bool:
 def _args_session_signal(args: str) -> bool:
     """参数里是否出现"正在使用会话"的通用信号。
 
-    只有命令确实是 curl/wget 时才看它们的 cookie 选项：``-b`` / ``-c`` 这类
-    短选项在别的命令里也有别的含义，token 级门控是为了防 ``python -c`` 误中。
-    显式 Cookie 头不限工具——它本身就是"带着会话发请求"的硬证据。
+    会话证据只认 curl/wget 段内的 cookie 选项与显式 ``Cookie:`` 请求头——
+    ``-H`` 头也走同一道 token 级门控。三类误报因此被排除：
+
+    1. ``-b`` / ``-c`` 在别的命令里另有含义（``grep -c`` 计数、``sort -b``
+       忽略前导空白、``python -c`` 执行代码），只按命令首词判断是不是 curl/wget；
+    2. ``echo`` / ``printf`` / ``python -c`` 里出现的 ``-H 'Cookie: ...'``
+       只是被打印或写进文件的字符串，命令本身没有发出带会话的请求；
+    3. here-document 正文是数据不是命令，先剥离正文再切命令段，
+       ``cat > notes.sh <<'EOF'`` 里的 curl 行不算会话证据。
     """
     if not args:
         return False

@@ -104,11 +104,22 @@ def test_run_id_is_unique_and_carries_challenge() -> None:
     assert all(len(i.split("-")) >= 4 for i in ids)
 
 
-def test_guard_state_path_agrees_with_fresh_box(workdir: Path) -> None:
-    """The sidecar path is derived once, so parent and child cannot drift."""
-    box, _ = _fresh_box("run-name", root=workdir)
+def test_guard_state_path_agrees_with_fresh_box(workdir: Path, monkeypatch) -> None:
+    """Both sides must follow the live ``_BOX_ROOT``, not an import-time copy.
 
-    assert _guard_state_path("run-name", root=workdir) == box / "guard_state.json"
+    A default argument is evaluated once at import, so a signature-level
+    ``root=_BOX_ROOT`` freezes the box directory while the sidecar path reads
+    the global on every call: the two then disagree as soon as the root is
+    overridden.  Only the explicit-argument form was covered before, which is
+    why the frozen default survived.
+    """
+    monkeypatch.setattr(batch_eval, "_BOX_ROOT", str(workdir / "boxes"))
+
+    box, _ = _fresh_box("run-name")
+    sidecar = _guard_state_path("run-name")
+
+    assert box == workdir / "boxes" / "run-name"
+    assert sidecar == box / "guard_state.json"
 
 
 def test_main_records_guard_without_name_error(workdir: Path, monkeypatch) -> None:

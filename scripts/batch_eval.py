@@ -802,7 +802,7 @@ def _wrap_private_tmp(cmd: list[str], box: Path, env: dict[str, str] | None = No
         *cmd,
     ]
 
-def _fresh_box(name: str, root: str | Path = _BOX_ROOT) -> tuple[Path, Path]:
+def _fresh_box(name: str, root: str | Path | None = None) -> tuple[Path, Path]:
     """给一次运行准备**干净**的沙箱目录，返回 (box, log 路径)。
 
     必须是"删了重建"而不是"存在就复用"：复用会让上一轮的
@@ -815,12 +815,15 @@ def _fresh_box(name: str, root: str | Path = _BOX_ROOT) -> tuple[Path, Path]:
 
     Args:
         name: 运行名（唯一）。
-        root: 沙箱根目录，测试时可换成临时目录。
+        root: 沙箱根目录，测试时可换成临时目录；``None`` 表示**调用时**
+            读全局 ``_BOX_ROOT``：默认参数只在 import 时求值一次，写进签名
+            就会冻结，与 ``_guard_state_path`` 的实时读取分叉成两个根。
 
     Returns:
         (沙箱目录, 日志文件路径)，目录已存在且为空。
     """
-    box = Path(root) / name
+    base = Path(root) if root is not None else Path(_BOX_ROOT)
+    box = base / name
     if box.exists():
         shutil.rmtree(box, ignore_errors=True)
     box.mkdir(parents=True, exist_ok=True)
