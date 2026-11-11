@@ -53,6 +53,59 @@ def atomic_write_json(path: str | Path, payload: Mapping[str, Any]) -> bool:
         return False
 
 
+#: v1.1 extension keys, all zero when an older sidecar has only the batch-1
+#: shape.  They never touch the summary line; the line parsers are anchored.
+_V11_DEFAULTS: dict[str, int] = {
+    "endpoint_probe": 0,
+    "endpoint_exec": 0,
+    "endpoint_window": 0,
+    "endpoint_window_probe": 0,
+    "endpoint_window_exec": 0,
+    "negative_groups": 0,
+    "negative_injections": 0,
+    "negative_limit": 0,
+    "truncation_pointers": 0,
+}
+
+
+def _as_int(value: Any) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
+
+
+def v11_fields(state: Mapping[str, Any] | dict[str, Any] | None) -> dict[str, int]:
+    """Read the v1.1 counters out of a sidecar, tolerating old files.
+
+    ``endpoints`` is written by the restart guard (probe vs shell sources);
+    ``negative`` is written by the negative-evidence guard (group and
+    injection counts plus truncation pointers).  A missing section yields
+    zeros, which is the honest "this run predates the field" reading.
+    """
+    out = dict(_V11_DEFAULTS)
+    if not isinstance(state, dict):
+        return out
+    endpoints = state.get("endpoints")
+    if isinstance(endpoints, dict):
+        out.update(
+            endpoint_probe=_as_int(endpoints.get("distinct_probe")),
+            endpoint_exec=_as_int(endpoints.get("distinct_exec")),
+            endpoint_window=_as_int(endpoints.get("window_size")),
+            endpoint_window_probe=_as_int(endpoints.get("window_probe")),
+            endpoint_window_exec=_as_int(endpoints.get("window_exec")),
+        )
+    negative = state.get("negative")
+    if isinstance(negative, dict):
+        out.update(
+            negative_groups=_as_int(negative.get("groups")),
+            negative_injections=_as_int(negative.get("injections")),
+            negative_limit=_as_int(negative.get("limit")),
+            truncation_pointers=_as_int(negative.get("truncation_pointers")),
+        )
+    return out
+
+
 def read_state(path: str | Path | None) -> dict[str, Any] | None:
     """Read a guard-state file, returning ``None`` when it is absent or broken."""
     if path is None:

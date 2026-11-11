@@ -48,6 +48,7 @@ from typing import TYPE_CHECKING, Any, Callable, Final, Sequence
 from urllib.parse import urlsplit
 
 from ctf_strix.enum_guard import MECHANISM_NAMES, _mechanism_of
+from ctf_strix.command_tokens import endpoints_from_arguments
 from ctf_strix.probe_surface import is_probe_tool
 
 if TYPE_CHECKING:
@@ -278,6 +279,8 @@ class RestartGuard:
         self._ep_seen: set[tuple[str, str]] = set()
         self._ep_window: deque[bool] = deque(maxlen=self._window)
         self._ep_ids: set[str] = set()
+        self._ep_window_source: deque[str] = deque(maxlen=self._window)
+        self._ep_source_seen: Counter[str] = Counter()
         self._last_origin: str | None = None
 
         self._issued: Counter[str] = Counter()
@@ -296,18 +299,55 @@ class RestartGuard:
             self._mech_window.append(novel)
             self._last_mechanism = mechanism
 
-    def note_endpoint(self, origin: str, path: str, request_id: str = "") -> None:
-        """Record one request into the T3 window."""
+    def note_endpoint(
+        self, origin: str, path: str, request_id: str = "", source: str = "probe"
+    ) -> None:
+        """Record one request into the T3 window.
+
+        ``source`` is ``probe`` for the traffic ledger written by ``http_probe``
+        and ``exec`` for a URL parsed out of a shell ``curl``/``wget`` call.
+        The window itself is unchanged (capacity 20, FIFO, novelty flag); the
+        source tag exists only so the guard-state sidecar can separate them.
+        """
 
         with self._lock:
             key = (origin, path)
             novel = key not in self._ep_seen
             self._ep_seen.add(key)
             self._ep_window.append(novel)
+            self._ep_window_source.append(source)
+            if novel:
+                self._ep_source_seen[source] += 1
             if origin:
                 self._last_origin = origin
             if request_id and request_id not in self._ep_ids:
                 self._ep_ids.add(request_id)
+
+    def note_exec_endpoint(self, origin: str, path: str) -> bool:
+        """Record a shell-issued endpoint, de-duplicated before it enters T3.
+
+        Repeated identical URLs are the autopsy's failure shape: letting each
+        repetition fill the 20-slot window turns it into a single-endpoint
+        window and destroys the very signal T3 reads.  A URL already known
+        from the probe ledger is also skipped -- it adds no novelty.
+        """
+        with self._lock:
+            if (origin, path) in self._ep_seen:
+                return False
+            self.note_endpoint(origin, path, source="exec")
+            return True
+
+    def endpoint_sources(self) -> dict[str, int]:
+        """Per-source endpoint counters for the guard-state sidecar."""
+        with self._lock:
+            window_probe = sum(1 for tag in self._ep_window_source if tag == "probe")
+            return {
+                "distinct_probe": int(self._ep_source_seen.get("probe", 0)),
+                "distinct_exec": int(self._ep_source_seen.get("exec", 0)),
+                "window_size": len(self._ep_window),
+                "window_probe": window_probe,
+                "window_exec": len(self._ep_window_source) - window_probe,
+            }
 
     def sync_ledger(self) -> None:
         """Consume new exchanges from the traffic ledger (read-only)."""
@@ -499,6 +539,15 @@ class RestartGuard:
 
         if not is_probe_tool(tool_name):
             return None
+        if tool_name == "exec_command":
+            # G1: a shell curl/wget reaches the target but never touches the
+            # http_probe ledger, so T3 used to be blind to the commonest run
+            # shape.  Feed the same window; repeated URLs are de-duplicated.
+            try:
+                for origin, path in endpoints_from_arguments(args or ""):
+                    self.note_exec_endpoint(origin, path)
+            except Exception:  # noqa: BLE001 - parsing must not break the tool
+                logger.warning("restart guard URL scan failed", exc_info=True)
         try:
             mechanism = self._mechanism_of(args or "")
         except Exception:  # noqa: BLE001 - classification is best effort
@@ -597,4 +646,5 @@ def stats() -> dict[str, Any]:
         "l3_ready": state.l3_ready,
         "issued": {level: guard.issued(level) for level in (L1, L2, L3)},
         "limits": dict(LIMITS),
+        "endpoints": guard.endpoint_sources(),
     }

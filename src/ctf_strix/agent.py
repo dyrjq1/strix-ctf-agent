@@ -2569,6 +2569,12 @@ def _run_agent(
 
     install_mount_hook()
 
+    # G4/G5 sit on the same seam.  Installed first so the response signature
+    # sees the bounded result before other guards append advice.
+    from ctf_strix.negative_guard import install as install_negative_guard
+
+    negative_guard = install_negative_guard()
+
     # Parallel hypothesis racing is opt-in.  The hook wraps create_agent /
     # agent_finish / finish_scan on the same mount seam as the other guards, so
     # it covers the shell and filesystem paths a child agent also uses.
@@ -2826,6 +2832,7 @@ def _run_agent(
             "_ctf_journey_guarded",
             "_ctf_sweep_guarded",
             "_ctf_target_guarded",
+            "_ctf_negative_guarded",
         )
     )
     print(f"[ctfy] guard mount verified={wired}", flush=True)
@@ -3425,6 +3432,8 @@ def _run_agent(
             # summary is the only place an operator can see that a family was
             # hard-blocked (and how many paid retries it swallowed).
             out_now["enum_guard"] = enum_guard.stats()
+        if negative_guard is not None:
+            out_now["negative_guard"] = negative_guard.stats()
             print(
                 "[ctfy] enum guard: "
                 f"blocked_calls={enum_guard.blocked_calls} "

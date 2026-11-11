@@ -27,11 +27,12 @@
 
 from __future__ import annotations
 
-import json
 import re
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
+from ctf_strix.command_tokens import command_text as _shared_command_text
+from ctf_strix.command_tokens import segments as _command_segments
 from ctf_strix.probe_surface import PROBE_TOOLS
 
 if TYPE_CHECKING:
@@ -99,23 +100,13 @@ def _command_text(args: str) -> str:
     "执行了 curl" 和 "在 python 脚本里打印了字符串 curl"，也能把 JSON 转义
     的引号还原成正常引号供 Cookie 头匹配。
     """
-    try:
-        data = json.loads(args)
-    except (TypeError, ValueError):
-        return args
-    if isinstance(data, dict):
-        for key in ("command", "cmd", "script", "chars"):
-            value = data.get(key)
-            if isinstance(value, str):
-                return value
-    return args
+    return _shared_command_text(args)
 
 
 def _has_shell_cookie_client(text: str) -> bool:
     """是否至少有一条命令以 curl / wget 开头。"""
-    for segment in re.split(r"[;&|\n]+", text):
-        candidate = segment.strip().lstrip("(`")
-        if _SHELL_CURL_WGET_RE.match(candidate):
+    for tokens in _command_segments(text):
+        if _SHELL_CURL_WGET_RE.match(tokens[0]):
             return True
     return False
 

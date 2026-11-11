@@ -595,6 +595,8 @@ def _parse_guard(
     Returns:
         含 enum/journey/finish 三组计数的字典；两条来源都缺失时给零值。
     """
+    from ctf_strix.guard_state import read_state, v11_fields
+
     out: dict[str, object] = {
         "reach": 0,
         "enum_keys": 0,
@@ -607,6 +609,7 @@ def _parse_guard(
         "journey_hits": log.count("USER JOURNEY GUARD"),
         "finish_refused": 0,
         "finish_hits": log.count("REFUSED: this summary"),
+        **v11_fields(None),
     }
     m = _GUARD_LINE_RE.search(log)
     if m:
@@ -623,9 +626,9 @@ def _parse_guard(
         # reach=0 说明守卫一次都没被调用过——这一题的守卫数据全是废的，
         # 不能当成"行为良好"的证据。标出来，免得又被读成"今天没触发"。
         out["mount_broken"] = out["reach"] == 0
+        # v1.1 counters are only in the sidecar; the line format is frozen.
+        out.update(v11_fields(read_state(guard_state)))
         return out
-
-    from ctf_strix.guard_state import read_state
 
     state = read_state(guard_state)
     if state is None:
@@ -649,6 +652,7 @@ def _parse_guard(
         journey_payloads=_int_field(journey.get("payloads")),
         journey_prompts=_int_field(journey.get("prompts")),
         finish_refused=_int_field(finish.get("refused")),
+        **v11_fields(state),
     )
     # 文件存在时只看启动时 verify_mount 的结果：True→装好了；False→没装上。
     out["mount_broken"] = not bool(state.get("mount_verified"))

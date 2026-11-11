@@ -147,8 +147,36 @@ def _guard_summary(guard: object, journey_state: object, finisher: object, reach
     )
 
 
+_EMPTY_ENDPOINTS: dict[str, int] = {
+    "distinct_probe": 0,
+    "distinct_exec": 0,
+    "window_size": 0,
+    "window_probe": 0,
+    "window_exec": 0,
+}
+
+
+def _endpoint_sources() -> dict[str, int]:
+    """Endpoint-source counters from the process-wide restart guard.
+
+    ``guard`` in this payload is the enumeration guard (it owns the mechanism
+    counts); the T3 window belongs to the restart guard singleton, which the
+    mount hook has already connected to every tool.
+    """
+    try:
+        from ctf_strix.restart_guard import current as current_restart_guard
+
+        return current_restart_guard().endpoint_sources()
+    except Exception:  # noqa: BLE001 - telemetry must never break the run
+        return dict(_EMPTY_ENDPOINTS)
+
+
 def _guard_state_payload(
-    guard: object, journey_state: object, finisher: object, mount_verified: bool
+    guard: object,
+    journey_state: object,
+    finisher: object,
+    mount_verified: bool,
+    negative: object | None = None,
 ) -> dict[str, object]:
     """State needed to rebuild the summary line after a SIGKILL.
 
@@ -174,6 +202,14 @@ def _guard_state_payload(
         },
         "mechanisms": {name: int(count) for name, count in counts.items()},
         "mount_verified": bool(mount_verified),
+        # v1.1: the frozen summary line stays byte-identical; new counters are
+        # sidecar-only and read back by ``_parse_guard``.
+        "endpoints": _endpoint_sources(),
+        "negative": (
+            negative.stats()
+            if negative is not None
+            else {"groups": 0, "injections": 0, "limit": 0, "truncation_pointers": 0}
+        ),
     }
 
 
@@ -207,6 +243,19 @@ async def main() -> int:
 
     install_mount_hook()
     print("[guard] mount hook installed (exec_command/write_stdin now covered)")
+
+    # G4/G5 live on the same seam, and are installed first so they see the
+    # bounded (truncated) result before other guards append their advice: the
+    # response signature must not drift when an unrelated hint fires.
+    from ctf_strix.negative_guard import K as NEGATIVE_K
+    from ctf_strix.negative_guard import LIMITS as NEGATIVE_LIMITS
+    from ctf_strix.negative_guard import install as install_negative_guard
+
+    negative = install_negative_guard()
+    print(
+        f"[guard] negative-evidence guard installed "
+        f"(K={NEGATIVE_K}, L4={NEGATIVE_LIMITS['L4']}/run, truncation pointer on)"
+    )
 
     # 枚举收敛必须由程序强制，不能只写在 prompt 里。实测两版文字规则都没拦住
     # CTFARENA-018 反复刷同一族端点——上下文里的自我约束会随轮次衰减，计数器不会。
@@ -282,7 +331,14 @@ async def main() -> int:
     # 白烧了 1170 秒。宁可启动时打一行 WARNING。
     from ctf_strix.guard_mount import verify_mount
 
-    wired = verify_mount(("_ctf_guarded", "_ctf_journey_guarded", "_ctf_sweep_guarded"))
+    wired = verify_mount(
+        (
+            "_ctf_guarded",
+            "_ctf_journey_guarded",
+            "_ctf_sweep_guarded",
+            "_ctf_negative_guarded",
+        )
+    )
     print(f"[guard] mount verified={wired} (exec_command reaches guards)")
 
     # 遥测也必须能在墙钟 SIGKILL 下存活：汇总行只在正常收尾时打印，被杀的那次
@@ -295,7 +351,7 @@ async def main() -> int:
     )
     guard_writer = guard_state_mod.install(
         guard_state_path,
-        lambda: _guard_state_payload(guard, journey.state, finisher, wired),
+        lambda: _guard_state_payload(guard, journey.state, finisher, wired, negative),
     )
     print(f"[guard] state file {guard_state_path}")
 

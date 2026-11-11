@@ -173,6 +173,7 @@ def test_verify_mount_is_asked_for_every_guard_mark() -> None:
         "_ctf_journey_guarded",
         "_ctf_sweep_guarded",
         "_ctf_target_guarded",
+        "_ctf_negative_guarded",
     }, f"verify_mount must require every guard mark, got {literal}"
 
 

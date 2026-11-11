@@ -949,7 +949,15 @@ def parse_guard(log: str, guard_state: Path | None = None) -> dict[str, Any]:
     same numbers; when the line is absent the keys are filled from it, and the
     result keys do not change.
     """
-    out: dict[str, Any] = {"reach": 0, "journey_prompts": 0, "enum_hits": 0}
+    from ctf_strix.guard_state import read_state as _read_state
+    from ctf_strix.guard_state import v11_fields as _v11_fields
+
+    out: dict[str, Any] = {
+        "reach": 0,
+        "journey_prompts": 0,
+        "enum_hits": 0,
+        **_v11_fields(None),
+    }
     m = re.search(
         r"\[guard\] reach=(\d+) \(calls into guards\) \| enum keys=\d+ "
         r"\| journey: wall=(\d+) authed=(\w+) created=(\w+) payloads=(\d+) "
@@ -979,6 +987,9 @@ def parse_guard(log: str, guard_state: Path | None = None) -> dict[str, Any]:
             except (TypeError, ValueError):
                 pass
     out["enum_hits"] = log.count("ENUMERATION GUARD")
+    # v1.1 counters live only in the sidecar; merge them without touching the
+    # fields the line path already established.
+    out.update(_v11_fields(_read_state(guard_state)))
     return out
 
 
