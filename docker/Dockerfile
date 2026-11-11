@@ -79,6 +79,37 @@ RUN set -eux; \
     apt-get install -y --no-install-recommends /tmp/radare2.deb; \
     rm -rf /var/lib/apt/lists/* /tmp/radare2.deb
 
+# 字典层（1.3.2）：技能卡硬引用的字典此前镜像里并不存在，是空承诺。
+# 全部钉上游 commit + sha256，构建期校验，错一个字节构建即失败。
+# a) /opt/wordlists 三张（SecLists）：目录/参数爆破。ctx-v1 复跑日志实证
+#    agent 在镜像里找不到任何字典，ffuf 只能逐个手写候选。
+# b) /usr/share/wordlists/metasploit 七张：ctf-web 卡多处「必须用现有 Kali
+#    字典」硬引用这些路径（burnett_top_1024 等）。
+# c) /usr/share/dict/words：classic-ciphers 英文判频脚本引用。
+# rockyou 不装（134MB；steganography.md 已注明不在镜像内）。
+ARG SECLISTS_SHA=758fecf4925900dd1bd0a3cba39551d6b4f2da8c
+ARG MSF_SHA=7e91b9f08618bc5b81d1ab03c6076e98fc3fe800
+ARG WORDS_URL="https://raw.githubusercontent.com/dwyl/english-words/20f5cc9b3f0ccc8ce45d814c532b7c2031bba31c/words_alpha.txt"
+ARG WORDS_SHA256=3ed0c94610d8bcf7c11bbb49c56aa49c7234d32b66824df91f554169e572da48
+RUN set -eux; \
+    mkdir -p /opt/wordlists /usr/share/wordlists/metasploit /usr/share/dict; \
+    sec="https://raw.githubusercontent.com/danielmiessler/SecLists/${SECLISTS_SHA}/Discovery/Web-Content"; \
+    msf="https://raw.githubusercontent.com/rapid7/metasploit-framework/${MSF_SHA}/data/wordlists"; \
+    get() { wget -q -O "$2" "$1"; echo "$3  $2" | sha256sum -c -; }; \
+    get "$sec/common.txt" /opt/wordlists/common.txt 47fb86ca6fb3f97e5491161581900d6d99851fb16764eacddf16aa85617c956a; \
+    get "$sec/burp-parameter-names.txt" /opt/wordlists/params.txt 91f7e457415ffd0e4278d13887804036b62240a135a022a6fd6e831a7151899f; \
+    get "$sec/raft-small-words.txt" /opt/wordlists/small.txt 1aadf7dafde5ca68f5e5160c9206f7be6f6fc701775cdea30ba01bbb6d8db8ad; \
+    get "$msf/burnett_top_1024.txt" /usr/share/wordlists/metasploit/burnett_top_1024.txt 586d1afd52aeadf7310cbea53a3271d31f16395a2099f291ecca0afcb65054eb; \
+    get "$msf/unix_passwords.txt" /usr/share/wordlists/metasploit/unix_passwords.txt ca72dd6853b6f74dbae1ee1be4e50b7d71194db51b45f17cfcac4d625f7cecc0; \
+    get "$msf/burnett_top_500.txt" /usr/share/wordlists/metasploit/burnett_top_500.txt 1b8a3bf5d9d8f7241480cf9437abe0f950bac7abe31038f9ff22d8381076f554; \
+    get "$msf/http_default_pass.txt" /usr/share/wordlists/metasploit/http_default_pass.txt 016547a9de2de022a431645eece8f613c525ca8a78fe445703b73a7891285a87; \
+    get "$msf/http_default_userpass.txt" /usr/share/wordlists/metasploit/http_default_userpass.txt ca96e35d7208be42d12737350d763683f2771e84a21a04f7a60550f83a7077b7; \
+    get "$msf/http_default_users.txt" /usr/share/wordlists/metasploit/http_default_users.txt 68fc4711646f3cab6d3cd434e21cbab6ff3b84c6007aa7853567795f55e87b78; \
+    get "$msf/tomcat_mgr_default_userpass.txt" /usr/share/wordlists/metasploit/tomcat_mgr_default_userpass.txt 527f3d2ba8ac90985f7ec4a6afa0ae234c5b174345d2d62a41cd02a7300ceed5; \
+    wget -q -O /usr/share/dict/words "$WORDS_URL"; \
+    echo "$WORDS_SHA256  /usr/share/dict/words" | sha256sum -c -; \
+    chmod 644 /opt/wordlists/*.txt /usr/share/wordlists/metasploit/*.txt /usr/share/dict/words
+
 WORKDIR /app
 
 # 依赖先装，源码后拷——改代码不会让依赖层失效，重建只要几秒。
