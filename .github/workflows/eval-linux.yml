@@ -53,7 +53,9 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-          cache: pip
+          # No pip cache: this repository only ships requirements.lock, and
+          # setup-python's cache lookup hard-fails on repositories without a
+          # requirements.txt / pyproject.toml.
 
       - name: Install locked dependencies
         run: |
