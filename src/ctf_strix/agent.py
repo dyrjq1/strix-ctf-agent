@@ -2029,6 +2029,17 @@ def main() -> int:
             # so an A/B can tell a parallel run from a single-threaded one
             # without parsing the human-readable writeup.
             payload["parallel"] = parallel_diag
+        # Guard counters are the only evidence that separates "the guard warned
+        # and the model ignored it" from "the guard never fired"; they used to
+        # live in the snapshot but never reach the graded artifact.
+        for guard_key in ("finish_guard", "sweep_guard"):
+            guard_diag = diag.get(guard_key) if isinstance(diag, dict) else None
+            if guard_diag is not None:
+                payload[guard_key] = guard_diag
+        if isinstance(diag, dict) and diag.get("silent_stop"):
+            # A clean return with no finish call and no answer used to look the
+            # same as any other unsuccessful run.
+            payload["silent_stop"] = True
         # result.json is the graded artifact: land it before any network I/O.
         # ``publisher.publish`` is synchronous (DNS, redirects, unreachable
         # endpoints) and can burn the whole shutdown reserve; if it ran first,
@@ -2318,6 +2329,19 @@ def install_toolset(task: dict[str, Any], kind: str) -> tuple[str, list[str]]:
     if install_soft_deadline(soft_seconds, _turn_budget(task)) is not None:
         print(f"[ctfy] soft deadline {soft_seconds:.0f}s installed", flush=True)
 
+    # 轮次倒计时守卫：预算耗尽裸崩（MaxTurnsExceeded、result=None）的收敛
+    # 通道。装在软截止之后——两者替换同一个包装点，后装的提示落在最外层。
+    try:
+        from ctf_strix import turn_budget
+
+        turn_budget.install()
+        print("[ctfy] turn budget guard installed", flush=True)
+    except Exception as exc:  # noqa: BLE001
+        print(
+            f"[ctfy] turn budget guard failed: {type(exc).__name__}: {exc}",
+            flush=True,
+        )
+
     # 附件题（rev/pwn/misc/crypto）才装文件入口原语；web 题不为它付 schema token。
     if kind in ("file", "tcp"):
         try:
@@ -2358,11 +2382,15 @@ def install_toolset(task: dict[str, Any], kind: str) -> tuple[str, list[str]]:
         from ctf_strix import skillpack
 
         names = skillpack.register()
+        # Method cards are keyed on tags, not on the skill pack: compute the
+        # hint even when no index registered, so a broken pack still gets them.
+        hint = skillpack.prompt_hint(names, kind=kind, tags=skillpack.tags_of(task))
         if names:
-            hint = skillpack.prompt_hint(names, kind=kind)
             print(f"[ctfy] skills registered={len(names)} ref={skillpack.ref_root()}", flush=True)
         else:
-            print("[ctfy] skills pack missing, routing hint not installed", flush=True)
+            print("[ctfy] skills pack missing, routing hint skipped", flush=True)
+        if hint:
+            print(f"[ctfy] user hint chars={len(hint)}", flush=True)
     except Exception as exc:  # noqa: BLE001 — 技能装不上也要能把题跑完
         print(f"[ctfy] skills registration failed: {type(exc).__name__}: {exc}", flush=True)
 
@@ -2607,7 +2635,9 @@ def _run_agent(
     # 和 v2 原语漏装（capabilities.py 模块文档记的同一类事故）是一个形态。
     from ctf_strix.sweep_guard import install as install_sweep_guard
 
-    install_sweep_guard()
+    # Keep the instance: without it the injected [SWEEP GUARD] text never reaches
+    # result.json, and a run that was warned looks identical to one that was not.
+    sweep_guard = install_sweep_guard()
 
     # Path-independent "the target is not there" guard.  ``enum_guard`` counts
     # per path family, so a single run's 95 curls at 95 distinct paths never
@@ -3363,6 +3393,11 @@ def _run_agent(
             # family produced no new information, so re-probing it is still
             # wasted work.
             enum_guard.soft_reset()
+            # 轮次倒计时按 attempt 复位：预算是 _attempt_turns 按 attempt 切
+            # 出来的，守卫计数必须与本 attempt 的真实预算一致。
+            from ctf_strix.turn_budget import reset_current as _reset_turn_budget
+
+            _reset_turn_budget(budget)
             try:
                 result = await run_strix_scan(
                     scan_config=config,
@@ -3443,6 +3478,10 @@ def _run_agent(
             )
         if finish_guard is not None and finish_guard.probe_note:
             out_now["checker_probe_note"] = finish_guard.probe_note
+        if finish_guard is not None:
+            out_now["finish_guard"] = finish_guard.stats()
+        if sweep_guard is not None:
+            out_now["sweep_guard"] = sweep_guard.stats()
         out_now.update(diag)
         if parallel_on:
             # Tokens are process-wide already; turns are root-only in the vendor
@@ -3521,6 +3560,24 @@ def _run_agent(
             _publish(force=True, background=False)
 
         turns, out = _snapshot_stats()
+        # 模型用纯文本收尾：run 正常返回，但既没调 finish_scan、也没有答案。
+        # 在 jsonl 里这和「真失败」同形，所以单独打标，事后统计才分得开。
+        #
+        # 两个计数器的语义决定这条判定：``refusals`` 只在「无 flag 的 finish
+        # 被拒」时增长，``allowed`` 只在放行时增长（正常通过、探针判定解出、
+        # 或拒满 ``_MAX_REFUSALS`` 后放弃）。两者都是 0 才说明这次 run 从头到
+        # 尾没碰过 finish_scan；「拒收后放行」会让两者都 > 0，那是失败收尾而
+        # 不是静默自停，不能被标进来。
+        if (
+            attempts > 0
+            and runs_ok > 0
+            and not answers
+            and not getattr(success, "solved", False)
+            and finish_guard is not None
+            and finish_guard.refusals == 0
+            and finish_guard.allowed == 0
+        ):
+            out["silent_stop"] = True
         if attempts > 0 and runs_ok == 0 and not answers and turns_exhausted:
             # Ran to the turn cap without ever finishing.  This is the same verdict
             # as an exhausted recovery guard, so upper layers can use one spelling.

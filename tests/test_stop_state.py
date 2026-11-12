@@ -270,3 +270,50 @@ def test_stop_in_second_attempt_counts_both(tmp_path, run_env, monkeypatch) -> N
     assert seen["n"] == 2
     assert payload["stop_reason"] == "recovery_exhausted"
     assert payload["turns"] == first_calls + second_calls
+
+
+def test_silent_stop_is_marked_when_a_run_ends_without_finish(
+    tmp_path, run_env, monkeypatch
+) -> None:
+    """纯文本收尾：正常返回、没调 finish_scan、没有答案。
+
+    jsonl 里这种收尾和真失败同形（都有工具调用、都没有异常），只能靠一个
+    显式标记把它们分开。
+    """
+    _write_task(tmp_path)
+    monkeypatch.setattr(runner_mod, "run_strix_scan", _fake_runner(None))
+
+    assert agent_mod.main() == 0
+
+    payload = _payload(tmp_path)
+    assert payload["stop_reason"] == "completed"
+    assert payload["silent_stop"] is True
+    assert payload["finish_guard"] == {"refusals": 0, "allowed": 0, "gave_up": 0}
+
+
+def test_silent_stop_absent_when_the_run_captured_a_flag(
+    tmp_path, run_env, monkeypatch
+) -> None:
+    """正常解出的 run 不能被打上静默自停的标记。"""
+
+    async def _run(**kwargs):
+        sink = kwargs["event_sink"]
+        sink("root", _event("tool_call_item", call_id="hit"))
+        sink(
+            "root",
+            _event(
+                "tool_call_output_item",
+                call_id="hit",
+                output=f"http://127.0.0.1:9 -> {FLAG}",
+            ),
+        )
+        return types.SimpleNamespace()
+
+    _write_task(tmp_path)
+    monkeypatch.setattr(runner_mod, "run_strix_scan", _run)
+
+    assert agent_mod.main() == 0
+
+    payload = _payload(tmp_path)
+    assert payload["answers"] == {"flag": FLAG}
+    assert "silent_stop" not in payload

@@ -102,6 +102,29 @@ def test_counters_split_warn_and_hard() -> None:
     assert guard.worst >= SWEEP_HARD + 20
 
 
+def test_stats_reports_all_four_counters() -> None:
+    """result.json 只能看到 stats()，四个计数少一个就归不了因。"""
+    guard = SweepGuard()
+    mid = "?" + "&".join(f"id={i}" for i in range(SWEEP_WARN + 2))
+    big = "?" + "&".join(f"id={i}" for i in range(SWEEP_HARD + 20))
+
+    guard.check("exec_command", mid)
+    guard.check("exec_command", big)
+
+    stats = guard.stats()
+    assert set(stats) == {"hits", "warn", "hard", "worst"}
+    assert (stats["hits"], stats["warn"], stats["hard"]) == (2, 1, 1)
+    assert stats["worst"] >= SWEEP_HARD + 20
+
+
+def test_stats_stay_zero_without_a_hit() -> None:
+    """没命中时快照必须是全零，否则"没触发"和"触发过"在数据上同形。"""
+    guard = SweepGuard()
+
+    assert guard.check("http_probe", '{"url": "https://x.test/admin"}') is None
+    assert guard.stats() == {"hits": 0, "warn": 0, "hard": 0, "worst": 0}
+
+
 def test_install_marks_exec_command(monkeypatch) -> None:
     """接线本身：install 之后，走过 `_with_bounded_result` 的工具必须带标记。
 

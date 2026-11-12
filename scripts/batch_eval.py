@@ -497,6 +497,75 @@ class Client:
             pass  # 删不掉不算错，TTL 会兜底
 
 
+#: 传输层异常的判定词：限定名里出现这些子串即视为 LLM 链路/socket 级崩溃。
+#: 机制级名单（按模块前缀 + 常见异常名），不针对任何具体题或具体文案。
+_TRANSPORT_MARKS = (
+    "httpx.",
+    "httpcore.",
+    "anyio.",
+    "openai.",
+    "litellm.",
+    "ssl.SSLError",
+    "ConnectionError",
+    "ConnectionResetError",
+    "ConnectionAbortedError",
+    "BrokenPipeError",
+    "TimeoutError",
+    "ReadError",
+    "WriteError",
+    "ConnectError",
+    "ConnectTimeout",
+    "ReadTimeout",
+    "WriteTimeout",
+    "RemoteProtocolError",
+    "LocalProtocolError",
+    "ProtocolError",
+    "IncompleteRead",
+    "SocketError",
+)
+
+
+def _is_transport_error(qualified_type: str) -> bool:
+    """异常限定名是否属于传输层（LLM 链路 / socket）崩溃。
+
+    Args:
+        qualified_type: ``[run-error]`` 行解析出的 ``module.TypeName``。
+
+    Returns:
+        属于传输层返回 True，该 run 在结果表里记 ``transport:<type>``，
+        与"能力不足的正常失败"区分开。
+    """
+    return any(mark in qualified_type for mark in _TRANSPORT_MARKS)
+
+
+def _crash_error(log: str) -> tuple[str, str] | None:
+    """从 run.log 文本解析子进程崩溃标记，返回 ``(error, detail)``。
+
+    标记来源有两处：``run_strix_ctf.py`` 异常收场时打的 ``[run-error]``
+    行，以及 ``run_agent`` 在子进程负/异常退出码时打的 ``[agent-exit]``
+    行。轮次打满（``MaxTurnsExceeded``）是正常收场，返回 ``None``。
+
+    Args:
+        log: 子进程完整日志文本。
+
+    Returns:
+        ``(error, detail)``；detail 可能为空串。没有崩溃标记时返回 None。
+    """
+    m_err = re.search(r"^\[run-error\] ([\w.]+): (.*)$", log, re.M)
+    m_rc = re.search(r"^\[agent-exit\] rc=(-?\d+)$", log, re.M)
+    if m_err:
+        etype = m_err.group(1)
+        if "MaxTurnsExceeded" in etype:
+            return None  # 轮次打满是收场，不是错误
+        detail = m_err.group(2)[:300]
+        if _is_transport_error(etype):
+            return f"transport:{etype}", detail
+        return f"crash:{etype}", detail
+    if m_rc:
+        return f"agent-exit:rc{m_rc.group(1)}", ""
+    return None
+
+
 def _probe_tcp(endpoint: str, attempts: int = 3) -> tuple[bool, str]:
     """探测 TCP 桥是否真的能连（不发 HTTP）。
 
@@ -1283,6 +1352,11 @@ def run_agent(
             fh.write(f"\n[WALLCLOCK TIMEOUT after {timeout_s}s]\n")
             fh.flush()
             _kill_group(proc)
+        # 崩溃取证：子进程负退出（信号）或异常退出码时留一条机器可读行。
+        # 退出码本身消失后，"崩在 import"和"正常跑完没解出"在日志上无法区分。
+        if proc.returncode not in (0, None):
+            fh.write(f"\n[agent-exit] rc={proc.returncode}\n")
+            fh.flush()
     text = log.read_text(encoding="utf-8", errors="ignore")
     # 把持久化的用量补写成与 run_strix_ctf 相同的格式，末尾追加。
     # 被 SIGKILL 的那条路径下，这是唯一还能拿到的数字。
@@ -1497,6 +1571,14 @@ def main() -> int:
             rec["tool_calls"] = log.count(" TOOL ")
             rec["turn_capped"] = "MaxTurnsExceeded" in log
             rec["wallclock_hit"] = "WALLCLOCK TIMEOUT" in log
+            # 崩溃进结果表：子进程里的异常和负退出码此前只留在 run.log 里，
+            # 结果表一律 error=None——008 的传输断流就是这么被记成"正常失败"
+            # 的，非能力损失（该重跑的证据）完全不可见。
+            crash = _crash_error(log)
+            if crash:
+                rec["error"], detail = crash
+                if detail:
+                    rec["error_detail"] = detail
 
             # 不能"排序取最后一个"，也不能只做不带靶机信息的启发式。
             # 实测踩过三种误判，全部由 flag_extract 处理：

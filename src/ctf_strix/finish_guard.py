@@ -63,9 +63,39 @@ _REFUSAL = {
         "reading the actual data.\n"
         "  3. If you never authenticated, the access-control bug is behind a session you "
         "have not created yet — register, log in, then walk IDs around your own.\n"
+        "  4. If you are stuck because 'the route does not exist', stop guessing "
+        "paths one by one. Map the real surface first: run route_map against the "
+        "live host to list actual API paths, method_sweep a candidate path to see "
+        "which method answers, and grep the JS/asset files you already downloaded "
+        "for fetch/axios/API URL strings — the endpoint is usually named there. "
+        "Route discovery tools exist for exactly this; use them instead of more "
+        "manual guesses.\n"
         "Call finish_scan again only once the flag string is in this summary."
     ),
 }
+
+#: 第 2 次拒绝起追加的换向指令。
+#:
+#: 实测：连收三次同一段「回去拿 flag」的通用文案后，模型会把同一份白卷
+#: summary 原样再交一次，然后开一条和上次一模一样的线——文案本身没有指出
+#: 「你正在重复」。所以第 2 次起要求它先点名一个**本次运行尚未试过的机制**，
+#: 把「再来一次」变成一次显式选择。措辞停在机制级、不出现任何题面特定字符串，
+#: 才能在所有题上复用。
+_REDIRECT = (
+    "\n\n[CHANGE MECHANISM] The previous refusal changed nothing: do not call "
+    "finish_scan again with the same summary — that is a wasted turn. Before you "
+    "try to finish again, name ONE mechanism this run has not exercised yet, "
+    "then exercise it:\n"
+    "  - authn/authz bypass: a session, role, or identity you have not held\n"
+    "  - parameter pollution or type confusion on an endpoint you already reached\n"
+    "  - the background / scheduled / job path instead of the request path\n"
+    "  - configuration or metadata disclosure: the app's own config, env, "
+    "manifest, or backup artifacts\n"
+    "  - an information-disclosure entry point you have not opened (debug "
+    "endpoint, verbose error, directory listing, export/download)\n"
+    "Repeating the same finish_scan without a different mechanism will be "
+    "refused again."
+)
 
 
 def _echo_refusal(flags: list[str]) -> dict[str, Any]:
@@ -122,6 +152,9 @@ class FinishGuard:
         """
         self.refusals = 0
         self.allowed = 0
+        # 拒满 ``_MAX_REFUSALS`` 后放行时置位：这一次是「放弃收尾」，不是
+        # 「通过收尾」。事后统计要能把白卷与正常收工分开。
+        self.gave_up = False
         self.require_flag = require_flag
         # A structured success ledger, when the caller wires one in.  The guard
         # only reports a flag it already validated; it never inspects prose.
@@ -206,11 +239,15 @@ class FinishGuard:
             return None
         if self.refusals >= _MAX_REFUSALS:
             self.allowed += 1
+            self.gave_up = True
             return None
         self.refusals += 1
-        if echo_only:
-            return _echo_refusal(echo_only)
-        return dict(_REFUSAL)
+        base = _echo_refusal(echo_only) if echo_only else dict(_REFUSAL)
+        if self.refusals >= 2:
+            # 第 1 次已经把「回去拿 flag」说清楚了；第 2 次起必须要求换向，
+            # 否则模型只会把同一份白卷再交一次。
+            base["error"] = base["error"] + _REDIRECT
+        return base
 
     async def check_async(self, raw_input: str) -> dict[str, Any] | None:
         """Async variant used by the tool wrapper.
@@ -267,6 +304,14 @@ class FinishGuard:
         if refusal is not None or not needs_probe:
             return refusal
         return self._after_probe(echo_only)
+
+    def stats(self) -> dict[str, int]:
+        """收工守卫的计数快照，供 result.json 事后归因。"""
+        return {
+            "refusals": self.refusals,
+            "allowed": self.allowed,
+            "gave_up": int(self.gave_up),
+        }
 
 
 def install(

@@ -19,10 +19,12 @@ only adapt its ``create()`` signature to strix's backend contract.
 
 from __future__ import annotations
 
+import functools
 import io
 import itertools
 import logging
 import os
+import re
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -67,6 +69,28 @@ _CAIDO_PROXY_KEYS = (
     "ALL_PROXY",
 )
 
+#: runner 进程凭据类变量。``unix_local.py`` 构造每次 exec 的环境时用
+#: ``os.environ.copy()`` 打底，runner 的全部环境变量原样进沙箱——模型跑一句
+#: ``env`` 就能读到解题用的 LLM key,且已实际发生过:一次失败 run 把 key
+#: 当成答案字符串提交(裸 hex 恰好命中答案形状)。
+#:
+#: 生效点必须在 ``UnixLocalSandboxClient._resolved_exec_context`` 的返回值上:
+#: 它先 ``os.environ.copy()`` 再 ``manifest.environment.resolve()`` update——
+#: resolve 只增/覆盖不删除，所以在 manifest 层 pop 对 runner 环境来的键无效
+#: (第一版踩过)。也不能直接清 runner 的 ``os.environ``:runner 进程自己调
+#: LLM 还要靠这些变量。在适配层包装该方法、对返回的 env dict 删凭据键，
+#: 把「平台凭据对 agent 不可见」从隐式假设变成硬保证。
+#: 模式匹配而非枚举:供应方换前缀(如 OpenRouter/Zhipu 自定义名)也覆盖。
+_CREDENTIAL_ENV_RE = re.compile(
+    r"^(?:LLM_|STRIX_)?(?:.*(?:API_KEY|TOKEN|SECRET)|.*_KEY)$|"
+    r"^(?:OPENAI|ANTHROPIC|GEMINI|ZHIPU|DEEPSEEK|DASHSCOPE|MISTRAL|"
+    r"COHERE|GROQ|TOGETHER|FIREWORKS)_[A-Z_]*$",
+    re.IGNORECASE,
+)
+
+#: 已知合法但字面含 KEY/TOKEN 的系统变量，显式豁免防误伤。
+_ENV_KEEP = frozenset({"PATH", "HOME", "PYTHONPATH", "KEYCLOAK_HOST"})
+
 
 def _strip_dead_proxy(manifest: Manifest) -> list[str]:
     """从沙箱环境里删掉指向不存在 Caido 的代理变量。
@@ -87,6 +111,36 @@ def _strip_dead_proxy(manifest: Manifest) -> list[str]:
     for key in removed:
         env.pop(key, None)
     return removed
+
+
+def _credential_env_keys(env: dict[str, str]) -> list[str]:
+    """按 ``_CREDENTIAL_ENV_RE`` 挑出 env dict 里的凭据键名。"""
+    return [k for k in env if k not in _ENV_KEEP and _CREDENTIAL_ENV_RE.match(k)]
+
+
+def _patch_exec_env_credentials() -> None:
+    """包装 ``UnixLocalSandboxClient._resolved_exec_context``,删凭据键。
+
+    每次工具 exec 都会走该方法构造环境(常规 exec / PTY / 读文件三条路径)，
+    在返回的 env dict 上删一次即覆盖全部路径。类级替换、幂等：重复 install
+    不会叠两层包装(叠了也只是白删一次，无害，但日志会重复)。
+    """
+    if getattr(UnixLocalSandboxClient, "_ctfy_env_patched", False):
+        return
+    original = UnixLocalSandboxClient._resolved_exec_context
+
+    @functools.wraps(original)
+    async def _resolved_exec_context(self: Any) -> tuple[dict[str, str], str]:
+        env, cwd = await original(self)
+        for key in _credential_env_keys(env):
+            env.pop(key, None)
+        return env, cwd
+
+    UnixLocalSandboxClient._resolved_exec_context = (  # type: ignore[method-assign]
+        _resolved_exec_context
+    )
+    UnixLocalSandboxClient._ctfy_env_patched = True  # type: ignore[attr-defined]
+    logger.info("Sandbox exec env: credential stripping active")
 
 
 async def _local_backend(
@@ -153,6 +207,7 @@ def install() -> None:
     """Register the ``local`` backend. Call before the first sandbox is created."""
     register_backend("local", _local_backend, supports_bind_mounts=True)
     _patch_extra_file_target()
+    _patch_exec_env_credentials()
     logger.info("Registered strix sandbox backend: local")
 
 

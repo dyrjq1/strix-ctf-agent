@@ -565,8 +565,10 @@ _USAGE_LINE = re.compile(
 _DONE_RE = _USAGE_LINE
 #: 形如答案的串。父进程用它判断"该不该给答案宽限"，与 `deadline_guard` 里的
 #: 同名正则保持一致——两边用不同规则会导致子进程觉得有答案、父进程觉得没有。
+#: （与 deadline_guard._ANSWER_RE 逐字同步；32-hex 分支带负向环视，避免把
+#: 更长字母数字串的片段当成答案。）
 _ANSWER_RE = re.compile(
-    r"(?:FLAG|flag|CTF|ctf|CTFY|ctfy)\{[^}\s]{2,}\}|\b[0-9a-f]{32}\b"
+    r"(?:FLAG|flag|CTF|ctf|CTFY|ctfy)\{[^}\s]{2,}\}|\b(?<![A-Za-z0-9_-])[0-9a-f]{32}\b"
 )
 
 #: 形如答案、但**确定不是**答案的串。被污染的 SAMPLE-004 跑了 600 秒，最后

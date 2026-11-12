@@ -326,7 +326,19 @@ async def main() -> int:
             f"wall={args.wall_deadline or args.soft_deadline * 2:.0f}s)"
         )
 
-    # 三个守卫装完之后立刻验证接线。不做这一步，接线失败会表现为
+    # 轮次预算守卫：与 deadline 守卫同一注入通道，但按**轮次**计数。
+    # agent.py 的 attempt 循环里有它，而这个 harness 入口此前从未挂载——
+    # 预算打满时 vendor 直抛 MaxTurnsExceeded、result=None，模型对
+    # "我还剩几轮"零感知，一个字没交就结束。必须**晚于** deadline 守卫
+    # 安装：两者替换同一个 factory._with_bounded_result，后装的在最外层，
+    # 提示顺序才是 [SOFT DEADLINE] 在前、[TURN BUDGET] 在后（贴着决策）。
+    from ctf_strix import turn_budget as turn_budget_mod
+
+    tb_guard = turn_budget_mod.install()
+    tb_guard.reset(args.turns)
+    print(f"[guard] turn budget installed (budget={args.turns})")
+
+    # 所有守卫装完之后立刻验证接线。不做这一步，接线失败会表现为
     # "计数器恒为 0"，和"今天没触发"完全无法区分——CTFARENA-012 就是这样
     # 白烧了 1170 秒。宁可启动时打一行 WARNING。
     from ctf_strix.guard_mount import verify_mount
@@ -337,6 +349,7 @@ async def main() -> int:
             "_ctf_journey_guarded",
             "_ctf_sweep_guarded",
             "_ctf_negative_guarded",
+            "_ctf_turn_budget",
         )
     )
     print(f"[guard] mount verified={wired} (exec_command reaches guards)")
@@ -621,6 +634,11 @@ async def main() -> int:
     except Exception as exc:  # noqa: BLE001 — a turn cap is a normal outcome here
         result = None
         print(f"\n[stopped] {type(exc).__name__}: {exc}")
+        # 父进程（batch_eval）不解析 [stopped]——那行连 MaxTurnsExceeded 这种
+        # 正常收场都包含，没法当错误信号。这里单独给一条带完整限定名的
+        # 机器可读行，传输层崩溃（断流/网关重置）才能进结果表的 error 字段，
+        # 否则表现成 error=None 的"正常失败"，非能力损失被计成能力损失。
+        print(f"[run-error] {type(exc).__module__}.{type(exc).__name__}: {exc}")
     elapsed = time.time() - started
 
     print(f"\n[done] {elapsed:.1f}s  result={type(result).__name__ if result else None}")

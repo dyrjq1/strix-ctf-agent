@@ -9,6 +9,8 @@
 
 from __future__ import annotations
 
+import re
+
 from ctf_strix.finish_guard import FinishGuard, _MAX_REFUSALS
 
 
@@ -44,6 +46,64 @@ def test_refusal_budget_is_bounded() -> None:
         assert guard.check("nothing here") is not None
     assert guard.check("nothing here") is None
     assert guard.allowed == 1
+
+
+def test_second_refusal_tells_the_model_to_change_mechanism() -> None:
+    """连拒两次仍是同一段文案时，模型会把同一份白卷原样再交一次。
+
+    第 2 次起必须要求换向，而且这段文案得停在机制级：出现 URL、IP、路径或
+    flag 字面量，通用守卫就退化成只对某一道题有效的提示。
+    """
+    guard = FinishGuard()
+    first = guard.check("nothing here")
+    second = guard.check("nothing here")
+    assert first is not None and second is not None
+
+    head = str(first["error"])
+    tail = str(second["error"])[len(head):]
+    assert str(second["error"]).startswith(head)
+    assert tail, "第 2 次拒绝必须比第 1 次多说换向指令"
+    assert "mechanism" in tail.lower()
+    assert "finish_scan" in tail
+    # 题面特定串：URL、flag 字面量、绝对路径片段。
+    for leak in ("http://", "https://", "FLAG{", "ctf{", "/flag"):
+        assert leak not in tail
+    assert not re.search(r"\b\d{1,3}(?:\.\d{1,3}){3}\b", tail)
+
+
+def test_first_refusal_stays_the_plain_instruction() -> None:
+    """第 1 次不该一上来就要求换向：它还没试过通用建议里的动作。"""
+    guard = FinishGuard()
+    first = guard.check("nothing here")
+
+    assert first is not None
+    assert "mechanism" not in str(first["error"]).lower()
+
+
+def test_fourth_call_is_allowed_and_marked_as_giving_up() -> None:
+    """拒满后放行等于放弃，不是通过；结果必须能被事后区分出来。"""
+    guard = FinishGuard()
+    for _ in range(_MAX_REFUSALS):
+        assert guard.check("nothing here") is not None
+    assert guard.gave_up is False
+
+    assert guard.check("nothing here") is None
+    assert guard.allowed == 1
+    assert guard.gave_up is True
+
+
+def test_stats_tracks_refusals_allowed_and_give_up() -> None:
+    guard = FinishGuard()
+    assert guard.stats() == {"refusals": 0, "allowed": 0, "gave_up": 0}
+
+    guard.check("nothing here")
+    guard.check("nothing here")
+    assert guard.stats() == {"refusals": 2, "allowed": 0, "gave_up": 0}
+
+    guard.check("nothing here")
+    assert guard.check("nothing here") is None
+    guard.check('{"summary": "got FLAG{abc123}"}')
+    assert guard.stats() == {"refusals": 3, "allowed": 2, "gave_up": 1}
 
 
 def test_engagement_and_checker_never_require_flag() -> None:

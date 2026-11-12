@@ -363,6 +363,15 @@ class SweepGuard:
             self.warn += 1
         return hint
 
+    def stats(self) -> dict[str, int]:
+        """计数快照：命中数、警告数、硬拦数、单次最大扫描规模。"""
+        return {
+            "hits": self.hits,
+            "warn": self.warn,
+            "hard": self.hard,
+            "worst": self.worst,
+        }
+
 
 def install() -> SweepGuard:
     """把扫描守卫挂到所有工具调用入口上。

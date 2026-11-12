@@ -236,6 +236,7 @@ def prompt_hint(
     names: list[str] | None = None,
     ref: str | None = None,
     kind: str | None = None,
+    tags: list[str] | None = None,
 ) -> str:
     """生成写进 ``user_instructions`` 的路由契约。
 
@@ -250,13 +251,23 @@ def prompt_hint(
         names: :func:`register` 的返回值，默认现算。
         ref: 子文件根路径，默认 :func:`ref_root`。
         kind: 题型（web/file/tcp/...）；只渲染该题型能执行的工具方向。
+        tags: 题目 tags；只用于方法卡求交集，原文不进提示。
 
     Returns:
-        多行指令；没有可用技能时返回空串。
+        多行指令；路由与方法卡都为空时返回空串。
+        方法卡只看 tags 与 kind，不依赖技能包是否存在。
     """
+    from ctf_strix import method_cards
     from ctf_strix import routing
 
     skill_names = names if names is not None else [f"{c}/{n}" for c, n, _ in index_skills()]
-    if not skill_names:
-        return ""
-    return routing.render(skill_names, ref or ref_root(), kind=kind)
+    routing_text = routing.render(skill_names, ref or ref_root(), kind=kind) if skill_names else ""
+    cards_text = method_cards.render(tags, kind=kind)
+    return "\n\n".join(part for part in (routing_text, cards_text) if part)
+
+
+def tags_of(task: dict | None) -> list[str]:
+    """题目 metadata 的 tags；只取 tags，不取标题与描述（零注入面）。"""
+    from ctf_strix import method_cards
+
+    return method_cards.tags_of(task)
