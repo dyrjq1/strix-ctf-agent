@@ -1543,15 +1543,25 @@ def _fetch_platform_attachments(task: dict[str, Any], work: Path) -> list[Path]:
         if declared and all(_local_attachment_path(work, name) for name in declared):
             return []
 
+        from ctf_strix.engagement import competition_id_of
+
         targets = dict(declared)
         instances = _attachment_instance(task)
         platform = _platform_url(task)
         challenge_id = _challenge_id(task)
+        competition = competition_id_of(task)
 
-        deadline = time.monotonic() + _ATTACHMENT_TIMEOUT
-        # A hanging REST call would otherwise spend the whole budget and leave
-        # the MCP channel 0.1s: reserve half for that hop.
-        rest_deadline = time.monotonic() + _ATTACHMENT_TIMEOUT / 2
+        start = time.monotonic()
+        deadline = start + _ATTACHMENT_TIMEOUT
+        # Three hops, three *independent* slices.  A single shared REST
+        # deadline let a hung instance listing (TLS handshake to a deny-
+        # internet container) consume the entire REST half, so the challenge
+        # listing was never attempted: "budget spent before listing" showed up
+        # in 59 of 350 official runs.  Absolute per-channel deadlines keep one
+        # hung hop from starving the next one; MCP still owns the remainder.
+        slice_s = _ATTACHMENT_TIMEOUT / 3
+        instance_deadline = start + slice_s
+        challenge_deadline = start + slice_s * 2
         written: list[Path] = []
         used: list[str] = []
 
@@ -1614,7 +1624,8 @@ def _fetch_platform_attachments(task: dict[str, Any], work: Path) -> list[Path]:
                 token,
                 names=None,
                 should_skip=skip,
-                deadline=rest_deadline,
+                deadline=instance_deadline,
+                competition_id=competition,
             )
             rest_listed = result.listed or rest_listed
             absorb(result)
@@ -1628,7 +1639,8 @@ def _fetch_platform_attachments(task: dict[str, Any], work: Path) -> list[Path]:
                 token,
                 names=None,
                 should_skip=skip,
-                deadline=rest_deadline,
+                deadline=challenge_deadline,
+                competition_id=competition,
             )
             rest_listed = result.listed or rest_listed
             absorb(result)

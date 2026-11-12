@@ -240,6 +240,26 @@ def _rest_headers(token: str, *, accept: str = "application/json") -> dict[str, 
     return headers
 
 
+def _scoped(url: str, competition_id: str) -> str:
+    """Attach ``competition_id`` to a player-API URL when we know it.
+
+    The attachment routes are competition-scoped (``GET
+    /api/v1/challenges/{id}/attachments?competition_id=...``).  An eval run's
+    token is scoped to exactly one competition, and without the query the
+    platform answers ``403 token_competition_forbidden`` -- measured on 69 of
+    350 official runs.  A plain user token is unscoped and works either way,
+    which is why the parameter stayed invisible in local testing.
+
+    Applied to listings *and* every per-file download; omitted entirely when
+    the caller has no competition id, so local/unscoped behaviour is unchanged.
+    """
+    cid = (competition_id or "").strip()
+    if not cid:
+        return url
+    sep = "&" if "?" in url else "?"
+    return f"{url}{sep}competition_id={urllib.parse.quote(cid, safe='')}"
+
+
 def _download_rest(
     base: str,
     specs: Mapping[str, FileSpec],
@@ -248,6 +268,7 @@ def _download_rest(
     deadline: float,
     token: str,
     result: ChannelResult,
+    competition_id: str = "",
 ) -> None:
     headers = _rest_headers(token, accept="application/octet-stream")
     for raw_name, spec in specs.items():
@@ -260,7 +281,9 @@ def _download_rest(
             continue
         if should_skip is not None and should_skip(name):
             continue
-        url = f"{base}/{urllib.parse.quote(name, safe='')}"
+        url = _scoped(
+            f"{base}/{urllib.parse.quote(name, safe='')}", competition_id
+        )
         try:
             status, _headers, blob = _http(
                 url, headers, timeout=_timeout(deadline), limit=MAX_ATTACHMENT_BYTES
@@ -291,6 +314,7 @@ def _fetch_rest(
     names: list[str] | None,
     should_skip: Callable[[str], bool] | None,
     deadline: float,
+    competition_id: str = "",
 ) -> ChannelResult:
     result = ChannelResult(channel=label)
     if names is None:
@@ -299,7 +323,9 @@ def _fetch_rest(
             return result
         try:
             status, _headers, body = _http(
-                base, _rest_headers(token), timeout=_timeout(deadline)
+                _scoped(base, competition_id),
+                _rest_headers(token),
+                timeout=_timeout(deadline),
             )
         except Exception as exc:  # noqa: BLE001 - caller keeps the old path
             result.errors.append(f"list {type(exc).__name__}: {_clip(exc)}")
@@ -331,6 +357,7 @@ def _fetch_rest(
         deadline=deadline,
         token=token,
         result=result,
+        competition_id=competition_id,
     )
     return result
 
@@ -343,8 +370,14 @@ def fetch_rest_challenge(
     names: list[str] | None = None,
     should_skip: Callable[[str], bool] | None = None,
     deadline: float,
+    competition_id: str = "",
 ) -> ChannelResult:
-    """List/download ``/api/v1/challenges/{id}/attachments``."""
+    """List/download ``/api/v1/challenges/{id}/attachments``.
+
+    ``competition_id`` is forwarded as a query parameter on the listing and on
+    every download.  Eval tokens are competition-scoped: without it the route
+    answers 403 even though the instance-scoped route succeeds.
+    """
     base = (
         f"{platform}/api/v1/challenges/"
         f"{urllib.parse.quote(challenge_id, safe='')}/attachments"
@@ -356,6 +389,7 @@ def fetch_rest_challenge(
         names=names,
         should_skip=should_skip,
         deadline=deadline,
+        competition_id=competition_id,
     )
 
 
@@ -367,6 +401,7 @@ def fetch_rest_instance(
     names: list[str] | None = None,
     should_skip: Callable[[str], bool] | None = None,
     deadline: float,
+    competition_id: str = "",
 ) -> ChannelResult:
     """List/download ``/api/v1/instances/{id}/attachments`` (per-team files)."""
     base = (
@@ -380,6 +415,7 @@ def fetch_rest_instance(
         names=names,
         should_skip=should_skip,
         deadline=deadline,
+        competition_id=competition_id,
     )
 
 

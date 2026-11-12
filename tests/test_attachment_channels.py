@@ -17,6 +17,7 @@ import base64
 import json
 import threading
 import time
+import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -792,3 +793,130 @@ def test_unknown_encoding_is_refused() -> None:
     """Only declared encodings are decoded; anything else is a failure."""
     with pytest.raises(attach._McpToolError):
         attach._decode_payload({"content": "x", "encoding": "rot13"})
+
+
+# --- DEF-12/DEF-13: competition-scoped tokens and independent REST slices ---
+
+
+def _scoped_handler(files: dict[str, bytes]):
+    """Stand-in for a competition-scoped eval token: 403 without the query."""
+    prefix = "/api/v1/challenges/CHAL/attachments"
+    inst_prefix = "/api/v1/instances/INST/attachments"
+
+    def factory(srv: "_Server"):
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *args: object) -> None:
+                pass
+
+            def do_GET(self) -> None:  # noqa: N802 - http.server API
+                srv.requests.append({"path": self.path})
+                parsed = urllib.parse.urlparse(self.path)
+                if urllib.parse.parse_qs(parsed.query).get("competition_id") != ["COMP"]:
+                    _respond(self, 403, b'{"detail":"token_competition_forbidden"}',
+                             "application/json")
+                    return
+                path = parsed.path
+                if path == inst_prefix:
+                    _respond(self, 200, b'{"files": []}', "application/json")
+                    return
+                if path == prefix:
+                    body = json.dumps({"files": [
+                        {"name": n, "size": len(b), "per_team": False}
+                        for n, b in files.items()
+                    ]}).encode()
+                    _respond(self, 200, body, "application/json")
+                    return
+                if path.startswith(prefix + "/"):
+                    name = path[len(prefix) + 1:]
+                    if name in files:
+                        _respond(self, 200, files[name], "application/octet-stream")
+                        return
+                _respond(self, 404, b"not found", "text/plain")
+
+        return Handler
+
+    return factory
+
+
+def test_scoped_url_helper_is_additive() -> None:
+    """An existing query survives, and an empty id changes nothing."""
+    assert attach._scoped("http://h/p", "") == "http://h/p"
+    assert attach._scoped("http://h/p", "C 1") == "http://h/p?competition_id=C%201"
+    assert attach._scoped("http://h/p?a=1", "C") == "http://h/p?a=1&competition_id=C"
+
+
+def test_competition_id_unblocks_scoped_attachment_routes(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Regression for the 69 official runs that logged 'list HTTP 403'.
+
+    The eval token only works when ``competition_id`` is on BOTH the listing
+    and the per-file download; without it the channel is fatal and the run
+    starts with no attachment bytes at all.
+    """
+    monkeypatch.delenv("CTFY_EVAL_COMPETITION_ID", raising=False)
+    blob = b"scoped-bytes"
+    task = _task("http://unused.invalid", competition_id="COMP",
+                 target_instance="INST")
+    with _Server(_scoped_handler({"readme.txt": blob})) as rest:
+        task["platform_url"] = rest.url
+        written = _fetch(task, tmp_path)
+
+    assert (tmp_path / "attachments" / "readme.txt").read_bytes() == blob
+    assert [p.name for p in written] == ["readme.txt"]
+    assert rest.requests, "no request was made"
+    queries = [
+        urllib.parse.parse_qs(urllib.parse.urlparse(r["path"]).query)
+        for r in rest.requests
+    ]
+    assert all(q.get("competition_id") == ["COMP"] for q in queries), rest.requests
+
+
+def test_env_competition_id_is_honoured(tmp_path: Path, monkeypatch) -> None:
+    """The platform may pass the competition id as an env var, not task.json."""
+    monkeypatch.setenv("CTFY_EVAL_COMPETITION_ID", "COMP")
+    blob = b"from-env"
+    task = _task("http://unused.invalid", target_instance="INST")
+    with _Server(_scoped_handler({"readme.txt": blob})) as rest:
+        task["platform_url"] = rest.url
+        _fetch(task, tmp_path)
+    assert (tmp_path / "attachments" / "readme.txt").read_bytes() == blob
+
+
+def test_hung_instance_listing_does_not_starve_challenge_listing(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Regression for the 59 official 'budget spent before listing' runs.
+
+    Three independent slices mean the instance hop can burn its entire slice
+    on a TLS handshake that never completes and the challenge hop still gets
+    a fresh attempt instead of being skipped outright.
+    """
+    monkeypatch.delenv("CTFY_EVAL_COMPETITION_ID", raising=False)
+    monkeypatch.setattr(agent, "_ATTACHMENT_TIMEOUT", 0.9)
+    prefix = "/api/v1/challenges/CHAL/attachments"
+    inst_prefix = "/api/v1/instances/INST/attachments"
+
+    def factory(srv: "_Server"):
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *args: object) -> None:
+                pass
+
+            def do_GET(self) -> None:  # noqa: N802 - http.server API
+                srv.requests.append({"path": self.path})
+                if self.path == inst_prefix:
+                    time.sleep(0.5)  # longer than one 0.3s slice
+                if self.path == prefix:
+                    _respond(self, 200, b'{"files": []}', "application/json")
+                    return
+                _respond(self, 200, b'{"files": []}', "application/json")
+
+        return Handler
+
+    task = _task("http://unused.invalid", target_instance="INST")
+    with _Server(factory) as rest:
+        task["platform_url"] = rest.url
+        _fetch(task, tmp_path)
+
+    paths = [r["path"] for r in rest.requests]
+    assert prefix in paths, f"challenge listing was starved: {paths}"
