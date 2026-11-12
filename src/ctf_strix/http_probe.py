@@ -142,13 +142,20 @@ def _phase_of(exc: BaseException) -> str:
     return "UNKNOWN"
 
 
-def _clip(body: str) -> str:
-    """按 flag 优先的规则裁剪响应体。"""
+def _clip(body: str, request_id: str = "") -> str:
+    """按 flag 优先的规则裁剪响应体，并把读取入口指给 traffic_view。"""
     limit = _FLAG_LIMIT if "FLAG{" in body else _BODY_LIMIT
     if len(body) <= limit:
         return body
     hidden = len(body) - limit
-    return f"{body[:limit]}\n…(+{hidden} chars, 用同一请求加 header 或换路径取全文)"
+    if request_id:
+        tail = (
+            f"…(+{hidden} chars, 用 traffic_view(request_id={request_id}, "
+            "part='response') 读已存原文，不要重发)"
+        )
+    else:
+        tail = f"…(+{hidden} chars, 用同一请求加 header 或换路径取全文)"
+    return f"{body[:limit]}\n{tail}"
 
 
 def _format_headers(headers: requests.structures.CaseInsensitiveDict) -> str:
@@ -302,7 +309,7 @@ async def http_probe(
     if hdrs:
         lines.append(f"hdr: {hdrs}")
     if method != "HEAD" and text:
-        lines.append(f"body: {_clip(text)}")
+        lines.append(f"body: {_clip(text, request_id)}")
     hint = _status_hint(resp.status_code, text)
     if hint:
         lines.append(f"next: {hint}")

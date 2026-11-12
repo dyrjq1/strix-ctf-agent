@@ -20,14 +20,27 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 
-#: flag 形态。不设长度下限——CTFY 的 flag 是 32 位 hex，但别的平台可能更短，
-#: 卡长度会漏掉合法 flag。改用"排除模板"来挡 ``FLAG{...}`` 这类占位符。
+#: flag 形态。**标签式前缀**：任何 2–16 位的字母数字/点/横线标签，紧跟
+#: ``{...}``，不枚举 ``FLAG`` / ``CTF`` 之类的固定前缀。
 #:
-#: ⚠️ 前缀必须覆盖平台真实出现的形态。HANDOFF 的交付示例写的是 ``ctfy{…}``，
-#: 而这里原来只认大写 ``FLAG``——同一个包里三个模块（本模块、``deadline_guard``、
-#: ``autosubmit``）对"什么算答案"各有一套正则，收工守卫认不出的答案会被判成
-#: "没拿到 flag"。现在统一成同一组前缀。
-FLAG_RE = re.compile(r"(?:FLAG|flag|CTF|ctf|CTFY|ctfy)\{[0-9a-zA-Z_\-]{2,}\}")
+#: 为什么不枚举前缀：平台题面**不声明** flag 格式（description 里没有任何
+#: "flag format" 字样），真答案的前缀可以完全不在白名单里（实测出现过
+#: ``HTB{…}`` 这种）。白名单一旦漏项，抽取层就整题失明 → 零提交；反过来
+#: 白名单里的 ``flag{…}`` / ``ctfy{…}`` 又恰恰是诱饵，交了判 false。
+#: 前缀不可枚举，所以只约束"长相"：标签 + 花括号体。
+#:
+#: 体字符集与长度门槛保持不变（``[0-9a-zA-Z_\-]{2,}``）：窄集挡得住自由文本
+#: 里的乱码；宽集留给 :data:`CANDIDATE_RE`。
+#:
+#: 已知代价（接受，不修）：LaTeX / 日志里的 ``word{var}`` 也会命中，例如
+#: ``div{margin}``——``is_placeholder`` / ``is_code_template`` 都挡不住。
+#: 下游靠平台的 verify-answer 预检（提交前先问判分器）拦这类误判，见
+#: ``scripts/batch_eval.py`` 的 ``Client.verify``。
+#:
+#: ⚠️ 不许引入捕获组：``AutoSubmitter.candidates()`` 用
+#: ``m.group(1) if pat.groups else m.group(0)`` 决定取哪一段，多一个括号就会
+#: 把错误片段当答案。
+FLAG_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.\-]{1,15}\{[0-9a-zA-Z_\-]{2,}\}")
 
 #: 「提交层认的答案形态」——**唯一真相**。``autosubmit`` 的候选抽取、
 #: ``skillpack.mask_flags`` 的装载遮蔽、``scripts/scrub_flags.py`` 的磁盘清理
@@ -37,7 +50,7 @@ FLAG_RE = re.compile(r"(?:FLAG|flag|CTF|ctf|CTFY|ctfy)\{[0-9a-zA-Z_\-]{2,}\}")
 #: ``[0-9a-zA-Z_-]``（防止把自由文本里的乱码当答案），这里放宽到
 #: ``[^}\s]{2,}``——writeup 里的历史 flag 常带 ``!``、``'``、``#``、``\``，
 #: 窄集抽不到，但 ``read_file`` 会原样喂给模型，被当成"检索到的证据"。
-CANDIDATE_RE = re.compile(r"(?:FLAG|flag|CTF|ctf|CTFY|ctfy)\{[^}\s]{2,}\}")
+CANDIDATE_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.\-]{1,15}\{[^}\s]{2,}\}")
 
 #: 判为"模板/占位符"的形态（大小写不敏感）：
 #:
@@ -62,9 +75,11 @@ CANDIDATE_RE = re.compile(r"(?:FLAG|flag|CTF|ctf|CTFY|ctfy)\{[^}\s]{2,}\}")
 _PLACEHOLDER_BODY = re.compile(r"(?:\.{2,}|[xX]{2,}|<[^<>]*>|\*{3,})")
 
 #: 前缀单独拿出来：双花括号要按"整个花括号部分"判断，先切前缀更好写。
-#: 长前缀必须排在前面：``re`` 的交替是最左优先，``CTF`` 会先吃掉 ``CTFY``
-#: 的三个字符，``rest`` 变成 ``Y{...}``，占位符判定直接失效（CodeBuddy P0）。
-_PREFIX_RE = re.compile(r"^(?:CTFY|FLAG|CTF)(?=\{)", re.IGNORECASE)
+#: 标签式前缀，与 :data:`FLAG_RE` 同形（2–16 位字母数字/点/横线 + ``{``）。
+#: 它只用于 ``match.end()`` 切出花括号体，不参与"这是不是 flag"的判断——
+#: 所以放宽前缀不会让占位符判定失效，也不用再关心交替顺序。字符集已含
+#: 大小写，不再挂 ``re.IGNORECASE``。
+_PREFIX_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.\-]{1,15}(?=\{)")
 
 def is_placeholder(flag: str) -> bool:
     """这个字符串是不是模板占位符（纯点 / 纯 x / 尖括号 / 双花括号 / 纯星号）。

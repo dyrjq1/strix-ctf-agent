@@ -47,6 +47,7 @@ from typing import Any
 from ctf_strix import deadline
 from ctf_strix import error_policy
 from ctf_strix import platform_attach as attach
+from ctf_strix.flag_extract import FLAG_RE
 from ctf_strix.success_stop import RecoveryExhausted
 from ctf_strix.success_stop import SolvedStop
 from ctf_strix.enum_guard import EnumExhausted
@@ -71,9 +72,11 @@ def _enable_local_cost_map() -> None:
 
 _enable_local_cost_map()
 
-#: 兜底 flag 形态（抽取器不可用时用）。与 ``flag_extract`` 的正则同源：
-#: CTFY 的 flag 可能是 ``FLAG{…}`` / ``ctfy{…}`` / ``flag{…}``。
-FLAG_PATTERN = re.compile(r"(?:FLAG|flag|CTF|ctf|CTFY|ctfy)\{[0-9a-zA-Z_\-]{4,}\}")
+#: 兜底 flag 形态（抽取器抛异常时降级用）。直接取 ``flag_extract.FLAG_RE``：
+#: 前缀是标签式的（任何 2–16 位字母数字/点/横线 + ``{...}``），不是白名单。
+#: 体长度门槛随之从 ``{4,}`` 放到 ``{2,}``——降级路径宁可多收，反正后面还有
+#: ``is_placeholder`` 与提交层。
+FLAG_PATTERN = FLAG_RE
 
 #: 题型 → goal 文件。缺失文件时用 ``_FALLBACK_GOALS`` 里的最小版本。
 GOAL_FILES: dict[str, str] = {

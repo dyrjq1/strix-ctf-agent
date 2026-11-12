@@ -249,3 +249,18 @@ def test_derived_candidates_empty_without_api_prefix() -> None:
 
     assert _derived_candidates({"/login": 2, "/static/x": 1}, "preview submit") == []
 
+
+def test_discovery_requests_land_in_the_traffic_ledger(base_url):
+    """route_map / method_sweep 的请求也必须入账，否则重扫无法被看见。"""
+    from ctf_strix import traffic
+
+    before = len(traffic.ledger().items())
+    run(route_map(base_url))
+    run(method_sweep("/api/plugins/stats", base_url=base_url))
+    after = len(traffic.ledger().items())
+
+    assert after > before
+    phases = {item.phase for item in traffic.ledger().items()}
+    assert "DISCOVERY" in phases
+    assert "SWEEP" in phases
+

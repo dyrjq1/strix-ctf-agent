@@ -57,9 +57,13 @@ from pathlib import Path
 from typing import Final
 from urllib.parse import unquote
 
-#: Same flag shape as ``flag_extract.FLAG_RE``.  Kept as a literal so this
-#: module has no import cycle and can be unit-tested alone.
-_FLAG_RE: Final = re.compile(r"(?:FLAG|flag|CTF|ctf|CTFY|ctfy)\{[0-9a-zA-Z_\-]{2,}\}")
+from ctf_strix.flag_extract import FLAG_RE
+
+#: 与 ``flag_extract.FLAG_RE`` 同一对象（标签式前缀，不是 FLAG/CTF 白名单）。
+#: 原来这里是一份字面量副本，理由是"模块可独立导入、无循环依赖"——实测代价
+#: 是两份前缀各自漂移，解码链在一处认得出 flag、在另一处认不出。``flag_extract``
+#: 只依赖标准库，导入它不会成环。
+_FLAG_RE: Final = FLAG_RE
 
 #: A 10MB "blob" is a file, not a blob.  Saying so costs one line instead of
 #: 256k characters of garbage in the context.

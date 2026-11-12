@@ -21,6 +21,8 @@ import subprocess
 from pathlib import Path
 from typing import Final
 
+from ctf_strix.flag_extract import FLAG_RE
+
 #: 单次子进程上限。binwalk 对大文件会跑很久，超过就跳过。
 _TIMEOUT: Final = 20
 #: strings 只看前 4000 条，避免 100MB 二进制把返回撑爆。
@@ -186,7 +188,10 @@ _NEXT: Final = {
     ),
 }
 
-_FLAG_RE: Final = re.compile(r"(?:FLAG|CTF|flag|ctfy)\{[^}\s]{4,80}\}")
+#: 与 ``flag_extract.FLAG_RE`` 同一对象（标签式前缀）。体门槛随真值从
+#: ``{4,80}`` 收到 ``{2,}``：只影响"这行是否算 flag-like hint"，调用方仍然
+#: 只取前 5 条，不会把输出撑爆。
+_FLAG_RE: Final = FLAG_RE
 
 
 def file_triage(path: str = ".") -> str:

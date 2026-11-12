@@ -7,7 +7,7 @@
 agent，更不该重跑靶机。
 
 SAMPLE-002 就是这么一次教训：run.log 里明明白白有
-``FLAG{1b89b7e8d76a29d75d9defa89c93b536}``，记录却是 ``ok=false / flag=null``，
+``FLAG-REDACTED``，记录却是 ``ok=false / flag=null``，
 连 ``submissions`` 字段都缺——看着像"平台判错"，其实是记录生成路径的问题。
 有这份日志，就能原地复现；没有，就只能猜。
 

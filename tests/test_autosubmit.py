@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import json
+import re
 from typing import Any
 
 import pytest
@@ -298,21 +299,30 @@ def test_non_ascii_flag_body_is_not_placeholder() -> None:
     assert AutoSubmitter.candidates("answer: FLAG{测试}") == ["FLAG{测试}"]
 
 
+#: 经典前缀。只用于"镜像里有没有历史示例/诱饵"这一条测试：生产代码不再
+#: 枚举前缀（标签式），这里留着是因为它正是那类示例串的写法。
+_CLASSIC_LABEL_RE = re.compile(r"(?i)(?:CTFY|FLAG|CTF)\{")
+
+
 def test_image_source_has_no_extractable_placeholder() -> None:
-    """镜像会把这些目录打进去，里面不许出现任何 ``FLAG_RE`` 命中。
+    """镜像会把这些目录打进去，里面不许出现"经典前缀 + 非模板体"的字面量。
 
     ``docker/Dockerfile`` 直接 ``COPY src/``，agent 读自己的源码时会把注释里
     的示例当成「检索到的证据」。2026-11-06 的假 solved 就是这么来的。
 
-    当前窄集命中数是 0，所以判据是"零命中"而不是"零占位符"——后者放过了
-    ``MetaCTF{fake_banner_flag_here}`` 这种 ``is_placeholder`` 认不出的示例串。
-    ``FLAG{...}``（点）这种宽集才命中的写法抽不出候选、进不了证据链，
-    最后一道 ``candidates()`` 也会用 ``is_placeholder`` 挡掉，所以文档里
-    保留它是安全的（``test_*placeholder*`` 覆盖那一层）。
+    ⚠️ 2026-11-12：前缀改成标签式之后，"零命中"不再可维持——源码里的
+    f-string（``agent-{name}``）和 LaTeX（``frame_{width}``）与真 flag 同形，
+    全仓几十处，形态层无法区分（``div{margin}`` 就是已知代价）。这类误判交给
+    平台 verify-answer 预检兜底，见 ``scripts/batch_eval.py``。
+
+    这里保留的是原来**真正在防的那件事**：不许有 ``MetaCTF{...}`` 这种
+    "经典前缀 + 看着像真答案"的示例串。``FLAG{...}``（点）这类占位符由
+    ``is_placeholder`` 放行——文档里就是靠它说明 flag 形状的；``${x}`` /
+    ``{{x}}`` 这类由 ``is_code_template`` 放行。
     """
     from pathlib import Path
 
-    from ctf_strix.flag_extract import FLAG_RE, is_placeholder
+    from ctf_strix.flag_extract import FLAG_RE, is_code_template, is_placeholder
 
     repo = Path(__file__).resolve().parents[1]
     # 与 docker/Dockerfile 的 COPY 清单对齐：src / vendor/src / config / docker。
@@ -338,10 +348,14 @@ def test_image_source_has_no_extractable_placeholder() -> None:
         text = data.decode("utf-8")
         scanned += 1
         for lineno, line in enumerate(text.splitlines(), 1):
-            # 当前镜像内窄集命中数为 0，所以任何命中都算回归：既能抓
-            # ``FLAG{xxxx}`` 这类占位符，也能抓 ``MetaCTF{fake_banner_flag_here}``
-            # 这种"看着像真答案的示例"（``is_placeholder`` 认不出它）。
+            # 经典前缀（FLAG / CTF / CTFY）是历史示例与诱饵的写法；标签式
+            # 前缀下任意 ``word{var}`` 都会命中，那部分只能靠预检兜底。
             for match in FLAG_RE.finditer(line):
-                offenders.append(f"{path}:{lineno}: {match.group(0)}")
+                hit = match.group(0)
+                if not _CLASSIC_LABEL_RE.search(hit):
+                    continue
+                if is_placeholder(hit) or is_code_template(hit):
+                    continue
+                offenders.append(f"{path}:{lineno}: {hit}")
     assert not offenders, "镜像源码里仍有占位串：\n" + "\n".join(offenders)
     assert scanned > 200, f"实际只扫到 {scanned} 个文本文件，范围不对"

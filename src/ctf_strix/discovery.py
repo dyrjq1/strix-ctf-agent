@@ -42,6 +42,8 @@ from urllib.parse import urljoin, urlparse
 import requests
 import urllib3
 
+from ctf_strix import traffic
+
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 #: 一次最多抓多少个 chunk。超过这个数说明是巨型 SPA，收益递减。
@@ -103,7 +105,32 @@ def _same_origin(base: str, url: str) -> bool:
 
 
 def _get(url: str, timeout: float = _TIMEOUT):
-    return requests.get(url, timeout=timeout, verify=False, allow_redirects=True)
+    request_id = traffic.ledger().next_id()
+    started = time.monotonic()
+    try:
+        resp = requests.get(url, timeout=timeout, verify=False, allow_redirects=True)
+    except Exception as exc:
+        traffic.record(
+            request_id=request_id,
+            method="GET",
+            url=url,
+            phase="DISCOVERY",
+            elapsed=time.monotonic() - started,
+            note=f"{type(exc).__name__}: {exc}"[:300],
+        )
+        raise
+    traffic.record(
+        request_id=request_id,
+        method="GET",
+        url=url,
+        status=resp.status_code,
+        resp_headers=dict(resp.headers),
+        resp_body=resp.text or "",
+        size=len(resp.content or b""),
+        elapsed=time.monotonic() - started,
+        phase="DISCOVERY",
+    )
+    return resp
 
 
 #: 常见 API 动词。用途不是"扫字典"，而是把**页面自己的词汇**拼到已发现的前缀上。
@@ -315,6 +342,9 @@ async def method_sweep(
         if wants_body:
             headers["Content-Type"] = "application/json"
 
+        request_id = traffic.ledger().next_id()
+        started = time.monotonic()
+
         # 为什么最多试三次、且最后一次不带 body：
         # 靶机在参数校验失败时常常"不等请求体读完就回包并关连接"，
         # 客户端还没发完 body 就收到 RST（Windows 10053），
@@ -324,8 +354,10 @@ async def method_sweep(
         attempts: list[bytes | None] = [b"{}", b"{}", None] if wants_body else [None, None, None]
         last: Exception | None = None
         r = None
+        sent_body: bytes | None = None
         for index, body in enumerate(attempts):
             try:
+                sent_body = body
                 r = requests.request(
                     method, url, timeout=_TIMEOUT, verify=False,
                     allow_redirects=False, headers=headers, data=body,
@@ -336,10 +368,33 @@ async def method_sweep(
                 if index + 1 < len(attempts):
                     time.sleep(0.1 * (index + 1))
         if r is None:
+            traffic.record(
+                request_id=request_id,
+                method=method,
+                url=url,
+                req_headers=headers,
+                req_body=(sent_body or b"").decode("utf-8", errors="replace"),
+                phase="SWEEP",
+                elapsed=time.monotonic() - started,
+                note=f"{type(last).__name__}: {last}"[:300],
+            )
             return {
                 "method": method, "url": url, "status": 0,
                 "note": f"{type(last).__name__} after {len(attempts)} tries",
             }
+        traffic.record(
+            request_id=request_id,
+            method=method,
+            url=url,
+            req_headers=headers,
+            req_body=(sent_body or b"").decode("utf-8", errors="replace"),
+            status=r.status_code,
+            resp_headers=dict(r.headers),
+            resp_body=r.text or "",
+            size=len(r.content or b""),
+            elapsed=time.monotonic() - started,
+            phase="SWEEP",
+        )
         allow = r.headers.get("allow", "")
         text = (r.text or "").replace("\n", " ")[:160]
         return {

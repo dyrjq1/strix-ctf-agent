@@ -262,7 +262,7 @@ def test_deadline_args_put_soft_deadline_at_75_percent() -> None:
     from batch_eval import _deadline_args
 
     assert _deadline_args(600) == [
-        "--soft-deadline", "450", "--wall-deadline", "600",
+        "--soft-deadline", "435", "--wall-deadline", "580",
     ]
     assert _deadline_args(0) == ["--soft-deadline", "1", "--wall-deadline", "1"]
 
@@ -297,8 +297,65 @@ def test_run_agent_passes_deadline_args_to_child(monkeypatch, workdir: Path) -> 
 
     argv = captured["argv"]
     assert "--soft-deadline" in argv
-    assert argv[argv.index("--soft-deadline") + 1] == "450"
-    assert argv[argv.index("--wall-deadline") + 1] == "600"
+    assert argv[argv.index("--soft-deadline") + 1] == "435"
+    assert argv[argv.index("--wall-deadline") + 1] == "580"
+
+
+def test_launch_ready_replaces_a_stuck_instance_once() -> None:
+    """wait_ready 超时不应直接丢题：旧实例要销毁，新实例要再等一次。"""
+    from batch_eval import _launch_ready
+
+    class Client:
+        def __init__(self) -> None:
+            self.launches = 0
+            self.teardowns: list[str] = []
+
+        def launch(self, cid: str) -> str:
+            self.launches += 1
+            return f"iid-{self.launches}"
+
+        def wait_ready(self, iid: str, timeout: int = 180) -> str:
+            if iid == "iid-1":
+                raise TimeoutError("not ready")
+            return "https://target/"
+
+        def teardown(self, iid: str) -> None:
+            self.teardowns.append(iid)
+
+    client = Client()
+    iid, target = _launch_ready(client, "CH-001")
+
+    assert iid == "iid-2"
+    assert target == "https://target/"
+    assert client.teardowns == ["iid-1"]
+    assert client.launches == 2
+
+
+def test_launch_ready_propagates_after_second_timeout() -> None:
+    """第二次仍超时要如实报错，不能把失败伪装成成功。"""
+    from batch_eval import _launch_ready
+
+    class Client:
+        def __init__(self) -> None:
+            self.launches = 0
+            self.teardowns: list[str] = []
+
+        def launch(self, cid: str) -> str:
+            self.launches += 1
+            return f"iid-{self.launches}"
+
+        def wait_ready(self, iid: str, timeout: int = 180) -> str:
+            raise TimeoutError("not ready")
+
+        def teardown(self, iid: str) -> None:
+            self.teardowns.append(iid)
+
+    client = Client()
+    with pytest.raises(TimeoutError):
+        _launch_ready(client, "CH-001")
+
+    assert client.launches == 2
+    assert client.teardowns == ["iid-1"]
 
 
 def test_suite_for_uses_static_table_without_network(monkeypatch):
@@ -469,3 +526,115 @@ def test_run_agent_passes_target_kind(monkeypatch, workdir: Path) -> None:
 
     argv = captured["argv"]
     assert argv[argv.index("--target-kind") + 1] == "tcp"
+
+
+# ---------------------------------------------------------------------------
+# 提交前 verify 预检：抽取层放宽前缀后，平台判分器是唯一裁判。
+# ---------------------------------------------------------------------------
+
+ANSWER_LOG = (
+    "127.0.0.1 says the token is HTB{the_right_0ne}\n"
+    "ANSWER[flag]=HTB{the_right_0ne}\n"
+)
+
+
+def _run_single(workdir: Path, monkeypatch, client_cls, log: str = ANSWER_LOG) -> dict:
+    """Run one challenge end to end with a fake client and return the result row."""
+    plan = workdir / "plan.json"
+    plan.write_text(json.dumps([{"id": "SMOKE-001", "difficulty": "easy"}]), encoding="utf-8")
+    out = workdir / "results.jsonl"
+    monkeypatch.setattr(batch_eval, "_BOX_ROOT", str(workdir / "boxes"))
+    monkeypatch.setattr(batch_eval, "Client", client_cls)
+    monkeypatch.setattr(batch_eval, "run_agent", lambda *a, **k: (log, 1.0))
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["batch_eval.py", "--plan", str(plan), "--out", str(out), "--token", "t", "--no-archive"],
+    )
+    assert batch_eval.main() == 0
+    return json.loads(out.read_text(encoding="utf-8").splitlines()[-1])
+
+
+def _fake_client(submit_log: list, verify=None):
+    """Minimal client; ``verify`` is attached only when the test wants it."""
+
+    class Fake:
+        def __init__(self, token: str) -> None:
+            self.token = token
+
+        def launch(self, cid: str, attempts: int = 5) -> str:
+            return "iid-1"
+
+        def wait_ready(self, iid: str, timeout: int = 180) -> str:
+            return "http://127.0.0.1:8080/"
+
+        def probe_reachable(self, url: str, attempts: int = 3) -> tuple[bool, str]:
+            return True, "ok"
+
+        def detail(self, cid: str) -> dict:
+            return {}
+
+        def teardown(self, iid: str) -> None:
+            return None
+
+        def submit(self, iid: str, answer: str, qid: str = "flag") -> dict:
+            submit_log.append((qid, answer))
+            return {"correct": True}
+
+    if verify is not None:
+        Fake.verify = staticmethod(verify)  # type: ignore[attr-defined]
+    return Fake
+
+
+def test_verify_hit_submits_only_that_answer(workdir: Path, monkeypatch) -> None:
+    """判分器认出候选中的一条：只交那一条，不浪费 attempts 试错。"""
+    submitted: list = []
+
+    def verify(iid: str, answer: str, qid: str = "flag"):
+        return answer == "HTB{the_right_0ne}"
+
+    rec = _run_single(workdir, monkeypatch, _fake_client(submitted, verify))
+
+    assert rec["verify_precheck"] == "hit"
+    assert submitted == [("flag", "HTB{the_right_0ne}")]
+    assert rec["correct"] is True
+    assert isinstance(rec["flag_shaped_tokens"], int) and rec["flag_shaped_tokens"] >= 1
+
+
+def test_verify_miss_suppresses_submission(workdir: Path, monkeypatch) -> None:
+    """全部候选都被判 false：不提交，只记数字——交上去只会污染台账。"""
+    submitted: list = []
+
+    def verify(iid: str, answer: str, qid: str = "flag"):
+        return False
+
+    rec = _run_single(workdir, monkeypatch, _fake_client(submitted, verify))
+
+    assert submitted == []
+    assert rec["verify_precheck"] == "miss"
+    assert rec["flag_shaped_but_unsubmitted"] >= 1
+    assert rec["correct"] is False
+
+
+def test_verify_exception_falls_back_to_first_candidate(workdir: Path, monkeypatch) -> None:
+    """预检抛异常必须 fail-open：原首选照交，否则一次抖动就等于零提交。"""
+    submitted: list = []
+
+    def verify(iid: str, answer: str, qid: str = "flag"):
+        raise RuntimeError("verifier exploded")
+
+    rec = _run_single(workdir, monkeypatch, _fake_client(submitted, verify))
+
+    assert rec["verify_precheck"] == "unavailable"
+    assert submitted == [("flag", "HTB{the_right_0ne}")]
+    assert rec["correct"] is True
+
+
+def test_client_without_verify_still_submits(workdir: Path, monkeypatch) -> None:
+    """旧 client（或任何没有 verify 的实现）不能被 getattr 之外的东西碰到。"""
+    submitted: list = []
+
+    rec = _run_single(workdir, monkeypatch, _fake_client(submitted))
+
+    assert rec["verify_precheck"] == "unavailable"
+    assert submitted == [("flag", "HTB{the_right_0ne}")]

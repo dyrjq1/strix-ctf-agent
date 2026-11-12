@@ -130,6 +130,20 @@ def scrub_text(text: str) -> tuple[str, int]:
     return CANDIDATE_RE.sub(repl, text), count
 
 
+#: ``--check`` 的命中口径：**经典前缀** + 非模板体。
+#:
+#: 前缀改成标签式之后，``CANDIDATE_RE`` 会把源码里的 f-string
+#: （``agent-{name}``）、LaTeX（``begin{document}``）、GraphQL
+#: （``schema{types{name}}``）都算成命中——全仓约 185 处，闸门于是永远红，
+#: 等于没有闸门。所以门禁收窄到"历史上真 flag 一直使用的经典前缀"这个仍可
+#: 识别的子集；任意前缀的那一类，形态上与代码产物无法区分，交给提交前的
+#: verify-answer 预检（见 ``scripts/batch_eval.py``）。
+#:
+#: 抹除（:func:`scrub_text`）仍然用宽集 ``CANDIDATE_RE``：多抹无害，
+#: 闸门则必须能分辨，两者口径不同是有意的。
+_LEAK_RE = re.compile(r"(?:CTFY|FLAG|CTF)\{[^}\s]{2,}\}", re.IGNORECASE)
+
+
 def find_hits(text: str) -> list[tuple[int, str]]:
     """列出文本里尚未抹掉的候选答案。
 
@@ -141,7 +155,7 @@ def find_hits(text: str) -> list[tuple[int, str]]:
     """
     hits: list[tuple[int, str]] = []
     for lineno, line in enumerate(text.splitlines(), 1):
-        for match in CANDIDATE_RE.finditer(line):
+        for match in _LEAK_RE.finditer(line):
             flag = match.group(0)
             if not (_is_template(flag) or is_code_template(flag)):
                 hits.append((lineno, flag))

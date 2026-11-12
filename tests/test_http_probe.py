@@ -111,6 +111,7 @@ def test_redirect_is_not_followed_by_default(base_url):
 def test_large_body_is_truncated(base_url):
     out = call(url=f"{base_url}/big")
     assert "chars" in out and "body:" in out
+    assert "traffic_view(request_id=" in out, "截断提示必须指向台账，而不是重发请求"
     assert len(out) < 2500, "工具输出必须短，否则会挤掉前几轮的结论"
 
 

@@ -479,7 +479,24 @@ def _obs_signature(result: Any, args: str) -> str:
     # 只有状态行里的 ``0.11s`` vs ``0.10s`` 不同 —— 守卫因此判成"两个新观测"，
     # 同一族永远凑不满 3 次，ENUMERATION GUARD 一次都没响。
     head = _norm_head(head)
-    body = re.sub(r"\d+", "#", body.lower())
+    # ⚠️ body 里的数字不能一刀切抹平。把所有数字都换成 ``#`` 的旧实现有两个
+    # 已知误伤：IDOR（user 1 与 user 2 的响应只差 ``balance`` 数字）、分页
+    # （每页条目数）、数值盲注（逐字符提取的差值）——真实进展被判成重复，
+    # 守卫把正在收敛的枚举当成"原地打转"打断。
+    # 反过来，传输层噪声里的数字必须洗掉，否则同一响应永远算新信息
+    # （traces/094 的教训）。折中口径：
+    #   - 已知噪声形态（时间戳/日期/时长/大小）整段折叠；
+    #   - 4 位以上十进制串折叠（pid、短随机 id、epoch 残片）；
+    #   - 1-3 位数字保留原值——枚举类进展（id=1..999、余额、条目数）都在这档。
+    body = body.lower()
+    for pat, repl in (
+        (r"\d{10,13}", "<ts>"),
+        (r"\d{4}-\d{2}-\d{2}(?:[ t]\d{2}:\d{2}(?::\d{2})?)?", "<date>"),
+        (r"\d+(?:\.\d+)? ?(?:ms|s)\b", "<t>"),
+        (r"\d+(?:\.\d+)? ?(?:b|kb|mb|gb)\b", "<size>"),
+        (r"\b\d{4,}\b", "<n>"),
+    ):
+        body = re.sub(pat, repl, body)
     body = re.sub(r"\s+", " ", body).strip()
     payload = head + "|" + body[:1500]
     return hashlib.sha1(payload.encode("utf-8", "replace")).hexdigest()[:12]

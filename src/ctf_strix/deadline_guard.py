@@ -47,6 +47,8 @@ import threading
 import time
 from typing import TYPE_CHECKING, Any
 
+from ctf_strix.flag_extract import FLAG_RE
+
 if TYPE_CHECKING:
     from agents import FunctionTool
 
@@ -56,8 +58,13 @@ logger = logging.getLogger(__name__)
 #:
 #: 刻意宽松：宁可多给 20 秒，也不要在最后一步把已到手的答案砍掉。有一道题
 #: 就是踩在这个边界上的——flag 在截止线前一刻出现，收尾没来得及跑完。
+#:
+#: 两个分支拼起来：前缀部分**直接取** ``FLAG_RE.pattern``（标签式前缀的唯一
+#: 真值，这里不再手抄一份白名单），32-hex 分支保持原样——裸 hex 是很多平台
+#: 的真实答案形态，但它不属于"标签 + 花括号"，所以只能并进来。负向环视必须
+#: 留着，否则 ``key=sk-<32hex>`` 这类密钥会被当成答案（tests/test_turn_budget）。
 _ANSWER_RE = re.compile(
-    r"(?:FLAG|flag|CTF|ctf|CTFY|ctfy)\{[^}\s]{2,}\}|\b(?<![A-Za-z0-9_-])[0-9a-f]{32}\b"
+    "(?:%s)|%s" % (FLAG_RE.pattern, r"\b(?<![A-Za-z0-9_-])[0-9a-f]{32}\b")
 )
 
 #: 施加过本守卫的工具标记。

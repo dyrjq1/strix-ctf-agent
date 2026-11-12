@@ -620,16 +620,26 @@ async def main() -> int:
 
     print(f"[scan] id={scan_id} kind={args.target_kind} target={args.target} turns={args.turns}")
     started = time.time()
+    scan_task = run_strix_scan(
+        scan_config=scan_config,
+        scan_id=scan_id,
+        image="unused-local",
+        local_sources=[],
+        extra_files=extra_files or None,
+        max_turns=args.turns,
+        cleanup_on_exit=True,
+        event_sink=sink,
+    )
     try:
-        result = await run_strix_scan(
-            scan_config=scan_config,
-            scan_id=scan_id,
-            image="unused-local",
-            local_sources=[],
-            extra_files=extra_files or None,
-            max_turns=args.turns,
-            cleanup_on_exit=True,
-            event_sink=sink,
+        if args.wall_deadline > 0:
+            result = await asyncio.wait_for(scan_task, timeout=float(args.wall_deadline))
+        else:
+            result = await scan_task
+    except asyncio.TimeoutError:
+        result = None
+        print(
+            f"\n[WALLCLOCK TIMEOUT after {args.wall_deadline:.0f}s] "
+            "internal deadline hit; scan cancelled cleanly"
         )
     except Exception as exc:  # noqa: BLE001 — a turn cap is a normal outcome here
         result = None

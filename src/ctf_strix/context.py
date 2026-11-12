@@ -74,6 +74,8 @@ from contextvars import ContextVar
 from itertools import count
 from typing import TYPE_CHECKING, Any
 
+from ctf_strix.flag_extract import CANDIDATE_RE
+
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
 
@@ -91,9 +93,11 @@ LAST_CAP_STATS: ContextVar[dict[str, Any] | None] = ContextVar(
 #: 遥测无法区分"本次新值"与"上一实例的残留"。
 _CAP_SEQ = count(1)
 
-#: flag 形态（与 finish_guard / flag_extract 同口径）。被截断的输出里若出现
-#: flag，必须原样留下——否则压缩会把答案压没，这是最不可接受的失败模式。
-_FLAG_RE = re.compile(r"(?:FLAG|flag|CTF|ctf|CTFY|ctfy)\{[^}\s]{2,}\}")
+#: flag 形态（与 finish_guard / flag_extract 同口径，直接取唯一真值）。
+#: 被截断的输出里若出现 flag，必须原样留下——否则压缩会把答案压没，
+#: 这是最不可接受的失败模式。用宽集（``CANDIDATE_RE``）而不是窄集：
+#: 压缩层宁可多留一小段，也不能因为体里有 ``!`` 之类的字符把答案丢掉。
+_FLAG_RE = CANDIDATE_RE
 
 #: 证据抽取的硬上限（字符）。证据块只装「结构性证据」，不装正文。
 _EVIDENCE_MAX_CHARS = 800

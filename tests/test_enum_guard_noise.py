@@ -140,3 +140,57 @@ def test_bundle_regex_still_fires_on_real_reads() -> None:
     assert _is_bundle_read('{"cmd": "curl -s https://x.test/_next/static/chunks/app.js"}')
     assert _is_bundle_read('{"cmd": "cd pm && cat BbkGSyGJ.js"}')
     assert _is_bundle_read('{"cmd": "head -c 8000 NXz3x3fk.js"}')
+
+
+# ---------------------------------------------------------------------------
+# 2026-11-12 第三轮：body 数字一刀切抹平的误伤（IDOR/分页/数值盲注）
+# ---------------------------------------------------------------------------
+
+
+def test_numeric_only_body_difference_is_new_information() -> None:
+    """只差一个正文的数，必须是新信息。
+
+    旧实现把 body 里所有数字换成 ``#``：IDOR（user 1 的 balance 与
+    user 2 的 balance）、分页（每页条目数）、数值盲注（逐字符提取的
+    差值）这类真实进展被算成重复，守卫把正在收敛的枚举打断。
+    """
+    a = '[HTTP 200] GET <url> | 0.11s | 41B\n{"id": 1, "balance": 100}'
+    b = '[HTTP 200] GET <url> | 0.11s | 41B\n{"id": 2, "balance": 250}'
+    assert _obs_signature(a, "") != _obs_signature(b, ""), (
+        "IDOR 的数字差异被抹掉——同一批用户枚举会被判成原地打转"
+    )
+
+
+def test_small_id_difference_is_new_information() -> None:
+    """1-3 位数字（枚举 id、条目数）保留原值参与指纹。"""
+    a = '[HTTP 200] GET <url> | 0.11s\n{"id": 41, "role": "user"}'
+    b = '[HTTP 200] GET <url> | 0.11s\n{"id": 42, "role": "user"}'
+    assert _obs_signature(a, "") != _obs_signature(b, "")
+
+
+def test_epoch_timestamp_jitter_is_not_new_information() -> None:
+    """10-13 位 epoch 残片是噪声：同一响应只差时间戳必须折叠。"""
+    a = '[HTTP 200] GET <url>\n{"ok": true, "ts": 1731400000}'
+    b = '[HTTP 200] GET <url>\n{"ok": true, "ts": 1731400123}'
+    assert _obs_signature(a, "") == _obs_signature(b, "")
+
+
+def test_pid_sized_decimal_jitter_is_not_new_information() -> None:
+    """4 位以上十进制串（pid、短随机 id）折叠，不制造假新颖。"""
+    a = "[HTTP 200] GET <url>\nref 58695 ok"
+    b = "[HTTP 200] GET <url>\nref 52998 ok"
+    assert _obs_signature(a, "") == _obs_signature(b, "")
+
+
+def test_body_duration_jitter_is_not_new_information() -> None:
+    """正文里的时长抖动（0.11s vs 0.94s）不算新信息。"""
+    a = "[HTTP 200] GET <url>\nquery ok elapsed 0.11s rows 3"
+    b = "[HTTP 200] GET <url>\nquery ok elapsed 0.94s rows 3"
+    assert _obs_signature(a, "") == _obs_signature(b, "")
+
+
+def test_body_size_jitter_is_not_new_information() -> None:
+    """正文里的大小抖动（41B vs 42B）不算新信息。"""
+    a = "[HTTP 200] GET <url>\nfile dumped 41B"
+    b = "[HTTP 200] GET <url>\nfile dumped 42B"
+    assert _obs_signature(a, "") == _obs_signature(b, "")

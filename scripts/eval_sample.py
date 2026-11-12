@@ -69,6 +69,11 @@ for _p in (ROOT / "src", ROOT / "vendor" / "src"):
     if _p.is_dir() and str(_p) not in sys.path:
         sys.path.insert(0, str(_p))
 
+#: 答案形态的唯一真值在 ``ctf_strix.flag_extract``。父进程的"答案宽限"判定
+#: 必须与子进程同一套前缀，否则两边对"有没有答案"会得出相反结论。这条 import
+#: 必须放在上面 sys.path 就位之后。
+from ctf_strix.flag_extract import FLAG_RE  # noqa: E402
+
 #: 每题的工作目录。**不能放在 /tmp**：jail 会把 /tmp 盖成空 tmpfs，
 #: 父进程也就再也读不到子进程的日志和用量了。
 BOX_ROOT = Path("/var/ctf/boxes")
@@ -566,9 +571,10 @@ _DONE_RE = _USAGE_LINE
 #: 形如答案的串。父进程用它判断"该不该给答案宽限"，与 `deadline_guard` 里的
 #: 同名正则保持一致——两边用不同规则会导致子进程觉得有答案、父进程觉得没有。
 #: （与 deadline_guard._ANSWER_RE 逐字同步；32-hex 分支带负向环视，避免把
-#: 更长字母数字串的片段当成答案。）
+#: 更长字母数字串的片段当成答案。前缀部分直接取 ``FLAG_RE.pattern``，
+#: 不再手抄一份前缀白名单。）
 _ANSWER_RE = re.compile(
-    r"(?:FLAG|flag|CTF|ctf|CTFY|ctfy)\{[^}\s]{2,}\}|\b(?<![A-Za-z0-9_-])[0-9a-f]{32}\b"
+    "(?:%s)|%s" % (FLAG_RE.pattern, r"\b(?<![A-Za-z0-9_-])[0-9a-f]{32}\b")
 )
 
 #: 形如答案、但**确定不是**答案的串。被污染的 SAMPLE-004 跑了 600 秒，最后

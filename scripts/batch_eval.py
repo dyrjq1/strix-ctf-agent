@@ -427,6 +427,42 @@ class Client:
         )
         return r.json()
 
+    def verify(self, iid: str, answer: str, qid: str = "flag") -> bool | None:
+        """Ask the platform's checker whether ``answer`` is right — without submitting.
+
+        Why this exists: the extractor is deliberately broad now (any label-shaped
+        prefix), so ``div{margin}`` and other source-code artefacts reach the
+        submission path.  The platform's own checker is the only authority on
+        which of them is a real answer, and this endpoint does **not** consume
+        ``attempts_remaining``, so asking first is free.
+
+        Args:
+            iid: instance id.
+            answer: one candidate answer.
+            qid: question id.
+
+        Returns:
+            True/False from ``body["correct"]``; ``None`` when the endpoint is
+            missing, errors, returns non-2xx, returns non-JSON, or omits
+            ``correct``.  Callers treat ``None`` as "no precheck available"
+            (fail-open) rather than "wrong".
+        """
+        try:
+            r = self.s.post(
+                f"{PLATFORM}/api/v1/instances/{iid}/verify-answer",
+                json={"question_id": qid, "answer": answer},
+                timeout=30,
+            )
+            if not 200 <= r.status_code < 300:
+                return None
+            body = r.json()
+        except Exception:  # noqa: BLE001 — a precheck must never break scoring
+            return None
+        if not isinstance(body, dict):
+            return None
+        correct = body.get("correct")
+        return correct if isinstance(correct, bool) else None
+
     def detail(self, challenge_id: str) -> dict:
         """取题目详情（描述 + 标签）。拿不到就返回空字典，不阻断评测。
 
@@ -1215,6 +1251,106 @@ def _answer_values(text: str) -> dict[str, str]:
     return pairs
 
 
+def _ranked_answers(*values: str | None, limit: int = 4) -> list[str]:
+    """Candidate answers in priority order, deduplicated, at most ``limit``.
+
+    Priority is the argument order: ``ANSWER[...]`` lines > ``best_flag`` >
+    ``fallback_flag``.  Empty and duplicate values are dropped — verifying the
+    same token twice costs a round trip and tells us nothing new.
+
+    Args:
+        values: candidates, most trustworthy first.
+        limit: cap on returned candidates (the platform's attempts budget is
+            small; four is enough to cover a decoy or two).
+
+    Returns:
+        Non-empty candidates, deduplicated, in order.
+    """
+    out: list[str] = []
+    for value in values:
+        text = (value or "").strip()
+        if text and text not in out:
+            out.append(text)
+    return out[:limit]
+
+
+def _launch_ready(client: object, challenge_id: str, attempts: int = 2):
+    """Launch an instance and wait until it is ready, retrying once on timeout.
+
+    The platform occasionally leaves an instance in ``starting`` past the
+    180s readiness window.  The old code surfaced that as a bare
+    ``TimeoutError`` and lost the whole challenge even though a fresh
+    instance would have answered.  This helper tears the stuck instance
+    down and asks for exactly one replacement before giving up.
+
+    Args:
+        client: Platform client exposing ``launch`` / ``wait_ready`` / ``teardown``.
+        challenge_id: Challenge id to launch.
+        attempts: How many launch+wait cycles to try (default 2).
+
+    Returns:
+        ``(instance_id, ready_target)`` from the successful cycle.
+
+    Raises:
+        TimeoutError: The last attempt still did not become ready.
+    """
+    last_iid: str | None = None
+    for cycle in range(max(1, int(attempts))):
+        iid = client.launch(challenge_id)
+        last_iid = iid
+        try:
+            target = client.wait_ready(iid)
+        except TimeoutError:
+            if cycle + 1 >= attempts:
+                raise
+            print(
+                f"  [ready-retry {cycle + 1}/{attempts}] instance {iid} "
+                "not ready in time; replacing it",
+                flush=True,
+            )
+            client.teardown(iid)
+            continue
+        return iid, target
+    raise TimeoutError(f"instance {last_iid} not ready after {attempts} attempts")
+
+
+def _verify_pick(
+    client: object, iid: str, qid: str, candidates: list[str]
+) -> tuple[str | None, str]:
+    """Pick the answer to submit by asking the platform's checker first.
+
+    Fail-open on purpose: a missing ``verify`` method, an exception, or a ``None``
+    verdict all mean "we cannot precheck", so the first candidate is submitted
+    exactly as before.  Only a *definite* False on every candidate suppresses
+    the submission — that keeps ``attempts_remaining`` clean instead of spending
+    it on answers the platform has already rejected.
+
+    Args:
+        client: harness client; ``verify`` is optional.
+        iid: instance id.
+        qid: question id.
+        candidates: answers in priority order.
+
+    Returns:
+        ``(value to submit or None, "hit" | "miss" | "unavailable")``.
+    """
+    if not candidates:
+        return None, "unavailable"
+    verify = getattr(client, "verify", None)
+    if not callable(verify):
+        return candidates[0], "unavailable"
+    for value in candidates:
+        try:
+            verdict = verify(iid, value, qid)
+        except Exception:  # noqa: BLE001 — precheck is advisory, never fatal
+            return candidates[0], "unavailable"
+        if verdict is True:
+            return value, "hit"
+        if verdict is None:
+            return candidates[0], "unavailable"
+    return None, "miss"
+
+
 def _archive_run(box: Path, name: str, dest_root: Path) -> Path:
     """把一题的取证材料整体拷到 ``dest_root/<name>/``。
 
@@ -1239,21 +1375,22 @@ def _archive_run(box: Path, name: str, dest_root: Path) -> Path:
 def _deadline_args(timeout_s: int) -> list[str]:
     """软/硬截止参数，供 ``run_agent`` 传给 ``run_strix_ctf.py``。
 
-    软截止放在墙钟的 75% 处：父进程到点会按进程组 SIGKILL，被杀的那次
-    run 既没有收尾也拿不到 usage（074/095 各丢一次 token 数）。软截止不杀
-    进程，只在工具结果里插一条「收敛」提示，把最后 25% 用在最强线索上。
-
-    提示里的硬上限必须等于父进程实际墙钟，否则模型会按错的剩余时间规划。
+    父进程的 ``proc.wait(timeout_s)`` 仍是**外部最后兜底**；子进程先在
+    ``timeout_s - WALL_RESERVE_SECONDS`` 处自停，才能把 usage/收尾写完并
+    以 0 退出。软截止再取内部墙钟的 75%，让最后 25% 用在最强线索上。
 
     Args:
         timeout_s: 父进程实际墙钟上限（秒）。
 
     Returns:
-        可直接拼进 argv 的参数列表。
+        可直接拼进 argv 的参数列表（内部墙钟已扣除 20s 收尾余量）。
     """
-    wall = max(int(timeout_s), 1)
-    soft = max(int(wall * 0.75), 1)
-    return ["--soft-deadline", str(soft), "--wall-deadline", str(wall)]
+    from ctf_strix.error_policy import WALL_RESERVE_SECONDS
+
+    external = max(int(timeout_s), 1)
+    internal = max(external - int(WALL_RESERVE_SECONDS), 1)
+    soft = max(int(internal * 0.75), 1)
+    return ["--soft-deadline", str(soft), "--wall-deadline", str(internal)]
 
 
 def run_agent(
@@ -1285,8 +1422,12 @@ def run_agent(
     # 每次都是全新沙箱：见 `_fresh_box` 里关于 session resume 的记录。
     box, log = _fresh_box(name)
 
+    # Windows 本地调试三件套：解释器取当前进程（.venv/bin/python 是 Linux
+    # 布局）、PATH 沿用宿主（否则 curl 等工具找不到）、进程组语义仅 POSIX。
+    is_win = sys.platform == "win32"
+
     env = {
-        "PYTHONPATH": "src:vendor/src",
+        "PYTHONPATH": os.pathsep.join(["src", "vendor/src"]),
         # 外网黑洞：比赛规定 agent_internet=deny，但沙箱里 curl 一个外网域名
         # 会**挂 20-60 秒**才超时。009 复跑实测：agent 试了两次下载字典
         # （raw.githubusercontent.com），外加 3 次 write_stdin 等待，约 8 次
@@ -1306,14 +1447,22 @@ def run_agent(
         # 每次 LLM 调用后原子落盘。进程被墙钟 SIGKILL 时，run_strix_ctf 末尾那行
         # `[usage]` 永远不会打印——两条 A/B 臂就这么丢了 token 数（只能记 n/a）。
         "CTF_USAGE_PATH": str(box / "usage.json"),
+        # Linux 镜像内的最小工具路径；Windows 本地调试沿用宿主 PATH，
+        # 否则子进程里 curl/nmap 等全部解析不到。
         "PATH": "/usr/local/bin:/usr/bin:/bin",
     }
+    if is_win:
+        # Windows 子进程不能裸 env：缺 SYSTEMROOT 时 Winsock（_overlapped）
+        # 初始化直接 WinError 10106，import asyncio 就死。从宿主环境叠加。
+        base = dict(os.environ)
+        base.update(env)
+        env = base
     # 软截止：墙钟的 75% 处。父进程到点会 SIGKILL 整组，被杀的那次 run
     # 既拿不到收尾也拿不到 usage（074/095 各丢一次数字）。软截止不杀进程，
     # 只在工具结果里插一条「收敛」提示，让模型把最后 25% 用在最强线索上。
     # 提示的秒数必须与父进程实际墙钟一致，否则模型会误判剩余预算。
     cmd = [
-        str(root / ".venv/bin/python"), "-u", str(root / "scripts/run_strix_ctf.py"),
+        sys.executable, "-u", str(root / "scripts/run_strix_ctf.py"),
         "--target", target, "--turns", str(turns), "--name", name,
         "--target-kind", target_kind,
         "--instruction", instruction,
@@ -1325,7 +1474,7 @@ def run_agent(
     started = time.time()
     # PYTHONPATH 是相对路径，必须配合 cwd=root 才能 import 到 ctf_strix，
     # 而沙箱隔离又要求 cwd=box——改成绝对路径，cwd 就能放心交给 box。
-    env["PYTHONPATH"] = f"{root / 'src'}:{root / 'vendor/src'}"
+    env["PYTHONPATH"] = os.pathsep.join([str(root / "src"), str(root / "vendor/src")])
 
     # ⚠️ 不能用 subprocess.run(timeout=...)。它只杀直接子进程，而 strix 会
     # fork 出沙箱/工具子进程，孙进程变孤儿继续打靶机，墙钟形同虚设。
@@ -1341,10 +1490,14 @@ def run_agent(
             f" box={box}\n"
         )
         fh.flush()
+        popen_kwargs = {}
+        if not is_win:
+            # start_new_session（setsid）仅 POSIX；Windows 上没有进程组语义。
+            popen_kwargs["start_new_session"] = True
         proc = subprocess.Popen(
             argv, env=env, cwd=str(box),
             stdout=fh, stderr=subprocess.STDOUT,
-            start_new_session=True,
+            **popen_kwargs,
         )
         try:
             proc.wait(timeout=timeout_s)
@@ -1491,8 +1644,7 @@ def main() -> int:
         svc_port = ""
         try:
             t0 = time.time()
-            iid = client.launch(cid)
-            target = client.wait_ready(iid)
+            iid, target = _launch_ready(client, cid)
             rec["launch_s"] = round(time.time() - t0, 1)
 
             # TCP / VPN 题必须建桥。不建的话 `_public_url()` 会把它拼成
@@ -1533,8 +1685,7 @@ def main() -> int:
                     tunnel.down()
                     tunnel = None
                 client.teardown(iid)
-                iid = client.launch(cid)
-                target = client.wait_ready(iid)
+                iid, target = _launch_ready(client, cid)
                 if isinstance(target, dict):
                     bridge, tunnel, target, target_kind, real_host, access = _attach(
                         iid, target, client
@@ -1587,6 +1738,7 @@ def main() -> int:
             #   3. 日志截断：flag 跨在 event_sink 截断边界上
             # 判据必须带本题靶机 host，否则分不清"这题的证据"和"别题的残留"。
             from ctf_strix.flag_extract import (
+                CANDIDATE_RE,
                 best_flag,
                 fallback_flag,
                 host_of,
@@ -1599,13 +1751,16 @@ def main() -> int:
             rec["guard"] = _parse_guard(log, _guard_state_path(run_id))
 
             own = host_of(target)
-            flag = best_flag(log, own)
+            best = best_flag(log, own)
             # 主判据挑不出时，用"唯一候选"兜底。理由见 fallback_flag 的 docstring：
             # 009 复跑里 agent 真的解出来了，却因为 host 与 flag 隔着一个
             # heredoc 而被判无证据——**解出来不提交，比交错更亏**。
+            flag = best
+            low: str | None = None
             rec["flag_confidence"] = "high" if flag else None
             if flag is None:
-                flag = fallback_flag(log, own)
+                low = fallback_flag(log, own)
+                flag = low
                 if flag:
                     rec["flag_confidence"] = "low"
             rec["flags_found"] = [flag] if flag else []
@@ -1626,6 +1781,8 @@ def main() -> int:
                     rec["flag_confidence"] = "contaminated"
                     print("  !! flag 疑似来自本地文档污染，不提交", flush=True)
                     flag = None
+                    # 兜底值就是被判污染的那一个，别让它在候选列表里复活。
+                    low = None
             # 多问题题：每个问题单独提交。平台按"全部正确"才算完全解出，
             # 只交 flag 等于白答（001 就吃过这个亏：flag 对了、另一问空着，
             # `my_fully_solved` 仍是 false）。
@@ -1634,17 +1791,33 @@ def main() -> int:
                 if isinstance(q, dict) and q.get("id")
             ]
             pairs = _answer_values(log)
+            # 观测：日志里"flag 形状"的串有几条。只记数字——结果行会被贴进
+            # 报告和 issue，正文（尤其是真答案）不能进去。
+            rec["flag_shaped_tokens"] = len(CANDIDATE_RE.findall(log))
+            rec["flag_shaped_but_unsubmitted"] = 0
             if multi:
                 submitted: dict[str, bool] = {}
                 for qid in multi:
-                    value = pairs.get(qid)
                     # A single-question challenge whose id is ``flag`` often
                     # ends with the token in a normal summary rather than an
                     # ANSWER line. Keep that evidence path, but never guess
                     # values for non-flag question ids.
-                    if not value and qid == "flag":
-                        value = flag
-                    if not value:
+                    candidates = _ranked_answers(
+                        pairs.get(qid),
+                        flag if qid == "flag" else None,
+                        low if qid == "flag" else None,
+                    )
+                    if not candidates:
+                        continue
+                    value, precheck = _verify_pick(client, iid, qid, candidates)
+                    if qid == "flag":
+                        rec["verify_precheck"] = precheck
+                    if value is None:
+                        # 平台判分器明确说这些都不对：不提交。交上去只会
+                        # 白白消耗 attempts，并污染台账。
+                        if qid == "flag":
+                            rec["flag_shaped_but_unsubmitted"] = len(candidates)
+                        submitted[qid] = False
                         continue
                     verdict = client.submit(iid, value, qid)
                     submitted[qid] = bool(verdict.get("correct"))
@@ -1655,14 +1828,22 @@ def main() -> int:
                         rec["solve_time_s"] = verdict.get("solve_time_s")
                 rec["answers_ok"] = submitted
                 rec["correct"] = bool(submitted) and all(submitted.values()) and len(submitted) == len(multi)
-            elif flag:
-                rec["flag_submitted"] = flag
-                verdict = client.submit(iid, flag)
-                rec["correct"] = bool(verdict.get("correct"))
-                rec["solve_time_s"] = verdict.get("solve_time_s")
-                rec["solve_rank"] = verdict.get("solve_rank")
             else:
-                rec["correct"] = False
+                candidates = _ranked_answers(pairs.get("flag"), flag, low)
+                if not candidates:
+                    rec["correct"] = False
+                else:
+                    value, precheck = _verify_pick(client, iid, "flag", candidates)
+                    rec["verify_precheck"] = precheck
+                    if value is None:
+                        rec["flag_shaped_but_unsubmitted"] = len(candidates)
+                        rec["correct"] = False
+                    else:
+                        rec["flag_submitted"] = value
+                        verdict = client.submit(iid, value)
+                        rec["correct"] = bool(verdict.get("correct"))
+                        rec["solve_time_s"] = verdict.get("solve_time_s")
+                        rec["solve_rank"] = verdict.get("solve_rank")
             print(f"  -> {'SOLVED' if rec['correct'] else 'FAILED'}  "
                   f"tools={rec['tool_calls']} agent={rec['agent_s']}s", flush=True)
         except TunnelRequiredError as exc:
