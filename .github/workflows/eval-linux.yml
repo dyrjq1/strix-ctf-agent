@@ -1,0 +1,201 @@
+name: eval-linux
+
+# Local Windows cannot run the full agent (strix's UnixLocalSandbox raises on
+# win32 and WSL is blocked by policy).  The official eval probe queue is also
+# saturated.  This workflow is the third path: a real Linux runner that starts
+# genuine platform instances through the player API/MCP, runs the exact same
+# scripts/run_strix_ctf.py that the image uses, and grades with verify-answer.
+# It is a measurement, not a leaderboard submission.
+
+on:
+  workflow_dispatch:
+    inputs:
+      challenges:
+        description: "Comma-separated challenge ids"
+        required: true
+        default: "CTFARENA-076"
+      wallclock:
+        description: "Per-challenge wallclock seconds"
+        required: true
+        default: "900"
+      turns:
+        description: "Per-challenge turn budget"
+        required: true
+        default: "40"
+      smoke_only:
+        description: "Only run preflight checks (no agent)"
+        required: true
+        default: "false"
+
+permissions:
+  contents: read
+
+jobs:
+  eval:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 350
+    env:
+      CTFY_TOKEN: ${{ secrets.CTFY_TOKEN }}
+      LLM_API_KEY: ${{ secrets.CTFY_LLM_KEY }}
+      LLM_API_BASE: ${{ secrets.CTFY_LLM_BASE }}
+      STRIX_LLM: ${{ secrets.CTFY_LLM_MODEL }}
+      # The runner must bypass the deliberate blackhole proxy for the platform
+      # API itself (autosubmit / verify-answer) as well as the LLM host.
+      CTF_NO_PROXY_EXTRA: "ctfy.tsinghua.edu.cn,.ctfy.run,.ctfy.io"
+      CTF_PRIVATE_TMP: "0"
+      PYTHONUNBUFFERED: "1"
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: accuracy-20261112
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install locked dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.lock
+
+      - name: Preflight (platform + LLM + one real instance)
+        env:
+          CHALLENGES: ${{ inputs.challenges }}
+        run: |
+          python - <<'PY'
+          import json, os, sys
+          import requests
+
+          base = "https://ctfy.tsinghua.edu.cn/api/v1"
+          tok = os.environ["CTFY_TOKEN"]
+          s = requests.Session()
+          s.headers.update({"Authorization": "Bearer " + tok,
+                            "Accept": "application/json"})
+
+          def check(label, fn):
+              try:
+                  print(f"[preflight] {label}: {fn()}", flush=True)
+              except Exception as exc:
+                  print(f"[preflight] {label}: FAILED {type(exc).__name__}: {exc}",
+                        flush=True)
+                  sys.exit(1)
+
+          def me():
+              r = s.get(base + "/me", timeout=30)
+              r.raise_for_status()
+              return "user=" + r.json().get("display_name", "?")
+
+          def catalog():
+              r = s.get(base + "/challenges", params={"limit": 1}, timeout=30)
+              r.raise_for_status()
+              d = r.json()
+              return "challenges=" + str(d.get("total", len(d.get("items", []))))
+
+          def llm():
+              url = os.environ["LLM_API_BASE"].rstrip("/") + "/chat/completions"
+              r = requests.post(
+                  url,
+                  headers={"Authorization": "Bearer " + os.environ["LLM_API_KEY"]},
+                  json={"model": os.environ["STRIX_LLM"].split("/", 1)[-1],
+                        "messages": [{"role": "user", "content": "reply OK"}],
+                        "max_tokens": 8},
+                  timeout=60,
+              )
+              r.raise_for_status()
+              return "model=" + r.json().get("model", "?")
+
+          check("platform /me", me)
+          check("platform catalog", catalog)
+          check("LLM endpoint", llm)
+
+          cid = [x.strip() for x in os.environ["CHALLENGES"].split(",") if x.strip()][0]
+          suites = s.get(base + "/suites", timeout=30).json().get("items", [])
+          suite = next((x["id"] for x in suites
+                        if cid.split("-")[0].upper() == (x.get("title") or "").upper()), "")
+          print(f"[preflight] suite for {cid}: {suite or '(unresolved)'}", flush=True)
+          if not suite:
+              sys.exit(1)
+          r = s.post(base + "/instances",
+                     json={"challenge_id": cid, "competition_id": suite}, timeout=120)
+          print(f"[preflight] start_instance: HTTP {r.status_code}", flush=True)
+          r.raise_for_status()
+          iid = r.json()["id"]
+          try:
+              import time
+              deadline = time.time() + 180
+              status = ""
+              while time.time() < deadline:
+                  d = s.get(base + f"/instances/{iid}/status", timeout=40).json()
+                  status = d.get("status", "")
+                  if status == "ready":
+                      break
+                  time.sleep(5)
+              svcs = (d.get("attack_surface") or {}).get("services") or []
+              print(f"[preflight] instance ready={status == 'ready'} "
+                    f"services={json.dumps(svcs)[:400]}", flush=True)
+              if status != "ready":
+                  sys.exit(1)
+          finally:
+              s.delete(base + f"/instances/{iid}", timeout=60)
+          PY
+
+      - name: Build plan
+        if: ${{ inputs.smoke_only != 'true' }}
+        env:
+          CHALLENGES: ${{ inputs.challenges }}
+        run: |
+          python - <<'PY'
+          import json, os
+          ids = [x.strip() for x in os.environ["CHALLENGES"].split(",") if x.strip()]
+          # diagnostic pool only; explicit flags so the pool guard cannot
+          # refuse a measurement when a listed id is in a historical bucket.
+          plan = [{"id": i, "difficulty": "medium",
+                   "allow_burned": True, "allow_sealed": True} for i in ids]
+          with open("ci-plan.json", "w", encoding="utf-8") as fh:
+              json.dump(plan, fh, ensure_ascii=False, indent=2)
+          print("plan:", plan)
+          PY
+
+      - name: Run real-instance batch eval
+        if: ${{ inputs.smoke_only != 'true' }}
+        env:
+          WALLCLOCK: ${{ inputs.wallclock }}
+          TURNS: ${{ inputs.turns }}
+        run: |
+          python scripts/batch_eval.py \
+            --plan ci-plan.json \
+            --token "$CTFY_TOKEN" \
+            --turns "$TURNS" \
+            --wallclock "$WALLCLOCK" \
+            --out ci-results.jsonl \
+            --archive-dir ci-runs
+
+      - name: Summarize
+        if: ${{ always() && inputs.smoke_only != 'true' }}
+        run: |
+          python - <<'PY'
+          import json, pathlib
+          p = pathlib.Path("ci-results.jsonl")
+          if not p.exists():
+              print("no results file")
+          else:
+              rows = [json.loads(x) for x in p.read_text(encoding="utf-8").splitlines() if x.strip()]
+              ok = sum(1 for r in rows if r.get("correct"))
+              print(f"RESULT {ok}/{len(rows)} = {ok / len(rows):.1%}" if rows else "RESULT empty")
+              for r in rows:
+                  print(" ", r.get("challenge"), "correct=", r.get("correct"),
+                        "error=", r.get("error"), "total_s=", r.get("total_s"))
+          PY
+
+      - name: Upload results
+        if: ${{ always() && inputs.smoke_only != 'true' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: eval-results-${{ github.run_id }}
+          path: |
+            ci-results.jsonl
+            ci-runs/**
+          if-no-files-found: warn
+          retention-days: 14
