@@ -31,6 +31,7 @@ from typing import TYPE_CHECKING, Any
 from agents.sandbox.sandboxes.unix_local import (
     UnixLocalSandboxClient,
     UnixLocalSandboxClientOptions,
+    UnixLocalSandboxSession,
 )
 from strix.runtime.backends import register_backend
 
@@ -74,7 +75,7 @@ _CAIDO_PROXY_KEYS = (
 #: ``env`` 就能读到解题用的 LLM key,且已实际发生过:一次失败 run 把 key
 #: 当成答案字符串提交(裸 hex 恰好命中答案形状)。
 #:
-#: 生效点必须在 ``UnixLocalSandboxClient._resolved_exec_context`` 的返回值上:
+#: 生效点必须在 ``UnixLocalSandboxSession._resolved_exec_context`` 的返回值上:
 #: 它先 ``os.environ.copy()`` 再 ``manifest.environment.resolve()`` update——
 #: resolve 只增/覆盖不删除，所以在 manifest 层 pop 对 runner 环境来的键无效
 #: (第一版踩过)。也不能直接清 runner 的 ``os.environ``:runner 进程自己调
@@ -119,15 +120,25 @@ def _credential_env_keys(env: dict[str, str]) -> list[str]:
 
 
 def _patch_exec_env_credentials() -> None:
-    """包装 ``UnixLocalSandboxClient._resolved_exec_context``,删凭据键。
+    """包装 ``UnixLocalSandboxSession._resolved_exec_context``,删凭据键。
 
     每次工具 exec 都会走该方法构造环境(常规 exec / PTY / 读文件三条路径)，
     在返回的 env dict 上删一次即覆盖全部路径。类级替换、幂等：重复 install
     不会叠两层包装(叠了也只是白删一次，无害，但日志会重复)。
+
+    ⚠️ 目标类是 ``UnixLocalSandboxSession``(持有 ``state.manifest``、真正构造
+    exec 环境的会话对象)，不是 ``UnixLocalSandboxClient``——第一版锚错了类，
+    真机启动即 ``AttributeError``(单测假模块同样锚错所以没拦住)。此处对目标
+    属性做显式检查，SDK 结构再变时启动即报可读错误，不在 run 中途炸。
     """
-    if getattr(UnixLocalSandboxClient, "_ctfy_env_patched", False):
+    if getattr(UnixLocalSandboxSession, "_ctfy_env_patched", False):
         return
-    original = UnixLocalSandboxClient._resolved_exec_context
+    original = getattr(UnixLocalSandboxSession, "_resolved_exec_context", None)
+    if original is None:
+        raise RuntimeError(
+            "unix_local.UnixLocalSandboxSession._resolved_exec_context 不存在——"
+            "agents SDK 结构可能已变化，凭据剥离补丁需要重新对位"
+        )
 
     @functools.wraps(original)
     async def _resolved_exec_context(self: Any) -> tuple[dict[str, str], str]:
@@ -136,10 +147,10 @@ def _patch_exec_env_credentials() -> None:
             env.pop(key, None)
         return env, cwd
 
-    UnixLocalSandboxClient._resolved_exec_context = (  # type: ignore[method-assign]
+    UnixLocalSandboxSession._resolved_exec_context = (  # type: ignore[method-assign]
         _resolved_exec_context
     )
-    UnixLocalSandboxClient._ctfy_env_patched = True  # type: ignore[attr-defined]
+    UnixLocalSandboxSession._ctfy_env_patched = True  # type: ignore[attr-defined]
     logger.info("Sandbox exec env: credential stripping active")
 
 

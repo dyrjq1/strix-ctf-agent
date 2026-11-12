@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import importlib
+import inspect
 import sys
 import types
 
@@ -20,9 +21,16 @@ import pytest
 
 @pytest.fixture()
 def local_backend(monkeypatch):
-    """加载带假 unix_local 的 ctf_strix.local_backend，返回 (模块, 假类)。"""
+    """加载带假 unix_local 的 ctf_strix.local_backend，返回 (模块, 假 Session 类)。
 
-    class FakeClient:
+    假模块镜像真实 SDK 结构：``_resolved_exec_context`` 在
+    ``UnixLocalSandboxSession`` 上（真正构造 exec 环境的会话对象），
+    ``UnixLocalSandboxClient`` 上**没有**这个方法——第一版实现锚错到
+    Client、假模块同样锚错，真机启动即 AttributeError 而单测全绿，
+    本结构就是为了不再复现这种「两层同错」。
+    """
+
+    class FakeSession:
         async def _resolved_exec_context(self):
             import os
 
@@ -30,16 +38,20 @@ def local_backend(monkeypatch):
             env.setdefault("SANDBOX_MARKER", "1")
             return env, "/workspace"
 
+    class FakeClient:  # 真实 SDK 的 Client 无此方法，这里刻意不给
+        pass
+
     fake = types.ModuleType("agents.sandbox.sandboxes.unix_local")
     fake.UnixLocalSandboxClient = FakeClient  # type: ignore[attr-defined]
     fake.UnixLocalSandboxClientOptions = type(  # type: ignore[attr-defined]
         "FakeOptions", (), {}
     )
+    fake.UnixLocalSandboxSession = FakeSession  # type: ignore[attr-defined]
     monkeypatch.setitem(sys.modules, "agents.sandbox.sandboxes.unix_local", fake)
     monkeypatch.delitem(sys.modules, "ctf_strix.local_backend", raising=False)
     module = importlib.import_module("ctf_strix.local_backend")
     try:
-        yield module, FakeClient
+        yield module, FakeSession
     finally:
         monkeypatch.delitem(sys.modules, "ctf_strix.local_backend", raising=False)
 
@@ -110,6 +122,45 @@ def test_patch_idempotent(local_backend):
     module._patch_exec_env_credentials()
     # 第二次调用不得再包一层：unwrap 一次仍是原方法。
     assert client_cls._resolved_exec_context.__wrapped__ is original
+
+
+def test_patch_targets_session_not_client(local_backend):
+    """补丁必须落在 Session（真正构造 exec 环境）上，且不能碰 Client。"""
+    module, session_cls = local_backend
+
+    module._patch_exec_env_credentials()
+    # 包装落在 Session 上；Client 上不该出现凭据剥离的任何痕迹。
+    assert getattr(session_cls, "_ctfy_env_patched", False) is True
+    assert session_cls._resolved_exec_context.__name__ == "_resolved_exec_context"
+    assert not hasattr(module.UnixLocalSandboxClient, "_ctfy_env_patched")
+    assert not hasattr(module.UnixLocalSandboxClient, "_resolved_exec_context")
+
+
+def test_patch_fails_loud_when_attribute_missing(monkeypatch):
+    """SDK 结构再变（方法被改名/移走）时启动即报可读错误，不在 run 中途炸。"""
+    import asyncio
+    import importlib
+    import sys
+
+    class BareSession:  # 无 _resolved_exec_context
+        pass
+
+    fake = types.ModuleType("agents.sandbox.sandboxes.unix_local")
+    fake.UnixLocalSandboxClient = type("FakeClient", (), {})
+    fake.UnixLocalSandboxClientOptions = type("FakeOptions", (), {})
+    fake.UnixLocalSandboxSession = BareSession
+    monkeypatch.setitem(sys.modules, "agents.sandbox.sandboxes.unix_local", fake)
+    monkeypatch.delitem(sys.modules, "ctf_strix.local_backend", raising=False)
+    module = importlib.import_module("ctf_strix.local_backend")
+    try:
+        with pytest.raises(RuntimeError, match="_resolved_exec_context"):
+            module._patch_exec_env_credentials()
+    finally:
+        monkeypatch.delitem(sys.modules, "ctf_strix.local_backend", raising=False)
+    # BareSession 未被污染，fail-loud 没有半途打标记。
+    assert not hasattr(BareSession, "_ctfy_env_patched")
+    assert not any(inspect.iscoroutinefunction(getattr(BareSession, n, None))
+                   for n in dir(BareSession))
 
 
 def test_regex_classification(local_backend):
