@@ -86,13 +86,23 @@ def test_stop_reason_reads_watchdog_hard_stop_line() -> None:
 @pytest.mark.parametrize(
     "log",
     [
-        "[stopped] error\n[run-error] agents.exceptions.MaxTurnsExceeded: too many\n",
         "[agent-exit] rc=1\n",
         "[agent-exit] rc=-15\n",
     ],
 )
 def test_stop_reason_maps_crash_shapes_to_error(log: str) -> None:
     assert _stop_reason_of(log) == "error"
+
+
+def test_stop_reason_maps_turn_cap_to_turn_capped() -> None:
+    """轮次耗尽要记成 ``turn_capped``，不是 ``error``。
+
+    2026-11-13 SAMPLE-023 实证：18 轮上限撞的是
+    ``agents.exceptions.MaxTurnsExceeded``，旧映射记 ``error`` → 看着像崩溃，
+    调度器无法据此判断「加轮次就能解」，白跑一轮。
+    """
+    log = "[stopped] error\n[run-error] agents.exceptions.MaxTurnsExceeded: too many\n"
+    assert _stop_reason_of(log) == "turn_capped"
 
 
 def test_stop_reason_of_a_quiet_run_is_unknown() -> None:

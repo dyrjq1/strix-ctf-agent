@@ -35,14 +35,17 @@ def _clean_watchdog():
     deadline.reset_for_tests()
     agent._deadline_owned = False
     agent._signal_installed = False
+    # 3.14/Linux 上 SIGALRM 在，但测试可能用 monkeypatch 删掉它来模拟无信号平台；
+    # 收尾时该属性可能仍处于被删状态，故 teardown 也要 getattr 兜底。
     previous_alarm = signal.getsignal(signal.SIGALRM) if hasattr(signal, "SIGALRM") else None
     try:
         yield
     finally:
         agent._cancel_hard_deadline()
-        if previous_alarm is not None:
+        sigalrm = getattr(signal, "SIGALRM", None)
+        if previous_alarm is not None and sigalrm is not None:
             try:
-                signal.signal(signal.SIGALRM, previous_alarm)
+                signal.signal(sigalrm, previous_alarm)
             except (OSError, ValueError):
                 pass
         error_policy.clear_wall_deadline()

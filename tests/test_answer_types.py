@@ -190,6 +190,36 @@ def test_persist_noops_without_env(monkeypatch, tmp_path) -> None:
     assert list(tmp_path.iterdir()) == []
 
 
+def test_merge_sidecar_clears_false_rejection() -> None:
+    """run 内已解出时，父进程事后重放的「判否」不能留在记录里。
+
+    SAMPLE-007 实测：sidecar 说 fully_solved，父进程仍记
+    ``answers_ok={'outage': False}`` + ``answers_rejected={'outage': 'false'}``。
+    实例已删，重放必拒，这是传输假否。
+    """
+    rec = {
+        "correct": False,
+        "answers_ok": {"outage": False},
+        "answers_rejected": {"outage": "false"},
+    }
+    batch_eval._merge_sidecar_verdict(rec, {
+        "correct": ["outage=true"],
+        "challenge_fully_solved": True,
+    })
+    assert rec["correct"] is True
+    assert rec["solved_by"] == "in_run_autosubmit"
+    assert rec["answers_ok"]["outage"] is True
+    assert "answers_rejected" not in rec
+
+
+def test_merge_sidecar_keeps_genuine_failures() -> None:
+    rec = {"correct": False, "answers_rejected": {"flag": "x"}}
+    batch_eval._merge_sidecar_verdict(rec, {"correct": [], "challenge_fully_solved": False})
+    assert rec["correct"] is False
+    assert rec["answers_rejected"] == {"flag": "x"}
+    assert rec["autosubmit_verdict"]["fully_solved"] is False
+
+
 def test_read_submit_sidecar_tolerates_missing(tmp_path) -> None:
     assert batch_eval._read_submit_sidecar(tmp_path / "nope.json") == {}
     p = tmp_path / "bad.json"

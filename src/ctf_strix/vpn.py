@@ -91,6 +91,29 @@ def _run(argv: list[str], *, timeout: float = 15.0) -> subprocess.CompletedProce
     return subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
 
 
+def allowed_ranges(raw: str | None) -> list[str]:
+    """``AllowedIPs`` 的全部网段，剔除默认路由。
+
+    多主机题（SAMPLE-023 "Split Horizon"：portal 主机 + 文件主机）要求
+    agent 能访问同一场景网段里的第二台主机。旧实现只取第一条
+    ``AllowedIPs``，隧道外的 .2 之外的主机全部不可达——agent 只能看到
+    被桥接到 127.0.0.1 的那一台，题就变成无解的。
+
+    默认路由（``0.0.0.0/0`` / ``::/0``）必须剔除：比赛
+    ``agent_internet=deny``，全隧道等于白送外网。若 profile 只有默认
+    路由，退回原值（否则隧道整条废掉）。
+
+    Args:
+        raw: profile 里 ``AllowedIPs`` 的原始字符串（逗号分隔）。
+
+    Returns:
+        要保留的网段列表，顺序与 profile 一致。
+    """
+    items = [x.strip() for x in str(raw or "").split(",") if x.strip()]
+    kept = [x for x in items if x not in ("0.0.0.0/0", "::/0")]
+    return kept or items
+
+
 class VpnTunnel:
     """一份实例级 wireguard profile 的运行态。"""
 
@@ -110,6 +133,9 @@ class VpnTunnel:
         self.peer_key = peer_key
         self.endpoint = endpoint
         self.allowed = allowed
+        #: 要逐条加路由的网段（IPv4 过滤见 up()）。多主机题靠这里把
+        #: 同一场景的第二台主机也放进隧道。
+        self.routes = allowed_ranges(allowed)
         self.address = address
         self.dns = dns
         self.up_ok = False
@@ -153,7 +179,7 @@ class VpnTunnel:
             private_key=str(iface_sec.get("PrivateKey")).strip(),
             peer_key=str(peer_sec.get("PublicKey")).strip(),
             endpoint=str(peer_sec.get("Endpoint")).strip(),
-            allowed=str(peer_sec.get("AllowedIPs")).split(",")[0].strip(),
+            allowed=", ".join(allowed_ranges(peer_sec.get("AllowedIPs"))),
             address=addr,
             dns=dns,
         )
@@ -188,7 +214,6 @@ class VpnTunnel:
         for argv in (
             ["ip", "-4", "addr", "add", self.address, "dev", self.iface],
             ["ip", "link", "set", "mtu", "1420", "up", "dev", self.iface],
-            ["ip", "-4", "route", "add", self.allowed, "dev", self.iface],
         ):
             proc = _run(argv)
             if proc.returncode != 0:
@@ -198,6 +223,16 @@ class VpnTunnel:
                     continue
                 logger.warning(
                     "vpn step failed: %s: %s", argv, (proc.stderr or proc.stdout).strip()
+                )
+                _run(["ip", "link", "del", self.iface])
+                return False
+        for route in self.routes:
+            if ":" in route:  # IPv6 网段不走 -4 路由（该隧道只配了 v4 地址）
+                continue
+            proc = _run(["ip", "-4", "route", "add", route, "dev", self.iface])
+            if proc.returncode != 0 and "File exists" not in (proc.stderr or ""):
+                logger.warning(
+                    "vpn route failed: %s: %s", route, (proc.stderr or proc.stdout).strip()
                 )
                 _run(["ip", "link", "del", self.iface])
                 return False

@@ -71,6 +71,7 @@ import signal
 import subprocess
 import sys
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -104,6 +105,10 @@ _FAIL_PENALTY = 90
 _GATING_BONUS = 40
 #: QA 题库题（is_qa_only）：不占实例配额、通常几分钟出结果，给一点优先。
 _QA_BONUS = 30
+
+#: 难度对墙钟的放大倍数（与 batch_eval 的 tiers 同源）。派单前用真实
+#: 上限判会话窗口够不够，而不是拿基准 wallclock 猜。
+_WALL_TIER = {"easy": 1.0, "medium": 1.5, "hard": 2.3}
 
 
 def challenge_score(
@@ -256,6 +261,81 @@ def fetch_scoreboard(token: str, cid: str, timeout: int = 30) -> dict[str, Any]:
     )
     r.raise_for_status()
     return r.json()
+
+
+def fetch_session_window(
+    token: str, cid: str, timeout: int = 30
+) -> tuple[float | None, float | None]:
+    """本场比赛的 ``(当前会话结束, 下一会话开始)``，Unix 秒。
+
+    练习场实测（2026-11-13）：sessions 是 4 小时一段、``:45–:00`` 暂停
+    15 分钟，``session_end_mode=delete``——会话一结束，在跑的实例直接
+    被删。run2 的 021/023「收场：error」与 003/017/018/021 的 ready
+    超时全部撞在 15:45 的会话边界上，不是模型能力问题。
+
+    无 sessions 字段（单场制）时返回 ``(None, None)``，调用方按不限期处理。
+    """
+    r = requests.get(
+        f"{PLATFORM}/api/v1/competitions/{cid}",
+        headers={"Authorization": f"Bearer {token}"},
+        timeout=timeout,
+    )
+    r.raise_for_status()
+    body = r.json()
+    data = body if isinstance(body, dict) else {}
+    sessions = data.get("sessions") or []
+    now = time.time()
+
+    def _ts(raw: Any) -> float | None:
+        if not raw:
+            return None
+        try:
+            return datetime.fromisoformat(str(raw).replace("Z", "+00:00")).timestamp()
+        except ValueError:
+            return None
+
+    spans = [
+        (_ts(s.get("starts_at")), _ts(s.get("ends_at")))
+        for s in sessions
+        if isinstance(s, dict)
+    ]
+    spans = [(a, b) for a, b in spans if a is not None and b is not None]
+    # 当前会话：starts_at <= now < ends_at（含 15 分钟暂停段外沿）。
+    current_end = next((b for a, b in spans if a <= now < b), None)
+    future_starts = sorted(a for a, _ in spans if a > now)
+    next_start = future_starts[0] if future_starts else (
+        _ts(data.get("next_session_starts_at"))
+    )
+    return current_end, next_start
+
+
+def session_allows_dispatch(
+    now: float,
+    session_end: float | None,
+    next_start: float | None,
+    needed_s: float,
+    *,
+    margin_s: float = 180.0,
+) -> tuple[bool, float]:
+    """会话窗口是否够跑完这一单；不够就返回要等多久。
+
+    ``needed_s`` 是该题的实际墙钟上限（含难度放大）。``margin_s`` 给
+    起实例、收尾提交、删实例留余量——实测这些加起来 60–120s，取 180s。
+
+    返回 ``(可以派单, 需要等待的秒数)``。``session_end is None``（单场制）
+    时永远放行。
+    """
+    if session_end is None:
+        return True, 0.0
+    if now >= session_end:
+        # 已在暂停段：等下一场开始（缺 next_start 时按结束点+15 分钟估）。
+        start = next_start if next_start is not None else session_end + 900.0
+        return False, max(5.0, start - now + 5.0)
+    remaining = session_end - now
+    if remaining < needed_s + margin_s:
+        start = next_start if next_start is not None else session_end + 900.0
+        return False, max(5.0, start - now + 5.0)
+    return True, 0.0
 
 
 def fetch_my_solves(token: str, cid: str, timeout: int = 30) -> set[str]:
@@ -564,13 +644,35 @@ def main() -> int:
 
     deadline = None
     if args.until:
-        from datetime import datetime
         deadline = datetime.fromisoformat(args.until).timestamp()
+
+    #: 会话窗口（练习场 4h 一段）：派单前要确认剩余时间够跑完这一单。
+    #: 每 5 分钟刷新一次，避免跨过一次会话边界还用旧窗口。
+    session_end: float | None = None
+    next_start: float | None = None
+    session_fetched_at = 0.0
+    session_warned = False
+
+    def _refresh_session(force: bool = False) -> None:
+        nonlocal session_end, next_start, session_fetched_at
+        if not force and time.time() - session_fetched_at < 300:
+            return
+        session_fetched_at = time.time()
+        try:
+            session_end, next_start = fetch_session_window(
+                args.token, args.competition
+            )
+        except Exception as exc:  # noqa: BLE001 — 拉不到就按不限期跑
+            print(f"[compete] 会话窗口拉取失败（按不限期处理）：{exc}", flush=True)
+            session_end, next_start = None, None
+
+    _refresh_session(force=True)
 
     while not stop:
         if deadline_reached(deadline):
             print("[compete] 到 --until，收工", flush=True)
             break
+        _refresh_session()
         try:
             challenges = fetch_challenges(args.token, args.competition)
         except Exception as exc:  # noqa: BLE001
@@ -586,8 +688,21 @@ def main() -> int:
                     "runs": 0,
                     "fails": 0,
                     "solves_count_seen": int(chal.get("solves_count") or 0),
+                    # 只落在调度器的账本里，供收工后分题型统计（web 一枝独秀
+                    # 会把 crypto/rev 的短板平均掉）。**不进派单 plan**——
+                    # 题内上下文隔离不变量不受影响。
+                    "category": str(chal.get("category") or ""),
+                    "difficulty": str(chal.get("difficulty") or ""),
                     "one_line": "",
                 }
+            elif cid and not (state[cid].get("category") and state[cid].get("difficulty")):
+                # 旧账本没有这两列：补一次，别让分题型统计只剩 "?"。
+                state[cid]["category"] = state[cid].get("category") or str(
+                    chal.get("category") or ""
+                )
+                state[cid]["difficulty"] = state[cid].get("difficulty") or str(
+                    chal.get("difficulty") or ""
+                )
         if time.time() - last_solve_sync >= 60 and not args.ignore_platform_solves:
             # B-28：赛中在浏览器/别处解出的题，60s 内同步进账，避免重派。
             last_solve_sync = time.time()
@@ -621,6 +736,25 @@ def main() -> int:
         while len(running) < args.lanes and queue:
             chal = queue.pop(0)
             cid = str(chal["id"])
+            needed = args.wallclock * _WALL_TIER.get(
+                str(chal.get("difficulty") or ""), 1.0
+            )
+            ok, wait = session_allows_dispatch(
+                time.time(), session_end, next_start, needed
+            )
+            if not ok:
+                # 会话边界前派单 = 跑到一半实例被删（实测 021/023 的
+                # error、003/017/018 的 ready 超时）。宁可空等下一场。
+                queue.insert(0, chal)
+                if not session_warned:
+                    print(
+                        f"[compete] 会话窗口不足（{cid} 需 {needed:.0f}s），"
+                        f"{wait:.0f}s 后下一场再派",
+                        flush=True,
+                    )
+                    session_warned = True
+                break
+            session_warned = False
             rec = state.setdefault(cid, {})
             rec["status"] = RUNNING
             running[cid] = _spawn(

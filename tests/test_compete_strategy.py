@@ -274,3 +274,46 @@ def test_deadline_reached_accepts_none_and_epochs() -> None:
     assert compete.deadline_reached(None) is False
     assert compete.deadline_reached(time.time() - 1) is True
     assert compete.deadline_reached(time.time() + 600) is False
+
+
+# ---------------------------------------------------------------- 会话窗口
+def test_session_allows_dispatch_without_sessions() -> None:
+    """单场制（无 sessions 字段）：永远放行。"""
+    assert compete.session_allows_dispatch(1000.0, None, None, 900) == (True, 0.0)
+
+
+def test_session_blocks_when_remaining_is_short() -> None:
+    """会话只剩 10 分钟、这单要 15 分钟 → 不派，等下一场。
+
+    这是 run2 的真实形态：15:45 会话结束删实例，派单在 15:37 发出，
+    跑到一半靶机消失，记成 error/ready 超时。
+    """
+    ok, wait = compete.session_allows_dispatch(
+        1000.0, session_end=1600.0, next_start=2500.0, needed_s=900
+    )
+    assert ok is False
+    assert wait == 1505.0  # 2500-1000+5
+
+
+def test_session_allows_when_remaining_fits_with_margin() -> None:
+    # 剩 1500s，要 900s + 180s 余量 → 放行。
+    assert compete.session_allows_dispatch(
+        1000.0, 2500.0, 3000.0, 900
+    ) == (True, 0.0)
+    # 剩 1080s 恰好等于 900+180 → 放行；再少 1 秒就不行。
+    assert compete.session_allows_dispatch(1000.0, 2080.0, 3000.0, 900)[0] is True
+    assert compete.session_allows_dispatch(1000.0, 2079.0, 3000.0, 900)[0] is False
+
+
+def test_session_inside_pause_waits_for_next() -> None:
+    ok, wait = compete.session_allows_dispatch(
+        1700.0, session_end=1600.0, next_start=2500.0, needed_s=60
+    )
+    assert ok is False
+    assert wait == 805.0
+
+
+def test_wall_tier_matches_batch_eval() -> None:
+    """派单判窗用的放大倍数必须与 batch_eval 的 tiers 一致。"""
+    for diff, wall_mult in (("easy", 1.0), ("medium", 1.5), ("hard", 2.3)):
+        assert compete._WALL_TIER[diff] == wall_mult

@@ -91,6 +91,58 @@ def test_declared_vpn_access_keeps_the_original_path() -> None:
     assert not any(path.endswith("/vpn-config") for path in session.paths)
 
 
+# ---------------------------------------------------------------- 纯附件题
+class _FileSession:
+    """ready 但没有服务，只有实例下发的文件（SAMPLE-017/018 的真实形态）。"""
+
+    def __init__(self) -> None:
+        self.paths: list[str] = []
+
+    def get(self, url: str, timeout: float = 0) -> _Resp:  # noqa: ARG002
+        self.paths.append(url)
+        if url.endswith("/status"):
+            return _Resp(200, data={
+                "status": "ready",
+                "attack_surface": {
+                    "services": [],
+                    "provided_files": [{"name": "checkin", "size": 690784}],
+                    "estate_names": [],
+                },
+            })
+        if url.endswith("/attachments"):
+            return _Resp(200, data={"files": [{"name": "checkin", "size": 690784}]})
+        if url.endswith("/attachments/checkin"):
+            return _Resp(200, data={})
+        raise AssertionError(f"unexpected request: {url}")
+
+
+def test_file_only_instance_is_not_a_timeout() -> None:
+    """ready + 无服务 + 有下发文件 = 纯附件题，不能等满 timeout 判 skip。"""
+    session = _FileSession()
+    client = _client(session)
+    target = client.wait_ready("iid-file")
+    assert isinstance(target, dict)
+    assert target["service_type"] == "file"
+
+
+def test_instance_attachments_are_downloaded(monkeypatch) -> None:
+    """实例附件是 017/018 的唯一输入，挑战级附件里没有它们。"""
+    class _S:
+        def get(self, url, timeout=0):  # noqa: ARG002
+            if url.endswith("/attachments"):
+                return _Resp(200, data={"files": [{"name": "checkin", "size": 4}]})
+            if url.endswith("/attachments/checkin"):
+                r = _Resp(200)
+                r.content = b"\x7fELF"
+                return r
+            raise AssertionError(url)
+
+    client = batch_eval.Client("t")
+    client.s = _S()  # type: ignore[assignment]
+    files = client.fetch_instance_attachments("iid-x")
+    assert files == {"checkin": b"\x7fELF"}
+
+
 class _FakeBridge:
     def __init__(self, host: str, port: int, access: str | None = None) -> None:
         self.host = host
@@ -445,3 +497,48 @@ def test_tunnel_dns_persistent_failure_still_skips(fake_network, monkeypatch) ->
         batch_eval._attach("iid-10", dict(PRIVATE_SVC), fake_network)
 
     assert slept == [5] * 6
+
+
+# ---------------------------------------------------------------- 隧道网段
+def test_allowed_ranges_keeps_every_private_range() -> None:
+    """多主机题：同一场景的第二台主机必须在隧道里（023 的 files 主机）。
+
+    旧实现只取 ``AllowedIPs.split(",")[0]``，隧道里只剩一个 /32，
+    portal 之外的场景主机全部不可达。
+    """
+    from ctf_strix.vpn import allowed_ranges
+
+    assert allowed_ranges("172.16.5.2/32, 172.16.5.0/24") == [
+        "172.16.5.2/32",
+        "172.16.5.0/24",
+    ]
+
+
+def test_allowed_ranges_drops_default_route() -> None:
+    """agent_internet=deny：全隧道等于白送外网，默认路由必须剔除。"""
+    from ctf_strix.vpn import allowed_ranges
+
+    assert allowed_ranges("0.0.0.0/0, 172.16.5.0/24") == ["172.16.5.0/24"]
+    assert allowed_ranges("172.16.5.0/24, ::/0") == ["172.16.5.0/24"]
+
+
+def test_allowed_ranges_falls_back_when_only_default() -> None:
+    """只给默认路由的 profile 不能剔空：剔空等于隧道整条废掉。"""
+    from ctf_strix.vpn import allowed_ranges
+
+    assert allowed_ranges("0.0.0.0/0") == ["0.0.0.0/0"]
+    assert allowed_ranges("") == []
+
+
+def test_tunnel_brief_states_ranges_dns_and_proxy_bypass() -> None:
+    """题面必须写清内网怎么用：网段、内部 DNS、--noproxy。"""
+    tunnel = SimpleNamespace(routes=["172.16.5.0/24"], dns=["172.16.5.3"])
+    text = batch_eval._tunnel_brief(tunnel)
+    assert "172.16.5.0/24" in text
+    assert "172.16.5.3" in text
+    assert "--noproxy" in text
+    assert ".internal" in text
+
+
+def test_tunnel_brief_absent_without_tunnel() -> None:
+    assert batch_eval._tunnel_brief(None) == ""

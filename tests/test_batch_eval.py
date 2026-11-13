@@ -799,6 +799,90 @@ def test_launch_waits_through_a_pause_without_burning_retries(
     assert slept == [8]  # retry_after 3 + 5s 余量
 
 
+class _CapacitySession:
+    """``GET /instances`` 计数用；配额判断**不许**读它（见下）。"""
+
+    headers: dict = {}
+
+    def __init__(self, statuses: list[list[str]]) -> None:
+        self.statuses = list(statuses)
+        self.gets = 0
+
+    class _Resp:
+        status_code = 200
+
+        def __init__(self, items: list[dict]) -> None:
+            import json as _json
+
+            self.text = _json.dumps({"items": items})
+
+    def get(self, url, timeout=0):  # noqa: ANN001, ARG002
+        self.gets += 1
+        batch = self.statuses.pop(0) if self.statuses else []
+        return self._Resp([{"id": f"i{n}", "status": s} for n, s in enumerate(batch)])
+
+
+def test_capacity_backoff_waits_a_step_even_when_the_list_looks_empty(
+    monkeypatch,
+) -> None:
+    """「still stopping」的实例已经从列表消失但**仍占配额**。
+
+    2026-11-13 实测：第一版按 ``GET /instances`` 判空 → 两题（CYBENCH-028/037）
+    连撞 5 次 429 直接判错。现在只信 POST 自己的 429 文案，给固定步长。
+    """
+    session = _CapacitySession([[]])  # 列表看起来是空的
+    client = _client_with(session)
+    slept: list[float] = []
+    monkeypatch.setattr(batch_eval.time, "sleep", lambda s: slept.append(s))
+
+    wait = client._capacity_backoff(
+        '{"code":"team_capacity_exceeded","detail":"Max 1 concurrent instances '
+        'per team (0 running, 1 still stopping)"}',
+        waited=0.0,
+    )
+
+    assert wait == 10.0
+    assert session.gets == 0  # 完全没靠列表判断
+
+
+def test_capacity_backoff_does_not_guess_without_a_cap_in_the_message() -> None:
+    """文案里取不到配额就不猜，交给退避逻辑——省得盲等。"""
+    session = _CapacitySession([])
+    client = _client_with(session)
+
+    assert client._capacity_backoff("{}", waited=0.0) == 0.0
+    assert session.gets == 0
+
+
+def test_capacity_backoff_gives_up_after_the_timeout() -> None:
+    """等满 180s 就不再等，退回退避——不能把一次启动卡死。"""
+    session = _CapacitySession([])
+    client = _client_with(session)
+
+    assert client._capacity_backoff(
+        "Max 1 concurrent instances per team (1 running)", waited=180.0
+    ) == 0.0
+
+
+def test_capacity_backoff_shrinks_the_last_step() -> None:
+    """剩余预算不足一个步长时，只睡剩下的那点。"""
+    client = _client_with(_CapacitySession([]))
+
+    assert client._capacity_backoff(
+        "Max 3 concurrent instances per team (3 running)", waited=174.0
+    ) == 6.0
+
+
+def test_capacity_note_extracts_the_state() -> None:
+    assert (
+        batch_eval._capacity_note(
+            '{"detail":"Max 1 concurrent instances per team (0 running, 1 still stopping)"}'
+        )
+        == "0 running, 1 still stopping"
+    )
+    assert batch_eval._capacity_note('{"detail":"nope"}') == "配额已满"
+
+
 def test_pause_beyond_cap_surfaces_as_paused_error(monkeypatch) -> None:
     """超出可等待上限：抛专用异常而不是硬吞，上层据此记 skip。"""
     session = _ScriptedSession(
