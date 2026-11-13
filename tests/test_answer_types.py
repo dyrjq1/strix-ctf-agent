@@ -117,6 +117,39 @@ def test_answer_values_split_on_json_escaped_newline() -> None:
     assert batch_eval._answer_values(raw) == {"outage": "true"}
 
 
+# ---------------------------------------------------------------- 附件投递
+def test_run_agent_delivers_attachments_into_sandbox(monkeypatch, tmp_path) -> None:
+    """附件题（003/005/017/018/021）的关键链路：文件必须真的进沙箱。
+
+    平台不会替我们投递到 batch_eval 自己的沙箱；旧码也从不下载，
+    agent 看到的是「题面提到一个文件，文件不存在」。
+    """
+    seen: dict = {}
+
+    class _Proc:
+        returncode = 0
+
+        def wait(self, timeout=None):
+            return 0
+
+    def fake_popen(argv, **kwargs):
+        seen["argv"] = argv
+        return _Proc()
+
+    monkeypatch.setattr(batch_eval.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(batch_eval, "_BOX_ROOT", str(tmp_path))
+    monkeypatch.setattr(batch_eval, "_private_tmp_available", lambda: False)
+
+    batch_eval.run_agent(
+        "http://127.0.0.1:1", 5, 60, "T-1", extra="x",
+        files={"a.bin": b"hi", "../evil": b"no"},
+    )
+    box = tmp_path / "T-1"
+    assert (box / "attachments" / "a.bin").read_bytes() == b"hi"
+    assert not (tmp_path / "evil").exists()  # 基名化，拒绝路径逃逸
+    assert "--files-dir" in seen["argv"]
+
+
 # ---------------------------------------------------------------- 裁决 sidecar
 import json  # noqa: E402
 

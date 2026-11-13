@@ -818,6 +818,50 @@ class Client:
         )
         return r.json()
 
+    def list_attachments(self, cid: str) -> list[dict]:
+        """挑战附件清单：``GET /api/v1/challenges/{id}/attachments``。
+
+        CTFY-0001 §1.2 说附件会在启动时投进 ``/ctfy/work/attachments/``，
+        但**评测 harness 路径没有平台投递**——本仓库的 batch_eval 起的是
+        自己的沙箱，不做这一步，于是 003/005/017/018/021 这类附件题对
+        agent 等于「题面提到一个文件，文件不存在」。这里补上。
+        """
+        try:
+            r = self.s.get(
+                f"{PLATFORM}/api/v1/challenges/{cid}/attachments", timeout=30
+            )
+            data = r.json()
+        except (requests.RequestException, ValueError):
+            return []
+        files = data.get("files") if isinstance(data, dict) else None
+        return [f for f in (files or []) if isinstance(f, dict) and f.get("name")]
+
+    def fetch_attachments(self, cid: str, cap_bytes: int = 64 * 1024 * 1024) -> dict[str, bytes]:
+        """把本题附件全部取回内存（名字 → 内容）。
+
+        总量封顶：附件是题目给的，不是攻击面；一次 run 往沙箱里塞几百 MB
+        会把 agent 的 ``ls``/``find`` 全部拖慢。超限的直接放弃并在记录里留痕。
+        """
+        out: dict[str, bytes] = {}
+        total = 0
+        for meta in self.list_attachments(cid):
+            name = str(meta["name"])
+            try:
+                r = self.s.get(
+                    f"{PLATFORM}/api/v1/challenges/{cid}/attachments/{name}",
+                    timeout=60,
+                )
+            except requests.RequestException:
+                continue
+            if r.status_code != 200:
+                continue
+            body = r.content
+            if total + len(body) > cap_bytes:
+                continue
+            out[name] = body
+            total += len(body)
+        return out
+
     def qa_submit(self, challenge_id: str, qid: str, answer: str) -> dict:
         """QA 题库题提交（无实例）。``POST /api/v1/qa/submissions``。
 
@@ -2250,8 +2294,18 @@ def run_qa_item(
         "`ANSWER[<问题id>]=<答案>`；选择题只用给定字母，多选可写 `A,C`。\n"
     )
     brief = f"{brief}\n\n{quiz}" if brief else quiz
+    # qa 题也可能带附件（SAMPLE-005 是三层压缩包，solves_count=0 就是
+    # 因为没人能拿到文件）。这里与实例路径同一套投递。
+    attachments = client.fetch_attachments(cid) if hasattr(client, "fetch_attachments") else {}
+    if attachments:
+        listing = "\n".join(
+            f"- `{n}` ({len(b)} bytes)" for n, b in sorted(attachments.items())
+        )
+        brief += "\n\n## 附件（已放进你的工作目录）\n" + listing
     # 给一个必然拒绝的本机端口：网络工具瞬时失败，模型不会把预算耗在探测上。
-    log, wall = run_agent("http://127.0.0.1:1", turns, wallclock, name, extra=brief)
+    log, wall = run_agent(
+        "http://127.0.0.1:1", turns, wallclock, name, extra=brief, files=attachments
+    )
     rec: dict[str, Any] = {
         "samples_used": 1,
         "agent_s": round(wall, 1),
@@ -2306,6 +2360,7 @@ def run_agent(
     platform: str = "",
     token: str = "",
     challenge_id: str = "",
+    files: dict[str, bytes] | None = None,
 ) -> tuple[str, float]:
     """跑一次 strix，返回 (完整日志, 墙钟耗时)。
 
@@ -2325,6 +2380,21 @@ def run_agent(
 
     # 每次都是全新沙箱：见 `_fresh_box` 里关于 session resume 的记录。
     box, log = _fresh_box(name)
+
+    # 附件投递：题面里写的文件必须真的在，否则 003/005/017/018/021 这类
+    # 附件题对 agent 就是「文件不存在」。run_strix_ctf 的 --files-dir 会把
+    # 这里的内容复制进 agent 工作区。
+    files_dir = None
+    if files:
+        files_dir = box / "attachments"
+        files_dir.mkdir(parents=True, exist_ok=True)
+        for fname, blob in files.items():
+            safe = Path(str(fname)).name  # 只取基名，拒绝 ../ 逃逸
+            if not safe or safe in (".", ".."):
+                continue
+            tmp = files_dir / f".{safe}.tmp"
+            tmp.write_bytes(blob)
+            os.replace(tmp, files_dir / safe)
 
     env = {
         "PYTHONPATH": "src:vendor/src",
@@ -2373,6 +2443,8 @@ def run_agent(
         "--guard-state", str(_guard_state_path(name)),
         *_deadline_args(timeout_s),
     ]
+    if files_dir is not None:
+        cmd += ["--files-dir", str(files_dir)]
     if instance and platform and token:
         # B-4 断链1（接线，平台试跑 2026-11-13 实录）：非 flag 答案链
         # （显式 flag > ``answer:`` 行 > 裸 hex）挂在子进程的 autosubmit 上，
@@ -2682,6 +2754,22 @@ def main() -> int:
             if retry_brief:
                 brief = f"{brief}\n\n{retry_brief}" if brief else retry_brief
                 rec["retry_notes_chars"] = len(retry_brief)
+            # 附件投递：平台把文件挂在挑战上，不会自动出现在我们自己的沙箱里。
+            attachments = (
+                client.fetch_attachments(cid)
+                if hasattr(client, "fetch_attachments") else {}
+            )
+            if attachments:
+                rec["attachments"] = sorted(attachments)
+                listing = "\n".join(
+                    f"- `{n}` ({len(b)} bytes)"
+                    for n, b in sorted(attachments.items())
+                )
+                note = (
+                    "## 附件（已放进你的工作目录，直接读，别去平台下载）\n"
+                    + listing
+                )
+                brief = f"{brief}\n\n{note}" if brief else note
             rec["brief_chars"] = len(brief)
             # 每题默认一次机会；--max-samples>1 时，只有「有证据的早停」才
             # 换策略重开（见 _resample_allowed）。判据与重开决定都在 harness
@@ -2712,6 +2800,7 @@ def main() -> int:
                     platform=PLATFORM,
                     token=client.token,
                     challenge_id=cid,
+                    files=attachments,
                 )
                 logs.append(sample_log)
                 total_wall += sample_wall
