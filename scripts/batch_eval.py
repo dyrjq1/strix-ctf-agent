@@ -703,7 +703,7 @@ class Client:
             pass
         return {}
 
-    def wait_ready(self, iid: str, timeout: int = 180) -> str:
+    def wait_ready(self, iid: str, timeout: int = 300) -> str:
         """轮询到 ready，返回可访问的靶机 URL。
 
         Raises:
@@ -2945,6 +2945,15 @@ def main() -> int:
             rec["correct"] = False
             rec["skipped"] = True
             print(f"  -> SKIP 需隧道，跳过", flush=True)
+        except TimeoutError as exc:
+            # 实例启动超时是**平台容量/调度**问题，不是题目做不出来。
+            # 2026-11-13 夜实测：017/018/021 三题连续 "not ready in 180s"，
+            # 旧码把它记成题目失败，两次就把题 defer 掉——那是把基础设施
+            # 故障当能力缺口。标 skip 走 B-23 口径单独计数。
+            rec["error"] = f"SKIPPED(实例未就绪): {exc}"
+            rec["correct"] = False
+            rec["skipped"] = True
+            print("  -> SKIP 实例未就绪，跳过", flush=True)
         except Exception as exc:  # noqa: BLE001
             rec["error"] = f"{type(exc).__name__}: {exc}"
             rec["correct"] = False
