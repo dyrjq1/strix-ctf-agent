@@ -23,35 +23,45 @@
 
 from __future__ import annotations
 
+from ctf_strix.tool_notes import append_note
+
 import asyncio
 import json
 import os
 import re
 import threading
+import time
 import urllib.error
 import urllib.request
+from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any
 
-from ctf_strix.flag_extract import CANDIDATE_RE, is_placeholder
+from ctf_strix.flag_extract import (
+    CANDIDATE_RE,
+    explicit_answer_values,
+    is_placeholder,
+    per_question_answers,
+)
 from ctf_strix.success_stop import answer_verdict, check_verdict, question_correct
 
 if TYPE_CHECKING:
     from agents import FunctionTool
 
 #: 候选答案形态。与 ctf_goal.txt 的定义、平台判分口径一致。
-#: 顺序即优先级：显式 flag 标记优先于裸 hex（一次 run 的 slug 是 32 位 hex）。
+#: 顺序即优先级：显式 flag 标记 > 显式 ``answer:`` 行 > 裸 hex（一次
+#: run 的 slug 是 32 位 hex）。显式行不是正则条目——``raw_input`` 是 JSON
+#: 参数串，值内换行是 ``\n`` 字面量，行锚定正则必须先解码再扫（见
+#: :func:`ctf_strix.flag_extract.explicit_answer_values`）——所以它在
+#: ``candidates()`` 里以函数调用插在 :data:`CANDIDATE_RE` 与 hex 之间。
 _CAND_PATTERNS: tuple[re.Pattern[str], ...] = (
     # 与 `flag_extract.CANDIDATE_RE` 同源：CTFY 的交付示例就是 `ctfy{…}`，
     # 少一个前缀等于把合法答案排除在候选之外；正则本体不再复制一份。
     CANDIDATE_RE,
-    # 显式标注的答案。``seeded`` 题的答案常在实例创建时下发，形状任意
-    # （不是 FLAG{...}，也不一定是 hex），只靠前两条正则永远抽不到。
-    # 这条只认模型自己写的 ``answer: xxx`` / ``flag=xxx``，不猜自由文本；
-    # 噪声由 verify-answer 预检兜住——判错的候选不会消耗提交次数。
-    re.compile(
-        r"""(?im)^[\s>*`-]*(?:final\s+)?(?:answer|flag)\s*[:=]\s*[`'"]?"""
-        r"""([^\s`'"]{6,200})"""
-    ),
+)
+
+#: 裸 hex：32 位（slug 常见长度）与 40–64 位（sha1/sha256）。排最后：
+#: 哈希、链接片段、session id 也长这样，误交白耗一次提交机会。
+_HEX_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"\b[0-9a-fA-F]{32}\b"),
     re.compile(r"\b[0-9a-fA-F]{40,64}\b"),
 )
@@ -64,11 +74,64 @@ _MAX_CANDIDATES = 6
 #: 正确解排在第 4 位以后就永远交不上，日志里还看不出发生过什么。
 _QA_ATTEMPT_CAP = 3
 
+#: 平台对每题的作答上限。实例式 question 的元数据里通常**没有**
+#: ``attempts_remaining``，旧代码把"没这个字段"当成"不限次数"，于是一道
+#: 题的 6 个候选会一次打光——第 6 次起平台直接拒绝，而真正正确的答案如果
+#: 排在第 6 位就没机会交。按平台上限记账，超出的候选写进 ``skipped``，
+#: 日志里能看出"不是没答案，是次数用完了"。
+_PLATFORM_ATTEMPT_CAP = 5
+
 # urllib 的 timeout 只吃**单个浮点数**，不是 requests 那样的 (connect, read)
 # 元组。传元组会抛 TypeError，而 `except Exception` 会把它吞成"没有 question"
 # ——这个 bug 让一次 run 的 autosubmit 静默失效了两轮，日志只说
 # "本题没有 flag 类 question"，看不出是参数类型错了。
 _TIMEOUT = 45
+
+#: 会话暂停（competition_paused）在轮内愿意睡的最长秒数（G4，协议 §4）。
+#: 比这更长的暂停说明下一轮才可能有效——继续睡只是白烧墙钟预算，记
+#: ``last_error`` 交给 rounds 补救；短暂停（赛程切换的间隙）睡过去再重试
+#: 一次，提交就不再静默失败。
+_PAUSE_WAIT_MAX_S = 300.0
+
+
+def _pause_wait_seconds(raw: str, code: int) -> float | None:
+    """从 403 响应体里取 competition_paused 该睡的秒数（G4，协议 §4）。
+
+    403 + ``competition_paused`` 时平台会带 ``next_session_starts_at``
+    （ISO8601）或 ``retry_after_s``：正确行为是睡到那时再试一次，而不是
+    记个错继续走——会话中断的窗口（赛程按 session 切）里提交会静默失败。
+
+    Args:
+        raw: 响应体文本（调用方先读掉，错误信息里还要用）。
+        code: HTTP 状态码，非 403 直接返回 None。
+
+    Returns:
+        该睡的秒数；不是暂停响应、时间解析不了、或暂停超出
+        :data:`_PAUSE_WAIT_MAX_S` 时返回 ``None``（调用方按普通失败走）。
+    """
+    if code != 403 or "competition_paused" not in (raw or ""):
+        return None
+    try:
+        body = json.loads(raw or "{}")
+    except ValueError:
+        return None
+    if not isinstance(body, dict):
+        return None
+    delay: float | None = None
+    retry = body.get("retry_after_s")
+    if isinstance(retry, (int, float)) and not isinstance(retry, bool):
+        delay = float(retry)
+    else:
+        starts = str(body.get("next_session_starts_at") or "")
+        if starts:
+            try:
+                when = datetime.fromisoformat(starts.replace("Z", "+00:00"))
+                delay = (when - datetime.now(timezone.utc)).total_seconds()
+            except ValueError:
+                return None
+    if delay is None or delay < 0 or delay > _PAUSE_WAIT_MAX_S:
+        return None
+    return delay
 
 
 class AutoSubmitter:
@@ -143,7 +206,21 @@ class AutoSubmitter:
             with urllib.request.urlopen(req, timeout=_TIMEOUT) as resp:  # noqa: S310
                 return json.loads(resp.read().decode() or "{}")
         except urllib.error.HTTPError as e:
-            return {"error": f"HTTP {e.code}: {e.read()[:180].decode(errors='replace')}"}
+            raw = e.read()[:180].decode(errors="replace")
+            # G4：会话暂停睡过去重试一次，而不是把整段窗口内的提交静默
+            # 折算成错误。只在暂停可预期（≤上限）时睡。
+            wait = _pause_wait_seconds(raw, e.code)
+            if wait is not None and wait > 0:
+                time.sleep(wait)
+                try:
+                    with urllib.request.urlopen(req, timeout=_TIMEOUT) as resp:  # noqa: S310
+                        return json.loads(resp.read().decode() or "{}")
+                except urllib.error.HTTPError as e2:
+                    raw2 = e2.read()[:180].decode(errors="replace")
+                    return {"error": f"HTTP {e2.code}: {raw2}"}
+                except Exception as e2:  # noqa: BLE001 — 重试失败不能让收工失败
+                    return {"error": f"{type(e2).__name__}: {e2}"}
+            return {"error": f"HTTP {e.code}: {raw}"}
         except Exception as e:  # noqa: BLE001 — 提交失败不能让收工本身失败
             return {"error": f"{type(e).__name__}: {e}"}
 
@@ -319,7 +396,20 @@ class AutoSubmitter:
             with urllib.request.urlopen(req, timeout=_TIMEOUT) as resp:  # noqa: S310
                 return json.loads(resp.read().decode() or "{}").get("questions") or []
         except urllib.error.HTTPError as e:
-            self.last_error = f"HTTP {e.code}: {e.read()[:180].decode(errors='replace')}"
+            raw = e.read()[:180].decode(errors="replace")
+            # G4：会话暂停与 _post 同款——睡过去重试一次。
+            wait = _pause_wait_seconds(raw, e.code)
+            if wait is not None and wait > 0:
+                time.sleep(wait)
+                try:
+                    with urllib.request.urlopen(req, timeout=_TIMEOUT) as resp:  # noqa: S310
+                        return (
+                            json.loads(resp.read().decode() or "{}").get("questions")
+                            or []
+                        )
+                except Exception:  # noqa: BLE001 — 重试失败走原失败路径
+                    pass
+            self.last_error = f"HTTP {e.code}: {raw}"
             if e.code in (401, 403) and self.fallback_question_ids:
                 return [
                     {
@@ -334,32 +424,73 @@ class AutoSubmitter:
             self.last_error = f"{type(e).__name__}: {e}"
             return []
 
+    def _questions_from_challenge(self) -> list[dict[str, Any]]:
+        """G1：从 challenge 端点读 question 列表（答对后解锁的 gated 题在这）。
+
+        实例端点的 ``questions`` 只在拉列表时反映当下可见集合；协议 §2 要求
+        ``gated_questions > 0`` 时每答对一题就重读 ``GET /api/v1/challenges/{id}``
+        ——新解锁的问题只暴露在 challenge 端点，轮内看不到就得多烧一整轮靠
+        平台 rounds 补救（平台试跑 SAMPLE-001 实证：flag 题锁在 slug 后）。
+
+        刷新结果**不**自动进提交循环：本轮候选里没有新问题的答案，拿旧候选
+        打新题只会烧提交次数。它只进 ``verdict["unlocked"]`` 与 decorate 的
+        回写——让模型看见「还有题、继续解」。
+
+        Returns:
+            challenge 端点的 question 列表；无 challenge_id / qa / 任何失败
+            返回空列表（记录 ``last_error``，不影响提交链）。
+        """
+        if self.is_qa or not self.challenge_id:
+            return []
+        req = urllib.request.Request(
+            f"{self.platform}/api/v1/challenges/{self.challenge_id}",
+            headers={"Authorization": f"Bearer {self.token}"},
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=_TIMEOUT) as resp:  # noqa: S310
+                body = json.loads(resp.read().decode() or "{}")
+                return body.get("questions") or []
+        except Exception as e:  # noqa: BLE001 — 刷新失败不能打断提交链
+            self.last_error = f"challenge refresh: {type(e).__name__}: {e}"
+            return []
+
     # ---------------------------------------------------------------- 候选
     @staticmethod
     def candidates(text: str) -> list[str]:
         """从 finish_scan 的 summary 里抽答案候选。
 
-        去重并保序：显式 ``FLAG{...}`` 排在裸 hex 之前，因为后者常是哈希、
-        链接片段或 session id，误交会白白消耗一次提交。
+        去重并保序：显式 ``FLAG{...}`` > 显式 ``answer:`` 行 > 裸 hex，
+        因为 hex 常是哈希、链接片段或 session id，误交会白白消耗一次提交。
 
         Args:
-            text: 原始参数字符串。
+            text: 原始参数字符串（finish_scan 的 raw_input，JSON 串）。
 
         Returns:
             去重后的候选列表，最多 :data:`_MAX_CANDIDATES` 个。
         """
         out: list[str] = []
+
+        def _add(value: str) -> None:
+            v = (value or "").rstrip(".,;:)]")
+            # 占位符在提交前最后再挡一次：2026-11-06 就是它把一道不可能
+            # 解出的题判成了 solved。markdown 装饰（``**FLAG{...}**``）要
+            # 剥一层再判，因为 ``is_placeholder`` 要求前缀在首位。
+            if v and not is_placeholder(v.strip("*_`#> ")) and v not in out:
+                out.append(v)
+
         for pat in _CAND_PATTERNS:
             for m in pat.finditer(text or ""):
-                # 带捕获组的模式只取组内容（标签本身不是答案）。
-                v = m.group(1) if pat.groups else m.group(0)
-                v = v.rstrip(".,;:)]")
-                # 占位符在提交前最后再挡一次：2026-11-06 就是它把一道不可能
-                # 解出的题判成了 solved。
-                # 带捕获组的分支会把 markdown 装饰一起带出来（``**FLAG{...}**``），
-                # 而 ``is_placeholder`` 要求前缀在首位，所以先剥一层再判。
-                if v and not is_placeholder(v.strip("*_`#> ")) and v not in out:
-                    out.append(v)
+                _add(m.group(0))
+        # 显式标注的答案：``seeded`` / slug 型题答案形状任意（不是
+        # FLAG{...}，也不一定是 hex），只靠正则永远抽不到。这条只认模型
+        # 自己写的 ``answer: xxx`` / ``flag=xxx``，不猜自由文本；噪声由
+        # verify-answer 预检兜住——判错的候选不会消耗提交次数。行锚定
+        # 正则扫不了 JSON 参数串，解码逻辑在 :func:`explicit_answer_values`。
+        for v in explicit_answer_values(text):
+            _add(v)
+        for pat in _HEX_PATTERNS:
+            for m in pat.finditer(text or ""):
+                _add(m.group(0))
         return out[:_MAX_CANDIDATES]
 
     # ---------------------------------------------------------------- 主流程
@@ -387,9 +518,11 @@ class AutoSubmitter:
                 "note": "qa 模式缺少 challenge_id/competition_id",
             }
         cands = self.candidates(raw_input)
-        if not cands:
-            return {"tried": [], "correct": [], "note": "summary 里没有任何答案候选"}
-
+        # B-4 契约行：``ANSWER[<qid>]=<value>`` 带 qid，是 checker/counter 类
+        # 非 flag 题答案唯一的交付通道（平台实测：模型把答案写进终稿，旧码
+        # 却在门口以「没有答案候选」拒收，整题零提交判负）。契约行存在时
+        # 即使宽集候选为空也必须进提交循环。
+        mapped = per_question_answers(raw_input)
         questions = self._questions()
         # 只按 mode 筛，**绝不**按 answered_correctly 筛。
         #
@@ -408,6 +541,13 @@ class AutoSubmitter:
         pending = [
             q for q in questions
             if q.get("mode") in ("dynamic", "static", "seeded")
+            # B-17：checker 题的交付是靶机副作用（deface / outage / persist），
+            # 平台在 POST /instances/{id}/check 里裁决并记 "<checker>"。没有
+            # 答案字符串也要给它一次机会——SAMPLE-006 就是这样零提交的。
+            or str(q.get("mode") or "") == "checker"
+            # 契约行点名的 question 一并入围：counter 类 checker 题仍可能
+            # 用"提交值"语义（claimed="3" 实证），映射到的值照交。
+            or str(q.get("id") or "") in mapped
         ]
         multiple = len(questions) > 1
         if not pending:
@@ -421,6 +561,16 @@ class AutoSubmitter:
             else:
                 why = "本题没有 flag 类 question"
             return {"tried": [], "correct": [], "note": why}
+
+        # B-26：checker 题的正确答案是"靶机副作用"，本来就没有答案字符串可交。
+        # 旧码在拿到 question 列表**之前**就以"没有任何答案候选"返回，/check
+        # 永远没被调用——SAMPLE-006 收工时 banner 已篡改、judge 可达，却零交付。
+        if (
+            not cands
+            and not mapped
+            and not any(str(q.get("mode") or "") == "checker" for q in pending)
+        ):
+            return {"tried": [], "correct": [], "note": "summary 里没有任何答案候选"}
 
         tried: list[dict[str, Any]] = []
         correct: list[str] = []
@@ -437,13 +587,57 @@ class AutoSubmitter:
                 qa_budget = self.is_qa and not isinstance(left, int)
                 if qa_budget:
                     left = _QA_ATTEMPT_CAP
+                capped_budget = False
+                if not self.is_qa and not isinstance(left, int):
+                    # 字段缺失 ≠ 不限次数。平台每题上限是 5，多打只会换来拒绝。
+                    left = _PLATFORM_ATTEMPT_CAP
+                    capped_budget = True
                 if isinstance(left, int) and left <= 0:
                     skipped.append(f"{qid}: attempts_remaining=0")
                     continue
-                for pos, ans in enumerate(cands):
+                # 契约行答案优先投。非白名单 mode 的 question 只投契约行答案
+                # ——把宽集候选（flag 形状/hex）往 checker 题上打，白耗一次
+                # 提交；verify 预检对 checker 类恒 False（平台实测：状态已
+                # 满足、答案正确仍返回 False），契约行答案必须绕过预检直接
+                # 提交，否则正确答案被预检压在门外。
+                # B-17：先走 /check。它对侧车读靶机状态，通过即记账——
+                # 值通道对 deface/outage/persist 这类题恒判否（平台流水
+                # 2026-10-28 vs 2026-11-13 对照），先交值等于白耗次数。
+                if str(q.get("mode") or "") == "checker":
+                    body = self._post(
+                        f"/api/v1/instances/{self.instance}/check",
+                        {"question_id": qid},
+                    )
+                    if os.environ.get("CTF_SUBMIT_DEBUG"):
+                        # 只读观测：checker 判否时唯一能定位"为什么"的原始回执。
+                        print(
+                            f"[submit] check {qid}: "
+                            f"{json.dumps(body, ensure_ascii=False)[:400]}",
+                            flush=True,
+                        )
+                    if "error" not in body and check_verdict(
+                        body, qid, multiple=multiple
+                    ):
+                        correct.append(f"{qid}=<checker>")
+                        tried.append({"qid": qid, "answer": "<checker>",
+                                      "correct": True, "channel": "check"})
+                        if self.success is not None:
+                            self.success.mark(
+                                "checker", "passed via /check", answer="<checker>"
+                            )
+                        break
+                whitelisted = q.get("mode") in ("dynamic", "static", "seeded")
+                first = mapped.get(str(qid))
+                probe_skip = first is not None and not whitelisted
+                q_cands = ([first] if first is not None else []) + (
+                    cands if whitelisted else []
+                )
+                for pos, ans in enumerate(q_cands):
                     # 先问不记账的判分器。它正确 → 只写一条提交记录；
                     # 它不可用（旧平台 / 网络抖动）→ 退回直接提交。
-                    probe = self._verify(qid, ans, multiple=multiple)
+                    probe = (
+                        None if probe_skip else self._verify(qid, ans, multiple=multiple)
+                    )
                     if probe and not probe.get("correct"):
                         tried.append({"qid": qid, "answer": ans, "correct": False,
                                       "verified": True})
@@ -497,14 +691,33 @@ class AutoSubmitter:
                         left -= 1
                         if left <= 0:
                             if qa_budget:
-                                untried = len(cands) - pos - 1
+                                untried = len(q_cands) - pos - 1
                                 skipped.append(
                                     f"{qid}: qa attempt cap {_QA_ATTEMPT_CAP} reached, "
+                                    f"{untried} candidates untried"
+                                )
+                            elif capped_budget:
+                                untried = len(q_cands) - pos - 1
+                                skipped.append(
+                                    f"{qid}: platform attempt cap "
+                                    f"{_PLATFORM_ATTEMPT_CAP} reached, "
                                     f"{untried} candidates untried"
                                 )
                             else:
                                 skipped.append(f"{qid}: attempts_remaining exhausted")
                             break
+        unlocked: list[str] = []
+        if correct and not self.is_qa and self.challenge_id:
+            # G1（协议 §2）：答对过才值得重读 challenge 端点——解锁由「答对」
+            # 触发，别在每次 finish 都多打一串请求。
+            fresh = self._questions_from_challenge()
+            if fresh:
+                known = {str(q.get("id") or "") for q in questions}
+                unlocked = [
+                    str(q.get("id") or "")
+                    for q in fresh
+                    if q.get("id") and str(q.get("id") or "") not in known
+                ]
         self.answers_tried.extend(tried)
         self.correct.extend(correct)
         # A single correct answer on a multi-question challenge is progress,
@@ -514,6 +727,9 @@ class AutoSubmitter:
             fully_solved = True
         else:
             fully_solved = platform_flag is not False and len(correct) == len(pending)
+        if unlocked:
+            # 新解锁的问题一个都没答，这轮当然不算完全解出（G1）。
+            fully_solved = False
         verdict: dict[str, Any] = {
             "tried": tried,
             "correct": correct,
@@ -521,6 +737,8 @@ class AutoSubmitter:
         }
         if skipped:
             verdict["skipped"] = skipped
+        if unlocked:
+            verdict["unlocked"] = unlocked
         self._persist(verdict)
         return verdict
 
@@ -560,6 +778,12 @@ class AutoSubmitter:
         lines = ["", "", "--- platform submission ---"]
         if verdict.get("correct"):
             lines.append(f"ACCEPTED: {', '.join(verdict['correct'])}")
+        if verdict.get("unlocked"):
+            lines.append(
+                "UNLOCKED: 答对后平台解锁了新问题（本轮内已可见）："
+                + ", ".join(str(q) for q in verdict["unlocked"])
+                + "。继续解它们——这一轮还没完，先别 finish。"
+            )
         elif verdict.get("tried"):
             lines.append(
                 f"REJECTED: 试了 {len(verdict['tried'])} 个候选，平台都判错。"
@@ -567,7 +791,7 @@ class AutoSubmitter:
             )
         else:
             lines.append(f"NOT SUBMITTED: {verdict.get('note', '无候选')}")
-        return summary + "\n".join(lines)
+        return append_note(summary, "\n".join(lines))
 
 
 class CheckerProbe:

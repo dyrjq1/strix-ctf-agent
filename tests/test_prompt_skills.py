@@ -224,3 +224,45 @@ def test_skill_index_names_both_read_channels_in_one_sentence() -> None:
     assert "exec_command" in sentence
     assert "view_image" in sentence
     assert "load_skill" in sentence
+
+#: §4.144 给 tcp 追加的第 5 条，逐字节钉住——它是 tcp 的 deep 路径相对
+#: §4.141 基线（backup/rt2-scanmode-20261113/prompt.py）**唯一**允许的增量；
+#: 第 1–4 条与该基线已逐字核对（本节收口时一次性验证，勿重复引入运行时
+#: 依赖 backup 的测试）。
+_TCP_ITEM5 = (
+    "5. Plain `tcp` connected but no bytes came back (or only a lone `0x15`/`0x16`\n"
+    "   byte) => the port speaks TLS. Retry with `tls=True`; `sni` defaults to the\n"
+    "   host. This platform's TCP access is TLS-SNI, so `pwn.remote(..., ssl=True)`\n"
+    "   is the equivalent. Never conclude \"the service ignores input\" from an empty\n"
+    "   plain reply.\n"
+)
+
+
+def test_tcp_deep_prompt_has_its_own_budget_sentinel() -> None:
+    """CROSS-CHECK 2（§4.141 × §4.144）：tcp 的 deep/quick 契约要有人守。
+
+    §4.141 把「deep 逐字节不变」写成硬约束并给 web 侧配了预算哨
+    （test_prompt_stays_small）；§4.144 给 `_TURNS_TCP` 追加第 5 条，tcp 的
+    deep 路径从此没有守卫。本测试钉四件事：第 5 条逐字节不变（唯一允许的
+    增量）、`_TURNS_TCP` 只许在付费区间内、tcp deep 渲染不越过 web 同款
+    哨位、quick 的增量仍然**恰好**是收敛段（没有顺手改别的段落）。
+    """
+    from ctf_strix import prompt
+
+    assert _TCP_ITEM5 in prompt._TURNS_TCP
+    assert prompt._TURNS_TCP.count("\n5. ") == 1
+    assert 500 <= len(prompt._TURNS_TCP) <= 1_000, (
+        f"tcp turns block is {len(prompt._TURNS_TCP)} chars"
+    )
+
+    before = prompt.active()
+    try:
+        prompt.activate("tcp", ("base", "tcp"))
+        deep = prompt.build({})
+        quick = prompt.build({}, scan_mode="quick")
+    finally:
+        prompt.activate(*before)
+    # 6,536 chars with the skill pack staged; the bound is state-robust (an
+    # unregistered render is smaller) and only an unmeasured section breaks it.
+    assert len(deep) < 7_000, f"tcp deep prompt grew to {len(deep)} chars"
+    assert len(quick) - len(deep) == len(prompt._SCAN_QUICK)

@@ -155,3 +155,86 @@ def test_plain_request_without_cookie_never_releases_the_guard() -> None:
 
     assert guard.state.authed is False
     assert guard.state.wall_hit == 1
+
+
+# ---------------------------------------------------------------------------
+# WEB-3: the header line has two renderings, and both carry a session
+# ---------------------------------------------------------------------------
+
+def _probe_output(
+    status: int,
+    *,
+    path: str,
+    headers: str = "content-type=application/json",
+    body: str = "",
+    hint: str = "",
+) -> str:
+    """One ``http_probe`` result, exactly as ``http_probe`` joins its lines."""
+    lines = [
+        f"[HTTP {status}] GET https://target.test{path} | 0.11s | 27B | "
+        f"application/json | id=r3",
+        f"hdr: {headers}",
+    ]
+    if body:
+        lines.append(f"body: {body}")
+    if hint:
+        lines.append(f"next: {hint}")
+    return "\n".join(lines)
+
+
+def test_http_probe_rendered_set_cookie_releases_the_guard() -> None:
+    """WEB-3: ``http_probe`` prints ``set-cookie=...``, not ``Set-Cookie: ...``.
+
+    ``_format_headers`` joins picked headers as ``name=value``.  The guard only
+    accepted the ``Set-Cookie:`` colon form (``curl -i`` output), so a login
+    completed through ``http_probe`` never released it -- six later payloads
+    hit the hard stop on a session that was already authenticated.
+    """
+    output = _probe_output(
+        200,
+        path="/api/login",
+        headers="content-type=application/json | set-cookie=sid=abc123; Path=/; HttpOnly",
+        body='{"ok":true}',
+    )
+
+    guard = JourneyGuard()
+    guard.observe("http_probe", "https://target.test/api/login", output)
+
+    assert _AUTH_OK_RE.search(output) is not None
+    assert guard.state.authed is True
+
+
+def test_probe_without_a_session_header_leaves_the_guard_armed() -> None:
+    """Reverse control: the widened separator must not accept a plain 200."""
+    output = _probe_output(200, path="/api/items", body="[]")
+
+    guard = JourneyGuard()
+    guard.observe("http_probe", "https://target.test/api/items", output)
+
+    assert _AUTH_OK_RE.search(output) is None
+    assert guard.state.authed is False
+
+
+def test_probe_login_releases_a_guard_already_counting_payloads() -> None:
+    """End to end: six payloads hard-stop, then a probe login silences it."""
+    guard = JourneyGuard()
+    payload = "curl -s 'https://target.test/api/items?id=1 OR 1=1'"
+
+    guard.observe("http_probe", "https://target.test/api/login", _probe_output(
+        401, path="/api/login", body='{"error":"unauthorized"}',
+        hint="鉴权被拒：先走注册/登录拿会话，别继续盲试参数。",
+    ))
+    hints = [guard.observe("exec_command", payload, "500 oops") for _ in range(6)]
+
+    assert any("HARD STOP" in (hint or "") for hint in hints), hints
+    assert guard.state.payloads == 6
+
+    guard.observe("http_probe", "https://target.test/api/login", _probe_output(
+        200, path="/api/login",
+        headers="content-type=application/json | set-cookie=sid=abc123; Path=/",
+        body='{"ok":true}',
+    ))
+
+    assert guard.state.authed is True
+    assert guard.observe("exec_command", payload, "200 []") is None
+    assert guard.state.payloads == 6, "a released guard must not keep counting"

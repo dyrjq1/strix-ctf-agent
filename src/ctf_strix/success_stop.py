@@ -258,8 +258,18 @@ class SuccessLedger:
         return False
 
     def snapshot(self) -> dict[str, Any]:
-        """Compact state for ``result.json`` diagnostics."""
-        return {"solved": self.solved, "source": self.source, "detail": self.detail}
+        """Compact state for ``result.json`` diagnostics.
+
+        ``answer`` rides along so the caller can tell a platform-confirmed
+        answer (``source="platform_submit"``) from a mere local extraction:
+        only the former is safe to copy into ``payload["answers"]``.
+        """
+        return {
+            "solved": self.solved,
+            "source": self.source,
+            "detail": self.detail,
+            "answer": self.answer,
+        }
 
 
 def _command_text(raw_input: str) -> str:

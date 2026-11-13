@@ -78,6 +78,22 @@ def test_playbook_has_five_stages_and_fits() -> None:
         assert re.search(rf"^{stage} ", text, re.M), f"stage {stage} missing"
 
 
+def test_playbook_has_a_depth_exit_not_a_breadth_quota() -> None:
+    """Breadth used to be the only quota; nothing asked to push one hit through.
+
+    The "same response twice" stop is also gone: RT-3 showed a breadth scan
+    answers every name differently, so that stop never fires. The replacement is
+    the class count, which the runtime guard already maintains.
+    """
+    text = method_cards.PLAYBOOK
+    assert "每轮最多" not in text, "breadth quota came back"
+    assert "两次同响应" not in text, "same-response stop is the RT-3 failure"
+    assert "3 深挖" in text
+    assert "利用成功" in text, "no instruction to push a hit to exploitation"
+    assert "交给 3" in text, "stage 2 must hand its best hit to stage 3"
+    assert "新攻击类" in text
+
+
 def test_worst_and_typical_render_stay_under_budget() -> None:
     every = [key for card in method_cards.CARDS for key in card.keys]
     assert len(method_cards.render(every, "web")) <= method_cards.MAX_CHARS
@@ -126,3 +142,48 @@ def test_all_keys_are_lowercase_observed_identifiers() -> None:
     for card in method_cards.CARDS:
         for key in card.keys:
             assert re.fullmatch(r"[a-z0-9_-]+", key), key
+
+
+def test_tools_named_reads_only_backticked_tool_names() -> None:
+    """The filter must not mistake prose or a shell flag for a tool."""
+    assert method_cards.tools_named("先 `exec_command` 看头，再 `http_probe`。") == {
+        "exec_command",
+        "http_probe",
+    }
+    assert method_cards.tools_named("`Flag` 与 `--help` 都不是工具名") == frozenset()
+    assert method_cards.tools_named("没有反引号") == frozenset()
+
+
+def test_select_drops_a_card_whose_tool_is_not_installed() -> None:
+    """A card naming a tool this run did not install costs a turn, not a hint.
+
+    The first card tells the model to start with ``ai_quick_scan``; on a run
+    where the AI gate was off that name does not resolve.
+    """
+    every = [key for card in method_cards.CARDS for key in card.keys]
+    installed = set(method_cards.tools_named(method_cards.render(every, "web")))
+    assert "ai_quick_scan" in installed  # sanity: the table does name it
+
+    cards = method_cards.select(["agentic_ai"], "web", available=installed)
+    assert cards
+    without = method_cards.select(
+        ["agentic_ai"], "web", available=installed - {"ai_quick_scan"}
+    )
+    assert all("ai_quick_scan" not in card.text for card in without)
+
+
+def test_select_with_available_none_keeps_the_whole_table() -> None:
+    """Callers that cannot see the registry get exactly the old behaviour."""
+    every = [key for card in method_cards.CARDS for key in card.keys]
+    baseline = method_cards.select(every, "web")
+    assert method_cards.select(every, "web", available=None) == baseline
+    assert len(baseline) == method_cards.MAX_CARDS
+
+
+def test_select_keeps_every_card_when_all_its_tools_are_installed() -> None:
+    """The filter is a subset test: a complete registry changes nothing."""
+    every = [key for card in method_cards.CARDS for key in card.keys]
+    installed = set(method_cards.tools_named(method_cards.render(every, "web")))
+    assert method_cards.select(every, "web", available=installed) == (
+        method_cards.select(every, "web")
+    )

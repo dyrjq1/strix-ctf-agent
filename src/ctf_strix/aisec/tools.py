@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+from collections.abc import Iterable
 from typing import Any, Final
 
 from ctf_strix.aisec import aig_probe
@@ -55,9 +56,10 @@ _MAX_LINES: Final = 40
 def _guard() -> UrlGuard:
     """从环境变量构造闸门。
 
-    ``CTF_AISEC_ALLOW`` 由评测/正赛脚本在启动 agent 前写入，值是本题
-    题面声明的 ``host:port``。agent 在沙箱内改不了这个变量（它是父进程
-    环境），因此这是可信的放行来源。
+    ``CTF_AISEC_ALLOW`` 由本进程的入口在注册工具后写入：``agent.py`` 与
+    ``scripts/run_strix_ctf.py`` 都调用 :func:`allow_targets`，输入是题面
+    声明的端点。它不经过工具参数，模型改不了；变量缺失时清单为空，
+    闸门退化为「只允许公网」。
 
     Returns:
         配置好的 :class:`UrlGuard`。
@@ -179,7 +181,7 @@ async def ai_cve_lookup(component: str, version: str = "", top_k: int = 8) -> st
         top_k: 最多返回条数，默认 8
 
     Returns:
-        按严重度排序的 CVE 列表，含版本约束表达式与规则文件路径
+        按严重度排序的 CVE 列表，含版本约束表达式与规则文件绝对路径
         （可直接读取该文件获取利用细节）。
     """
     if not aig_probe.data_dir():
@@ -194,11 +196,17 @@ async def ai_cve_lookup(component: str, version: str = "", top_k: int = 8) -> st
             "可能是新版，或题目为自研 / 逻辑漏洞。建议直接读靶机接口找业务逻辑问题。"
         )
     lines = [f"[ai_cve_lookup] {component} {version or '(无版本约束类)'} 命中 {len(vulns)} 条："]
+    # N-8：file 是相对规则目录的 vuln/<组件>/<cve>.yaml，拼成绝对路径——
+    # 否则「可直接读取该文件」的承诺在 agent 的 cwd 下不成立（相对路径不可解析）。
+    base = aig_probe.data_dir()
     for v in vulns[: max(1, int(top_k))]:
         # 空规则 = 无版本约束，多是未授权访问一类，单独标注便于优先尝试
         rule = v.get("rule") or "无版本约束（逻辑漏洞）"
         lines.append(f"- {v.get('cve') or 'N/A'} [{v.get('severity') or '?'}] {(v.get('summary') or '')[:80]}")
-        lines.append(f"  约束: {rule} | 规则文件: {v.get('file')}")
+        floc = v.get("file")
+        if floc and base:
+            floc = str(base / floc)
+        lines.append(f"  约束: {rule} | 规则文件: {floc}")
     if len(vulns) > top_k:
         lines.append(f"（另有 {len(vulns) - top_k} 条未显示，可提高 top_k）")
     lines.append(
@@ -240,6 +248,10 @@ async def ai_quick_scan(target: str) -> str:
 
 #: strix / openai-agents 注册用
 TOOLS: Final = (ai_fingerprint, ai_cve_lookup, ai_quick_scan)
+
+#: 离线 CVE 查询单独一组：它不探测目标、不需要放行清单，只是把内置规则库
+#: 当本地数据查。tcp 题的 banner 里带着组件与版本，这是镜像内唯一的 CVE 来源。
+OFFLINE_TOOLS: Final = (ai_cve_lookup,)
 
 
 async def web_cve_lookup(component: str, version: str = "", top_k: int = 8) -> str:
@@ -318,6 +330,39 @@ def register_web_cve(register_fn: Any | None = None) -> list[str]:
     return [w.name for w in wrapped]
 
 
+def register_offline(register_fn: Any | None = None) -> list[str]:
+    """Register ``ai_cve_lookup`` alone, without the two HTTP probes.
+
+    For a kind that has no page to fingerprint but can still learn a
+    component version (a tcp banner).  No allowlist is seeded: the lookup
+    never touches the target.
+
+    Args:
+        register_fn: injection point, defaults to ``factory.register_agent_tools``.
+
+    Returns:
+        The registered names.
+    """
+    if register_fn is None:
+        from strix.agents import factory
+
+        register_fn = factory.register_agent_tools
+        try:
+            existing = {getattr(tool, "name", "") for tool in factory.registered_agent_tools()}
+        except Exception:  # noqa: BLE001 — older runtime without the query API
+            existing = set()
+    else:
+        existing = set()
+
+    from agents import function_tool
+
+    wrapped = [function_tool(timeout=60)(fn) for fn in OFFLINE_TOOLS]
+    pending = [tool for tool in wrapped if tool.name not in existing]
+    if pending:
+        register_fn(*pending)
+    return [w.name for w in wrapped]
+
+
 # ---------------------------------------------------------------- strix 接入
 
 
@@ -362,11 +407,14 @@ def register(register_fn: Any | None = None) -> list[str]:
     return [w.name for w in wrapped]
 
 
-def allow_for(target: str) -> None:
+def allow_for(target: str) -> str:
     """把目标写进 ``CTF_AISEC_ALLOW``，供本进程内的工具使用。
 
     Args:
         target: 形如 ``10.0.0.5:11434`` 或 ``http://10.0.0.5:11434``。
+
+    Returns:
+        写入的 ``host:port`` 键。
     """
     import urllib.parse
 
@@ -374,9 +422,41 @@ def allow_for(target: str) -> None:
     p = urllib.parse.urlsplit(u)
     host = p.hostname or ""
     port = p.port or (443 if p.scheme == "https" else 80)
+    key = f"{host}:{port}"
     cur = {x for x in os.environ.get("CTF_AISEC_ALLOW", "").split(",") if x}
-    cur.add(f"{host}:{port}")
+    cur.add(key)
     os.environ["CTF_AISEC_ALLOW"] = ",".join(sorted(cur))
+    return key
+
+
+def allow_targets(targets: Iterable[str]) -> list[str]:
+    """按题面声明的端点写放行清单，返回最终清单。
+
+    这是两个真实入口唯一该用的入口。在此之前只有 ``__main__`` 调过
+    ``allow_for``，运行时清单恒空，所有私网靶机在网段检查那一步就被拒——
+    三个 AI 安全工具在真题上永远返回「目标被拒绝」。
+
+    只接受单主机端点：网段（``10.20.0.0/16``）、裸路径和空值跳过。放行粒度
+    必须是 ``host:port``，否则 ``allow 10.0.0.0/8`` 等于没拦。
+
+    Args:
+        targets: 题面声明的目标地址，URL 或 ``host:port``。
+
+    Returns:
+        排序后的 ``host:port`` 清单（可能为空）。
+    """
+    allowed: set[str] = set()
+    for target in targets:
+        text = str(target or "").strip()
+        if not text:
+            continue
+        if "://" in text:
+            if not text.lower().startswith(("http://", "https://")):
+                continue
+        elif "/" in text:
+            continue  # CIDR 或裸路径：不是单主机端点
+        allowed.add(allow_for(text))
+    return sorted(allowed)
 
 
 if __name__ == "__main__":

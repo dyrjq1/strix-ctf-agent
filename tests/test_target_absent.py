@@ -537,3 +537,326 @@ def test_target_absent_stop_waits_for_the_next_round_boundary(
     assert payload["stop_reason"] == "solved"
     assert steps[-1] == "sibling-output", steps
     assert "boundary" not in steps
+
+
+# ---------------------------------------------------------------------------
+# WEB-3: an auth wall is a live application, not an absent target
+# ---------------------------------------------------------------------------
+
+UNAUTHORIZED = '{"error":"unauthorized"}'
+
+
+def _probe_result(status: int, body: str, *, path: str = "/x") -> str:
+    """One ``http_probe`` result: status head, ``hdr:`` lines, ``body:`` line."""
+    return (
+        f"[HTTP {status}] GET https://absent.test{path} | 0.11s | 27B | "
+        "application/json\n"
+        "hdr: content-type=application/json\n"
+        f"body: {body}\n"
+        "next: 鉴权被拒：先走注册/登录拿会话，别继续盲试参数。\n"
+    )
+
+
+def test_401_on_six_paths_does_not_declare_the_target_absent(factory):
+    """WEB-3: six paths behind one login wall must not kill a live target.
+
+    ``{"error":"unauthorized"}`` has no application marker (its only key is in
+    ``_ERROR_KEYS``) and 401 is not in ``_DEAD_STATUSES``, so before the auth
+    branch every one of these counted as "uninformative" and the sixth tripped
+    the guard -- on a target whose routing layer had just answered.
+    """
+    results = [_probe_result(401, UNAUTHORIZED, path=f"/p{i}") for i in range(8)]
+    tool = RawTool("http_probe", results)
+    guard, (wrapped,) = _install(factory, [tool])
+
+    outputs = [_run(wrapped, _args(f"/p{index}")) for index in range(8)]
+
+    assert not any(out.startswith("ERROR:") for out in outputs)
+    assert not guard.tripped, "an auth wall means the application is up"
+    assert guard.observations == 0
+
+
+def test_403_on_six_paths_does_not_declare_the_target_absent(factory):
+    """403 is the same signal: something answered and refused on purpose."""
+    results = [_probe_result(403, UNAUTHORIZED, path=f"/p{i}") for i in range(6)]
+    tool = RawTool("http_probe", results)
+    guard, (wrapped,) = _install(factory, [tool])
+
+    outputs = [_run(wrapped, _args(f"/p{index}")) for index in range(6)]
+
+    assert not any(out.startswith("ERROR:") for out in outputs)
+    assert not guard.tripped
+
+
+def test_hidden_status_with_auth_body_does_not_fire(factory):
+    """``curl -s`` prints only the body: the auth phrase is the only signal."""
+    tool = FakeTool("exec_command", [UNAUTHORIZED])
+    guard, (wrapped,) = _install(factory, [tool])
+
+    outputs = [_run(wrapped, _args(f"/probe-{index}")) for index in range(8)]
+
+    assert not any(out.startswith("ERROR:") for out in outputs)
+    assert not guard.tripped
+
+
+def test_auth_wall_latches_the_origin_alive(factory):
+    """One 401 proves liveness: later identical 404s cannot resurrect the verdict."""
+    wall = _probe_result(401, UNAUTHORIZED, path="/login")
+    results = [wall] + [_probe_result(404, GO_404, path=f"/p{i}") for i in range(10)]
+    tool = RawTool("http_probe", results)
+    guard, (wrapped,) = _install(factory, [tool])
+
+    outputs = [_run(wrapped, _args("/login"))]
+    outputs += [_run(wrapped, _args(f"/probe-{index}")) for index in range(10)]
+
+    assert not any(out.startswith("ERROR:") for out in outputs)
+    assert not guard.tripped
+
+
+def test_generic_error_body_still_fires(factory):
+    """Reverse control: the auth regex must not rescue a dead host.
+
+    ``{"error":"not found"}`` says nothing about authentication, so six
+    distinct paths answering it still declare the target absent.
+    """
+    tool = FakeTool("exec_command", ['{"error":"not found"}'])
+    guard, (wrapped,) = _install(factory, [tool])
+
+    outputs = [_run(wrapped, _args(f"/probe-{index}")) for index in range(6)]
+
+    assert outputs[-1].startswith("ERROR: [TARGET ABSENT]")
+    assert guard.tripped
+
+
+def test_present_non_auth_status_ignores_auth_words_in_the_body(factory):
+    """A printed status decides on its own: 500 + "unauthorized" prose still counts."""
+    results = [
+        _probe_result(500, "internal error: unauthorized middleware failed")
+        for _ in range(6)
+    ]
+    tool = RawTool("http_probe", results)
+    guard, (wrapped,) = _install(factory, [tool])
+
+    outputs = [_run(wrapped, _args(f"/probe-{index}")) for index in range(6)]
+
+    assert outputs[-1].startswith("ERROR: [TARGET ABSENT]")
+    assert guard.tripped
+
+
+# ---------------------------------------------------------------------------
+# PWN-8: tcp / tcp_batch get their own dead-target channel
+# ---------------------------------------------------------------------------
+#
+# ``target_absent`` used to read only http(s) URLs out of the arguments, so a
+# socket tool was invisible to it: a dead service could absorb every retry and
+# the run burned the wall clock.  The rule added here is deliberately narrower
+# than the http one, because "the port refused" is *not* "the host is gone":
+#
+#   * three failed connects to the same ``host:port``      -> refuse that origin
+#   * three DNS failures for the same ``host:port``        -> end the run
+#   * anything that proves the socket opened (banner, TLS or send failure) resets
+#
+# A refused port is the common wrong-port mistake, so it must never end the run
+# -- only stop the agent from re-dialling the same address.
+
+REFUSED = (
+    "[tcp] connection refused by tcp-absent.test:9. next: confirm the port from "
+    "the task statement; a refused port on a running box usually means the wrong "
+    "port, not a dead box."
+)
+TIMEOUT = (
+    "[tcp] connect timed out to tcp-absent.test:9 after 5s. next: retry once; a "
+    "host that keeps timing out on this exact port is not answering."
+)
+NO_ROUTE = (
+    "[tcp] cannot reach tcp-absent.test:9 (OSError: Network is unreachable). "
+    "next: no route to that address -- check the VPN/tunnel before assuming the "
+    "service is down."
+)
+DNS_FAIL = (
+    "[tcp] DNS failed for tcp-absent.test: [Errno 11001] getaddrinfo failed. next: "
+    "check the hostname from the task statement."
+)
+LIVE = "[tcp] tcp-absent.test:9 connected in 3 ms; banner=12 B ascii='ctf ready'\n> "
+TLS_FAIL = (
+    "[tcp] TLS handshake failed (SSLError: wrong version number). next: retry "
+    "without tls=True; the port answered TCP but not TLS."
+)
+SEND_FAIL = "[tcp] send failed: [Errno 32] Broken pipe. The peer closed after the banner."
+PARAM_ERROR = "[tcp] host is empty. Format: tcp(host='node1.ctfy.run', port=1337)"
+
+
+def _tcp_args(port: int = 9, host: str = "tcp-absent.test") -> str:
+    return json.dumps({"host": host, "port": port})
+
+
+def test_three_refused_connects_block_that_host_port(factory):
+    tool = RawTool("tcp", [REFUSED])
+    guard, (wrapped,) = _install(factory, [tool])
+
+    outputs = [_run(wrapped, _tcp_args()) for _ in range(3)]
+
+    assert not any(out.startswith("ERROR:") for out in outputs[:2])
+    blocked = outputs[2]
+    assert blocked.startswith("ERROR: [TCP UNREACHABLE]")
+    assert len(blocked) < 400
+    assert tool.calls == 3
+    # A refused port is a wrong-port hint, not a dead host: the run must go on.
+    assert not guard.tripped
+    assert guard.tripped_origin is None
+
+    calls_at_verdict = tool.calls
+    refused = _run(wrapped, _tcp_args())
+    assert refused.startswith("ERROR: [TCP UNREACHABLE]")
+    assert tool.calls == calls_at_verdict, "a blocked tcp call must not dial again"
+    assert guard.blocked_calls == 1
+
+
+def test_three_dns_failures_end_the_run(factory):
+    tool = RawTool("tcp", [DNS_FAIL])
+    guard, (wrapped,) = _install(factory, [tool])
+
+    outputs = [_run(wrapped, _tcp_args()) for _ in range(3)]
+
+    assert outputs[-1].startswith("ERROR: [TCP UNREACHABLE]")
+    assert guard.tripped
+    assert guard.tripped_origin == "tcp-absent.test:9"
+    detail = guard.stop_detail()
+    assert "did not resolve as a hostname" in detail
+    # The http wording would be a lie here: there were no paths and no response.
+    assert "uninformative response" not in detail
+
+
+def test_two_failures_are_not_enough(factory):
+    tool = RawTool("tcp", [REFUSED])
+    guard, (wrapped,) = _install(factory, [tool])
+
+    outputs = [_run(wrapped, _tcp_args()) for _ in range(2)]
+
+    assert not any(out.startswith("ERROR:") for out in outputs)
+    assert not guard.tripped
+    assert not guard._tcp_dead
+
+
+def test_mixed_failure_kinds_accumulate_on_one_origin(factory):
+    """Refused + timeout + no-route is still "three connects that never opened"."""
+    tool = RawTool("tcp", [REFUSED, TIMEOUT, NO_ROUTE])
+    guard, (wrapped,) = _install(factory, [tool])
+
+    outputs = [_run(wrapped, _tcp_args()) for _ in range(3)]
+
+    assert outputs[-1].startswith("ERROR: [TCP UNREACHABLE]")
+
+
+def test_a_completed_handshake_resets_the_counts(factory):
+    tool = RawTool("tcp", [REFUSED, REFUSED, LIVE, REFUSED, REFUSED])
+    guard, (wrapped,) = _install(factory, [tool])
+
+    outputs = [_run(wrapped, _tcp_args()) for _ in range(5)]
+
+    assert not any(out.startswith("ERROR:") for out in outputs), (
+        "the live call in the middle must clear the two failures before it"
+    )
+    assert not guard._tcp_dead
+
+
+@pytest.mark.parametrize("proof_of_life", [LIVE, TLS_FAIL, SEND_FAIL])
+def test_anything_that_opened_the_socket_is_alive(factory, proof_of_life):
+    """TLS/send failures happen *after* accept: the box is up, the port is right."""
+    tool = RawTool("tcp", [proof_of_life])
+    guard, (wrapped,) = _install(factory, [tool])
+
+    outputs = [_run(wrapped, _tcp_args()) for _ in range(6)]
+
+    assert not any(out.startswith("ERROR:") for out in outputs)
+    assert not guard._tcp_dead
+    assert guard.observations == 6
+
+
+def test_a_different_port_is_a_different_origin(factory):
+    tool = RawTool("tcp", [REFUSED])
+    guard, (wrapped,) = _install(factory, [tool])
+
+    # Two failures each on two ports: four failures, zero verdicts.
+    for port in (9, 1337):
+        for _ in range(2):
+            out = _run(wrapped, _tcp_args(port=port))
+            assert not out.startswith("ERROR:")
+
+    assert not guard._tcp_dead
+    # ... and a port that has not burned its attempts still runs after another
+    # one is dead.  (1337 has two failures banked, so the third would verdict.)
+    for _ in range(3):
+        _run(wrapped, _tcp_args(port=9))
+    assert _run(wrapped, _tcp_args(port=1338)).startswith("[tcp]")
+
+
+def test_argument_errors_never_reach_the_network_and_never_count(factory):
+    tool = RawTool("tcp", [PARAM_ERROR, "[tcp] invalid port 'x'. It must be 1-65535."])
+    guard, (wrapped,) = _install(factory, [tool])
+
+    outputs = [_run(wrapped, _tcp_args()) for _ in range(6)]
+
+    assert not any(out.startswith("ERROR:") for out in outputs)
+    assert guard.observations == 0
+    assert not guard._tcp_fail
+
+
+def test_a_host_without_a_usable_port_is_not_counted(factory):
+    """No port in the arguments -> no origin -> nothing to blame."""
+    tool = RawTool("tcp", [REFUSED])
+    guard, (wrapped,) = _install(factory, [tool])
+
+    outputs = [_run(wrapped, json.dumps({"host": "tcp-absent.test"})) for _ in range(5)]
+
+    assert not any(out.startswith("ERROR:") for out in outputs)
+    assert guard.observations == 0
+
+
+def test_a_recorded_answer_stops_tcp_counting_too(factory):
+    tool = RawTool("tcp", [REFUSED])
+    guard, (wrapped,) = _install(factory, [tool])
+    guard.note_answer()
+
+    outputs = [_run(wrapped, _tcp_args()) for _ in range(6)]
+
+    assert not any(out.startswith("ERROR:") for out in outputs)
+    assert not guard._tcp_dead
+
+
+def test_tcp_batch_refusals_are_counted_as_well(factory):
+    """``tcp_batch`` is the other tool that dials; it must be covered too."""
+    tool = RawTool("tcp_batch", [REFUSED])
+    guard, (wrapped,) = _install(factory, [tool])
+
+    outputs = [_run(wrapped, _tcp_args()) for _ in range(3)]
+
+    assert outputs[-1].startswith("ERROR: [TCP UNREACHABLE]")
+    assert not guard.tripped, "a refused port must not end the run"
+
+
+def test_tcp_batch_success_header_is_read_as_alive(factory):
+    """A batch that reached the service must never be counted as a dead one."""
+    live = "[tcp_batch] tcp-absent.test:9 2 payload(s) same_conn=True in 0.3s\n#0 ok\n#1 ok"
+    tool = RawTool("tcp_batch", [live])
+    guard, (wrapped,) = _install(factory, [tool])
+
+    outputs = [_run(wrapped, _tcp_args()) for _ in range(4)]
+
+    assert not any(out.startswith("ERROR:") for out in outputs)
+    assert not guard._tcp_dead
+    assert guard.observations == 4
+
+
+def test_an_http_trip_does_not_poison_tcp_origins(factory):
+    """The two channels share counters only through the run-level stop."""
+    tool = RawTool("tcp", [REFUSED])
+    guard, (wrapped,) = _install(factory, [tool])
+
+    for _ in range(3):
+        _run(wrapped, _tcp_args())
+    assert not guard.tripped
+
+    # One http 404 is not "six distinct paths", and the http path must not be
+    # blocked by a tcp verdict.
+    assert guard.refusal(_args("/probe")) is None

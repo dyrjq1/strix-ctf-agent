@@ -808,5 +808,5 @@ next one.
 **Key insight:** MCP shines for iterative, understanding-heavy analysis where the
 agent needs to read decompiler output and follow relationships. For one-shot
 recon (`file`, `strings`, `checksec`) the CLI quick-wins in
-[SKILL.md](SKILL.md#quick-wins-try-first) are still faster — reach for MCP once you
+[`ctf-reverse.md`](ctf-reverse.md#quick-wins-try-first) are still faster — reach for MCP once you
 are past triage and actually reversing logic.

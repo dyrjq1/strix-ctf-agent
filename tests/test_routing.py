@@ -4,13 +4,29 @@ These tests guard three failure modes that are invisible in a run log:
 
 1. a route pointing at a skill that is not installed (the model calls
    ``load_skill`` and gets an error instead of an index);
-2. the block growing past its budget (paid on every LLM call);
+2. the block growing past its paid budget (the numbers live *here*, not in
+   ``routing``: ``render`` never truncates, on purpose -- a silently dropped
+   route is a dead direction, and the budget is the test's assertion, not a
+   runtime cap).  The runtime defense for the joined ``user_instructions``
+   block lives one layer up: ``skillpack.prompt_hint`` caps its exit at
+   ``HINT_MAX_CHARS`` (line boundary + visible mark) -- the same budget,
+   guarded dev-time here and at runtime there;
 3. the four disciplines silently disappearing in a later edit.
 """
 
 from __future__ import annotations
 
 from ctf_strix import routing, skillpack
+
+#: Paid size ceilings, asserted here rather than enforced in ``render``.
+#:
+#: These used to be ``routing.MAX_CHARS`` / ``routing.KIND_MAX_CHARS``, which
+#: nothing in the runtime ever read -- a constant that looks like a cap but
+#: trims nothing is worse than no constant: it invites someone to "rely" on it.
+#: Truncation stays off deliberately; the assertion fails instead of the route
+#: silently disappearing from the prompt.
+_MAX_CHARS = 3000
+_KIND_MAX_CHARS = 2400
 
 
 def test_every_route_target_is_a_real_category() -> None:
@@ -33,7 +49,7 @@ def test_render_is_empty_without_names() -> None:
 def test_render_fits_the_character_budget() -> None:
     names = [f"{c}/{c}" for c, _n, _p in skillpack.index_skills()]
     text = routing.render(names, "/var/ctf/jail/skills")
-    assert len(text) <= routing.MAX_CHARS, f"routing block is {len(text)} chars"
+    assert len(text) <= _MAX_CHARS, f"routing block is {len(text)} chars"
 
 
 def test_render_keeps_the_four_disciplines() -> None:
@@ -43,6 +59,19 @@ def test_render_keeps_the_four_disciplines() -> None:
     assert "falsifier" in text
     assert "40% and 70%" in text
     assert "do NOT `load_skill`" in text
+
+
+def test_render_pushes_the_best_hit_to_exploitation() -> None:
+    """Depth needs an entry: one enumeration pass, then exploit the best hit.
+
+    The old step 3 stopped on "two identical responses", a condition a breadth
+    scan never meets; the class count replaces it.
+    """
+    names = [f"{c}/{c}" for c, _n, _p in skillpack.index_skills()]
+    text = routing.render(names, "/skills")
+    assert "a second sweep is not progress" in text
+    assert "add no new attack class" in text
+    assert "Two identical responses" not in text
 
 
 def test_triage_line_dropped_when_not_registered() -> None:
@@ -86,7 +115,7 @@ def test_each_kind_stays_under_the_paid_budget() -> None:
     names = [f"{c}/{c}" for c, _n, _p in skillpack.index_skills()]
     for kind in ("web", "file", "tcp"):
         text = routing.render(names, skillpack.ref_root(), kind=kind)
-        assert len(text) <= routing.KIND_MAX_CHARS, f"{kind} block is {len(text)} chars"
+        assert len(text) <= _KIND_MAX_CHARS, f"{kind} block is {len(text)} chars"
 
 
 def test_bare_skill_names_are_not_rendered() -> None:

@@ -16,10 +16,12 @@
    ``CTF_ALLOW_SUBAGENTS`` 未开）。模型被要求执行一个**工具面里不存在**的动作。
    043 的日志里 root 反复自称 coordinator，正是这段话的产物。
 
-2. ``<environment>``：声称装了 ``nmap`` / ``sqlmap`` / ``ffuf`` / ``nuclei`` /
-   ``subfinder``，并且 "Caido CLI … already running"。
-   镜像里这些都不存在（``tool_trim`` 摘 Caido 工具的理由就是"无 caido-cli"）。
-   模型据此规划扫描器，一次就是一个白烧的轮次。
+2. ``<environment>``：声称装了 ``nuclei`` / ``subfinder``，并且
+   "Caido CLI … already running"。镜像里这三样都不存在（``tool_trim`` 摘 Caido
+   工具的理由就是"无 caido-cli"），模型据此规划扫描器，一次就是一个白烧的轮次。
+   ``nmap`` / ``sqlmap`` / ``ffuf`` 则是真的装了（``docker/check_toolchain.sh``
+   每次构建都探测），所以本文件的 Environment 段逐条列出装了什么、没装什么——
+   **只有一处工具事实来源**，不再和 ``config/goal_preamble.txt`` 各说一套。
 
 3. ``<vulnerability_focus>`` / ``create_vulnerability_report``：整段讲
    "漏洞必须用 reporting agent 提交报告才算发现"，而 CTF 的交付物是 flag 字符串。
@@ -76,18 +78,87 @@ causes the wrong result, and what single check should expose it.
 
 """
 
+#: ``scan_mode="quick"`` 的收敛段。strix 原实现用它选 ``scan_modes/<mode>``
+#: 技能（``vendor/src/strix/agents/prompt.py:54``），产物里就是多一份
+#: 「先收敛、后扩展」的指令。我们替换的是整个 ``render_system_prompt``，所以
+#: 这段只能由我们自己渲染，否则 ``scan_mode`` 就只是被扔掉的一个参数。
+#: 只写机制、不写工具名 —— ``## Environment`` 是工具事实的单一来源。
+_SCAN_QUICK = """\
+## Scan mode: quick (converge first)
+
+Reconnaissance is time-boxed: collect only what you need to name one mechanism,
+then drive that mechanism to a read before opening a second surface. When it
+fails in the same shape twice, change mechanism -- a larger payload set or
+wordlist is the same hypothesis at bigger size, not a new one. Depth beats
+breadth: one request that reads the secret is worth more than a map of
+everything else.
+
+"""
+
+#: What "solved" means.  It differs by challenge kind and cannot be left to the
+#: goal file: the goal file is appended *below* this text, so a core prompt that
+#: says "there is no report to write" argues against the deliverable an
+#: engagement is graded on.  A flag challenge is scored on one answer string; an
+#: engagement on the report it saves, so an unsaved finding is worth zero.
+_DELIVERABLE_FLAG = (
+    "The only thing\nthat scores is the answer string, graded exactly. There is "
+    "no report to write."
+)
+_DELIVERABLE_REPORT = (
+    "There is no single answer string: what scores is the report you save, and "
+    "only what has been written down can score. Give each finding the exact "
+    "request, the response you got back, and the data you should not have seen "
+    "— and write them down as you go, because an unsaved finding is worth zero."
+)
+
+#: Same split for the stop condition: a flag challenge waits for one quoted
+#: string, an engagement for findings that each carry their own evidence.
+_FINISH_FLAG = (
+    "Call `finish_scan` only when the answer string is in front of you, quoted\n"
+    "verbatim (case and braces matter). Before calling it, answer honestly: do I "
+    "have\nexecution/file/DB read, and did I actually read the secret — or only "
+    "a schema?\n"
+    "Deliver each answer on its own line as ANSWER[<question_id>]=<value> —\n"
+    "that line is what the submission layer submits, verbatim."
+)
+_FINISH_REPORT = (
+    "Call `finish_scan` when the report covers what you found and every finding\n"
+    "carries its own request and response. Before calling it, answer honestly: is\n"
+    "each claim backed by a request I actually sent and a response I actually "
+    "read,\nor am I writing from memory?"
+)
+
+#: Third instance of the same defect: the costliest-failure paragraph is aimed at
+#: a run that has a flag to read.  For an engagement the exploit *is* the finding,
+#: and the failure is not writing it down.
+_PROOF_FLAG = (
+    "**Proof is not the deliverable.** If you have code execution, file read, or DB\n"
+    "read, spend the same turn reading the answer: `find / -iname '*flag*'`,\n"
+    "`cat /flag*`, `SELECT * FROM <table>`. A demonstrated vulnerability that you "
+    "did\nnot exploit is zero points."
+)
+_PROOF_REPORT = (
+    "**An unwritten finding is not a finding.** If you have code execution, file\n"
+    "read, or DB read, capture the exact request, the response, and the data you\n"
+    "should not have seen — then put it in the report in the same turn. A\n"
+    "demonstrated vulnerability you did not write down is zero points."
+)
+
 _CORE = """\
-You are the solver for one CTF challenge on the CTFY platform. The only thing
-that scores is the answer string, graded exactly. There is no report to write.
+You are the solver for one CTF challenge on the CTFY platform. {deliverable}
 
 ## Environment (verified facts, not guesses)
 
-- No nuclei/Caido/Docker; nmap/sqlmap/ffuf are installed. impacket/flask-unsign/RsaCtfTool are installed too. HTTP via `requests`
-  or `curl`.
+- CLIs: `nmap` `sqlmap` `ffuf` `smbclient` `curl` `nc` `file` `strings` `xxd`
+  `readelf` `objdump` `gdb` `ROPgadget` `r2` `binwalk` `exiftool` `7z` `tshark`
+  `tcpdump` `fls` `steghide` `upx` `checksec` `impacket` `flask-unsign` `RsaCtfTool`.
+- No nuclei, Caido, Docker, gobuster, volatility; use a listed CLI instead of
+  hand-writing it, and `command -v NAME` once if unsure. HTTP via `requests` or
+  `curl`.
 - `python3` has: `requests` `Crypto` `Cryptodome` `z3` `PIL` `pwn` `numpy`
   `sympy` `gmpy2` `scipy` `matplotlib` `pefile` `yara` `segno` `dnslib`
   `capstone` `unicorn` `paramiko` `rpyc` `plumbum`.
-- No internet: anything else **cannot be installed**; don't try.
+- Internet: **none**; anything else cannot be installed; don't try.
 - Evidence: results must be **printed by a script**, not reasoned.
 - >30s: not inline (partial output). `nohup python3 x.py > log 2>&1 &`, poll
   `cat log` or `write_stdin`.
@@ -97,24 +168,20 @@ that scores is the answer string, graded exactly. There is no report to write.
 
 {turns}
 
-{race}
+{mode}{race}
 {hypothesis}## The failure mode that costs the most
 
-**Enumerating one more name is not progress.** When a family of requests returns
-the same response twice, the mechanism is wrong, not the payload. Change the
-class of attack: parameter pollution, IDOR, auth bypass, injection, SSTI, SSRF,
-path traversal, deserialization, prototype pollution, template/model loading.
+**A new name is not a new hypothesis.** A path, id or param in one attack
+class is one guess; a breadth scan answers each, so "same response twice"
+never fires. Count classes, not names: adding no untried class means the
+mechanism is wrong. One endpoint, many payloads, two shapes is blind
+extraction -- progress while you can name the value it reads.
 
-**Proof is not the deliverable.** If you have code execution, file read, or DB
-read, spend the same turn reading the answer: `find / -iname '*flag*'`,
-`cat /flag*`, `SELECT * FROM <table>`. A demonstrated vulnerability that you did
-not exploit is zero points.
+{proof}
 
 ## Finish
 
-Call `finish_scan` only when the answer string is in front of you, quoted
-verbatim (case and braces matter). Before calling it, answer honestly: do I have
-execution/file/DB read, and did I actually read the secret — or only a schema?
+{finish}
 """
 
 #: ``How to spend turns`` differs by challenge kind.  A file challenge has no
@@ -162,6 +229,11 @@ _TURNS_TCP = """\
    one line per response — that is how an offset is found.
 4. Name the crash before you weaponise it: which input, which offset, which
    register or return address it overwrites.
+5. Plain `tcp` connected but no bytes came back (or only a lone `0x15`/`0x16`
+   byte) => the port speaks TLS. Retry with `tls=True`; `sni` defaults to the
+   host. This platform's TCP access is TLS-SNI, so `pwn.remote(..., ssl=True)`
+   is the equivalent. Never conclude "the service ignores input" from an empty
+   plain reply.
 """
 
 _TURNS: dict[str, str] = {
@@ -378,6 +450,7 @@ def _render_core(
     names: frozenset[str] | set[str] | None = None,
     *,
     is_root: bool = True,
+    scan_mode: str = "deep",
 ) -> str:
     """Fill the Tools and How-to-spend-turns sections for one challenge kind.
 
@@ -389,6 +462,12 @@ def _render_core(
         kind: challenge kind from ``agent._challenge_kind``.
         groups: installer groups that actually registered.
         names: tool names measured in the registry; ``None`` trusts the groups.
+        scan_mode: strix's ``scan_mode`` from ``scan_config``; ``"quick"``
+            injects :data:`_SCAN_QUICK`, anything else renders exactly the
+            pre-existing text. ``"deep"`` must stay a byte-for-byte no-op for
+            every kind except ``"engagement"``: two size budgets and the
+            measured web/checker/file/tcp prompts depend on it, while
+            engagement's deliverable sentence is corrected on purpose.
 
     Returns:
         The core prompt text, ready to concatenate.
@@ -398,6 +477,7 @@ def _render_core(
 
     tools = catalogue.prompt_block(kind, groups, names)
     turns = _TURNS.get(kind, _TURNS_WEB)
+    mode = _SCAN_QUICK if str(scan_mode or "").strip().lower() == "quick" else ""
     # `names` only carries the extra tools registered through
     # `register_agent_tools`; `create_agent` lives in the vendor base tuple,
     # so testing membership here would silently hide the protocol.
@@ -406,8 +486,20 @@ def _render_core(
     # that received this section would be told to do something its runtime
     # guard refuses -- and on a long run it would burn turns trying.
     race = _RACE if (is_root and subagents_allowed()) else ""
+    # The deliverable and the stop condition are the two sentences that name
+    # what the run is for.  Both are wrong for an engagement -- there is no
+    # answer string to quote, and the report *is* the deliverable -- and the
+    # goal file sits below this text, so it cannot retract them.
+    engagement = kind == "engagement"
     return _CORE.format(
-        tools=tools, turns=turns, hypothesis=_HYPOTHESIS, race=race
+        tools=tools,
+        turns=turns,
+        hypothesis=_HYPOTHESIS,
+        race=race,
+        mode=mode,
+        deliverable=_DELIVERABLE_REPORT if engagement else _DELIVERABLE_FLAG,
+        finish=_FINISH_REPORT if engagement else _FINISH_FLAG,
+        proof=_PROOF_REPORT if engagement else _PROOF_FLAG,
     ).strip()
 
 
@@ -415,20 +507,27 @@ def build(
     system_prompt_context: dict[str, Any] | None = None,
     *,
     is_root: bool = True,
+    scan_mode: str = "deep",
 ) -> str:
     """拼出 CTF 系统提示。
 
     Args:
         system_prompt_context: strix 传入的 per-run 上下文（含 authorized_targets）。
+        is_root: 是否根 agent；只有根会拿到 ``## Parallel`` 段。
+        scan_mode: strix 的扫描模式。``"quick"`` 追加收敛段；
+            ``"deep"``/未知值渲染结果与改动前逐字节相同。
 
     Returns:
         提示全文。
     """
     if os.environ.get("CTF_PROMPT_OFF", "").strip().lower() in ("1", "true", "yes"):
         # 回滚 / A/B 对照：退回 strix 原始的 103,541 字符通用提示。
+        # 模式照传：退回原样应连 scan_mode 的语义一起退，而不是钉死 deep。
         from strix.agents.prompt import render_system_prompt as original
 
-        return original(scan_mode="deep", system_prompt_context=system_prompt_context)
+        return original(
+            scan_mode=scan_mode, system_prompt_context=system_prompt_context
+        )
 
     env_text = os.environ.get("CTF_PROMPT_OVERRIDE", "").strip()
     if env_text and Path(env_text).is_file():
@@ -437,10 +536,37 @@ def build(
         return OVERRIDE.read_text(encoding="utf-8")
 
     core = _render_core(
-        _ACTIVE_KIND, _ACTIVE_GROUPS, _ACTIVE_NAMES, is_root=is_root
+        _ACTIVE_KIND,
+        _ACTIVE_GROUPS,
+        _ACTIVE_NAMES,
+        is_root=is_root,
+        scan_mode=scan_mode,
     )
     parts = [core, _targets_block(system_prompt_context), _skills_block()]
     return "\n\n".join(part for part in parts if part) + "\n"
+
+
+def render_system_prompt(
+    *,
+    skills: list[str] | None = None,
+    scan_mode: str = "deep",
+    is_whitebox: bool = False,
+    is_root: bool = False,
+    is_diff_scoped: bool = False,
+    interactive: bool = False,
+    system_prompt_context: dict[str, Any] | None = None,
+    include_scope: bool = True,
+) -> str:  # noqa: ARG001 - 其余参数只为与 strix 原签名一致
+    """strix ``render_system_prompt`` 的替身。
+
+    签名逐字对齐 vendor（``strix/agents/prompt.py``），因为
+    ``strix.core.runner`` 按关键字调用它。**``scan_mode`` 必须透传**：strix
+    原本用它选 ``scan_modes/<mode>`` 技能，是我们唯一能拿到的「本次要收敛
+    还是铺开」的信号；早先的实现把它丢掉，quick 语义就静默失效了。
+
+    ``build`` 是模块级名字，测试里 monkeypatch 它即可直接观察透传。
+    """
+    return build(system_prompt_context, is_root=is_root, scan_mode=scan_mode)
 
 
 def install() -> bool:
@@ -464,22 +590,9 @@ def install() -> bool:
     if getattr(prompt_mod, "_ctf_prompt_installed", False):
         return True
 
-    def render(
-        *,
-        skills: list[str] | None = None,
-        scan_mode: str = "deep",
-        is_whitebox: bool = False,
-        is_root: bool = False,
-        is_diff_scoped: bool = False,
-        interactive: bool = False,
-        system_prompt_context: dict[str, Any] | None = None,
-        include_scope: bool = True,
-    ) -> str:  # noqa: ARG001 - 签名必须与 strix 原函数一致
-        return build(system_prompt_context, is_root=is_root)
-
-    prompt_mod.render_system_prompt = render  # type: ignore[assignment]
-    factory.render_system_prompt = render  # type: ignore[assignment]
-    runner.render_system_prompt = render  # type: ignore[assignment]
+    prompt_mod.render_system_prompt = render_system_prompt  # type: ignore[assignment]
+    factory.render_system_prompt = render_system_prompt  # type: ignore[assignment]
+    runner.render_system_prompt = render_system_prompt  # type: ignore[assignment]
     prompt_mod._ctf_prompt_installed = True  # type: ignore[attr-defined]
     logger.info("ctf-ctx: CTF system prompt installed")
     return True

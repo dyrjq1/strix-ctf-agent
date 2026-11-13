@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import os
 import re
-from typing import Callable
+from typing import Any, Callable
 
 
 RegisterFn = Callable[[], list[str]]
@@ -103,13 +103,7 @@ def wants_aisec(kind: str, task: dict | None = None) -> tuple[bool, str]:
         return True, "CTF_AISEC=1"
     if kind not in WEB_KINDS:
         return False, f"kind={kind} has no web surface"
-    if not task:
-        return False, "no task metadata"
-    blob = " ".join(_metadata_tokens(task)).lower()
-    hits = [hint for hint in _AISEC_HINTS if _hint_matches(hint, blob)]
-    if hits:
-        return True, "task metadata mentions " + ", ".join(sorted(set(hits))[:3])
-    return False, "task metadata has no AI-security signal"
+    return _aisec_signal(task)
 
 
 def _hint_matches(hint: str, blob: str) -> bool:
@@ -223,11 +217,97 @@ def install_soft_deadline(soft_seconds: float, turns: int):
     from ctf_strix.deadline_guard import install as install_deadline_guard
 
     return install_deadline_guard(
-        DeadlineGuard(
-            wall=soft_seconds * 2,
-            soft=soft_seconds,
-            stall=max(soft_seconds / 3, 30.0),
-            grace=20.0,
-            turns=turns,
-        )
+        DeadlineGuard(wall=soft_seconds * 2, soft=soft_seconds, turns=turns)
     )
+
+def _aisec_signal(task: dict | None) -> tuple[bool, str]:
+    """Answer the metadata half of :func:`wants_aisec`.
+
+    Args:
+        task: the parsed ``task.json``; ``None`` means "no metadata available".
+
+    Returns:
+        ``(enabled, reason)``; ``True`` only when a hint matches the task's own
+        metadata.  Kept separate so the offline gate below applies the same
+        evidence instead of growing a second, subtly different hint list.
+    """
+    if not task:
+        return False, "no task metadata"
+    blob = " ".join(_metadata_tokens(task)).lower()
+    hits = [hint for hint in _AISEC_HINTS if _hint_matches(hint, blob)]
+    if hits:
+        return True, "task metadata mentions " + ", ".join(sorted(set(hits))[:3])
+    return False, "task metadata has no AI-security signal"
+
+
+#: Kinds with no HTTP surface of their own where the offline CVE lookup still
+#: pays.  A tcp challenge is a remote service whose banner names a component and
+#: version; ``ai_cve_lookup`` reads a bundled rule base, needs no target and no
+#: network, and is the only CVE source in the offline image.
+_AISEC_OFFLINE_KINDS: tuple[str, ...] = ("tcp",)
+
+
+def aisec_offline(kind: str, task: dict | None = None) -> tuple[bool, str]:
+    """Decide whether the offline CVE lookup alone should be registered.
+
+    :func:`wants_aisec` answers "does this target have an AI surface", and "no"
+    is the right answer for a tcp challenge -- there is no page to fingerprint.
+    The lookup is a different tool: it needs no target, so it is not withheld
+    from a kind that can still use it.  The full three-tool set stays behind
+    :func:`wants_aisec`.
+
+    Args:
+        kind: challenge kind from ``agent._challenge_kind``.
+        task: the parsed ``task.json``; the evidence is the same metadata
+            :func:`wants_aisec` reads.
+
+    Returns:
+        ``(enabled, reason)``, printed once at start-up like the other gates.
+        ``CTF_AISEC=0`` vetoes it and ``CTF_AISEC=1`` arms it, the same as the
+        wider gate; otherwise the challenge metadata decides.
+    """
+    forced = os.environ.get("CTF_AISEC", "").strip().lower()
+    if forced in ("0", "false", "no"):
+        return False, "CTF_AISEC=0"
+    if kind not in _AISEC_OFFLINE_KINDS:
+        return False, f"kind={kind} has no offline AI surface"
+    if forced in ("1", "true", "yes"):
+        return True, "CTF_AISEC=1"
+    return _aisec_signal(task)
+
+
+#: Tools strix assembles from the sandbox toolset instead of adding them to
+#: ``factory._BASE_TOOLS``; a method card that names one is still valid.
+_SHELL_TOOL_NAMES: frozenset[str] = frozenset({"exec_command", "write_stdin"})
+
+
+def _tool_name(obj: Any) -> str:
+    """Name of a tool object or bare function (``""`` when it has neither)."""
+    return str(getattr(obj, "name", "") or getattr(obj, "__name__", "") or "")
+
+
+def live_tool_names() -> frozenset[str]:
+    """Every tool name registered in this process, for method-card filtering.
+
+    ``factory.registered_agent_tools()`` returns :class:`FunctionTool` objects
+    (``.name``); ``_BASE_TOOLS`` holds bare functions (``__name__``) and is what
+    ``tool_trim`` edits, so both are read.
+
+    Returns:
+        The union of the shell toolset, the registered extension tools and the
+        vendor base tools.  An **empty** set means the probe failed -- callers
+        must treat it as "unknown", not as "nothing is registered", which is why
+        both entrypoints pass ``live_tool_names() or None``.
+    """
+    names = set(_SHELL_TOOL_NAMES)
+    try:
+        from strix.agents import factory
+    except Exception:  # noqa: BLE001 -- no strix runtime (unit tests, tooling)
+        return frozenset()
+    try:
+        names.update(_tool_name(tool) for tool in factory.registered_agent_tools())
+        names.update(_tool_name(tool) for tool in getattr(factory, "_BASE_TOOLS", ()))
+    except Exception:  # noqa: BLE001 -- older runtime without the query API
+        return frozenset()
+    names.discard("")
+    return frozenset(names)

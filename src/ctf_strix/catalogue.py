@@ -89,8 +89,8 @@ CATALOGUE: Final[tuple[ToolInfo, ...]] = (
     # -- web ---------------------------------------------------------------
     ToolInfo(
         "http_probe",
-        "one structured HTTP exchange (status, headers, body, timing); also "
-        "how to send a body or a header set without writing a script",
+        "one HTTP exchange in, one structured line out; a per-host cookie jar "
+        "keeps a login alive across calls; bodies and headers need no script",
         WEB_KINDS,
         "web",
     ),
@@ -145,14 +145,16 @@ CATALOGUE: Final[tuple[ToolInfo, ...]] = (
     ),
     ToolInfo(
         "decode_blob",
-        "decode a multi-layer encoded string (base64/hex/url/rot) and report "
-        "the chain that worked",
+        "decode a multi-layer blob and report the chain: "
+        "base64/base32/base58/base85/ascii85/hex/binary, gzip/zlib/utf-16 "
+        "between layers, rot13/rot47/url/html-entity on top",
         FILE_KINDS | TCP_KINDS,
         "file",
     ),
     ToolInfo(
         "unpack_archive",
-        "extract an archive safely and keep going into nested archives; "
+        "extract an archive safely and keep going into nested archives: "
+        "zip/tar/gzip/bzip2/xz/zstd, plus 7z/rar through the system 7z; "
         "refuses entries that escape the output directory",
         FILE_KINDS | TCP_KINDS,
         "file",
@@ -206,7 +208,9 @@ CATALOGUE: Final[tuple[ToolInfo, ...]] = (
         "ai_cve_lookup",
         "look one component and version up in the bundled rule base; there is "
         "no internet, so this is the only CVE source",
-        WEB_KINDS,
+        # tcp too: the lookup needs no target and no network, and a remote
+        # service's banner is where the component and version come from.
+        WEB_KINDS | TCP_KINDS,
         "aisec",
     ),
     ToolInfo(

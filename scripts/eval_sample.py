@@ -69,6 +69,11 @@ for _p in (ROOT / "src", ROOT / "vendor" / "src"):
     if _p.is_dir() and str(_p) not in sys.path:
         sys.path.insert(0, str(_p))
 
+#: 答案形态的唯一真值在 ``ctf_strix.flag_extract``。父进程的"答案宽限"判定
+#: 必须与子进程同一套前缀，否则两边对"有没有答案"会得出相反结论。这条 import
+#: 必须放在上面 sys.path 就位之后。
+from ctf_strix.flag_extract import FLAG_RE  # noqa: E402
+
 #: 每题的工作目录。**不能放在 /tmp**：jail 会把 /tmp 盖成空 tmpfs，
 #: 父进程也就再也读不到子进程的日志和用量了。
 BOX_ROOT = Path("/var/ctf/boxes")
@@ -566,9 +571,10 @@ _DONE_RE = _USAGE_LINE
 #: 形如答案的串。父进程用它判断"该不该给答案宽限"，与 `deadline_guard` 里的
 #: 同名正则保持一致——两边用不同规则会导致子进程觉得有答案、父进程觉得没有。
 #: （与 deadline_guard._ANSWER_RE 逐字同步；32-hex 分支带负向环视，避免把
-#: 更长字母数字串的片段当成答案。）
+#: 更长字母数字串的片段当成答案。前缀部分直接取 ``FLAG_RE.pattern``，
+#: 不再手抄一份前缀白名单。）
 _ANSWER_RE = re.compile(
-    r"(?:FLAG|flag|CTF|ctf|CTFY|ctfy)\{[^}\s]{2,}\}|\b(?<![A-Za-z0-9_-])[0-9a-f]{32}\b"
+    "(?:%s)|%s" % (FLAG_RE.pattern, r"\b(?<![A-Za-z0-9_-])[0-9a-f]{32}\b")
 )
 
 #: 形如答案、但**确定不是**答案的串。被污染的 SAMPLE-004 跑了 600 秒，最后
@@ -790,7 +796,9 @@ def run_agent(
                         if _is_noise(m.group(0)):
                             continue
                         diag["answer_seen_at"] = round(elapsed, 1)
-                        diag["answer_hint"] = m.group(0)
+                        # B-5 日志卫生：diag 会整只进结果记录（rec["watch"]），
+                        # 不落答案明文，只记长度。
+                        diag["answer_len"] = len(m.group(0))
                         break
                 if _DONE_RE.search(body):
                     done_at = done_at or now
@@ -804,8 +812,8 @@ def run_agent(
                     if st.get("soft_hit"):
                         diag["soft_injected"] = True
                     if diag["answer_seen_at"] is None and st.get("answer_at_s"):
+                        # sidecar 已不携带答案明文（B-5），这里只取时刻。
                         diag["answer_seen_at"] = float(st["answer_at_s"])
-                        diag["answer_hint"] = st.get("answer")
                 except (OSError, ValueError):
                     pass
 
@@ -1429,7 +1437,8 @@ def eval_one(
                 # 不能按 answered_correctly 过滤：那是实例级标记，平台会把题库
                 # 历史带下来。SAMPLE-006 一开局 deface 就是 true，于是 checker
                 # 一次都没跑，而 agent 明明已经拿到 banner 被改写的证据
-                # （answer_hint=FLAG{banner_defacement_confirmed...}），最终判 FAIL。
+                # （run.log 里已有 flag 形态串；旧 answer_hint 明文字段已按
+                # B-5 日志卫生摘除），最终判 FAIL。
                 #
                 # requires 也一样：前置 question 若在**本轮或平台账本**里都被认为
                 # 已满足，就允许跑 checker。checker 是服务端 sidecar 实测，跑一次

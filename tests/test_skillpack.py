@@ -43,10 +43,21 @@ def test_index_skills_returns_one_per_category() -> None:
         assert path.parent.name == category
 
 
-def test_index_skills_skips_skill_md() -> None:
-    """``SKILL.md`` 是上游遗留的重复索引，不能混进来占 prompt。"""
-    names = [p.name for _, _, p in skillpack.index_skills()]
-    assert "SKILL.md" not in names
+def test_index_skills_skips_skill_md(tmp_path: Path) -> None:
+    """上游重同步可能把 ``SKILL.md`` 带回来；它绝不能混进注册面。
+
+    仓库里已无 SKILL.md（只保留索引一份真相），所以这里用合成目录验证跳过
+    逻辑——否则这条测试会变成一个空转的断言。
+    """
+    pack = tmp_path / "pack"
+    cat = pack / "ctf-demo"
+    cat.mkdir(parents=True)
+    (cat / "ctf-demo.md").write_text(
+        "---\nname: ctf-demo\n---\nbody\n", encoding="utf-8"
+    )
+    (cat / "SKILL.md").write_text("---\nname: skill\n---\nbody\n", encoding="utf-8")
+    names = [p.name for _, _, p in skillpack.index_skills(pack)]
+    assert names == ["ctf-demo.md"]
 
 
 def test_render_keeps_frontmatter_first(tmp_path: Path) -> None:
@@ -132,6 +143,116 @@ def test_index_hint_sends_text_and_images_to_registered_channels() -> None:
     assert "cat/sed -n" in hint
     assert "`view_image`" in hint
     assert "load_skill" in hint
+
+
+def test_render_lists_child_files(tmp_path: Path) -> None:
+    """索引必须自带子文件清单，否则封顶后模型只知道方向、不知道读哪个文件。
+
+    ``context.py`` 对注入的索引做头尾封顶（8,000 / head 4,800），13 个索引里
+    8 个超限，而"子文件链接表"长在中段——正好被折叠掉。清单紧跟路径提示，
+    落在 head 区间，封顶裁不到。
+    """
+    src = skillpack.PACK_DIR / "ctf-crypto" / "ctf-crypto.md"
+    text = skillpack.render(src, "/var/ctf/jail/skills", "ctf-crypto")
+    assert skillpack._FILES_MARK in text
+    # 提示在前、清单在后，且都落在封顶的 head 窗口内。
+    assert text.index("> 子文件目录") < text.index(skillpack._FILES_MARK) < 1_200
+    # 每个名字只出现一次（索引正文里同一文件常被多行引用）。
+    for name in ("classic-ciphers.md", "patterns/RSA-FERMAT.md"):
+        assert text.count(f"`{name}`") == 1
+    # 清单是裸文件名，不带索引里的描述——描述会让块超预算。
+    assert "Vigenere" not in text.split(skillpack._FILES_MARK, 1)[1].split("\n", 1)[0]
+
+
+def _frontmatter(path: Path) -> str:
+    """索引的 frontmatter 原文（``render`` 会把它留在最前）。"""
+    text = path.read_text(encoding="utf-8")
+    m = skillpack._FRONTMATTER.match(text)
+    return m.group(0) if m else ""
+
+
+def _context_cap() -> int:
+    """``context.CAP_CHARS``：超过它的索引才会被裁剪，只有它们值得测。"""
+    from ctf_strix import context
+
+    return context.CAP_CHARS
+
+
+#: 会被 ``context`` 封顶的索引分类（其余索引原样进上下文，没有清单块需求）。
+_OVERSIZE = [
+    category
+    for category, _, path in skillpack.index_skills()
+    if len(path.read_text(encoding="utf-8")) > _context_cap()
+]
+
+
+@pytest.mark.parametrize("evidence", [False, True])
+@pytest.mark.parametrize("category", _OVERSIZE)
+def test_child_file_list_survives_context_cap(category: str, evidence: bool) -> None:
+    """封顶之后，清单块必须逐字节还在——这是本改动的全部意义。
+
+    用真实的 ``context._cap_text`` 与生产常量（不是复刻的近似值），否则
+    测的是本文件里的算术，不是运行期的裁剪。
+    """
+    from ctf_strix import context
+
+    ref = "/var/ctf/jail/skills"
+    path = skillpack.PACK_DIR / category / f"{category}.md"
+    body = path.read_text(encoding="utf-8")[len(_frontmatter(path)) :]
+    block = skillpack._files_index(body, ref, category)
+    assert block, f"{category} 没有清单块，封顶测试会空转"
+
+    rendered = skillpack.render(path, ref, category)
+    capped = context._cap_text(
+        rendered,
+        limit=context.CAP_CHARS,
+        head=context.HEAD_CHARS,
+        tail=context.TAIL_CHARS,
+        evidence=evidence,
+    )
+    assert block in capped, f"{category} 的清单块被封顶裁掉或截断了"
+
+
+def test_render_skips_list_when_no_local_files(tmp_path: Path) -> None:
+    """没有本地 md 可读时不出清单块——空块只是噪音。"""
+    src = tmp_path / "demo.md"
+    src.write_text(
+        "---\nname: demo\n---\n# Demo\n"
+        "See [the docs](https://example.com/a.md) or [notes](notes.txt).\n",
+        encoding="utf-8",
+    )
+    text = skillpack.render(src, "/p", "ctf-demo")
+    assert skillpack._FILES_MARK not in text
+
+
+def test_files_index_keeps_relative_paths_and_drops_anchors(tmp_path: Path) -> None:
+    """跨方向链接与 ``.md#锚点`` 都是有效路径；只去掉锚点、保留相对写法。"""
+    src = tmp_path / "demo.md"
+    src.write_text(
+        "---\nname: demo\n---\n"
+        "- [a](step.md#usage)\n"
+        "- [b](../ctf-misc/ctf-misc.md)\n"
+        "- [c](https://example.com/x.md)\n"
+        "- [d](script.py)\n"
+        "- [again](step.md#other)\n",
+        encoding="utf-8",
+    )
+    text = skillpack.render(src, "/p", "ctf-demo")
+    line = text.split(skillpack._FILES_MARK, 1)[1].split("\n", 1)[0]
+    assert "`step.md`" in line and "#" not in line
+    assert "`../ctf-misc/ctf-misc.md`" in line
+    assert "example.com" not in line
+    assert "script.py" not in line
+
+
+def test_files_index_degrades_instead_of_truncating() -> None:
+    """超预算时给 ``ls`` 指引，不给半截名单——半截名单会让模型以为文件就这些。"""
+    ref = "/var/ctf/jail/skills"
+    body = "\n".join(f"- [f{i}](file-{i}.md)" for i in range(200))
+    block = skillpack._files_index(body, ref, "ctf-demo")
+    assert "超出内联预算" in block
+    assert f"`ls {ref}/ctf-demo/`" in block
+    assert "file-0.md" not in block
 
 
 def test_prompt_hint_empty_when_no_skills() -> None:
@@ -252,3 +373,60 @@ def test_dollar_prefixed_body_is_a_real_flag_not_code() -> None:
     assert not is_code_template("FLAG{$3cr3t}")
     assert not is_placeholder("FLAG{$3cr3t}")
     assert skillpack.mask_flags("FLAG{$3cr3t}") == "FLAG{...}"
+
+def test_prompt_hint_under_ceiling_is_byte_identical() -> None:
+    """低于上限时出口封顶必须是零操作：不加标记、与未封顶的拼接逐字节相同。
+
+    今天实测最坏 2,834 < 4,200，运行期行为零变化；这条断言钉住它。
+    """
+    names = [f"{c}/{c}" for c, _n, _p in skillpack.index_skills()]
+    hint = skillpack.prompt_hint(names, ref="/skills")
+    assert hint
+    assert len(hint) <= skillpack.HINT_MAX_CHARS
+    assert skillpack._HINT_CAPPED_MARK not in hint
+    from ctf_strix import method_cards, routing
+
+    raw = "\n\n".join(
+        part
+        for part in (routing.render(names, "/skills"), method_cards.render(None))
+        if part
+    )
+    assert hint == raw
+
+def test_prompt_hint_caps_oversized_block_at_line_boundary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """判据表膨胀越过上限时：有界、按整行截断、可见标记收尾。
+
+    模拟 ROUTES 长文案膨胀（codex RISK 1 的最小复现），防线在出口生效。
+    """
+    from ctf_strix import routing
+
+    rows = [f"- row {i:03d} " + "x" * 96 for i in range(80)]
+    giant = "\n".join(rows)
+    assert len(giant) > skillpack.HINT_MAX_CHARS
+    monkeypatch.setattr(routing, "render", lambda *args, **kwargs: giant)
+    hint = skillpack.prompt_hint(["ctf-web/ctf-web"], ref="/skills")
+    assert len(hint) <= skillpack.HINT_MAX_CHARS
+    assert hint.endswith(skillpack._HINT_CAPPED_MARK)
+    kept = hint[: -len(skillpack._HINT_CAPPED_MARK)].strip().split("\n")
+    assert all(line in rows for line in kept if line)
+    # 真的在截，不是整段丢弃。
+    assert len(hint) > skillpack.HINT_MAX_CHARS - 300
+
+def test_files_index_drops_flag_shaped_filenames() -> None:
+    """RISK 8：清单不得把 flag 形态的文件名送进提示。
+
+    清单块从未遮蔽的正文抽取（mask_flags 只作用于 body 之后）；带 flag
+    形态的文件名是零污染面破口——遮蔽会给出读不到的假路径，所以直接不列。
+    """
+    body = (
+        "- [normal](normal.md)\n"
+        "- [old writeup](writeup-flag{deadbeef42}.md)\n"
+        "- [cross](../ctf-misc/ctf-misc.md)\n"
+    )
+    block = skillpack._files_index(body, "/skills", "ctf-demo")
+    assert "`normal.md`" in block
+    assert "deadbeef42" not in block
+    assert "flag{" not in block
+    assert "../ctf-misc/ctf-misc.md" in block

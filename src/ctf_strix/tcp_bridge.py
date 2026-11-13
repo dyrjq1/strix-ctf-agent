@@ -50,6 +50,137 @@ from typing import Any
 _CHUNK = 8192
 
 
+class UdpRelay:
+    """把本地 UDP 端口中继到远端 ``(host, port)``。
+
+    与 :class:`TcpBridge` 同接口（``start`` / ``stop`` / ``local_url``），
+    harness 收尾逻辑不用分叉。
+
+    为什么每个客户端源地址单独一条上游 socket：题目常要求"同一个源端口
+    发第二条"。如果每条数据报都 ``sendto`` 远端，上游看到的源端口每次都换，
+    服务端就认不出是同一个人；``connect`` 过的 UDP socket 让上游源端口固定。
+
+    Args:
+        host: 远端 host。
+        port: 远端 port。
+        listen_host: 本地监听地址，默认只监听回环。
+        listen_port: 本地监听端口，0 表示让内核挑一个空闲端口。
+    """
+
+    def __init__(
+        self,
+        host: str,
+        port: int,
+        listen_host: str = "127.0.0.1",
+        listen_port: int = 0,
+    ) -> None:
+        self.host = host
+        self.port = int(port)
+        self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._sock.bind((listen_host, listen_port))
+        self.listen_port: int = self._sock.getsockname()[1]
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        #: 客户端源地址 → 已 connect 的上游 socket。
+        self._peers: dict[tuple[str, int], socket.socket] = {}
+
+    def start(self) -> "UdpRelay":
+        """开始中继（后台线程）。
+
+        Returns:
+            self，便于链式调用。
+        """
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
+        return self
+
+    def stop(self) -> None:
+        """停止中继并关闭所有 socket。可重复调用。"""
+        self._stop.set()
+        for peer in list(self._peers.values()):
+            try:
+                peer.close()
+            except OSError:
+                pass
+        self._peers.clear()
+        try:
+            self._sock.close()
+        except OSError:
+            pass
+        if self._thread is not None:
+            self._thread.join(timeout=2)
+
+    def __enter__(self) -> "UdpRelay":
+        return self.start()
+
+    def __exit__(self, *exc: Any) -> None:
+        self.stop()
+
+    @property
+    def local_url(self) -> str:
+        """给 agent 看的连接串（与 TcpBridge 同形）。"""
+        return f"127.0.0.1:{self.listen_port}"
+
+    # ---------------------------------------------------------------- 内部
+    def _loop(self) -> None:
+        import selectors
+
+        sel = selectors.DefaultSelector()
+        sel.register(self._sock, selectors.EVENT_READ, None)
+        try:
+            while not self._stop.is_set():
+                for key, _ in sel.select(0.3):
+                    if key.data is None:
+                        try:
+                            data, addr = self._sock.recvfrom(65535)
+                        except OSError:
+                            continue
+                        peer = self._peers.get(addr)
+                        if peer is None:
+                            peer = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                            peer.connect((self.host, self.port))
+                            sel.register(peer, selectors.EVENT_READ, addr)
+                            self._peers[addr] = peer
+                        try:
+                            peer.send(data)
+                        except OSError:
+                            # 上游 ICMP 不可达等：丢掉映射，下一条重建。
+                            self._forget(sel, addr, peer)
+                    else:
+                        addr = key.data
+                        peer = key.fileobj
+                        try:
+                            data = peer.recv(65535)
+                        except OSError:
+                            self._forget(sel, addr, peer)
+                            continue
+                        try:
+                            self._sock.sendto(data, addr)
+                        except OSError:
+                            pass
+        finally:
+            for key in list(sel.get_map().values()):
+                try:
+                    sel.unregister(key.fileobj)
+                except (KeyError, ValueError):
+                    pass
+            sel.close()
+
+    def _forget(
+        self, sel: Any, addr: tuple[str, int], peer: Any
+    ) -> None:
+        try:
+            sel.unregister(peer)
+        except (KeyError, ValueError):
+            pass
+        self._peers.pop(addr, None)
+        try:
+            peer.close()
+        except OSError:
+            pass
+
+
 class TcpBridge:
     """把 ``listen_port`` 桥到远端 ``(host, port)``。
 

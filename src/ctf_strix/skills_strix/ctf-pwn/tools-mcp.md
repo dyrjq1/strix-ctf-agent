@@ -226,7 +226,7 @@ disassemble_function address=<gadget_addr>  # ONLY when hunting exact bytes for 
 - Recovering struct layouts (`set_function_prototype`, `declare_c_type` in IDA)
   so heap-overflow offsets are exact.
 - Confirming the comparison direction for canary/flag checks before committing to
-  an exploit strategy (see [SKILL.md](SKILL.md#protection-implications-for-exploit-strategy)).
+  an exploit strategy (see [`ctf-pwn.md`](ctf-pwn.md#protection-implications-for-exploit-strategy)).
 
 **Key insight:** In pwn you eventually need exact bytes (gadgets, offsets), so you
 *will* drop to assembly — but only after the decompiler has told you *which*

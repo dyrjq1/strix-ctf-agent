@@ -1033,7 +1033,9 @@ for prompt in PROMPTS:
    ```
 
 **Non-standard flag format detection:**
-- If the CTF normally uses `utflag{...}` but the model reveals `flag{...}`, try BOTH formats
+- The tag comes from the target, not from the CTF's usual convention: if the target prints
+  `flag{...}` while the CTF normally uses `utflag{...}`, submit exactly what the target
+  printed. Do not swap, rename or normalize the tag, and do not submit several variants.
 - Acrostic outputs hinting at "F-L-A-G-{" suggest non-standard prefix
 - The "gap" in "Mind the Gap" was literally the non-standard flag format
 

@@ -27,6 +27,8 @@
 
 from __future__ import annotations
 
+from ctf_strix.tool_notes import append_note
+
 import re
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
@@ -57,9 +59,17 @@ _DENIED_RE = re.compile(
 )
 
 #: 表示"认证成功"的线索，出现在输出里。Set-Cookie 是最硬的信号。
-#: output 侧五模式保持原样：它们盯的是"服务端把会话发回来了"。
+#:
+#: 分隔符必须写成 ``[:=]``：同一条响应有两种渲染口径。
+#: ``curl -i`` 原样打印响应头行，是 ``Set-Cookie: sid=...``；而
+#: ``http_probe._format_headers`` 把头部压成 ``name=value`` 的单行，
+#: 是 ``set-cookie=sid=...``。只认冒号时，用 ``http_probe`` 走完登录的解
+#: **永远解除不了未认证状态**——守卫会在 6 次载荷后硬停一个已经登录的会话
+#: （报告 WEB-3）。任何改动这一行的修复都必须同时跑
+#: ``tests/test_journey_guard_auth.py`` 里两种形态的用例。
 _AUTH_OK_RE = re.compile(
-    r"set-cookie:|access_token|\"token\"\s*:|session=|Bearer\s+[A-Za-z0-9._\-]{10,}",
+    r"set-cookie\s*[:=]|access_token|\"token\"\s*:|session="
+    r"|Bearer\s+[A-Za-z0-9._\-]{10,}",
     re.IGNORECASE,
 )
 
@@ -453,7 +463,7 @@ def install() -> JourneyGuard:
             # 与枚举守卫不同，这里必须拿到 output——认证成功与否只体现在响应里。
             hint = guard.observe(tool.name, raw_input, str(result))
             if hint:
-                return f"{result}{hint}"
+                return append_note(result, hint)
             return result
 
         tool.on_invoke_tool = invoke

@@ -205,8 +205,17 @@ def record(
     elapsed: float = 0.0,
     phase: str = "",
     note: str = "",
+    body_keep: int = _BODY_KEEP,
 ) -> Exchange:
-    """Store one exchange.  Called by ``http_probe`` after every attempt."""
+    """Store one exchange.  Called after every attempt that touches the target.
+
+    ``body_keep`` raises the stored prefix for a caller whose body is the point
+    of the request (``route_map`` downloads whole JS bundles to read routes out
+    of them; the default 16 KB keeps a header and half a function).  Anything
+    ``<= 0`` falls back to the default, so callers that do not care can leave it
+    out and get the historical behaviour.
+    """
+    keep = body_keep if body_keep > 0 else _BODY_KEEP
     item = Exchange(
         id=request_id,
         ts=time.time(),
@@ -216,7 +225,7 @@ def record(
         req_body=_clip_body(req_body, _REQ_KEEP),
         status=status,
         resp_headers=dict(resp_headers or {}),
-        resp_body=_clip_body(resp_body),
+        resp_body=_clip_body(resp_body, keep),
         size=size,
         elapsed=elapsed,
         phase=phase,

@@ -61,11 +61,17 @@ to ``stop_reason="enum_exhausted"``.
 
 from __future__ import annotations
 
+from ctf_strix.tool_notes import append_note
+
 import hashlib
+import json
 import re
 from collections import Counter
 from typing import TYPE_CHECKING, Any, Final
 
+from ctf_strix.command_tokens import command_text as _command_text
+from ctf_strix.command_tokens import segments as _command_segments
+from ctf_strix.journey_guard import _args_session_signal
 from ctf_strix.probe_surface import PROBE_TOOLS
 
 if TYPE_CHECKING:
@@ -102,6 +108,17 @@ _STALL_REPEAT = 4
 #: budget.  Only the *class* is new here, not the threshold.
 _CLASS_STREAK_AFTER = _STALL_AFTER
 _CLASS_STREAK_REPEAT = _STALL_REPEAT
+
+#: How many *consecutive never-before-requested paths* make a run of requests a
+#: shape rather than navigation.  Physical basis: one unseen path is how every
+#: request to a new route looks; two in a row, neither carrying any mechanism
+#: syntax, is the model naming things instead of attacking them -- the wording
+#: of a single hypothesis in many names.  This is not a budget: it decides when
+#: a shape becomes *classifiable*, and the actionable hint still waits for
+#: ``_CLASS_STREAK_AFTER`` saws.  Retries of an already-requested path never
+#: reach it, which is what keeps blind extraction (one endpoint, many payloads)
+#: out of the enumeration counter.
+_BREADTH_CLASSIFY_AT: Final[int] = 2
 
 #: 从命令里提取"被探测的路径族"。抽不出来就不计——宁可漏抓，不可误伤。
 _PATH_RE = re.compile(r"[A-Za-z0-9_\-./]*(?:api|admin|flag|config|debug|static|assets)[A-Za-z0-9_\-./]*")
@@ -317,11 +334,163 @@ def _host_of(args: str) -> str | None:
     return m.group(1).rstrip(".;:") if m else None
 
 
+# ---- 指纹的另外两维：HTTP 方法与认证态 ----------------------------------
+#
+# 为什么要这两维（报告 WEB-3③ / WEB-6）：``blocked`` 的键一旦只有
+# ``工具|host|族``，同一路径族的**所有方法、无论带不带会话**都在工具执行前被硬拒。
+# 拿到账号之后再打同一个接口、或者把 GET 换成 POST 试写入口，都会被一句
+# "this family is blocked" 挡回去——守卫把"这条路没有新信息"说成了"这条路
+# 永远不许走"。换方法就是换请求，带上会话就是换身份，两者都是**真实的状态
+# 变化**，旧计数不该继承过来。
+
+#: 方法词表。只认这八个，避免把 ``-X PRIVATE`` 之类的目录名当方法。
+_METHOD_WORDS: Final[frozenset[str]] = frozenset(
+    {"GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "TRACE"}
+)
+#: 显式方法选项。``-X`` 只归 curl：wget 的 ``-X`` 是 ``--exclude-directories``，
+#: 把目录名当成方法会把 GET 认成 ``PUBLIC``（见 ``command_tokens._WGET_VALUE_OPTIONS``）。
+_CURL_METHOD_OPTIONS: Final[frozenset[str]] = frozenset({"-X", "--request"})
+_WGET_METHOD_OPTIONS: Final[frozenset[str]] = frozenset({"--method"})
+#: 带请求体的选项：不写 ``-X`` 时 curl / wget 也会改发 POST。
+#: ``-d`` / ``-F`` 只归 curl —— wget 的 ``-d`` 是 ``--debug``。
+_CURL_BODY_FLAGS: Final[frozenset[str]] = frozenset(
+    {"-d", "--data", "--data-raw", "--data-binary", "--data-urlencode", "--json", "-F", "--form"}
+)
+_WGET_BODY_FLAGS: Final[frozenset[str]] = frozenset(
+    {"--post-data", "--post-file", "--body-data", "--body-file"}
+)
+_CURL_HEAD_FLAGS: Final[frozenset[str]] = frozenset({"-I", "--head"})
+_CURL_GET_FLAGS: Final[frozenset[str]] = frozenset({"-G", "--get"})
+#: 会话请求头。``Cookie`` / ``Authorization`` 是"这次请求带着身份"的机制级证据；
+#: 其余自定义头（含 ``X-Forwarded-For``）不改变身份，不算。
+_SESSION_HEADER_NAMES: Final[frozenset[str]] = frozenset({"cookie", "authorization"})
+#: ``Cookie: v`` / ``Cookie=v`` / ``"Cookie": "v"`` —— 最后一种是
+#: ``http_probe`` 的 ``headers_json`` 传 JSON 文本时的形态（引号在分隔符前）。
+_SESSION_HEADER_RE = re.compile(
+    r"(?:^|[\s\"',{;])(?:cookie|authorization)\s*[\"']?\s*[:=]\s*\S", re.I
+)
+
+
+def _json_object(args: str) -> dict[str, Any] | None:
+    """参数里的 JSON 对象；解析不出来（shell 原文形态）就返回 None。"""
+    try:
+        data = json.loads(args)
+    except (TypeError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _client_of(token: str) -> str | None:
+    """``curl`` / ``wget``（允许带目录与 ``.exe``），其余返回 None。"""
+    base = token.rsplit("/", 1)[-1].lower()
+    if base.endswith(".exe"):
+        base = base[:-4]
+    return base if base in ("curl", "wget") else None
+
+
+def _segment_method(tokens: list[str], client: str) -> str | None:
+    """一个 curl / wget 命令段的方法：显式选项优先，否则由旗标隐含。"""
+    explicit = _CURL_METHOD_OPTIONS if client == "curl" else _WGET_METHOD_OPTIONS
+    body = _CURL_BODY_FLAGS if client == "curl" else _WGET_BODY_FLAGS
+    implied: str | None = None
+    index = 1
+    while index < len(tokens):
+        token = tokens[index]
+        option, separator, attached = token.partition("=")
+        # curl 也吃 ``-XPOST`` 这种粘写形态。
+        short = token[:2] if len(token) > 2 and not token.startswith("--") else ""
+        if option in explicit or short in explicit:
+            if separator:
+                candidate = attached
+            elif short in explicit:
+                candidate = token[2:]
+            else:
+                index += 1
+                candidate = tokens[index] if index < len(tokens) else ""
+            word = candidate.strip().upper()
+            if word in _METHOD_WORDS:
+                return word
+        elif token in body or (
+            len(token) > 2 and not token.startswith("--") and token[:2] in body
+        ):
+            implied = implied or "POST"
+        elif client == "curl" and token in _CURL_HEAD_FLAGS:
+            implied = implied or "HEAD"
+        elif client == "curl" and token in _CURL_GET_FLAGS:
+            implied = implied or "GET"
+        index += 1
+    return implied
+
+
+def _method_of(args: str) -> str:
+    """这次调用用的是哪个 HTTP 方法；判断不出来按 GET 计。
+
+    两处来源：探测工具的 ``method`` / ``methods`` 参数（``method_sweep`` 与
+    ``path_variants`` 收的是逗号分隔串，排序后拼成一个稳定键），以及 shell 里
+    curl / wget 段的方法选项。
+    """
+    data = _json_object(args)
+    if data is not None:
+        raw = data.get("method")
+        if isinstance(raw, str):
+            word = raw.strip().upper()
+            if word in _METHOD_WORDS:
+                return word
+        many = data.get("methods")
+        if isinstance(many, str):
+            words = sorted(
+                {w for w in re.split(r"[\s,]+", many.upper()) if w in _METHOD_WORDS}
+            )
+            if words:
+                return "+".join(words)
+    for tokens in _command_segments(_command_text(args)):
+        client = _client_of(tokens[0]) if tokens else None
+        if client is None:
+            continue
+        method = _segment_method(tokens, client)
+        if method is not None:
+            return method
+    return "GET"
+
+
+def _auth_of(args: str) -> str:
+    """这次调用是否带着会话；键里只留 ``auth`` / ``anon`` 两值。
+
+    先读 JSON 参数里的 ``headers`` / ``headers_json`` / ``cookies`` —— 覆盖
+    ``http_probe`` 这类以 JSON 传参的探测工具（``command_text`` 只解码
+    ``command``/``cmd``/``script``/``chars``，对这些工具返回原文，shell 门控
+    看不到任何东西）。再退回 shell 门控 ``journey_guard._args_session_signal``，
+    它负责 ``curl -b`` / ``--cookie-jar`` / ``-H 'Cookie: ...'`` 的引号与
+    heredoc 处理，不重复实现。
+    """
+    data = _json_object(args)
+    if data is not None:
+        for field in ("headers", "header", "headers_json"):
+            headers = data.get(field)
+            if isinstance(headers, dict):
+                for name, value in headers.items():
+                    if value and str(name).strip().lower() in _SESSION_HEADER_NAMES:
+                        return "auth"
+            elif isinstance(headers, str) and _SESSION_HEADER_RE.search(headers):
+                return "auth"
+        for field in ("cookies", "cookie"):
+            cookies = data.get(field)
+            if isinstance(cookies, dict) and cookies:
+                return "auth"
+            if isinstance(cookies, str) and cookies.strip():
+                return "auth"
+    return "auth" if _args_session_signal(args) else "anon"
+
+
 def _fingerprint(tool_name: str, args: str) -> str | None:
     """把一次探测归一化成指纹，用于判断"是不是同一族"。
 
-    只保留：工具名 + 目标 host + 命中的业务路径词。丢掉具体的 URL 参数、
-    文件名、随机串——那些正是模型用来"换个参数重试"的空间。
+    只保留：工具名 + 目标 host + HTTP 方法 + 认证态 + 命中的业务路径词。丢掉
+    具体的 URL 参数、文件名、随机串——那些正是模型用来"换个参数重试"的空间。
+
+    **族名必须是最后一段**：``finish()``、``_blocked_error()``、
+    ``exhausted_detail()`` 都按末段取族名，测试也按 ``.endswith("|api/login")``
+    断言。新增维度只能往中间插。
 
     Args:
         tool_name: 工具名。
@@ -371,7 +540,7 @@ def _fingerprint(tool_name: str, args: str) -> str | None:
     if not families:
         return None
 
-    return f"{tool_name}|{host}|{sorted(families)[0]}"
+    return f"{tool_name}|{host}|{_method_of(args)}|{_auth_of(args)}|{sorted(families)[0]}"
 
 
 #: "又在读前端 bundle" 的特征：curl/wget 一个 .js、cat 一个 .js、或 read_file 到 .js。
@@ -396,6 +565,15 @@ _WRITE_REDIRECT_RE = re.compile(r"\b(?:cat|tee)\b[^\n]*?(?:>>?|<<)")
 _HEAD_DURATION_RE = re.compile(r"\b\d+(?:\.\d+)?\s*(?:ms|s|seconds?|sec)\b", re.I)
 _HEAD_SIZE_RE = re.compile(r"\b\d+(?:\.\d+)?\s*(?:B|KB|MB|bytes?)\b", re.I)
 
+#: ``http_probe`` 的状态行末尾挂着本轮的交换 id（``traffic.next_id()`` →
+#: ``id=r7``），它对每个响应都不同，但**不代表任何状态变化**。留着它，
+#: 同一路径同一响应的两次探测就是两个指纹 —— 重复计数恒 0、stall 恒不涨，
+#: ENUMERATION GUARD 在最该响的地方永远不响（报告 WEB-2）。
+#:
+#: 只洗 ``id=rNN`` 这一种形态：``[HTTP 403]`` 里的状态码、``phase=CONNECT``
+#: 里的归因都必须是语义的一部分。
+_HEAD_REQ_ID_RE = re.compile(r"\bid=r\d+\b")
+
 
 def _norm_head(head: str) -> str:
     """归一化状态行里逐次变化的部分，保留状态码等语义数字。
@@ -408,6 +586,7 @@ def _norm_head(head: str) -> str:
     """
     out = _HEAD_DURATION_RE.sub("<t>", head)
     out = _HEAD_SIZE_RE.sub("<n>", out)
+    out = _HEAD_REQ_ID_RE.sub("id=<id>", out)
     return re.sub(r"\s+", " ", out).strip()
 
 
@@ -525,9 +704,23 @@ class EnumerationGuard:
     另外维护**全局停滞**计数：连续 N 次调用（跨所有族）都没产生新指纹，
     说明模型在原地打转，不管它换没换路径。
 
+    ## 第三套计数：机制类别（以及广度为什么躲在它后面）
+
+    上面两套都按"响应"或"族"计数，于是"换名字不换假设"两处都躲得过：换名字
+    就是新指纹、新族。第三套按 CAPEC-1000 顶层的机制类别计（见
+    ``_MECHANISM_RULES``），同一个类别里换六个名字仍然是一个假设。
+
+    但只按"族内叶子 ≥ 2"归类仍有一个洞：``_path_family`` 按**目录**切族，
+    一次跨目录扫描（``/admin/x``、``/backup/y``、``/uploads/z``）每个名字各成
+    一族、各只有一片叶子，永远凑不满叶数门槛——这正是"广度扫描天然规避全部
+    停止判据"。所以这里另留运行级路径集合：连续 ``_BREADTH_CLASSIFY_AT`` 条
+    **从没请求过**的路径、且都不带机制语法，同样归入信息收集。已知路径的重试
+    会清零该连击，盲注那种"一个端点、几百个 payload"因此不受影响。
+
     Attributes:
         counts: 族 → 连续同响应次数。
         stall: 连续零新信息的调用数（跨族）。
+        new_path_streak: 连续请求"本 run 没请求过"的路径的次数。
     """
 
     def __init__(self) -> None:
@@ -559,6 +752,15 @@ class EnumerationGuard:
         self.exhausted_family: str | None = None
         #: Distinct request paths seen per family (path-diversity gate).
         self._family_paths: dict[str, set[str]] = {}
+        #: Every ``host|path`` this run has asked for.  ``_family_paths`` is
+        #: keyed by fingerprint, and ``_path_family`` splits on the *directory*,
+        #: so a scan that walks one directory per name (``/admin/x``,
+        #: ``/backup/y``, ``/uploads/z``) lands in a different family every time,
+        #: each with a single leaf.  The family rule therefore never sees it;
+        #: only a run-wide path set does.
+        self._run_paths: set[str] = set()
+        #: Consecutive calls that asked for a path this run had never requested.
+        self.new_path_streak: int = 0
 
     def mechanism_counts(self) -> dict[str, int]:
         """Return a read-only snapshot of the per-CAPEC-class probe counts.
@@ -582,7 +784,8 @@ class EnumerationGuard:
 
     def exhausted_detail(self) -> str:
         """One-line reason for the ``EnumExhausted`` exception."""
-        family = (self.exhausted_family or "target").split("|", 2)[-1]
+        # 族名永远是键的末段（键形如 ``工具|host|方法|认证态|族``）。
+        family = (self.exhausted_family or "target").rsplit("|", 1)[-1]
         return (
             f"enumeration exhausted: '{family}' stayed blocked after "
             f"{self.refusal_count(self.exhausted_family or '')} refused calls; "
@@ -613,6 +816,8 @@ class EnumerationGuard:
         self._global.clear()
         self.leaves.clear()
         self._family_paths.clear()
+        self._run_paths.clear()
+        self.new_path_streak = 0
         self.refusal_counts.clear()
         self.exhausted_family = None
         self.stall = 0
@@ -626,8 +831,12 @@ class EnumerationGuard:
         must not end the retry attempt on its very first call -- the model gets
         one honest chance under the new instruction.  The blocks themselves
         stay: that family produced no new information, so probing it again is
-        still wasted work.  ``blocked_calls`` is a run-wide statistic and is
-        left alone, like in :meth:`note_answer`.
+        still wasted work.  "That family" is one *cell* of the request cube --
+        same tool, host, HTTP method and authentication state (see
+        :func:`_fingerprint`); a retry that changes method or brings a session
+        is a different cell and starts from zero, so the block does not hold
+        the model to an identity it no longer has.  ``blocked_calls`` is a
+        run-wide statistic and is left alone, like in :meth:`note_answer`.
         """
         self.refusal_counts.clear()
         self.exhausted_family = None
@@ -698,10 +907,18 @@ class EnumerationGuard:
                     "Stop downloading/cat-ing .js: feed those paths to method_sweep, "
                     "then POST to the most plausible one."
                 )
+        fresh_path = False
         if key is not None:
             path = _request_path(args)
             if path is not None:
                 self._family_paths.setdefault(key, set()).add(path)
+                run_path = f"{_host_of(args) or ''}|{path}"
+                fresh_path = run_path not in self._run_paths
+                if fresh_path:
+                    self._run_paths.add(run_path)
+                    self.new_path_streak += 1
+                else:
+                    self.new_path_streak = 0
         sig = _obs_signature(result, args)
         fresh = (key, sig) not in self._global
         self._global.add((key, sig))
@@ -728,13 +945,32 @@ class EnumerationGuard:
             # same path family asked for a second distinct leaf is the 043
             # behaviour -- many new names, one hypothesis.  One leaf alone is
             # ordinary navigation and is left unclassified.
+            #
+            # The leaf comes from ``_request_path`` (query-free), not from the
+            # raw argument tail.  ``/api/search?q=1`` … ``?q=40`` is *one*
+            # leaf: a payload sweep against a single endpoint is blind
+            # extraction, a legitimate deepening, and the report marks it as
+            # must-not-mis-classify.  Reading the argument tail made every
+            # ``?q=N`` a fresh leaf and fired this hint on exactly that shape.
             family = _path_family(args)
-            if family is not None:
-                leaf = args.rsplit("/", 1)[-1]
+            path = _request_path(args)
+            if family is not None and path is not None:
+                leaf = path.rsplit("/", 1)[-1]
                 leaves = self.leaves.setdefault(family, set())
                 leaves.add(leaf)
                 if len(leaves) >= 2:
                     mechanism = "information-collection"
+        if mechanism is None and fresh_path and self.new_path_streak >= _BREADTH_CLASSIFY_AT:
+            # Cross-directory scan: naming one directory per guess makes every
+            # guess its own family with one leaf, so the rule above can never
+            # fire -- breadth walked that way dodged every stop criterion the
+            # guard had.  Consecutive *never-requested* paths, none carrying any
+            # mechanism syntax, are the same hypothesis ("where else might
+            # something be?") written as many names, so they join the same
+            # class counter.  A retry of an already-requested path resets the
+            # streak above, which is what keeps blind extraction (one endpoint,
+            # hundreds of payloads) out of here.
+            mechanism = "information-collection"
         class_hint = None
         if mechanism is not None:
             if mechanism not in self.mechanisms:
@@ -774,12 +1010,13 @@ class EnumerationGuard:
         The family segment is truncated so the message stays well under 400
         characters even when a path segment is pathological.
         """
-        family = key.split("|", 2)[-1][:80]
+        # 族名是键的末段（``工具|host|方法|认证态|族``），按最后一段切。
+        family = key.rsplit("|", 1)[-1][:80]
         return (
             f"ERROR: [ENUMERATION GUARD] '{family}' returned the IDENTICAL "
             "response too many times; this family is blocked. Change mechanism "
             "now: auth bypass, injection, SSRF pivot, file read, or use existing "
-            "access. Do not resend this family."
+            "access. Do not resend this family. Switch method or get a session."
         )
 
     def _class_hint(self, mechanism: str) -> str | None:
@@ -809,10 +1046,12 @@ class EnumerationGuard:
         untried = [name for name in MECHANISM_NAMES if name not in self.mechanisms]
         untried_text = ", ".join(untried) if untried else "(none left)"
         return (
-            f"\n\n[MECHANISM GUARD] {streak} probes in a row stayed inside "
-            f"'{mechanism}' and no new attack class was found. "
-            "If you cannot name the exact value this run is extracting, the "
-            "mechanism is wrong: parameter count is not a hypothesis. "
+            f"\n\n[MECHANISM GUARD] {streak} probes in a row added no attack "
+            f"class this run had not already tried (last: '{mechanism}'). "
+            "A new name is not a new hypothesis: a fresh path, a fresh id or a "
+            "fresh parameter is still the same guess when the class does not "
+            "change. If you cannot name the exact value this run is "
+            "extracting, the mechanism is wrong. "
             f"Untried classes: {untried_text}. "
             "Pick the one the evidence you already have points at."
         )
@@ -887,7 +1126,7 @@ def install() -> EnumerationGuard:
                     # A hard block replaces the tool output entirely.
                     return hint
                 # 结果体量不确定（可能不是 str），统一转成字符串追加。
-                return f"{result}{hint}"
+                return append_note(result, hint)
             return result
 
         tool.on_invoke_tool = invoke

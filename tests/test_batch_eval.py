@@ -469,3 +469,349 @@ def test_run_agent_passes_target_kind(monkeypatch, workdir: Path) -> None:
 
     argv = captured["argv"]
     assert argv[argv.index("--target-kind") + 1] == "tcp"
+
+
+# ---------------------------------------------------------------------------
+# 提交前 verify 预检：抽取层放宽前缀后，平台判分器是唯一裁判。
+# ---------------------------------------------------------------------------
+
+ANSWER_LOG = (
+    "127.0.0.1 says the token is HTB{the_right_0ne}\n"
+    "ANSWER[flag]=HTB{the_right_0ne}\n"
+)
+
+
+def _run_single(workdir: Path, monkeypatch, client_cls, log: str = ANSWER_LOG) -> dict:
+    """Run one challenge end to end with a fake client and return the result row."""
+    plan = workdir / "plan.json"
+    plan.write_text(json.dumps([{"id": "SMOKE-001", "difficulty": "easy"}]), encoding="utf-8")
+    out = workdir / "results.jsonl"
+    monkeypatch.setattr(batch_eval, "_BOX_ROOT", str(workdir / "boxes"))
+    monkeypatch.setattr(batch_eval, "Client", client_cls)
+    monkeypatch.setattr(batch_eval, "run_agent", lambda *a, **k: (log, 1.0))
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["batch_eval.py", "--plan", str(plan), "--out", str(out), "--token", "t", "--no-archive"],
+    )
+    assert batch_eval.main() == 0
+    return json.loads(out.read_text(encoding="utf-8").splitlines()[-1])
+
+
+def _fake_client(submit_log: list, verify=None):
+    """Minimal client; ``verify`` is attached only when the test wants it."""
+
+    class Fake:
+        def __init__(self, token: str) -> None:
+            self.token = token
+
+        def launch(self, cid: str, attempts: int = 5) -> str:
+            return "iid-1"
+
+        def wait_ready(self, iid: str, timeout: int = 180) -> str:
+            return "http://127.0.0.1:8080/"
+
+        def probe_reachable(self, url: str, attempts: int = 3) -> tuple[bool, str]:
+            return True, "ok"
+
+        def detail(self, cid: str) -> dict:
+            return {}
+
+        def teardown(self, iid: str) -> None:
+            return None
+
+        def submit(self, iid: str, answer: str, qid: str = "flag") -> dict:
+            submit_log.append((qid, answer))
+            return {"correct": True}
+
+    if verify is not None:
+        Fake.verify = staticmethod(verify)  # type: ignore[attr-defined]
+    return Fake
+
+
+def test_verify_hit_submits_only_that_answer(workdir: Path, monkeypatch) -> None:
+    """判分器认出候选中的一条：只交那一条，不浪费 attempts 试错。"""
+    submitted: list = []
+
+    def verify(iid: str, answer: str, qid: str = "flag"):
+        return answer == "HTB{the_right_0ne}"
+
+    rec = _run_single(workdir, monkeypatch, _fake_client(submitted, verify))
+
+    assert rec["verify_precheck"] == "hit"
+    assert submitted == [("flag", "HTB{the_right_0ne}")]
+    assert rec["correct"] is True
+    assert isinstance(rec["flag_shaped_tokens"], int) and rec["flag_shaped_tokens"] >= 1
+
+
+def test_verify_miss_suppresses_submission(workdir: Path, monkeypatch) -> None:
+    """全部候选都被判 false：不提交，只记数字——交上去只会污染台账。"""
+    submitted: list = []
+
+    def verify(iid: str, answer: str, qid: str = "flag"):
+        return False
+
+    rec = _run_single(workdir, monkeypatch, _fake_client(submitted, verify))
+
+    assert submitted == []
+    assert rec["verify_precheck"] == "miss"
+    assert rec["flag_shaped_but_unsubmitted"] >= 1
+    assert rec["correct"] is False
+
+
+def test_verify_exception_falls_back_to_first_candidate(workdir: Path, monkeypatch) -> None:
+    """预检抛异常必须 fail-open：原首选照交，否则一次抖动就等于零提交。"""
+    submitted: list = []
+
+    def verify(iid: str, answer: str, qid: str = "flag"):
+        raise RuntimeError("verifier exploded")
+
+    rec = _run_single(workdir, monkeypatch, _fake_client(submitted, verify))
+
+    assert rec["verify_precheck"] == "unavailable"
+    assert submitted == [("flag", "HTB{the_right_0ne}")]
+    assert rec["correct"] is True
+
+
+def test_client_without_verify_still_submits(workdir: Path, monkeypatch) -> None:
+    """旧 client（或任何没有 verify 的实现）不能被 getattr 之外的东西碰到。"""
+    submitted: list = []
+
+    rec = _run_single(workdir, monkeypatch, _fake_client(submitted))
+
+    assert rec["verify_precheck"] == "unavailable"
+    assert submitted == [("flag", "HTB{the_right_0ne}")]
+
+
+def test_checker_questions_skip_verify_precheck() -> None:
+    """checker/judge 题的 verify_answer 恒判否，预检会把提交掐死。
+
+    SAMPLE-006/007 实测 ``answers_ok={qid: false}`` 而 ``answers_submitted``
+    为空——候选一条都没交出去。这两种 mode 必须直接提交，交给平台判定器。
+    """
+    assert batch_eval._should_precheck("dynamic")
+    assert batch_eval._should_precheck("static")
+    assert batch_eval._should_precheck("seeded")
+    assert not batch_eval._should_precheck("checker")
+    assert not batch_eval._should_precheck("judge")
+    assert not batch_eval._should_precheck("")
+
+
+# ---------------------------------------------------------------------------
+# B-18：跑后提交路径的 checker 题必须走 /check。
+# ---------------------------------------------------------------------------
+
+
+def _checker_client(submit_log: list, check_body: dict):
+    """detail 里带一道 checker 题的假客户端；``check`` 回放给定裁决。"""
+
+    class Fake:
+        def __init__(self, token: str) -> None:
+            self.token = token
+
+        def launch(self, cid: str, attempts: int = 5) -> str:
+            return "iid-1"
+
+        def wait_ready(self, iid: str, timeout: int = 180) -> str:
+            return "http://127.0.0.1:8081/"
+
+        def probe_reachable(self, url: str, attempts: int = 3) -> tuple[bool, str]:
+            return True, "ok"
+
+        def detail(self, cid: str) -> dict:
+            return {
+                "questions": [{"id": "deface", "mode": "checker"}],
+            }
+
+        def teardown(self, iid: str) -> None:
+            return None
+
+        def check(self, iid: str, qid: str) -> dict:
+            body = dict(check_body)
+            body.setdefault("question_id", qid)
+            return body
+
+        def submit(self, iid: str, answer: str, qid: str = "flag") -> dict:
+            submit_log.append((qid, answer))
+            return {"correct": True}
+
+    return Fake
+
+
+def test_postrun_checker_passes_via_check_without_answer_line(
+    workdir: Path, monkeypatch
+) -> None:
+    """没有 ANSWER 行也要交付：checker 题的答案是靶机副作用（SAMPLE-006）。
+
+    跑后路径此前 ``if not candidates: continue``，一次都没发。
+    """
+    submitted: list = []
+    client = _checker_client(
+        submitted, {"passed": True, "timed_out": False}
+    )
+    rec = _run_single(
+        workdir, monkeypatch, client, log="recon only, no contract line\n"
+    )
+
+    assert submitted == []          # 没有值要交
+    assert rec["checker_passed"] == ["deface"]
+    assert rec["answers_ok"] == {"deface": True}
+    assert rec["correct"] is True
+
+
+def test_postrun_checker_falls_back_to_value_when_check_fails(
+    workdir: Path, monkeypatch
+) -> None:
+    """``/check`` 不过时保留值通道（counter 类 judge 题：claimed="3"）。"""
+    submitted: list = []
+    client = _checker_client(
+        submitted, {"passed": False, "timed_out": False}
+    )
+    rec = _run_single(
+        workdir, monkeypatch, client, log="ANSWER[deface]=3\n"
+    )
+
+    assert submitted == [("deface", "3")]
+    assert rec["checker_checked"] == ["deface"]
+    assert rec["answers_ok"] == {"deface": True}
+    assert rec["correct"] is True
+
+
+def test_checker_passed_rejects_incomplete_verdict() -> None:
+    """``/check`` 契约缺字段、超时、或没给 passed 都不算通过（fail-closed）。"""
+
+    class C:
+        def __init__(self, body):
+            self.body = body
+
+        def check(self, iid: str, qid: str) -> dict:
+            body = dict(self.body)
+            body.setdefault("question_id", qid)
+            return body
+
+    assert batch_eval._checker_passed(C({"passed": True, "timed_out": False}), "i", "q", False)
+    assert not batch_eval._checker_passed(C({"passed": True}), "i", "q", False)
+    assert not batch_eval._checker_passed(C({"passed": True, "timed_out": True}), "i", "q", False)
+    assert not batch_eval._checker_passed(C({"passed": False, "timed_out": False}), "i", "q", False)
+    # 多问题题必须显式说全解
+    assert not batch_eval._checker_passed(
+        C({"passed": True, "timed_out": False}), "i", "q", True
+    )
+
+    class Boom:
+        def check(self, iid: str, qid: str) -> dict:
+            raise RuntimeError("network down")
+
+    assert not batch_eval._checker_passed(Boom(), "i", "q", False)
+
+
+# ---------------------------------------------------------------------------
+# B-24：403 ``competition_paused`` 是等待信号，不是题目失败。
+# ---------------------------------------------------------------------------
+
+
+def test_paused_response_yields_a_wait_instead_of_a_failure() -> None:
+    """run3 首撞的真实响应：403 + code=competition_paused + retry_after_s。"""
+
+    class _R:
+        status_code = 403
+
+        def json(self):
+            return {
+                "code": "competition_paused",
+                "detail": {"retry_after_s": 750},
+            }
+
+    assert batch_eval._paused_retry_after(_R()) == 750
+
+
+def test_paused_helper_ignores_other_responses() -> None:
+    class _R403:
+        status_code = 403
+
+        def json(self):
+            return {"code": "forbidden"}
+
+    class _R429:
+        status_code = 429
+
+        def json(self):
+            return {"code": "team_capacity_exceeded"}
+
+    assert batch_eval._paused_retry_after(_R403()) is None
+    assert batch_eval._paused_retry_after(_R429()) is None
+
+
+class _PausedResp:
+    def __init__(self, code: int, body: dict) -> None:
+        self.status_code = code
+        self._body = body
+        import json as _json
+
+        self.text = _json.dumps(body)
+
+    def json(self):
+        return self._body
+
+
+class _ScriptedSession:
+    """按脚本回放响应；记录每次 POST。"""
+
+    headers: dict = {}
+
+    def __init__(self, responses: list) -> None:
+        self.responses = list(responses)
+        self.posts = 0
+
+    def post(self, url, json=None, timeout=0):  # noqa: ANN001, ARG002
+        self.posts += 1
+        return self.responses.pop(0)
+
+
+def _client_with(session: _ScriptedSession):
+    client = batch_eval.Client("tok")
+    client.s = session
+    client.competition_id = "comp"
+    client.reap_orphans = lambda *a, **k: []
+    return client
+
+
+def test_launch_waits_through_a_pause_without_burning_retries(
+    monkeypatch,
+) -> None:
+    """暂停 → 等待 retry_after+5 → 重试成功；只算一次真实尝试。"""
+    session = _ScriptedSession(
+        [
+            _PausedResp(403, {"code": "competition_paused",
+                              "detail": {"retry_after_s": 3}}),
+            _PausedResp(200, {"id": "iid-9"}),
+        ]
+    )
+    client = _client_with(session)
+    slept: list[float] = []
+    monkeypatch.setattr(batch_eval.time, "sleep", lambda s: slept.append(s))
+
+    iid = client.launch("SAMPLE-001", attempts=1)
+
+    assert iid == "iid-9"
+    assert "iid-9" in client.owned
+    assert session.posts == 2
+    assert slept == [8]  # retry_after 3 + 5s 余量
+
+
+def test_pause_beyond_cap_surfaces_as_paused_error(monkeypatch) -> None:
+    """超出可等待上限：抛专用异常而不是硬吞，上层据此记 skip。"""
+    session = _ScriptedSession(
+        [
+            _PausedResp(403, {"code": "competition_paused",
+                              "detail": {"retry_after_s": 99999}}),
+        ]
+    )
+    client = _client_with(session)
+    monkeypatch.setattr(batch_eval.time, "sleep", lambda s: None)
+
+    with pytest.raises(batch_eval.CompetitionPausedError) as caught:
+        client.launch("SAMPLE-001", attempts=1)
+
+    assert caught.value.retry_after_s == 99999
+    assert session.posts == 1

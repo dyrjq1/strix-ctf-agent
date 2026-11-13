@@ -17,6 +17,7 @@ from __future__ import annotations
 import base64
 from pathlib import Path
 
+from ctf_strix import agent
 from ctf_strix.agent import _local_attachments
 
 
@@ -46,6 +47,23 @@ def test_platform_files_and_dotfiles_are_excluded(tmp_path: Path) -> None:
     (tmp_path / ".hidden").write_text("x", encoding="utf-8")
     (tmp_path / "real.txt").write_text("keep", encoding="utf-8")
     assert list(_paths(_local_attachments(tmp_path))) == ["/workspace/real.txt"]
+
+
+def test_pyc_attachment_is_shipped(tmp_path: Path) -> None:
+    """A pure-bytecode reverse challenge is **only** the .pyc.
+
+    Filtering ``.pyc`` as build junk left such challenges with zero attachments
+    and an immediate ``no_target`` (REVIEW-20261112 REV-1).  ``file_triage``
+    has a ``pyc`` family, so the file is the challenge, not noise.
+    """
+    # Non-UTF-8 bytes: a real .pyc's code objects never survive a decode.
+    marker = b"\x55\x0d\x0d\x0a" + b"\xff\xfe\x80" * 6
+    (tmp_path / "chall.pyc").write_bytes(marker)
+    (tmp_path / "run.log").write_text("noise", encoding="utf-8")
+    files = _paths(_local_attachments(tmp_path))
+    assert "/workspace/chall.pyc.b64" in files
+    assert base64.b64decode(files["/workspace/chall.pyc.b64"]) == marker
+    assert "noise" not in "".join(files.values())
 
 
 def test_platform_mcp_config_is_not_injected(tmp_path: Path) -> None:
@@ -81,3 +99,49 @@ def test_same_name_in_different_dirs_does_not_collide(tmp_path: Path) -> None:
     files = _paths(_local_attachments(tmp_path))
     assert files["/workspace/one/README"] == "one"
     assert files["/workspace/two/README"] == "two"
+
+
+def test_oversized_attachment_is_named_not_inlined(tmp_path: Path,
+                                                   monkeypatch) -> None:
+    """FMT-7: ``extra_files`` carries bytes inline, so the copy needs a bound.
+
+    The download cap was raised for declared attachments; without a bound here
+    a large image is read, base64-encoded and tarred at once, trading a missing
+    attachment for an out-of-memory kill.  The file stays on disk, so the note
+    names its absolute path for ``exec_command``.
+    """
+    monkeypatch.setattr(agent, "MAX_INLINE_ATTACHMENT_BYTES", 8)
+    (tmp_path / "small.txt").write_text("ok", encoding="utf-8")
+    big = tmp_path / "image.raw"
+    big.write_bytes(b"X" * 64)
+
+    files = _paths(_local_attachments(tmp_path))
+
+    assert files["/workspace/small.txt"] == "ok"
+    assert not any(key.startswith("/workspace/image.raw") for key in files)
+    note = files["/workspace/ATTACHMENTS_TOO_LARGE.txt"]
+    assert str(big) in note
+    assert "64 bytes" in note
+    assert "exec_command" in note
+
+
+def test_inline_total_bound_stops_copying(tmp_path: Path, monkeypatch) -> None:
+    """A per-file bound is not enough: fifty 31 MiB files still add up."""
+    monkeypatch.setattr(agent, "MAX_INLINE_ATTACHMENT_BYTES", 8)
+    monkeypatch.setattr(agent, "MAX_INLINE_TOTAL_BYTES", 10)
+    (tmp_path / "a.txt").write_text("123456", encoding="utf-8")
+    (tmp_path / "b.txt").write_text("123456", encoding="utf-8")
+
+    files = _paths(_local_attachments(tmp_path))
+
+    assert files["/workspace/a.txt"] == "123456"
+    assert "/workspace/b.txt" not in files
+    note = files["/workspace/ATTACHMENTS_TOO_LARGE.txt"]
+    assert str(tmp_path / "b.txt") in note
+    assert str(tmp_path / "a.txt") not in note
+
+
+def test_files_within_the_bound_are_inlined_without_a_note(tmp_path: Path) -> None:
+    """反例：默认上限下旧行为逐字节不变，不能凭空多出一张清单。"""
+    (tmp_path / "a.txt").write_text("a", encoding="utf-8")
+    assert _paths(_local_attachments(tmp_path)) == {"/workspace/a.txt": "a"}

@@ -792,3 +792,59 @@ def test_unknown_encoding_is_refused() -> None:
     """Only declared encodings are decoded; anything else is a failure."""
     with pytest.raises(attach._McpToolError):
         attach._decode_payload({"content": "x", "encoding": "rot13"})
+
+
+def _fetch_report(task: dict, work: Path) -> tuple[list[Path], dict]:
+    """Fetch with the FMT-1 out-parameter filled."""
+    report: dict = {}
+    return agent._fetch_platform_attachments(task, work, report), report
+
+
+def test_listed_but_unsaved_attachments_are_reported(tmp_path: Path) -> None:
+    """FMT-1: a listing the download step cannot satisfy is not "no files".
+
+    The old return value was ``[]`` in both cases, so ``main`` took the
+    zero-turn ``no_target`` exit and never called the model.
+    """
+    with _Server(_rest_handler(
+        None, {"image.raw": b"payload"}, download_status={"image.raw": 500},
+    )) as rest:
+        written, report = _fetch_report(_task(rest.url), tmp_path)
+
+    assert written == []
+    assert report["listed"] is True
+    assert report["channels"] == ["rest-challenge"]
+    assert report["written"] == 0
+    assert report["missing"] == ["image.raw"]
+    assert agent._attachment_delivery_failed(report) is True
+
+
+def test_failed_listing_is_not_a_delivery_failure(tmp_path: Path) -> None:
+    """反例：列表都没拿到，就还是「平台没附件」，零回合退出必须保持原样。"""
+    with _Server(_rest_handler(None, {}, list_status=404)) as rest:
+        written, report = _fetch_report(_task(rest.url), tmp_path)
+
+    assert written == []
+    assert "listed" not in report
+    assert agent._attachment_delivery_failed(report) is False
+
+
+def test_successful_delivery_is_not_a_delivery_failure(tmp_path: Path) -> None:
+    """反例：一个文件落盘就说明通道健康，不该被标成盲跑。"""
+    with _Server(_rest_handler(None, {"a.txt": b"ok"})) as rest:
+        written, report = _fetch_report(_task(rest.url), tmp_path)
+
+    assert [p.name for p in written] == ["a.txt"]
+    assert report["written"] == 1
+    assert report["missing"] == []
+    assert agent._attachment_delivery_failed(report) is False
+
+
+def test_blind_start_is_visible_after_the_run() -> None:
+    """A blind start has to be readable from result.json, not only stdout."""
+    diag = {"attachment_delivery_failed": {"channels": ["rest-challenge"],
+                                           "written": 0}}
+    text = agent._writeup(_task("http://unused.invalid"), {}, None, 1.0, diag)
+    assert "attachment_delivery_failed" in text
+    quiet = agent._writeup(_task("http://unused.invalid"), {}, None, 1.0, {})
+    assert "attachment_delivery_failed" not in quiet

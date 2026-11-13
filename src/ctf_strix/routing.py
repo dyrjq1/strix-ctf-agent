@@ -99,14 +99,6 @@ ROUTES: tuple[tuple[str, str, tuple[str, ...], str], ...] = (
     ),
 )
 
-#: Character ceiling for the unfiltered table. It is user_instructions and is
-#: paid on every call; beyond this size the text belongs in an index, not the
-#: prompt. Real runs always pass ``kind`` and land well under KIND_MAX_CHARS.
-MAX_CHARS = 3000
-
-#: Ceiling for a single-kind table -- the size a run actually pays.
-KIND_MAX_CHARS = 2400
-
 
 def _table(usable: dict[str, str], kind: str | None = None) -> str:
     """Render registered directions, filtered by the run's challenge kind.
@@ -187,12 +179,13 @@ def render(
         "   Liveness gate: same body on every path, or only a framework 404 "
         "with no app marker = dead instance. Say so and stop; do not enumerate.\n"
         + step_two
-        + "2b. **Prefer the enumerator.** If `route_map`, `path_variants`, "
+        + "2b. **Prefer the enumerator -- once.** If `route_map`, `path_variants`, "
         "`method_sweep`, `tcp_batch`, `decode_blob` or `file_triage` covers it, "
-        "call it once instead of looping by hand.\n"
+        "call it once instead of looping by hand, then take the best hit to "
+        "exploitation; a second sweep is not progress.\n"
         "3. **Write the falsifier before the first payload**: \"If mechanism M holds, "
-        "check C returns X; if Y, M is closed.\" Two identical responses from "
-        "one family = wrong mechanism: change the attack class, not the payload.\n"
+        "check C returns X; if Y, M is closed.\" Names that add no new attack "
+        "class = wrong mechanism: change the class, not the name.\n"
         "4. **Re-plan at 40% and 70%.** Three lines: proven / assumed / "
         "the one fact that unlocks the flag.\n"
         "Non-skill subfiles: text via `exec_command` (cat/sed -n), images via "

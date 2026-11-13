@@ -110,6 +110,8 @@ def test_every_registered_tool_is_described_in_the_catalogue():
         registered.add(fn.__name__)
     for fn in aisec_tools.WEB_CVE_TOOLS:
         registered.add(fn.__name__)
+    for fn in aisec_tools.OFFLINE_TOOLS:
+        registered.add(fn.__name__)
 
     missing = registered - declared
     assert not missing, f"registered but never described: {sorted(missing)}"
@@ -125,6 +127,7 @@ def test_catalogue_does_not_promise_tools_nobody_registers():
     registered |= {fn.__name__ for fn in (*nonweb.FILE_TOOLS, *nonweb.TCP_TOOLS)}
     registered |= {fn.__name__ for fn in aisec_tools.TOOLS}
     registered |= {fn.__name__ for fn in aisec_tools.WEB_CVE_TOOLS}
+    registered |= {fn.__name__ for fn in aisec_tools.OFFLINE_TOOLS}
     # The web primitives' public names differ from their function names in one
     # case (``method_sweep`` is built by the discovery module's register()).
     registered |= {"http_probe", "route_map", "method_sweep", "path_variants"}
@@ -155,7 +158,11 @@ def test_next_commands_only_use_binaries_the_image_installs():
     assert "xxd" in dockerfile
     assert "unzip" in dockerfile
 
-    banned = ("checksec", "zsteg", "exiftool", "tshark", "tcpdump", "binwalk")
+    # ``zsteg`` is a Ruby gem and really is absent.  The rest of the old ban
+    # list -- checksec / exiftool / tshark / tcpdump / binwalk -- is installed
+    # and probed by docker/check_toolchain.sh, so naming them in ``_NEXT`` is
+    # correct; the pre-REV-5 list was rejecting the image's own toolset.
+    banned = ("zsteg",)
     for family, hint in file_triage._NEXT.items():
         for name in banned:
             assert name not in hint, f"_NEXT[{family}] still suggests missing {name}"

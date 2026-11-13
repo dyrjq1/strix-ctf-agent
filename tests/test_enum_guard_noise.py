@@ -109,6 +109,30 @@ def test_different_status_codes_are_still_different_observations() -> None:
     )
 
 
+def test_http_probe_request_id_does_not_create_false_novelty() -> None:
+    """``http_probe`` 状态行末尾的 ``id=rNN`` 每轮都变，但不是状态变化。
+
+    报告 WEB-2：``traffic.next_id()`` 返回 ``r<seq>``，而 ``_norm_head`` 只洗了
+    耗时与字节数。同一路径同一响应的两次探测于是拿到两个指纹 —— 库内已有的
+    ``test_head_digits_...`` 用的是手写状态行，没有 ``id=`` 尾巴，所以这条
+    失配在单测里一直是绿的。
+    """
+    args = '{"url": "https://x.test/api/widgets", "method": "GET"}'
+    a = "[HTTP 200] GET <url> | 0.11s | 123B | text/html | id=r7\nbody"
+    b = "[HTTP 200] GET <url> | 0.14s | 123B | text/html | id=r8\nbody"
+    assert _obs_signature(a, args) == _obs_signature(b, args), (
+        "状态行里的 id=rNN 没有被归一化——同族重复永远数不到阈值"
+    )
+
+
+def test_request_id_normalisation_keeps_real_status_changes() -> None:
+    """洗 ``id=`` 不能顺手把状态码洗掉（反向对照）。"""
+    args = '{"url": "https://x.test/api/widgets", "method": "GET"}'
+    a = "[HTTP 403] GET <url> | 0.11s | 41B | text/html | id=r7\nbody"
+    b = "[HTTP 500] GET <url> | 0.11s | 41B | text/html | id=r7\nbody"
+    assert _obs_signature(a, args) != _obs_signature(b, args)
+
+
 def test_bundle_regex_does_not_fire_on_prose() -> None:
     """英文散文里出现 ``cation ... .js`` 不能算成"在读 bundle"。
 

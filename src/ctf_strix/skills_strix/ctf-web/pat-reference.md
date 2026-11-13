@@ -290,6 +290,6 @@ Content is for educational and research use; only test on systems you have permi
 
 ## Cross-references
 
-- `ctf-web/SKILL.md` → Additional Resources → this file
+- [`ctf-web.md`](ctf-web.md) → Additional Resources → this file
 - `ctf-web/field-notes.md` → footer cross-ref → this file
 - Upstream docs: [PayloadsAllTheThings README](https://github.com/swisskyrepo/PayloadsAllTheThings)

@@ -317,3 +317,38 @@ def test_silent_stop_absent_when_the_run_captured_a_flag(
     payload = _payload(tmp_path)
     assert payload["answers"] == {"flag": FLAG}
     assert "silent_stop" not in payload
+
+
+# --- B-22：静默自停（从未调过 finish_scan）时补跑 checker 探针 ---------------
+#
+# SAMPLE-006/019 实录：模型纯文本收尾，finish_scan 一次没调，stats 里
+# refusals=0 / allowed=0；checker 题的 /check 记账只挂在 finish_scan 的守卫上，
+# 于是整题零交付。判据必须只看「有没有碰过守卫」，不能看 kind 或题面。
+
+
+def test_silent_finish_without_finish_scan_is_detected() -> None:
+    assert agent_mod._silent_checker_fallback_needed(
+        engagement=False,
+        checker=object(),
+        stats={"refusals": 0, "allowed": 0},
+    )
+
+
+def test_used_finish_scan_disables_the_fallback() -> None:
+    for stats in ({"refusals": 1, "allowed": 0}, {"refusals": 0, "allowed": 1}):
+        assert not agent_mod._silent_checker_fallback_needed(
+            engagement=False, checker=object(), stats=stats
+        )
+
+
+def test_engagement_and_missing_probe_never_probe() -> None:
+    silent = {"refusals": 0, "allowed": 0}
+    assert not agent_mod._silent_checker_fallback_needed(
+        engagement=True, checker=object(), stats=silent
+    )
+    assert not agent_mod._silent_checker_fallback_needed(
+        engagement=False, checker=None, stats=silent
+    )
+    assert not agent_mod._silent_checker_fallback_needed(
+        engagement=False, checker=object(), stats=None
+    )

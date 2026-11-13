@@ -10,8 +10,8 @@ that network. Do NOT create or launch anything on the platform — it is live.
 ## Method
 
 1. **Map first.** Discover live hosts and open services before touching any of
-   them: python3 sockets, or `nmap` if it happens to be installed. Record
-   host -> port -> service -> version.
+   them: use the host/port scanner listed under `## Environment`, do not
+   hand-write one. Record host -> port -> service -> version.
 2. **Walk the application as a user would.** For each web service, enumerate
    routes, read the app's own pages, and create an account if registration
    exists. Access-control findings only appear once you have a session.

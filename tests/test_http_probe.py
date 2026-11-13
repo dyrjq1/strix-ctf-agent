@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import socket
 import sys
 import threading
@@ -19,7 +20,16 @@ import pytest
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "src"))
 
+from ctf_strix import traffic  # noqa: E402
 from ctf_strix.http_probe import http_probe  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def fresh_ledger(monkeypatch):
+    """每次测试用独立的内存台账，不往仓库根目录写 .ctf_traffic.jsonl。"""
+    ledger = traffic.TrafficLedger(None)
+    monkeypatch.setattr(traffic, "_LEDGER", ledger)
+    return ledger
 
 
 class _Handler(BaseHTTPRequestHandler):
@@ -159,3 +169,47 @@ def test_bad_headers_json_is_reported():
     """参数写错要在本地立刻说清楚，不能变成一次无效的网络请求。"""
     out = call(url="http://127.0.0.1:9/", headers_json="{not json}")
     assert "headers_json" in out and "JSON" in out
+
+
+# -- WEB-4：截断与"下一步"都要先指回台账，而不是再发一次请求 ------------------
+
+def test_every_response_line_carries_a_ledger_id(base_url, fresh_ledger):
+    """首行的 id 必须能在台账里取回同一个响应，否则 id 只是装饰。"""
+    out = call(url=f"{base_url}/ok")
+    rid = re.search(r"id=(r\d+)", out.splitlines()[0]).group(1)
+    saved = fresh_ledger.get(rid)
+    assert saved is not None, out
+    assert saved.status == 200
+    assert '"hello":"world"' in saved.resp_body
+
+
+def test_truncated_body_points_at_the_ledger_offset(base_url, fresh_ledger):
+    """截断处要说"全文在台账里、offset 从这里续读"，不是"加个头再来一次"。"""
+    out = call(url=f"{base_url}/big")
+    m = re.search(r'traffic_view\("(r\d+)", offset=(\d+)\)', out)
+    assert m, out
+    rid, offset = m.group(1), int(m.group(2))
+    assert offset == 1200, out  # 截断点即续读点
+
+    saved = fresh_ledger.get(rid)
+    assert saved is not None, f"{rid} 只出现在文案里"
+    assert len(saved.resp_body) == 5000, "全文必须原样存在台账里"
+
+    rest = traffic.traffic_view(rid, part="response", offset=offset, length=8000)
+    assert "x" * 100 in rest, rest
+    assert "chars left" not in rest, "offset=截断点应当能一次读完剩下部分"
+
+
+def test_a_404_sends_you_to_the_ledger_first(base_url):
+    """404 的下一步是先看已记录的路径，不是凭空换一个新路径再撞 404。"""
+    out = call(url=f"{base_url}/no-such-route")
+    assert "[HTTP 404]" in out
+    assert "traffic_list(url_contains=" in out
+    assert re.search(r'traffic_view\("r\d+"\)', out), out
+    assert "换路径取全文" not in out, "旧文案把重发请求当成取全文的手段"
+
+
+def test_an_empty_200_points_at_the_ledger(base_url):
+    out = call(url=f"{base_url}/empty")
+    assert "空 body" in out
+    assert "traffic_list(url_contains=" in out

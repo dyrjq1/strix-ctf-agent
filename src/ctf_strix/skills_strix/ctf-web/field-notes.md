@@ -1,6 +1,6 @@
 # CTF Web Field Notes
 
-Long-form exploit notes that were moved out of `SKILL.md` so the main skill can stay focused on routing and first-pass execution.
+Long-form exploit notes kept out of [`ctf-web.md`](ctf-web.md) so the main skill can stay focused on routing and first-pass execution.
 
 ## Table of Contents
 

@@ -47,9 +47,11 @@ from typing import Any
 from ctf_strix import deadline
 from ctf_strix import error_policy
 from ctf_strix import platform_attach as attach
+from ctf_strix.flag_extract import FLAG_RE
 from ctf_strix.success_stop import RecoveryExhausted
 from ctf_strix.success_stop import SolvedStop
 from ctf_strix.enum_guard import EnumExhausted
+from ctf_strix.progress_guard import NoProgress
 from ctf_strix.success_stop import SuccessLedger
 from ctf_strix.target_absent import TargetAbsent
 from ctf_strix.usage_meter import begin_run as begin_usage_run
@@ -71,9 +73,11 @@ def _enable_local_cost_map() -> None:
 
 _enable_local_cost_map()
 
-#: 兜底 flag 形态（抽取器不可用时用）。与 ``flag_extract`` 的正则同源：
-#: CTFY 的 flag 可能是 ``FLAG{…}`` / ``ctfy{…}`` / ``flag{…}``。
-FLAG_PATTERN = re.compile(r"(?:FLAG|flag|CTF|ctf|CTFY|ctfy)\{[0-9a-zA-Z_\-]{4,}\}")
+#: 兜底 flag 形态（抽取器抛异常时降级用）。直接取 ``flag_extract.FLAG_RE``：
+#: 前缀是标签式的（任何 2–16 位字母数字/点/横线 + ``{...}``），不是白名单。
+#: 体长度门槛随之从 ``{4,}`` 放到 ``{2,}``——降级路径宁可多收，反正后面还有
+#: ``is_placeholder`` 与提交层。
+FLAG_PATTERN = FLAG_RE
 
 #: 题型 → goal 文件。缺失文件时用 ``_FALLBACK_GOALS`` 里的最小版本。
 GOAL_FILES: dict[str, str] = {
@@ -96,6 +100,13 @@ _TRUTHY = {"1", "true", "yes", "on"}
 #: Attachment list/download timeout. Short on purpose: the old no-target
 #: path is better than stalling on an unreachable platform.
 _ATTACHMENT_TIMEOUT = 20
+
+#: ``extra_files`` 只接受内联字节（没有 path 引用通道），一个文件进沙盒要走
+#: 磁盘 -> base64 -> tar 三份拷贝。下载上限放宽到 256 MiB 后（FMT-1），不单独
+#: 设内联上限就是把"附件没拿到"换成"进程 OOM"。超限文件改为在 workspace 里
+#: 留一张绝对路径清单，本地后端同机可直读。
+MAX_INLINE_ATTACHMENT_BYTES = 32 * 1024 * 1024
+MAX_INLINE_TOTAL_BYTES = 48 * 1024 * 1024
 
 _FALLBACK_GOALS: dict[str, str] = {
     "web": (
@@ -255,8 +266,18 @@ def _targets_from(task: dict[str, Any]) -> list[str]:
     urls = [entry for entry in raw if entry.startswith(("http://", "https://"))]
     # v3：jeopardy 的靶址在 target_endpoints / CTFY_TARGET_URL，不在 scope。
     for endpoint in _target_endpoints(task):
-        if _is_web_endpoint(endpoint) and endpoint["url"] not in urls:
-            urls.append(endpoint["url"])
+        if not _is_web_endpoint(endpoint):
+            continue
+        url = str(endpoint.get("url") or "")
+        if "://" not in url:
+            # WEB-8：协议保证 web 端点带 scheme，裸 ``host:port`` 是 tcp/udp
+            # 专用形态。万一 web 端点给了裸地址（平台笔误/旧样本），按 type
+            # 补 scheme——把无 scheme 的串塞进扫描目标，http_probe 只能在
+            # DNS/TLS 阶段报错，白烧一轮。
+            kind = str(endpoint.get("type") or "http")
+            url = f"{'https' if kind == 'https' else 'http'}://{url}"
+        if url not in urls:
+            urls.append(url)
     if urls:
         return urls
 
@@ -483,7 +504,9 @@ def _challenge_kind(task: dict[str, Any], work: Path | None = None) -> str:
     判据全部来自 task.json 的显式字段：
 
     - ``run_mode == "engagement"`` → engagement（交付物是报告）；
-    - 只有 checker 类 question → checker（没有 flag，收工守卫必须让路）；
+    - **每个** question 都显式声明 ``mode == "checker"`` → checker（没有 flag，
+      收工守卫必须让路）。少一个声明就不成立——没写 ``mode`` 的 question 可能
+      就是真正要交 flag 的那道；
     - scope 全是 ``host:port`` 且无 scheme → tcp；
     - 没有网络目标但声明了附件 → file；
     - 其余 → web。
@@ -494,12 +517,21 @@ def _challenge_kind(task: dict[str, Any], work: Path | None = None) -> str:
     if str(task.get("run_mode") or "").strip().lower() == "engagement":
         return "engagement"
 
-    modes = {
-        str(q.get("mode")).strip().lower()
-        for q in (task.get("questions") or [])
-        if isinstance(q, dict) and q.get("mode")
-    }
-    if modes and modes <= {"checker"}:
+    declared = task.get("questions") or []
+    if isinstance(declared, dict):
+        declared = [declared]
+    # "every question is a checker" is not the same as "the questions that
+    # bothered to say so are all checkers".  The old comprehension skipped any
+    # question without a ``mode`` field, so one checker question plus one real
+    # flag question (mode omitted) still gave ``modes == {"checker"}`` ->
+    # kind=checker -> require_flag=False -> the run could finish with no flag
+    # at all (report WEB-11).  A missing or blank mode is *unknown*, and
+    # unknown keeps the flag requirement.
+    modes = [
+        str(q.get("mode") or "").strip().lower() if isinstance(q, dict) else ""
+        for q in (declared if isinstance(declared, (list, tuple)) else [])
+    ]
+    if modes and all(mode == "checker" for mode in modes):
         return "checker"
 
     raw = _raw_scope(task)
@@ -1083,6 +1115,14 @@ class WallclockExceeded(BaseException):
 #: 失败上限的 1.7 倍，再紧只会误伤还在推进的题。
 _WALL_TIERS: dict[str, int] = {"easy": 600, "medium": 900, "hard": 1380}
 
+#: 内部 wall deadline 比外层击杀时刻提前这么多秒。
+#:
+#: 评测 harness（``scripts/batch_eval.py::_deadline_args``）把 ``--wall-deadline``
+#: 传给本入口，随后在同一个秒数上用 ``killpg(SIGKILL)`` 收尾——内部等到同一刻
+#: 再动，``main()`` 的 finally 永远跑不完，``result.json`` 写不出来（rc=-15）。
+#: 正式赛平台用自己的 harness，所以只能在这里自己提前收尾。
+DEADLINE_HEADROOM_SECONDS: float = 45.0
+
 
 def _wall_budget(task: dict[str, Any]) -> int:
     """解析容器路径的墙钟预算（秒）；0 表示关闭。
@@ -1098,6 +1138,18 @@ def _wall_budget(task: dict[str, Any]) -> int:
             return 0
     difficulty = str((task.get("challenge") or {}).get("difficulty") or "").strip().lower()
     return _WALL_TIERS.get(difficulty, _WALL_TIERS["hard"])
+
+
+def _budget_for_stop(wall_budget: int) -> int:
+    """内层 deadline 实际使用的秒数：原始预算减去收尾预留。
+
+    非正数表示「关闭墙钟」（见 :func:`_wall_budget`），不能折算成 1s——
+    那会从「没有时间限制」变成「1 秒后自杀」。其余情况至少留 1s，避免
+    预算比预留还小时算出 0 或负数把 watchdog 反向关掉。
+    """
+    if wall_budget <= 0:
+        return wall_budget
+    return max(wall_budget - int(DEADLINE_HEADROOM_SECONDS), 1)
 
 
 def _wallclock_handler(wall_seconds: int, *, guard: Any = None) -> Any:
@@ -1141,6 +1193,7 @@ _STOP_TYPES: tuple[type[BaseException], ...] = (
     IdleTimeout,
     TargetAbsent,
     EnumExhausted,
+    NoProgress,
 )
 
 
@@ -1408,7 +1461,11 @@ def _local_attachments(work: Path) -> list[dict[str, str]]:
                 continue
             if not path.is_file() or path.name in reserved:
                 continue
-            if path.suffix in {".tmp", ".log", ".pyc"} or path.name.startswith("."):
+            # ``.pyc`` must NOT be filtered: a pure-bytecode reverse challenge
+            # is only the .pyc, and dropping it left the agent with zero files
+            # and a ``no_target`` stop (REVIEW-20261112 REV-1).  ``file_triage``
+            # already has a ``pyc`` family, so it knows what to do with one.
+            if path.suffix in {".tmp", ".log"} or path.name.startswith("."):
                 continue
             if path in seen:
                 continue
@@ -1418,17 +1475,31 @@ def _local_attachments(work: Path) -> list[dict[str, str]]:
     import base64
 
     out: list[dict[str, str]] = []
+    inline_total = 0
+    oversized: list[Path] = []
     for path in found[:50]:
-        try:
-            data = path.read_bytes()
-        except OSError:
-            continue
         # 用相对工作目录的路径当 workspace 路径：子目录里的同名附件（很常见：
         # 多个 challenge 各有一个 README）不会互相覆盖。
         try:
             rel = path.relative_to(work).as_posix()
         except ValueError:
             rel = path.name
+        try:
+            size = path.stat().st_size
+        except OSError:
+            continue
+        if (
+            size > MAX_INLINE_ATTACHMENT_BYTES
+            or inline_total + size > MAX_INLINE_TOTAL_BYTES
+        ):
+            # 超限不注入，但要在沙盒里留一条可读线索，否则 agent 会以为附件缺失。
+            oversized.append(path)
+            continue
+        try:
+            data = path.read_bytes()
+        except OSError:
+            continue
+        inline_total += len(data)
         try:
             out.append({"workspace_path": f"/workspace/{rel}", "content": data.decode("utf-8")})
         except UnicodeDecodeError:
@@ -1438,7 +1509,40 @@ def _local_attachments(work: Path) -> list[dict[str, str]]:
                     "content": base64.b64encode(data).decode(),
                 }
             )
+    if oversized:
+        # 只留清单，不复制字节：清单本身很小，且是 agent 唯一能知道文件存在的途径。
+        out.append(_oversized_attachment_note(oversized))
     return out
+
+
+def _oversized_attachment_note(paths: list[Path]) -> dict[str, str]:
+    """Workspace note naming attachments too large to inline (FMT-7).
+
+    ``session_manager`` stages ``extra_files`` from content, not from a path, so
+    inlining a large image costs roughly three times its size in RAM.  The file
+    is already on disk; the local runtime shares that filesystem, so an
+    absolute path is usable directly.
+
+    Args:
+        paths: Files that were downloaded but not copied into the sandbox.
+
+    Returns:
+        One ``extra_files`` entry carrying the note.
+    """
+    lines = [
+        "These attachments were downloaded but are too large to copy into /workspace.",
+        "Use these absolute paths with exec_command:",
+    ]
+    for path in paths:
+        try:
+            size = path.stat().st_size
+        except OSError:
+            size = -1
+        lines.append(f"- {path} ({size} bytes)")
+    return {
+        "workspace_path": "/workspace/ATTACHMENTS_TOO_LARGE.txt",
+        "content": "\n".join(lines) + "\n",
+    }
 
 
 def _local_attachment_path(work: Path, name: str) -> Path | None:
@@ -1501,7 +1605,9 @@ def _declared_specs(task: dict[str, Any]) -> dict[str, "attach.FileSpec"]:
     return specs
 
 
-def _fetch_platform_attachments(task: dict[str, Any], work: Path) -> list[Path]:
+def _fetch_platform_attachments(
+    task: dict[str, Any], work: Path, report: dict[str, Any] | None = None
+) -> list[Path]:
     """Download this challenge's attachments, one channel at a time per file.
 
     The challenge-level REST endpoint is authoritative when it answers, but a
@@ -1524,6 +1630,10 @@ def _fetch_platform_attachments(task: dict[str, Any], work: Path) -> list[Path]:
     Args:
         task: Parsed task.json (``platform_url`` / ``challenge.id``).
         work: Challenge working directory.
+        report: Optional out-parameter.  Filled with ``listed`` (a channel
+            described attachments), ``channels``, ``written`` and ``missing``
+            so the caller can tell "nothing was shipped" apart from "shipped
+            but no byte reached the disk" (FMT-1).
 
     Returns:
         Paths written by this call; empty when nothing was fetched.
@@ -1600,6 +1710,14 @@ def _fetch_platform_attachments(task: dict[str, Any], work: Path) -> list[Path]:
                 detail = "; ".join(attach.redact(e, secrets) for e in result.errors[:4])
                 print(f"[ctfy] {result.channel}: {detail}", flush=True)
             print(f"[ctfy] {result.status()}", flush=True)
+            if report is not None:
+                # Updated per channel, not once at the end: a later channel
+                # raising must not erase what an earlier one already proved.
+                if result.listed:
+                    report["listed"] = True
+                report["channels"] = list(dict.fromkeys(used))
+                report["written"] = len(written)
+                report["missing"] = [name for name in targets if not have(name)]
 
         rest_listed = False
 
@@ -1677,6 +1795,16 @@ def _fetch_platform_attachments(task: dict[str, Any], work: Path) -> list[Path]:
             flush=True,
         )
         return []
+
+
+def _attachment_delivery_failed(report: dict[str, Any]) -> bool:
+    """True when a channel listed attachments but none reached the disk.
+
+    A failed listing and a failed download used to look identical to ``main``
+    (zero files either way), and both took the zero-turn ``no_target`` exit.
+    Only the first is a legitimate reason not to start (FMT-1).
+    """
+    return bool(report.get("listed")) and not report.get("written")
 
 
 def _attachment_instance(task: dict[str, Any]) -> list[str]:
@@ -1770,11 +1898,15 @@ def main() -> int:
     # harness 里生效，本入口没有。软截止同步设为墙钟的 75%（与 harness
     # ``_deadline_args`` 同口径）；已显式设置的 CTFY_SOFT_DEADLINE 不覆盖。
     wall_budget = _wall_budget(task)
-    error_policy.set_wall_deadline(_llm_wall_deadline(wall_budget))
-    if wall_budget > 0:
-        os.environ.setdefault("CTFY_SOFT_DEADLINE", str(max(int(wall_budget * 0.75), 1)))
+    # 内层 deadline 必须比外层击杀早：harness 到点用同一个秒数 SIGKILL，
+    # 内层同时刻才动的话 finally 没机会跑，result.json 就没了。headroom
+    # 让墙钟异常在还剩收尾余量时抛进 main；日志仍报原始预算。
+    budget_for_stop = _budget_for_stop(wall_budget)
+    error_policy.set_wall_deadline(_llm_wall_deadline(budget_for_stop))
+    if budget_for_stop > 0:
+        os.environ.setdefault("CTFY_SOFT_DEADLINE", str(max(int(budget_for_stop * 0.75), 1)))
         if _install_hard_deadline(
-            wall_budget,
+            budget_for_stop,
             result_path=result_path,
             schema_version=BRIEF_SCHEMA_VERSION,
         ):
@@ -1793,6 +1925,8 @@ def main() -> int:
     # 在 try 外等待网络会让它直接逃出 main，连 result.json 都写不出来。
     kind = "web"
     attachments: list[dict[str, str]] = []
+    attach_report: dict[str, Any] = {}
+    attach_blind: dict[str, Any] | None = None
     publisher = None
 
     try:
@@ -1807,7 +1941,7 @@ def main() -> int:
             # 平台不一定把附件投进工作目录，task.json 的 ``attachments`` 也可能是
             # 空数组。先按题从选手 API 拉一遍，让 kind 判定能看到附件；失败只是
             # warning，维持原来的 no_target 路径。
-            _fetch_platform_attachments(task, work)
+            _fetch_platform_attachments(task, work, attach_report)
             kind = _challenge_kind(task, work)
             # 附件只读一次：main 要用它判断"附件题是不是空的"，_run_agent 要把它
             # 注入 sandbox。读两遍等于把同一批文件从磁盘搬两遍。
@@ -1830,10 +1964,28 @@ def main() -> int:
                     f"target_instance={task.get('target_instance')}"
                 )
                 stop_reason = "no_target"
-            elif kind == "file" and not specs and not attachments:
+            elif (
+                kind == "file"
+                and not specs
+                and not attachments
+                and not _attachment_delivery_failed(attach_report)
+            ):
                 error = "附件题但没有可读附件（工作目录为空）"
                 stop_reason = "no_target"
             else:
+                if kind == "file" and not specs and not attachments:
+                    # 平台列了附件却一字节都没落盘：以前这里零回合退出，题面看起来
+                    # 就是"没有附件"。照常起跑，并把"为什么瞎跑"写进诊断（FMT-1）。
+                    attach_blind = {
+                        key: attach_report.get(key)
+                        for key in ("channels", "written", "missing")
+                        if key in attach_report
+                    }
+                    print(
+                        "[ctfy] attachments were listed but none could be saved; "
+                        "running without them",
+                        flush=True,
+                    )
                 if kind == "engagement":
                     # 报告投递在进运行时**之前**建好：运行时起不来时，
                     # result.json 里仍然有"投递是否配置齐全"这条诊断。
@@ -1852,6 +2004,10 @@ def main() -> int:
                     qids=all_qids,
                     derived=mirrored,
                 )
+                if attach_blind is not None and isinstance(diag, dict):
+                    # ``_run_agent`` returns a fresh diag; without re-attaching,
+                    # a blind start is indistinguishable from "no attachments".
+                    diag["attachment_delivery_failed"] = attach_blind
                 if (
                     stop_reason == "completed"
                     and (diag.get("success") or {}).get("solved")
@@ -1949,6 +2105,28 @@ def main() -> int:
         turns_used = max(turns_used, stop_turns)
         diag.update(stop_diag)
         print(f"[ctfy] {exc}", flush=True)
+    except NoProgress as exc:
+        # Not a crash: the run stopped because the whole observation window
+        # produced nothing new and the focused dive that followed spent its
+        # budget the same way.  A stop reason of its own is what lets the outer
+        # harness decide "restart with a different strategy while samples
+        # remain" instead of reading this as an error and abandoning the item.
+        # The structured marker (host / family / mechanism / signature) travels
+        # in diagnostics, never the response body, and never an answer value.
+        error = str(exc)
+        stop_reason = "no_progress"
+        stop_turns, stop_diag = _take_stop_state(exc)
+        turns_used = max(turns_used, stop_turns)
+        diag.update(stop_diag)
+        diag["progress_guard"] = dict(exc.stats)
+        if exc.host or exc.family or exc.mechanism or exc.signature:
+            diag["stall_marker"] = {
+                "host": exc.host,
+                "family": exc.family,
+                "mechanism": exc.mechanism,
+                "signature": exc.signature,
+            }
+        print(f"[ctfy] {exc}", flush=True)
     except OutputBudgetExceeded as exc:
         # 单次 LLM 调用输出失控。和墙钟一样是「止损」，不是崩溃：已经
         # 抽到的 answers 照常落盘，但归咎口径必须独立，否则无法从失败
@@ -1990,9 +2168,27 @@ def main() -> int:
         error_policy.clear_wall_deadline()
 
         tokens = _usage_snapshot()
+        success_diag = diag.get("success") if isinstance(diag, dict) else None
+        # 平台代交 ``payload["answers"]``，每交一个错值烧掉该题的一次错误上限。
+        # 只有平台自己确认过（``platform_submit``）的值才能给镜像背书；其余
+        # 镜像只是猜测，留在 writeup 里，不进提交面。
+        confirmed = ""
+        if isinstance(success_diag, dict) and success_diag.get("source") == "platform_submit":
+            confirmed = str(success_diag.get("answer") or "")
+        submitted = _submittable_answers(answers, mirrored, confirmed)
+        dropped = [key for key in answers if key not in submitted]
+        if dropped:
+            if isinstance(diag, dict):
+                diag["answers_unverified"] = dropped
+            # 只打 id，不打值：这是日志里唯一会带出答案的地方。
+            print(
+                "[ctfy] answers: unverified mirrors not submitted: "
+                + ", ".join(dropped),
+                flush=True,
+            )
         payload: dict[str, Any] = {
             "schema_version": BRIEF_SCHEMA_VERSION,
-            "answers": answers,
+            "answers": submitted,
             # solved 由平台按 submissions 记录自己写，镜像不自称（§3 明确）。
             "turns": turns_used,
             # 规范字段是 input_tokens / output_tokens，不是笼统的 tokens。
@@ -2011,7 +2207,6 @@ def main() -> int:
             # Same reason as llm_errors: a stop caused by one runaway call must
             # be queryable without parsing the writeup.
             payload["output_budget"] = output_budget
-        success_diag = diag.get("success") if isinstance(diag, dict) else None
         if success_diag:
             # 止损终止与正常收尾共用同一份：只看 stop_reason 分不出"平台确认
             # 已解出"和"跑完没解出"，这条诊断必须能自证。
@@ -2032,14 +2227,27 @@ def main() -> int:
         # Guard counters are the only evidence that separates "the guard warned
         # and the model ignored it" from "the guard never fired"; they used to
         # live in the snapshot but never reach the graded artifact.
-        for guard_key in ("finish_guard", "sweep_guard"):
+        for guard_key in ("finish_guard", "sweep_guard", "progress_guard"):
             guard_diag = diag.get(guard_key) if isinstance(diag, dict) else None
             if guard_diag is not None:
                 payload[guard_key] = guard_diag
+        stall_marker = diag.get("stall_marker") if isinstance(diag, dict) else None
+        if stall_marker:
+            # 停滞事实（host / path family / mechanism class / 12 位响应指纹）
+            # 必须随 result.json 出去：外层 harness 要不要用剩余样本换策略重开，
+            # 唯一的输入就是这条。四字段都不含响应正文，也不含答案。
+            payload["stall_marker"] = stall_marker
         if isinstance(diag, dict) and diag.get("silent_stop"):
             # A clean return with no finish call and no answer used to look the
             # same as any other unsuccessful run.
             payload["silent_stop"] = True
+        attach_diag = (
+            diag.get("attachment_delivery_failed") if isinstance(diag, dict) else None
+        )
+        if attach_diag:
+            # A run that started blind must be queryable: it explains turns
+            # spent on a target whose files never arrived (FMT-1).
+            payload["attachment_delivery_failed"] = attach_diag
         # result.json is the graded artifact: land it before any network I/O.
         # ``publisher.publish`` is synchronous (DNS, redirects, unreachable
         # endpoints) and can burn the whole shutdown reserve; if it ran first,
@@ -2170,6 +2378,16 @@ def _writeup(
     llm_errors = (diag or {}).get("llm_errors")
     if llm_errors:
         lines.append(f"llm_errors: {json.dumps(llm_errors, ensure_ascii=False)}")
+    if (diag or {}).get("boot_retry"):
+        # 起跑失败重试是接入层信号，不是题目结论：只有把这次 run 标出来，
+        # 事后统计才能把「基础设施抖了一下」和「模型不会做」分开。
+        # diag 里其余键不进 result.json（顶层是白名单），所以写进 writeup。
+        lines.append("boot_retry: one attempt failed before any model call")
+    attach_diag = (diag or {}).get("attachment_delivery_failed")
+    if attach_diag:
+        lines.append(
+            f"attachment_delivery_failed: {json.dumps(attach_diag, ensure_ascii=False)}"
+        )
     if error:
         lines.append(f"error: {error}")
     return "\n".join(lines)
@@ -2221,6 +2439,34 @@ def _measured_groups(kind: str) -> list[str]:
         if info.group != "base" and info.name in present
     }
     return [group for group in ("web", "file", "tcp", "aisec") if group in found]
+
+
+def _silent_checker_fallback_needed(
+    *,
+    engagement: bool,
+    checker: Any,
+    stats: dict[str, Any] | None,
+) -> bool:
+    """静默收尾时是否要补跑一遍 checker 探针。
+
+    「静默」的判据与 ``silent_stop`` 标记同源：``refusals`` 与 ``allowed``
+    都是 0，说明这次 run 从头到尾没碰过 ``finish_scan``。那种收尾下
+    ``CheckerProbe`` 没有触发点，checker 题（deface / outage / persist）
+    就一次 ``/check`` 都没发——SAMPLE-006/019 实测整题零交付。
+
+    Args:
+        engagement: engagement run 的交付物是报告，不适用。
+        checker: ``CheckerProbe`` 或 None。
+        stats: ``finish_guard.stats()``；None 表示守卫没装上。
+
+    Returns:
+        True 表示应当替模型补发 checker 探针。
+    """
+    if engagement or checker is None:
+        return False
+    if not stats:
+        return False
+    return int(stats.get("refusals") or 0) == 0 and int(stats.get("allowed") or 0) == 0
 
 
 def _autosubmit_target(task: dict[str, Any]) -> tuple[str, str, str] | None:
@@ -2302,8 +2548,10 @@ def install_toolset(task: dict[str, Any], kind: str) -> tuple[str, list[str]]:
         the Tools section stay in step.
     """
 
+    from ctf_strix.capabilities import aisec_offline
     from ctf_strix.capabilities import install_soft_deadline
     from ctf_strix.capabilities import install_web_capabilities
+    from ctf_strix.capabilities import live_tool_names
     from ctf_strix.capabilities import wants_aisec
 
     # Only kinds with a live web surface pay for the HTTP primitives.  A file or
@@ -2374,6 +2622,56 @@ def install_toolset(task: dict[str, Any], kind: str) -> tuple[str, list[str]]:
     except Exception as exc:  # noqa: BLE001
         print(f"[ctfy] usage meter unavailable: {type(exc).__name__}: {exc}", flush=True)
 
+    # AI 安全能力（指纹 + CVE 匹配）：走官方 register_agent_tools，不改 vendor。
+    # 规则库缺失时不注册——挂一个必然报错的工具只会浪费轮次。
+    # 2026-11-02: this used to register whenever the rule data was on disk, while
+    # the eval harness defaulted CTF_AISEC=0.  The submitted image therefore had
+    # three schemas the measured one never had -- the same drift as the web
+    # primitives and sweep_guard before it.  One rule now lives in
+    # capabilities.wants_aisec and both entrypoints call it.
+    #
+    # 2026-11-13 (AI-5): this block runs *before* the skill pack because the hint
+    # below is filtered against the tools that actually registered, and the first
+    # card names ai_quick_scan.  Ordering it the other way round would compute the
+    # filter from a registry that is still missing every AI tool.  The narrower
+    # aisec_offline gate covers a tcp challenge tagged AI-facing: wants_aisec is
+    # False there (no HTTP surface) but the offline lookup still has a banner.
+    aisec_on, aisec_reason = wants_aisec(kind, task)
+    aisec_offline_on, aisec_offline_reason = aisec_offline(kind, task)
+    try:
+        from ctf_strix.aisec import aig_probe
+        from ctf_strix.aisec import tools as aisec_tools
+
+        if not (aisec_on or aisec_offline_on):
+            print(f"[ctfy] aisec off ({aisec_reason})", flush=True)
+        elif not aig_probe.data_dir():
+            reason = aisec_reason if aisec_on else aisec_offline_reason
+            print(f"[ctfy] aisec wanted but rules missing ({reason})", flush=True)
+        elif aisec_on:
+            registered = aisec_tools.register()
+            # AI-1: allow_for() existed but no entrypoint called it, so the
+            # allowlist was always empty and every private target -- i.e. every
+            # real one -- was refused by the network check.  The declared
+            # endpoints are the only trusted source; tool arguments cannot add
+            # to it.
+            allowed = aisec_tools.allow_targets(_targets_from(task))
+            print(
+                f"[ctfy] aisec tools={len(registered)} "
+                f"allow={','.join(allowed) or '(none)'} ({aisec_reason})",
+                flush=True,
+            )
+        else:
+            # Offline lookup only: no probe, so no allowlist to seed and no
+            # HTTP schema paid on every call.
+            registered = aisec_tools.register_offline()
+            print(
+                f"[ctfy] aisec offline tools={len(registered)} "
+                f"({aisec_offline_reason})",
+                flush=True,
+            )
+    except Exception as exc:  # noqa: BLE001 — 增强能力失败不能让整题跑不动
+        print(f"[ctfy] aisec registration failed: {type(exc).__name__}: {exc}", flush=True)
+
     # 技能包：12 个方向索引，走 strix 自带的 load_skill。只注册索引、不注册
     # 整包——整包 145 条进 system prompt，其中 133 条是没有 frontmatter 的参考
     # 子文件，对模型零信息量。
@@ -2384,7 +2682,14 @@ def install_toolset(task: dict[str, Any], kind: str) -> tuple[str, list[str]]:
         names = skillpack.register()
         # Method cards are keyed on tags, not on the skill pack: compute the
         # hint even when no index registered, so a broken pack still gets them.
-        hint = skillpack.prompt_hint(names, kind=kind, tags=skillpack.tags_of(task))
+        # The filter reads the live registry, so this runs after every installer
+        # above (AI-5).
+        hint = skillpack.prompt_hint(
+            names,
+            kind=kind,
+            tags=skillpack.tags_of(task),
+            available=live_tool_names() or None,
+        )
         if names:
             print(f"[ctfy] skills registered={len(names)} ref={skillpack.ref_root()}", flush=True)
         else:
@@ -2393,28 +2698,6 @@ def install_toolset(task: dict[str, Any], kind: str) -> tuple[str, list[str]]:
             print(f"[ctfy] user hint chars={len(hint)}", flush=True)
     except Exception as exc:  # noqa: BLE001 — 技能装不上也要能把题跑完
         print(f"[ctfy] skills registration failed: {type(exc).__name__}: {exc}", flush=True)
-
-    # AI 安全能力（指纹 + CVE 匹配）：走官方 register_agent_tools，不改 vendor。
-    # 规则库缺失时不注册——挂一个必然报错的工具只会浪费轮次。
-    # 2026-11-02: this used to register whenever the rule data was on disk, while
-    # the eval harness defaulted CTF_AISEC=0.  The submitted image therefore had
-    # three schemas the measured one never had -- the same drift as the web
-    # primitives and sweep_guard before it.  One rule now lives in
-    # capabilities.wants_aisec and both entrypoints call it.
-    aisec_on, aisec_reason = wants_aisec(kind, task)
-    try:
-        from ctf_strix.aisec import aig_probe
-        from ctf_strix.aisec import tools as aisec_tools
-
-        if not aisec_on:
-            print(f"[ctfy] aisec off ({aisec_reason})", flush=True)
-        elif not aig_probe.data_dir():
-            print(f"[ctfy] aisec wanted but rules missing ({aisec_reason})", flush=True)
-        else:
-            registered = aisec_tools.register()
-            print(f"[ctfy] aisec tools={len(registered)} ({aisec_reason})", flush=True)
-    except Exception as exc:  # noqa: BLE001 — 增强能力失败不能让整题跑不动
-        print(f"[ctfy] aisec registration failed: {type(exc).__name__}: {exc}", flush=True)
 
     # ── 上下文管理（2026-11-01）────────────────────────────────────────────
     # 两处改动都挂在框架已有的接缝上，vendor 不动：
@@ -2523,6 +2806,76 @@ def _record_answer(
     return written
 
 
+def _submittable_answers(
+    answers: dict[str, str], mirrored: set[str], confirmed: str
+) -> dict[str, str]:
+    """Drop mirrored guesses the platform has not confirmed.
+
+    The platform submits every value in ``payload["answers"]`` and spends one
+    of that question's wrong-answer attempts on each (P0-0 item 2).  A mirror
+    is a guess by construction, so shipping it spends the quota on a value the
+    run itself never believed in.
+
+    A mirror is kept only when it equals the answer the platform already
+    accepted (``SuccessLedger`` ``source="platform_submit"``).  That is the
+    two-id shape of ledger 4.9: one real value, two visible ids, and both ids
+    must carry the confirmed value to score.
+
+    The primary answer is never touched -- it is evidence, not a mirror, and
+    an offline run (no platform confirmation at all) must still be able to
+    report it.
+
+    Args:
+        answers: every id the run wrote, primary and mirrors alike.
+        mirrored: ids whose current value is a mirror.
+        confirmed: the answer the platform confirmed, empty when unknown.
+
+    Returns:
+        A copy of ``answers`` with unconfirmed mirrors removed.
+    """
+    if not mirrored:
+        return dict(answers)
+    kept: dict[str, str] = {}
+    for key, value in answers.items():
+        if key in mirrored and value != confirmed:
+            continue
+        kept[key] = value
+    return kept
+
+
+def _attachment_section(attachment_files: list[dict[str, str]]) -> str:
+    """渲染"工作目录里已有什么"一段；无附件时返回空串。
+
+    strix 只把 ``workspace_files`` 渲染进 task，``extra_files`` 是静默注入的。
+    不说一声，agent 会不知道这些文件从哪来、甚至以为工作目录是空的。
+
+    路径按**相对工作目录**渲染（FMT-3）：``extra_files`` 的 key 沿用 strix 的
+    ``/workspace/<rel>`` 约定（本地 backend 的 ``rel_path()`` 只认这个前缀），
+    但这是一个私有临时目录，``/workspace`` 在沙箱里根本不存在——shell 的 CWD
+    才是它。渲染成绝对 ``/workspace/...`` 时，模型照抄去 ``cat`` 会 404。
+    """
+    if not attachment_files:
+        return ""
+    listing = "\n".join(
+        "- " + (
+            "./" + entry["workspace_path"][len("/workspace/"):]
+            if entry["workspace_path"].startswith("/workspace/")
+            else entry["workspace_path"]
+        )
+        for entry in attachment_files
+    )
+    return (
+        "## Files already in your workspace\n\n"
+        "The platform's attachments have been placed in your working directory — "
+        "that is the shell's CWD, so use them with exactly these relative paths:\n\n"
+        f"{listing}\n\n"
+        "Any path written `/workspace/NAME` in tool output refers to the same "
+        "file: drop the `/workspace/` prefix to use it.\n\n"
+        "Files ending in `.b64` are base64-encoded binaries — decode them first:\n"
+        "`base64 -d FILE.b64 > FILE`."
+    )
+
+
 def _run_agent(
     task: dict[str, Any],
     answers: dict[str, str],
@@ -2596,6 +2949,16 @@ def _run_agent(
     from ctf_strix.guard_mount import install_mount_hook
 
     install_mount_hook()
+
+    # 零进展守卫装在**最内层**（挂载钩子之后、其余守卫之前）。后装的守卫是外层，
+    # 各自会往结果尾部追加建议文本；只有装在里层，``_obs_signature`` 看到的才是
+    # 有界结果本身，一次观测不会因为别人贴了一句话就变成"新观测"。
+    # 代价：读 negative_guard 的 K=3 组数晚一次调用（外层先返回结果），可接受。
+    from ctf_strix.progress_guard import install as install_progress_guard
+
+    # Keep the instance: its trip state and stats go into result.json, otherwise
+    # a run that stopped for "no progress" is indistinguishable from a crash.
+    progress_guard = install_progress_guard()
 
     # G4/G5 sit on the same seam.  Installed first so the response signature
     # sees the bounded result before other guards append advice.
@@ -2696,6 +3059,8 @@ def _run_agent(
                     success=success,
                     fallback_question_ids=question_ids,
                     fallback_question_modes=question_modes,
+                    # G1：gated 题答对后的刷新走 challenge 端点，需要题号。
+                    challenge_id=challenge_id_of(task),
                 )
         except Exception as exc:  # noqa: BLE001 -- probing is an optimisation
             print(f"[ctfy] autosubmit unavailable: {type(exc).__name__}: {exc}", flush=True)
@@ -2766,6 +3131,7 @@ def _run_agent(
                         fallback_question_ids=question_ids,
                         fallback_question_modes=question_modes,
                         submitter=submitter,
+                        challenge_id=challenge_id_of(task),
                     )
                     print(f"[ctfy] autosubmit on (instance {submitted_to[1][:8]}...)", flush=True)
                 diag["autosubmit"] = "on"
@@ -3040,6 +3406,11 @@ def _run_agent(
             # blocked while the value was unknown must open again, and the
             # retry counter that would escalate to EnumExhausted resets.
             enum_guard.note_answer()
+            # Same reasoning for the no-progress guard: a run that has an
+            # answer must never be stopped for "no new observation", and the
+            # stretch of probes that produced the answer may well have been
+            # repeating a dead path first.
+            progress_guard.note_answer()
         if round_boundary and target_guard.tripped and not success.solved:
             # The crossing tool call already returned the hard error.  Raise
             # from the sink, at a round boundary; ``main`` maps TargetAbsent
@@ -3080,6 +3451,29 @@ def _run_agent(
                 enum_guard.exhausted_detail(),
                 family=enum_guard.exhausted_family or "",
                 refusals=enum_guard.refusal_count(enum_guard.exhausted_family or ""),
+            )
+        if round_boundary and progress_guard.tripped and not success.solved:
+            # The deep dive is spent: the window closed with no new observation
+            # and the three focused attempts after it produced nothing either.
+            # Stopping here is what makes the marker worth writing -- ``main``
+            # records ``stop_reason="no_progress"`` plus the guard's counters,
+            # and the *outer* harness decides whether a remaining sample is
+            # worth a restart against a different strategy.  The agent never
+            # decides that itself: its history no longer contains why the last
+            # attempt failed, so a self-restart replays the same paths in new
+            # words.
+            #
+            # Same round-boundary gate as the two raises above, for the same
+            # FIFO reason: boundary N lands before round N's outputs, so
+            # stopping at N+1 never drops a sibling call's output (B1).
+            _host, _family, _mechanism, _signature = progress_guard.last_probe
+            raise NoProgress(
+                progress_guard.trip_detail(),
+                stats=progress_guard.stats(),
+                host=_host,
+                family=_family,
+                mechanism=_mechanism,
+                signature=_signature,
             )
         if round_boundary and not success.solved and idle.expired(now):
             # A dead-target run: after deciding the target was dead the model
@@ -3256,17 +3650,9 @@ def _run_agent(
             "answer, not only the first. An id that is missing scores zero even "
             "when the string is right."
         )
-    if attachment_files:
-        # strix 只把 ``workspace_files`` 渲染进 task，``extra_files`` 是静默注入的。
-        # 不说一声，agent 会不知道这些文件从哪来、甚至以为工作目录是空的。
-        listing = "\n".join(f"- {entry['workspace_path']}" for entry in attachment_files)
-        parts.append(
-            "## Files already in your workspace\n\n"
-            "The platform's attachments have been placed in your working directory:\n\n"
-            f"{listing}\n\n"
-            "Files ending in `.b64` are base64-encoded binaries — decode them first:\n"
-            "`base64 -d FILE.b64 > FILE`."
-        )
+    section = _attachment_section(attachment_files)
+    if section:
+        parts.append(section)
     parts.append(f"## Challenge description\n\n{description}")
     instruction = "\n\n".join(part.strip() for part in parts if part and part.strip())
 
@@ -3312,11 +3698,35 @@ def _run_agent(
     except ValueError:
         split = 0.6
     budgets = _attempt_turns(max_turns, attempts, min(max(split, 0.2), 0.9))
+    # 启动失败重试：一个 attempt 在产生第一次工具调用之前就抛异常，说明的是
+    # harness 接入失败，不是题目结论。默认 CTF_ATTEMPTS=1 时它会把整题记成
+    # ``errored``（零次 LLM 产出）。这里只对这种「零调用」的死起跑补一次，
+    # 且预算取 ``max_turns - turns_total``（上一轮没花掉的那部分），所以
+    # **整题 turn 上限不变**——这不是调预算，是把已经批下来的预算从一次
+    # 根本没开始的 attempt 里挪回来。
+    boot_retry_used = False
+    # 重试必须在**新的** scan_id 下重起，不能在原 id 上续：
+    #   * 死起跑那次是最后一个 attempt，``cleanup_on_exit`` 已在 finally 里
+    #     销毁沙箱（``session_manager.cleanup`` 弹出缓存并删容器）；
+    #   * 更硬的一条：vendor 把 ``agents.json`` 存在当成 resume 信号
+    #     （``runner.py:240``）。死起跑在 ``create_or_reuse`` 里抛异常时，
+    #     ``_maybe_snapshot`` 已经把空图写进 agents.json，而 ``agents.db``
+    #     要到 ``open_agent_session`` 才创建，于是原 id 的第二次调用会直接
+    #     撞上 ``runner.py:294`` 的「missing SDK session database」。
+    # 死起跑本来就没有 /tmp 脚本、登录态或 SDK 历史要延续，换 id 是等价的
+    # 全新开始，附件也要在新沙箱里重铺。
+    active_scan_id = scan_id
+    first_on_sandbox = True
 
     async def _go() -> None:
         nonlocal result, turns_total, root_agent, runs_ok, turns_exhausted
-        nonlocal in_flight_calls_before
-        for index, budget in enumerate(budgets):
+        nonlocal in_flight_calls_before, boot_retry_used
+        nonlocal active_scan_id, first_on_sandbox
+        # ``budgets`` 会在死起跑时追加一项，所以不能用 ``enumerate`` 快照式
+        # 迭代；``while`` 让「追加后是否继续」显式可见。
+        index = 0
+        while index < len(budgets):
+            budget = budgets[index]
             if not engagement and qid in answers:
                 break
             # A prior attempt hit the single-call output cap.  Starting another
@@ -3334,6 +3744,7 @@ def _run_agent(
             call_start = len(attempt_pairs)
             output_start = len(attempt_outputs)
             calls_before = root_tool_calls
+            llm_calls_before = _usage_snapshot().get("llm_calls", 0)
             in_flight_calls_before = calls_before
             config = dict(scan_config)
             if index > 0:
@@ -3344,27 +3755,38 @@ def _run_agent(
                     attempt_outputs[:output_start],
                 )
                 if not digest:
-                    print("[ctfy] retry skipped: empty digest", flush=True)
-                    break
-                # Resume the same scan: strix restores the sandbox session and
-                # the SDK history, then injects this as a new user message.
-                # A fresh scan_id would lose /tmp scripts and login state.
-                config["resume_instruction"] = (
-                    "## Previous attempt (failed)\n\n"
-                    + digest
-                    + f"\n\nThis is attempt {index + 1} of {len(budgets)}. "
-                    "Do not repeat the calls listed above. Change the mechanism, "
-                    "not the parameter values. Start from an untried method or an "
-                    "untried class of path, and read the real answer once you have "
-                    "execution, file read, or DB read."
-                )
-                print(
-                    f"[ctfy] retry with digest: {len(digest)} chars "
-                    f"from {call_start} calls",
-                    flush=True,
-                )
-                if os.environ.get("CTF_DIGEST_DEBUG", "").strip().lower() in ("1", "true", "yes"):
-                    print(digest, flush=True)
+                    if call_start == 0:
+                        # 之前的 attempt 一次调用都没发出：没有历史可续，摘要
+                        # 不是重试的前提。以前这里 break，等于让一次死起跑把
+                        # 后面所有 attempt 一起吞掉。
+                        print("[ctfy] retry without digest: no prior calls", flush=True)
+                    else:
+                        print("[ctfy] retry skipped: empty digest", flush=True)
+                        break
+                else:
+                    # Resume the same scan: strix restores the sandbox session and
+                    # the SDK history, then injects this as a new user message.
+                    # A fresh scan_id would lose /tmp scripts and login state.
+                    config["resume_instruction"] = (
+                        "## Previous attempt (failed)\n\n"
+                        + digest
+                        + f"\n\nThis is attempt {index + 1} of {len(budgets)}. "
+                        "Do not repeat the calls listed above. Change the mechanism, "
+                        "not the parameter values. Start from an untried method or an "
+                        "untried class of path, and read the real answer once you have "
+                        "execution, file read, or DB read."
+                    )
+                    print(
+                        f"[ctfy] retry with digest: {len(digest)} chars "
+                        f"from {call_start} calls",
+                        flush=True,
+                    )
+                    if os.environ.get("CTF_DIGEST_DEBUG", "").strip().lower() in (
+                        "1",
+                        "true",
+                        "yes",
+                    ):
+                        print(digest, flush=True)
             print(
                 f"[ctfy] attempt {index + 1}/{len(budgets)} turns={budget}",
                 flush=True,
@@ -3398,14 +3820,17 @@ def _run_agent(
             from ctf_strix.turn_budget import reset_current as _reset_turn_budget
 
             _reset_turn_budget(budget)
+            # 只有「这块沙箱还是全新的」那一次才铺附件：后续 attempt 复用同一
+            # 沙箱，重铺会覆盖容器里已经改过的文件。
+            extras = (attachment_files or None) if first_on_sandbox else None
             try:
                 result = await run_strix_scan(
                     scan_config=config,
-                    scan_id=scan_id,
+                    scan_id=active_scan_id,
                     coordinator=attempt_coordinator,
                     image="unused-local",
                     local_sources=[],
-                    extra_files=(attachment_files or None) if index == 0 else None,
+                    extra_files=extras,
                     max_turns=budget,
                     # Keep the sandbox alive between attempts; the final
                     # attempt is responsible for tearing it down.
@@ -3414,13 +3839,16 @@ def _run_agent(
                 )
             except Exception as exc:  # noqa: BLE001 — turn 用尽属于正常终止
                 print(f"[ctfy] scan ended: {type(exc).__name__}: {exc}", flush=True)
-                turns_total += max(root_tool_calls - calls_before, 0)
+                first_on_sandbox = False
+                spent = max(root_tool_calls - calls_before, 0)
+                turns_total += spent
                 in_flight_calls_before = None
                 if _is_turn_exhausted(exc):
                     # Counted apart from a crash: the attempt did run, it just
                     # never produced a lifecycle call.  ``main`` reports it as
                     # ``recovery_exhausted`` instead of ``error``.
                     turns_exhausted += 1
+                    index += 1
                     continue
                 if error_policy.classify_error(exc) == "credential_failure":
                     # A rejected key cannot recover by starting another
@@ -3430,8 +3858,31 @@ def _run_agent(
                     if detail is not None:
                         llm_errors.append(detail)
                         break
+                # 死起跑：这个 attempt 一次工具调用、一次完成的模型调用都没有。
+                # 只补这一次，预算取没花掉的余额，整题上限因此不变。
+                leftover = max_turns - turns_total
+                if (
+                    index == 0
+                    and not boot_retry_used
+                    and spent == 0
+                    and _usage_snapshot().get("llm_calls", 0) == llm_calls_before
+                    and leftover > 0
+                ):
+                    boot_retry_used = True
+                    budgets.append(leftover)
+                    # 换 id 重起一块新沙箱（理由见循环外的注释）。
+                    active_scan_id = f"{scan_id}-r1"
+                    first_on_sandbox = True
+                    print(
+                        f"[ctfy] boot retry after {type(exc).__name__} "
+                        f"before any call; budget={leftover} "
+                        f"scan_id={active_scan_id}",
+                        flush=True,
+                    )
+                index += 1
                 continue
             runs_ok += 1
+            first_on_sandbox = False
             # The root may have been stopped by a child agent's trip and return
             # normally.  Do not launch the next attempt in that case.
             if usage_trip_info() is not None:
@@ -3439,6 +3890,7 @@ def _run_agent(
             used = _requests_of(result)
             turns_total += used if used > 0 else max(root_tool_calls - calls_before, 0)
             in_flight_calls_before = None
+            index += 1
 
     def _snapshot_stats() -> tuple[int, dict[str, Any]]:
         """当前轮次与诊断的快照。
@@ -3467,13 +3919,28 @@ def _run_agent(
             # summary is the only place an operator can see that a family was
             # hard-blocked (and how many paid retries it swallowed).
             out_now["enum_guard"] = enum_guard.stats()
-        if negative_guard is not None:
-            out_now["negative_guard"] = negative_guard.stats()
             print(
                 "[ctfy] enum guard: "
                 f"blocked_calls={enum_guard.blocked_calls} "
                 f"blocked={len(enum_guard.blocked)} "
                 f"exhausted={enum_guard.exhausted}",
+                flush=True,
+            )
+        if negative_guard is not None:
+            out_now["negative_guard"] = negative_guard.stats()
+        if progress_guard is not None:
+            # 零进展守卫：没 trip 的 run 也要看得到 fresh 率。这是"有没有换来
+            # 新观测"的唯一可观测出口——失败轨迹复盘时先看它，再看 elapsed。
+            out_now["progress_guard"] = progress_guard.stats()
+            print(
+                "[ctfy] progress: "
+                f"probes={progress_guard.probes} "
+                f"fresh={progress_guard.fresh} "
+                f"rate={progress_guard.fresh_rate:.0%} "
+                f"streak={progress_guard.streak} "
+                f"deep={progress_guard.deep_left}/{progress_guard.deep_active} "
+                f"marks={progress_guard.marks} "
+                f"tripped={progress_guard.tripped}",
                 flush=True,
             )
         if finish_guard is not None and finish_guard.probe_note:
@@ -3502,6 +3969,37 @@ def _run_agent(
         # normally after ``request_stop``.  Re-raise here so the run still lands in
         # ``main``'s output_budget branch instead of looking like a clean finish.
         raise_if_tripped()
+
+        # B-22：静默自停兜底。模型用纯文本收尾、从未调 finish_scan 时，
+        # checker 题的 ``/check`` 记账没有触发点；这里替它走一遍，判据与
+        # finish_guard 完全一致。值类题的 /check 只会回 passed=false。
+        if _silent_checker_fallback_needed(
+            engagement=engagement,
+            checker=checker_probe,
+            stats=finish_guard.stats() if finish_guard is not None else None,
+        ):
+            try:
+                # CheckerProbe 是一次性缓存：内部逐题打 /check，只回一个总裁决。
+                # 这里已经在 ``asyncio.run(_go())`` 之后（同步域），另起一个
+                # 短循环调用它；探针此时从未被用过，锁是新建的。
+                passed = bool(asyncio.run(checker_probe.check()))
+            except Exception as exc:  # noqa: BLE001 -- 兜底失败不能改收尾
+                print(
+                    "[ctfy] checker fallback failed: "
+                    f"{type(exc).__name__}: {exc}",
+                    flush=True,
+                )
+                passed = False
+            if passed:
+                print("[ctfy] checker passed after silent stop", flush=True)
+                try:
+                    success.mark(
+                        "checker",
+                        "passed via /check after silent stop",
+                        answer="<checker>",
+                    )
+                except Exception:  # noqa: BLE001
+                    pass
 
         # ``finish_scan`` is usually the last call, so no further tool output will
         # arrive to promote a claim recorded in its arguments.  Settle here as well,
@@ -3590,6 +4088,9 @@ def _run_agent(
             # `and not answers` 是防御：将来若有人在进循环前就填好了 answers，
             # 那不是"没跑起来"，不该被标成 error。
             out["no_attempt_ran"] = True
+        if boot_retry_used:
+            # 事后统计接入失败率用的观测点；不影响 stop_reason。
+            out["boot_retry"] = True
         return turns, out
     except BaseException as exc:
         # A solve recorded by finish_guard/autosubmit can arrive before the

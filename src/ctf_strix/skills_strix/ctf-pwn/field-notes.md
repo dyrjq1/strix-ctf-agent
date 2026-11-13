@@ -1,6 +1,6 @@
 # Pwn Field Notes
 
-Detailed pwn notes that support [`SKILL.md`](SKILL.md). Read this file after confirming the challenge really needs exploitation.
+Detailed pwn notes that support [`ctf-pwn.md`](ctf-pwn.md). Read this file after confirming the challenge really needs exploitation.
 
 ## Table of Contents
 

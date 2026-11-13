@@ -22,6 +22,8 @@ G4 does not look at the T1 threshold.
 
 from __future__ import annotations
 
+from ctf_strix.tool_notes import append_note
+
 import hashlib
 import logging
 import re
@@ -178,6 +180,16 @@ class NegativeEvidenceGuard:
                 "truncation_pointers": self._pointers,
             }
 
+    def stuck_groups(self) -> list[tuple[str, str]]:
+        """Groups that reached K identical responses (no private state escapes).
+
+        The keys are the normalised arguments and the response sha1, so a caller
+        can tell "the set grew" without this guard exposing counters that other
+        guards must not mutate.
+        """
+        with self._lock:
+            return [key for key, group in self._groups.items() if group.closed]
+
 
 _GUARD: NegativeEvidenceGuard | None = None
 _GUARD_LOCK = threading.Lock()
@@ -204,9 +216,15 @@ def reset_for_tests() -> None:
 def install() -> NegativeEvidenceGuard:
     """Wrap ``exec_command`` only, on the same mount seam as the other guards.
 
-    Install it immediately after ``guard_mount.install_mount_hook()`` so it is
-    the innermost guard: it sees the bounded (truncated) result before any
-    other guard appends advice, which keeps the response signature stable.
+    Guard order is outermost-last: every guard installed *after* this one sees
+    the signature computed here, and this one sees hints appended by guards
+    installed before it.  ``progress_guard`` is installed before it on purpose
+    -- the observation fingerprint must not contain another guard's hint text,
+    or one observation that got advice would count as two.  The cost is the
+    reverse direction: during a progress dive (three terminal calls) the hint
+    appended by ``progress_guard`` changes this guard's response signature, so
+    a same-command repeat is not counted here for those calls.  The dive stops
+    the run on its own at the third call, so nothing is lost by that.
     """
     from strix.agents import factory
 
@@ -233,7 +251,7 @@ def install() -> NegativeEvidenceGuard:
                 logger.warning("negative evidence guard failed", exc_info=True)
                 return result
             if hint:
-                return f"{result}{hint}"
+                return append_note(result, hint)
             return result
 
         tool.on_invoke_tool = invoke

@@ -45,21 +45,16 @@ done
 | vLLM | `/v1/models` 返回 OpenAI 兼容列表，`/metrics` 暴露引擎指标 |
 | LiteLLM | `/health` 或 `/v1/models`，路径含 `litellm` |
 
-有本地规则库时（`aisec/` 目录）优先走工具，别手写：
+有本地规则库时优先走注册工具，别手写脚本（规则库已随镜像离线分发）：
 
-```bash
-python3 aisec/aig_tool.py scan http://TARGET:PORT     # 指纹 + CVE 一次出
-```
+- `ai_quick_scan`（参数：目标 URL）——指纹 + CVE 一次出
+- `ai_fingerprint`（参数：目标 URL）——只要指纹
 
 ## 第二步：按组件查已知 CVE
 
 拿到**确切版本**再查。版本常在响应头或专用接口里，不在首页。
 
-```bash
-python3 aisec/aig_tool.py lookup ollama 0.1.29    # 27 条，含 CVE-2024-7773
-python3 aisec/aig_tool.py lookup dify 0.6.9       # 25 条
-python3 aisec/aig_tool.py lookup comfyui 0.3.27   # 9 条
-```
+`ai_cve_lookup`（参数：组件名、版本）——ollama 0.1.29 命中 27 条（含 CVE-2024-7773）、dify 0.6.9 命中 25 条、comfyui 0.3.27 命中 9 条。
 
 **先看 severity 和是否有 HTTP PoC，再决定要不要花时间。** 版本号取不到时（出题人改过 banner），退回第三步的思路题。
 

@@ -116,9 +116,7 @@ def test_turn_budget_mark_reaches_exec_command():
 
     guard_mount.install_mount_hook()
     deadline_guard.install(
-        deadline_guard.DeadlineGuard(
-            wall=100, soft=75, stall=25.0, grace=5.0, turns=10
-        )
+        deadline_guard.DeadlineGuard(wall=100, soft=75, turns=10)
     )
     guard = turn_budget.install()
     guard.reset(10)

@@ -361,13 +361,13 @@ def test_skill_packs_do_not_tell_the_model_to_pip_install() -> None:
     The skill body may still explain that installing fails; what it must not do
     is present an install command as the prerequisite.
 
-    Both files matter: ``SKILL.md`` is the upstream document, but
-    ``skillpack.index_skills()`` registers ``<category>/<category>.md``, and
-    that is what the model actually reads.
+    ``skillpack.index_skills()`` registers ``<category>/<category>.md``, so
+    that is the only skill document the model reads and the only one worth
+    policing here.
     """
     offenders = []
     pack = ROOT / "src" / "ctf_strix" / "skills_strix"
-    paths = sorted(pack.glob("*/SKILL.md")) + sorted(
+    paths = sorted(
         p for p in pack.glob("*/*.md") if p.name == p.parent.name + ".md"
     )
     for path in paths:
@@ -404,7 +404,10 @@ def test_prompt_environment_lists_what_the_image_really_has() -> None:
         assert f"`{namespace}`" in text, f"Environment omits installed {namespace}"
 
     lowered = text.lower()
-    assert "no internet" in lowered
+    # RT-1: the offline line reads "Internet: **none**; anything else cannot
+    # be installed".  It deliberately does not start with "- No ", because
+    # tests/test_env_claims.py parses "- No a, b, c;" as a tool list.
+    assert "internet: **none**" in lowered
     assert "cannot be installed" in text
     assert "plain Python" in text or "python3" in text
     assert "nohup" in text, "long-task guidance is missing"

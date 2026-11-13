@@ -24,8 +24,11 @@ one stalled class would fire while the run was still finding new surface.
 
 ## Ladder and budgets (frozen; no implicit growth)
 
-* L1 x2 -- mark the current mechanism class refuted, require the next probe
-  to use an unused mechanism class.  The guard hard-refuses a violating probe.
+* L1 x2 -- mark the current mechanism class refuted, ask the next probe to
+  use an unused mechanism class.  The guard is advisory only: a probe that
+  reuses the refuted class still runs, and its result carries a low-yield
+  note.  A hard refusal used to block exactly the right deep-dive shape
+  (blind/UNION extraction against one endpoint), so it was downgraded.
 * L2 x1 -- mechanisms exhausted: switch to the least-explored discovered
   origin.
 * L3 x1 -- both T2 and T3 stalled and more than half the wall budget spent:
@@ -37,6 +40,8 @@ early would be a disguised budget change.
 """
 
 from __future__ import annotations
+
+from ctf_strix.tool_notes import append_note
 
 import hashlib
 import logging
@@ -465,10 +470,11 @@ class RestartGuard:
         return (
             f"\n\n[RESTART GUARD L1] Mechanism class '{current}' is now marked "
             "REFUTED: it has produced no new mechanism or endpoint inside the "
-            "recent window. Your next probe MUST use one of these unused "
-            f"classes: {', '.join(unused)}. A classified probe outside that set "
-            "will be refused by the guard. Name the exact value you expect, "
-            "then send one probe that tests it."
+            "recent window. Your next probe should use one of these unused "
+            f"classes: {', '.join(unused)}. The guard does not block anything: "
+            "a probe that stays in the refuted class still runs, and the guard "
+            "will only point out that it stayed there. Name the exact value you "
+            "expect, then send one probe that tests it."
         )
 
     def _build_l2_text(self) -> str | None:
@@ -506,12 +512,16 @@ class RestartGuard:
 
     # -------------------------------------------------------------- probe gate
     def check_call(self, tool_name: str, args: str) -> str | None:
-        """Hard-validate the next classified probe after an L1 instruction.
+        """Return an advisory note for the next classified probe after L1.
+
+        The note never blocks: ``attach`` runs the probe and appends the note
+        to its result.  The L1 policy is consumed by the first classified
+        probe whichever class it uses, so the note appears at most once.
 
         Returns:
-            A refusal string when the probe violates the L1 mechanism set;
-            ``None`` otherwise.  Unclassifiable calls are left alone so local
-            work does not get blocked by a rule about attack mechanisms.
+            An advisory string when the probe stays in the refuted mechanism
+            class; ``None`` otherwise.  Unclassifiable calls are left alone so
+            local work never draws a rule about attack mechanisms.
         """
 
         with self._lock:
@@ -520,17 +530,20 @@ class RestartGuard:
             mechanism = self._mechanism_of(args or "")
             if mechanism is None:
                 return None
-            if mechanism in self._l1_policy:
-                self._l1_policy = None
+            allowed = self._l1_policy
+            self._l1_policy = None
+            if mechanism in allowed:
                 return None
-            allowed = ", ".join(
-                name for name in MECHANISM_NAMES if name in self._l1_policy
+            allowed_names = ", ".join(
+                name for name in MECHANISM_NAMES if name in allowed
             )
+            refuted = self._last_mechanism or "the current mechanism"
             return (
-                "ERROR: [RESTART GUARD] The previous L1 instruction marked "
-                f"'{self._last_mechanism or 'the current mechanism'}' refuted. "
-                f"This probe uses '{mechanism}', which is outside the allowed "
-                f"set: {allowed}. Change mechanism before sending another probe."
+                "\n\n[RESTART GUARD L1] advisory, not a refusal: the previous "
+                f"L1 instruction marked '{refuted}' refuted, but this probe "
+                f"stayed in '{mechanism}'. The probe was sent anyway. If its "
+                "result is another dead end, change attack class before the "
+                f"next one; unused classes: {allowed_names}."
             )
 
     # -------------------------------------------------------------- observe
@@ -609,42 +622,21 @@ def attach(tool: "FunctionTool") -> "FunctionTool":
 
     async def invoke(ctx: Any, raw_input: str) -> Any:
         guard = current()
+        note: str | None = None
         try:
-            refusal = guard.check_call(tool.name, raw_input)
+            note = guard.check_call(tool.name, raw_input)
         except Exception:  # noqa: BLE001 - a guard fault must not break tools
             logger.warning("restart guard check failed", exc_info=True)
-            refusal = None
-        if refusal is not None:
-            return refusal
         result = await inner(ctx, raw_input)
         try:
             hint = guard.observe(tool.name, raw_input, result)
         except Exception:  # noqa: BLE001
             logger.warning("restart guard observe failed", exc_info=True)
-            return result
-        if hint:
-            return f"{result}{hint}"
+            hint = None
+        if note or hint:
+            return append_note(result, f"{note or ''}{hint or ''}")
         return result
 
     tool.on_invoke_tool = invoke
     setattr(tool, _MARK, True)
     return tool
-
-
-def stats() -> dict[str, Any]:
-    """Read-only snapshot for diagnostics."""
-
-    guard = current()
-    state = guard.evaluate()
-    return {
-        "elapsed_s": round(state.elapsed_s, 1),
-        "wall_s": round(state.wall_s, 1),
-        "t1": state.t1,
-        "t2": state.t2,
-        "t3": state.t3,
-        "triggered": state.triggered,
-        "l3_ready": state.l3_ready,
-        "issued": {level: guard.issued(level) for level in (L1, L2, L3)},
-        "limits": dict(LIMITS),
-        "endpoints": guard.endpoint_sources(),
-    }

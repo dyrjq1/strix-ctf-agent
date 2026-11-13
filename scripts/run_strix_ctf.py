@@ -23,6 +23,32 @@ import sys
 import time
 from pathlib import Path
 
+#: 进程启动时刻（monotonic）。子进程墙钟预算从这里起算，而不是从 watchdog
+#: 安装时刻——安装前的导入/工具注册耗时同样占父进程的墙钟（B-2）。
+_T0 = time.monotonic()
+
+
+def _stop_reason(exc: BaseException) -> str:
+    """Map a guard's ``BaseException`` shutdown to the harness's stop reason.
+
+    ``agent.py`` (the platform entry point) writes these reasons into
+    ``result.json``; this script runs the scan through strix's own runner
+    instead, so it has to emit the same vocabulary on stdout for the batch
+    harness to read.  The strings must stay identical to ``agent.py``.
+    """
+    from ctf_strix.enum_guard import EnumExhausted
+    from ctf_strix.progress_guard import NoProgress
+    from ctf_strix.target_absent import TargetAbsent
+
+    for cls, reason in (
+        (NoProgress, "no_progress"),
+        (EnumExhausted, "enum_exhausted"),
+        (TargetAbsent, "target_absent"),
+    ):
+        if isinstance(exc, cls):
+            return reason
+    return "unknown"
+
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__)
@@ -110,6 +136,16 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--platform", default="", help="Platform base URL, e.g. https://ctfy.tsinghua.edu.cn")
     p.add_argument("--instance", default="", help="Instance id to submit against")
+    p.add_argument(
+        "--challenge-id",
+        default="",
+        help=(
+            "Challenge id for the gated-question refresh (G1): the protocol "
+            "asks us to re-read GET /api/v1/challenges/{id} after each "
+            "correct answer so newly unlocked questions become visible "
+            "within the round."
+        ),
+    )
     p.add_argument(
         "--guard-state",
         default=None,
@@ -244,6 +280,19 @@ async def main() -> int:
     install_mount_hook()
     print("[guard] mount hook installed (exec_command/write_stdin now covered)")
 
+    # 零进展守卫必须紧跟在 mount hook 之后、negative_guard 之前装：观测签名
+    # 要在 bounded 结果上单独算，任何一个守卫追加的建议文字都会把同一份
+    # 观测变成两份不同的观测。装漏了，整窗零新观测的 run 就只能烧完轮次。
+    from ctf_strix.progress_guard import _STALL_WINDOW as PROGRESS_STALL
+    from ctf_strix.progress_guard import install as install_progress_guard
+
+    progress_guard = install_progress_guard()
+    print(
+        f"[guard] progress guard installed "
+        f"(stall>={PROGRESS_STALL} probes without a new observation, "
+        f"markers={os.environ.get('CTFY_STALL_MARKERS') or 'in-memory only'})"
+    )
+
     # G4/G5 live on the same seam, and are installed first so they see the
     # bounded (truncated) result before other guards append their advice: the
     # response signature must not drift when an unrelated hint fires.
@@ -299,7 +348,10 @@ async def main() -> int:
         from ctf_strix.autosubmit import install as install_autosubmit
 
         autosub = install_autosubmit(
-            args.platform, args.instance, os.environ.get("CTF_PLATFORM_TOKEN", "")
+            args.platform,
+            args.instance,
+            os.environ.get("CTF_PLATFORM_TOKEN", ""),
+            challenge_id=args.challenge_id,
         )
         print(f"[guard] autosubmit installed (instance {args.instance[:8]}...)")
 
@@ -311,19 +363,45 @@ async def main() -> int:
         from ctf_strix.deadline_guard import DeadlineGuard
         from ctf_strix.deadline_guard import install as install_deadline_guard
 
-        stall = float(args.soft_deadline) / 3  # 仅用于提示里给出"还剩多久"
         deadline = install_deadline_guard(
             DeadlineGuard(
                 wall=args.wall_deadline or args.soft_deadline * 2,
                 soft=args.soft_deadline,
-                stall=stall,
-                grace=20.0,
                 turns=args.turns,
             )
         )
         print(
             f"[guard] deadline guard installed (soft={args.soft_deadline:.0f}s, "
             f"wall={args.wall_deadline or args.soft_deadline * 2:.0f}s)"
+        )
+
+    # B-2/P0#6（DEF-9）：进程内硬墙钟，与 agent.main() 同一实现（同源）。
+    # 此前这条 harness 入口只有软截止注入，硬上限全靠父进程到点整组杀——
+    # 被杀的那次 run 收尾行（[stop]/[usage]/[deadline]）全部打不出来，
+    # 归因只能事后猜（45 题大测的墙钟死全走了这条路）。装两级 watchdog：
+    # 软阶段在 sink 检查点抛 WallclockExceeded 干净收场（收尾照常打印、
+    # exit 0），硬阶段 daemon 在预算+WALL_RESERVE 后 os._exit(0) 兜住
+    # 卡死在 C 调用里的主线程。预算 = 父进程墙钟 - 启动耗时 - headroom
+    # （agent 侧同一常量），保证子进程抢在父进程杀线之前收场。
+    from ctf_strix import agent as agent_mod
+
+    hard_watchdog = False
+    if args.wall_deadline > 0:
+        _since_start = time.monotonic() - _T0
+        _hard_budget = max(
+            int(args.wall_deadline)
+            - int(_since_start)
+            - int(agent_mod.DEADLINE_HEADROOM_SECONDS),
+            1,
+        )
+        hard_watchdog = agent_mod._install_hard_deadline(
+            _hard_budget, result_path=None
+        )
+        print(
+            f"[guard] hard watchdog installed (budget={_hard_budget}s, "
+            f"since_start={_since_start:.1f}s, "
+            f"headroom={agent_mod.DEADLINE_HEADROOM_SECONDS:.0f}s, "
+            f"armed={hard_watchdog})"
         )
 
     # 轮次预算守卫：与 deadline 守卫同一注入通道，但按**轮次**计数。
@@ -382,6 +460,8 @@ async def main() -> int:
     # AI 安全能力（指纹 + CVE 匹配）。走 strix 官方扩展点 register_agent_tools，
     # 不改 _BASE_TOOLS，vendor 保持原样。
     # 规则库缺失时不注册——挂一个必然报错的工具只会浪费轮次。
+    # 定义在 try 之外：import 失败时后面 if aisec_registered 不能 NameError。
+    aisec_registered = False
     try:
         from ctf_strix.aisec import aig_probe
         from ctf_strix.aisec import tools as aisec_tools
@@ -390,6 +470,7 @@ async def main() -> int:
         # overrides, otherwise the challenge's own metadata decides.  Before
         # this, the harness defaulted off and the submitted image defaulted on,
         # so the measured tool surface was not the delivered one.
+        from ctf_strix.capabilities import aisec_offline
         from ctf_strix.capabilities import wants_aisec
 
         # This script receives the challenge description as text (--instruction),
@@ -400,11 +481,27 @@ async def main() -> int:
             "tags": [t for t in (args.tags or [])],
         }
         enabled, reason = wants_aisec(args.target_kind, aisec_task)
+        offline, offline_reason = aisec_offline(args.target_kind, aisec_task)
         if enabled and aig_probe.data_dir():
             registered = aisec_tools.register()
+            aisec_registered = True
             print(f"[aisec] registered {len(registered)} tools: {', '.join(registered)} ({reason})")
-            print(f"[aisec] rules={aig_probe.data_dir()} allow={os.environ.get('CTF_AISEC_ALLOW', '(none)')}")
-        elif enabled:
+            # Same wiring as the official entrypoint: without it the allowlist
+            # is empty and every private target is refused (AI-1).
+            allowed = aisec_tools.allow_targets([args.target])
+            print(
+                f"[aisec] rules={aig_probe.data_dir()} "
+                f"allow={','.join(allowed) or '(none)'}"
+            )
+        elif offline and aig_probe.data_dir():
+            registered = aisec_tools.register_offline()
+            aisec_registered = True
+            print(
+                f"[aisec] offline registered {len(registered)} tools: "
+                f"{', '.join(registered)} ({offline_reason})"
+            )
+        elif enabled or offline:
+            reason = reason if enabled else offline_reason
             print(f"[aisec] wanted ({reason}) but rules missing, tools NOT registered")
         else:
             print(f"[aisec] off ({reason})")
@@ -413,7 +510,7 @@ async def main() -> int:
 
     # Structured HTTP + route discovery.  Shared with the official entrypoint
     # (ctf_strix.agent) so the harness and the submitted image cannot drift
-    # apart again.
+    # apart again: both gate it on args.target_kind, no unconditional install.
     from ctf_strix.capabilities import install_web_capabilities
 
     # Same gate as the official entrypoint: HTTP primitives only where there is
@@ -421,6 +518,12 @@ async def main() -> int:
     # very drift this change removes -- a run measured with four extra schemas
     # is not the run the platform will make.
     groups: list[str] = ["base"]
+    # The aisec tools registered above belong to the "aisec" catalogue group;
+    # without this the Tools section describes fewer tools than the run actually
+    # has (the same registration/prompt drift as the web primitives).  The
+    # official entrypoint gets it for free: _measured_groups reads the registry.
+    if aisec_registered:
+        groups.append("aisec")
     if args.target_kind in ("web", "checker", "engagement"):
         web_tools, web_errors = install_web_capabilities()
         groups.append("web")
@@ -466,17 +569,26 @@ async def main() -> int:
     # skillpack 插进去的路径提示兜住（指向 jail 内的 bind 挂载点）。
     try:
         from ctf_strix import skillpack
+        from ctf_strix.capabilities import live_tool_names
 
         names = skillpack.register()
         if names:
             print(f"[skills] registered {len(names)}: {', '.join(names)}")
             print(f"[skills] ref={skillpack.ref_root()}")
-            # 分流约束必须写进 user_instructions：strix 的 <available_skills>
-            # 只列名字，不会告诉模型"先 triage、再只挑一个方向"。
-            hint = skillpack.prompt_hint(names)
-            args.instruction = (hint + "\n\n" + args.instruction).strip()
         else:
             print("[skills] pack missing, routing hint NOT installed")
+        # 分流约束必须写进 user_instructions：strix 的 <available_skills>
+        # 只列名字，不会告诉模型"先 triage、再只挑一个方向"。
+        # 方法卡按 tags 选，与技能包无关；过滤用的是上面装完的工具面（AI-5），
+        # 所以这一段必须排在所有安装器之后。
+        hint = skillpack.prompt_hint(
+            names,
+            kind=args.target_kind,
+            tags=list(args.tags or []),
+            available=live_tool_names() or None,
+        )
+        if hint:
+            args.instruction = (hint + "\n\n" + args.instruction).strip()
     except Exception as e:  # noqa: BLE001 — 技能装不上也要能把题跑完
         print(f"[skills] registration failed: {type(e).__name__}: {e}")
 
@@ -512,10 +624,22 @@ async def main() -> int:
 
     from strix.core.runner import run_strix_scan
 
+    # 守卫的收场异常继承 BaseException（故意不让 except Exception 吞掉），
+    # 所以这里要显式接住并翻译成父进程能读的 stop_reason。
+    from ctf_strix.enum_guard import EnumExhausted
+    from ctf_strix.progress_guard import NoProgress
+    from ctf_strix.target_absent import TargetAbsent
+
     # strix's sink receives (agent_id, stream_event). We only care about tool
     # calls and tool outputs — that is where a CTF run either makes progress or
     # spins, and printing model token deltas would bury it.
     def sink(agent_id: str, event: object) -> None:
+        # 进程内墙钟的软阶段检查点（B-2）：SIGALRM 只在主线程执行 Python
+        # 时直接抛；主线程挂在 await 上时只剩 watchdog 的旗子，这里把旗子
+        # 翻译成异常。事件回调是主线程最频繁的检查点（agent.main 的 sink
+        # 同款接线）。
+        if hard_watchdog:
+            agent_mod._check_soft_timeout()
         item = getattr(event, "item", None)
         kind = getattr(item, "type", None)
         if kind == "tool_call_item":
@@ -631,6 +755,36 @@ async def main() -> int:
             cleanup_on_exit=True,
             event_sink=sink,
         )
+    except agent_mod.WallclockExceeded as exc:
+        # 墙钟软着陆（B-2）：到点收场不算崩溃——照常走下面的 [usage]/守卫
+        # 汇总，exit 0。机器可读行 reason=wallclock 不在父进程的重开集合
+        # （预算问题重开只是重复烧钱），也不再被记成 rc=-9 硬杀或
+        # 「error=None 的正常失败」。
+        result = None
+        print(f"\n[stopped] {type(exc).__name__}: {exc}")
+        print("[stop] reason=wallclock")
+    except (NoProgress, EnumExhausted, TargetAbsent) as exc:
+        # 这三种不是崩溃，是「有证据的收场」：整窗零新观测（NoProgress）、
+        # 同一族被硬拒后还在重试（EnumExhausted）、靶面全是同一份非应答
+        # （TargetAbsent）。它们都继承 BaseException——故意的，`except
+        # Exception` 遍布 runner 和工具包装层，被吞一次就回到了这些守卫
+        # 要打断的那条重试循环。所以这里必须显式接住。
+        #
+        # 接住之后只做一件事：给父进程一条机器可读的收场行，然后照常走完
+        # 下面的 [usage] / 守卫汇总，退出码 0。要不要用剩下的样本重开、
+        # 换哪种策略，是外层 harness（batch_eval --max-samples）的决定。
+        result = None
+        reason = _stop_reason(exc)
+        print(f"\n[stopped] {type(exc).__name__}: {exc}")
+        extra = ""
+        if isinstance(exc, NoProgress):
+            # 停滞事实带出去：上一轮死在哪（host / path family / 机制类）是
+            # 下一轮换策略唯一的输入。签名只是观测指纹，不含响应正文。
+            extra = (
+                f" host={exc.host or '-'} family={exc.family or '-'}"
+                f" mechanism={exc.mechanism or '-'} signature={exc.signature or '-'}"
+            )
+        print(f"[stop] reason={reason}{extra}")
     except Exception as exc:  # noqa: BLE001 — a turn cap is a normal outcome here
         result = None
         print(f"\n[stopped] {type(exc).__name__}: {exc}")
@@ -639,6 +793,25 @@ async def main() -> int:
         # 机器可读行，传输层崩溃（断流/网关重置）才能进结果表的 error 字段，
         # 否则表现成 error=None 的"正常失败"，非能力损失被计成能力损失。
         print(f"[run-error] {type(exc).__module__}.{type(exc).__name__}: {exc}")
+    # 守卫置位不会自己抛异常：``ProgressGuard.install()`` 只写标记、置
+    # ``tripped``，run 照常返回。``agent.py`` 在轮次边界查 ``tripped`` 并
+    # ``raise NoProgress``；本脚本走的是 strix 自己的 runner，没有那一段，
+    # 所以这里补同一条收场。漏了它，"深挖耗尽结束 run"在 batch 路径上就只剩
+    # 一个标记文件，run 继续烧轮次——正是这条机制要打断的形态。
+    if result is not None and progress_guard.tripped:
+        host, family, mechanism, signature = progress_guard.last_probe
+        print(f"\n[stopped] NoProgress: {progress_guard.trip_detail()}")
+        # 行格式与异常分支完全一致，父进程只认 ``[stop] reason=`` 一条正则。
+        print(
+            f"[stop] reason=no_progress host={host or '-'} family={family or '-'}"
+            f" mechanism={mechanism or '-'} signature={signature or '-'}"
+        )
+        result = None
+    if hard_watchdog:
+        # 收尾汇总阶段解除自家 watchdog（agent.main 同款顺序：先解除再
+        # 清理），避免 alarm 打断 [usage]/守卫汇总的打印；父进程的墙钟
+        # 仍然兜底这一段的极端挂死。
+        agent_mod._cancel_hard_deadline()
     elapsed = time.time() - started
 
     print(f"\n[done] {elapsed:.1f}s  result={type(result).__name__ if result else None}")
@@ -674,9 +847,12 @@ async def main() -> int:
 
     if deadline is not None:
         snap = deadline.snapshot()
+        # B-5 日志卫生：run.log 会被 harness 归档、复盘时整份共享，答案
+        # 明文不进这一行；父进程（eval_sample）只消费 soft_injected=。
         print(
             f"[deadline] elapsed={snap['elapsed']}s tools={snap['tool_calls']} "
-            f"soft_injected={snap['soft_hit']} answer={snap['answer']}"
+            f"soft_injected={snap['soft_hit']} "
+            f"answer_seen_at={snap['answer_at_s']}s"
         )
 
     # strix writes its run artefacts under ~/.strix/runs/<scan_id>. Dump whatever
@@ -697,4 +873,16 @@ async def main() -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(asyncio.run(main()))
+    # 最后一道网（B-2）：SIGALRM 打在挂起的协程上时，WallclockExceeded
+    # 从 asyncio.run 逃逸，main 里的 except 接不住（Windows 无此路径，
+    # VM/Linux 是常态）。同样翻译成机器可读的 wallclock 收场 + exit 0，
+    # 与 deadline.HARD_EXIT_CODE 的 CTFY-0001 契约一致。
+    from ctf_strix.agent import WallclockExceeded as _WallclockExceeded
+
+    try:
+        _exit_code = asyncio.run(main())
+    except _WallclockExceeded as exc:
+        print(f"\n[stopped] {type(exc).__name__}: {exc}", flush=True)
+        print("[stop] reason=wallclock", flush=True)
+        _exit_code = 0
+    sys.exit(_exit_code)

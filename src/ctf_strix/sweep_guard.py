@@ -49,6 +49,8 @@ for a,b in itertools.product(words,words):          # 40x40 笛卡尔积
 
 from __future__ import annotations
 
+from ctf_strix.tool_notes import append_note
+
 import re
 from typing import TYPE_CHECKING, Any
 
@@ -93,6 +95,8 @@ _COMBINE_RE = re.compile(
     r"|\[[^\]\n]{0,120}?\bfor\s+\w+\s+in\s+\w+"                  # 列表推导
     r"|\{[^}\n]{0,120}?\bfor\s+\w+\s+in\s+\w+"                   # 集合/字典推导
     r"|\brange\s*\("                                              # 计数循环
+    r"|\bseq\s"                                                   # shell 计数序列
+    r"|\{\s*-?\d+\s*\.\.\s*-?\d+"                                 # shell 花括号范围
 )
 
 #: 批量发送：把枚举结果一次性推到目标。只有组合没有发送不算扫描。
@@ -104,8 +108,10 @@ _SEND_RE = re.compile(
     r"|requests\.(?:post|get|put|patch|head|options)\("
     r"|urllib\.request|http\.client|socket\.socket"
     r"|ThreadPoolExecutor|ProcessPoolExecutor|\.map\s*\("
-    r"|curl\s"
-    r"|/api/|/playground|@@INCLUDE:",
+    r"|curl\s|wget\s"
+    r"|/api/|/playground|@@INCLUDE:"
+    # 目录/参数爆破工具：工具名本身就是"我在把词表往目标上推"的声明。
+    r"|\b(?:ffuf|gobuster|feroxbuster|wfuzz|dirb|dirsearch|nuclei)\b",
 )
 
 #: 列表/集合/字典推导式。单独拎出来是为了**计数**——推导式个数决定
@@ -116,9 +122,42 @@ _COMP_RE = re.compile(r"\[[^\]\n]{0,120}?\bfor\s+\w+\s+in\s+\w+|\{[^}\n]{0,120}?
 #: 050 的真实形态（6 个种子词做笛卡尔积）只有 6 个字面量，但它是 36 次请求。
 _PRODUCT_SAME_RE = re.compile(r"product\(\s*(\w+)\s*,\s*\1\s*\)")
 
-#: 计数循环的规模：``range(500)`` / ``for i in range(1, 500)``。
+#: 计数循环的规模：``range(500)`` / ``for i in range(1, 500)`` / ``range(0, 5000, 2)``。
 #: 只取上界，不解析变量——估的是量级，不是精确值。
-_RANGE_RE = re.compile(r"range\(\s*\d*\s*,?\s*(\d{2,7})\s*\)")
+#:
+#: 2026-11-13 修：旧写法是 ``range\(\s*\d*\s*,?\s*(\d{2,7})\s*\)``，捕获组前面那个
+#: 贪婪 ``\d*`` 会把数字**先抢光**再回溯，导致 ``range(3000)`` 分出 ``"00"``
+#: （`int("00") == 0`）、``range(5000)`` 分出 ``"00"``——四位数以上的计数循环
+#: 规模恒为 0，``_generated_sweep`` 因此恒定返回 None。实测证据：
+#: ``_RANGE_RE.findall('for i in range(3000): ...')`` → ``['00']``。
+#: 这是本模块第三次"守卫装了等于没装"（前两次：``\"api\"`` 未反转义、install 未接线），
+#: 所以正则的每一段都必须是可被单测钉住的确定性行为。
+#:
+#: 新写法把起始值做成**可选的非捕获前缀**、上界独占捕获组，再吃掉可选的第三个参数。
+#: ``range(3)`` 仍得 3（< SWEEP_WARN，不误报）；``range(n)`` 无字面量，不匹配。
+_RANGE_RE = re.compile(r"range\(\s*(?:\d+\s*,\s*)?(\d{1,7})(?:\s*,\s*[-+]?\d+)?\s*\)")
+
+#: shell 花括号范围：``{1..2000}``、``{0..999..2}``。计数精确，不是估计。
+_BRACE_RE = re.compile(r"\{\s*(-?\d+)\s*\.\.\s*(-?\d+)")
+
+#: ``seq 2000`` / ``seq 1 2000`` / ``seq -w 1 2000``。单参数时上界即规模。
+_SEQ_RE = re.compile(r"\bseq\s+(?:-[A-Za-z-]+\s+)*(\d+)(?:\s+(\d+))?")
+
+#: 词表驱动的批量发送：候选**不在参数里**，而在一个文件/一个工具的内置词表里。
+#: 这类调用的规模无法从参数文本推出——不能编数字，只能提示"这是对未确认名字
+#: 空间的爆破"。必须与 ``_SEND_RE`` 同时命中才算（否则 ``xargs``/``while read``
+#: 这类通用管道会把正常的文件处理也标红）。
+#:
+#: 刻意**不**收 ``-w``：``curl -w '%{http_code}'`` 是最常见的状态码写法，
+#: 收了会把每一次带状态码的探测都误判成爆破。
+_FILE_SWEEP_RE = re.compile(
+    r"\bxargs\b"
+    r"|\bwhile\b[^\n]{0,80}\bread\b"
+    r"|\bfor\s+\w+\s+in\s+open\("                                  # for p in open('list')
+    r"|\.readlines\(\)"
+    r"|\b(?:ffuf|gobuster|feroxbuster|wfuzz|dirb|dirsearch|nuclei)\b"
+    r"|\bFUZZ\b"
+)
 
 #: JSON 参数里的转义。`on_invoke_tool` 拿到的是**序列化后**的字符串：
 #: 真实参数 `{"cmd": "a=[\"api\"]"}` 到手时字面量是 `a=[\"api\"]`。
@@ -203,7 +242,8 @@ def _generated_sweep(args: str) -> tuple[str, int] | None:
     #   1. 不同字面量个数（字典规模本身）；
     #   2. `itertools.product(x, x)` 同变量 → 平方（050 的 6 个词是 36 次）；
     #   3. 推导式个数 → 种子 × (推导式数 + 1)（050 的 `[/{x}] + [/api/{x}]` 是 2 遍）；
-    #   4. `range(N)` 的上界。
+    #   4. `range(N)` 的上界；
+    #   5. shell 花括号范围 `{1..2000}` / `seq 1 2000` 的**精确**项数。
     seeds = {m.group(1) for m in _STR_LITERAL_RE.finditer(args)}
     scale = len(seeds)
 
@@ -220,9 +260,44 @@ def _generated_sweep(args: str) -> tuple[str, int] | None:
         except (TypeError, ValueError):
             continue
 
+    # shell 计数循环：`for i in {1..2000}` / `for i in $(seq 1 2000)`。
+    # 这两者没有"种子"，规模完全由区间长度决定，必须单独算。
+    for m in _BRACE_RE.finditer(args):
+        try:
+            lo, hi = int(m.group(1)), int(m.group(2))
+        except (TypeError, ValueError):
+            continue
+        scale = max(scale, abs(hi - lo) + 1)
+
+    for m in _SEQ_RE.finditer(args):
+        try:
+            first = int(m.group(1))
+            last = int(m.group(2)) if m.group(2) else None
+        except (TypeError, ValueError):
+            continue
+        scale = max(scale, abs(last - first) + 1 if last is not None else first)
+
     if scale < SWEEP_WARN:
         return None
     return "generated", scale
+
+
+def _file_sweep(args: str) -> tuple[str, int] | None:
+    """词表驱动的批量发送：候选在文件里，规模从参数文本推不出来。
+
+    与 `_generated_sweep` 的分工：那边能算出确切量级（`range(3000)` 就是 3000），
+    这边算不出来。**算不出来不等于不是扫描**——`ffuf -w list.txt -u .../FUZZ`
+    的整个存在意义就是把词表刷一遍，`cat list | xargs curl` 同理。
+
+    返回的 count 固定为 `SWEEP_WARN`（"至少是一个需要停下来的量"），
+    提示文案里**不出现任何具体数字**，只问"你手上有没有真实标识符"——
+    编造一个"2000"会让模型以为守卫看得到它看不到的东西。
+    """
+    if not _SEND_RE.search(args):
+        return None
+    if not _FILE_SWEEP_RE.search(args):
+        return None
+    return "wordlist-run", SWEEP_WARN
 
 
 def sweep_summary(args: str) -> tuple[str, int] | None:
@@ -244,6 +319,9 @@ def sweep_summary(args: str) -> tuple[str, int] | None:
         return None
 
     best: tuple[str, int] | None = _generated_sweep(args)
+    if best is None:
+        # 只有算不出确切量级时才退到"词表驱动"这一族：确切数字比族名有信息量。
+        best = _file_sweep(args)
 
     includes = {m.group(1) for m in _INCLUDE_RE.finditer(args)}
     if includes and (best is None or len(includes) > best[1]):
@@ -285,6 +363,22 @@ def hint_for(family: str, count: int) -> str | None:
             "  3. If the content is still not the answer, change mechanism: the "
             "scheduled/background path, auth boundary, or the data the app "
             "discloses about itself."
+        )
+
+    if family == "wordlist-run":
+        # 刻意不给数字：候选数量在文件里，守卫看不到。说"你扫了一个词表"
+        # 是真话，说"你扫了 2000 个"是编的。
+        return (
+            "\n\n[SWEEP GUARD] This tool call drives a WORD LIST: the candidates "
+            "live in a file (or in the tool's own built-in list), not in the "
+            "arguments, so one call here already fires the whole list at the "
+            "target. That is a brute force over a name space you have not "
+            "confirmed exists.\n"
+            "Before the next call, answer: do I already have a list of REAL "
+            "identifiers from this run's responses? If yes, read their contents "
+            "instead of widening the word list. If no, listing names is the "
+            "wrong mechanism — start from what the app itself disclosed, or "
+            "switch mechanism entirely."
         )
 
     hard = count >= SWEEP_HARD
@@ -408,7 +502,7 @@ def install() -> SweepGuard:
             hint = guard.check(tool.name, raw_input)
             result = await inner(ctx, raw_input)
             if hint:
-                return f"{result}{hint}"
+                return append_note(result, hint)
             return result
 
         tool.on_invoke_tool = invoke

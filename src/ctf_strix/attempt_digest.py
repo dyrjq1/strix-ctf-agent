@@ -17,8 +17,12 @@ from dataclasses import dataclass
 from typing import Iterable, Sequence
 from urllib.parse import urlsplit
 
+from ctf_strix.flag_extract import CANDIDATE_RE
 
-_FLAG_RE = re.compile(r"(?:FLAG|flag|CTF|ctf|CTFY|ctfy)\{[^}\s]{2,}\}")
+#: 取「提交层认的答案形态」（体是宽集 ``[^}\s]{2,}``）。这里唯一的用途是
+#: "日志里出现过 flag 形状就抹掉"，判宽一点更安全：漏抹等于把上一轮的答案
+#: 留在重试摘要里，那正是本模块要防的泄漏。前缀同样来自唯一真值，不再手抄。
+_FLAG_RE = CANDIDATE_RE
 _SECRET_RE = re.compile(
     r"(?i)\b(token|api[_-]?key|secret|password|passwd|session|authorization)"
     r"(\s*[=:]\s*)(?:bearer\s+)?[A-Za-z0-9._\-+/=]{6,}"

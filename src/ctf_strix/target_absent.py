@@ -20,8 +20,10 @@ response instead of on the request shape:
 * "uninformative" means any non-2xx/3xx answer whose body carries no
   application marker -- every such response counts, not only the
   404/410/502/503/504 "dead" set, which bypasses the marker check entirely;
-* one 2xx/3xx **or an application-marker body** from the host disarms the guard
-  permanently -- a live target is never "absent"; and
+* one 2xx/3xx, **an application-marker body**, or an **auth wall** (a 401/403
+  answer, or an auth-shaped body when the tool hid the status line) from the
+  host disarms the guard permanently -- a live target is never "absent"; the
+  auth wall itself is ``journey_guard``'s business, not this guard's; and
 * an answer already recorded also disarms it: the run has something to submit,
   so ending early would trade a score for wall clock.
 
@@ -49,7 +51,8 @@ import re
 from typing import TYPE_CHECKING, Any, Final
 from urllib.parse import urlsplit
 
-from ctf_strix.probe_surface import is_probe_tool
+from ctf_strix.nonweb import tcp_connect_state
+from ctf_strix.probe_surface import NETWORK_TOOLS, is_probe_tool
 
 if TYPE_CHECKING:
     from agents import FunctionTool
@@ -61,6 +64,29 @@ _MARK: Final = "_ctf_target_guarded"
 
 #: How many distinct paths must repeat one identical uninformative body.
 TARGET_ABSENT_PATHS: Final[int] = 6
+
+#: How many failed *connections* to one ``host:port`` before ``tcp`` /
+#: ``tcp_batch`` stop running for that origin.  A failed dial costs up to
+#: 10s of wall clock (``nonweb.tcp`` caps it at ``min(10.0, window + 7.0)``),
+#: so a black-holed service that is retried is the single most expensive way
+#: to waste a run.  Three tries separates "wrong port / transient blip" from
+#: "nothing is listening" without being trigger-happy.
+#:
+#: Cost model (updated for §4.144/§4.145, CROSS-CHECK 1): this counter sees
+#: *dials* through the first-line classifier, and a dead try never reaches
+#: the TLS probe -- the probe only runs after a plain round connected and
+#: stayed silent, and a TLS-side failure still classifies as ``live``, so
+#: the threshold cannot misfire on the extra connection.  What changed is
+#: the run-level bill, not the per-try one: a silent-but-live target costs
+#: the read window **plus** one 4s-capped auto-TLS probe connection that
+#: this counter never sees.  "3 tries" still means 3 dials' worth of
+#: dead budget; it no longer bounds the total tcp wall clock.
+TCP_DEAD_CONNECTS: Final[int] = 3
+
+#: How many DNS failures on one host before the whole run stops.  A name that
+#: does not resolve is host-level: no port on it can answer, so this is the
+#: only tcp outcome strong enough to end the round (see :meth:`stop_detail`).
+TCP_DNS_STOPS: Final[int] = 3
 
 #: Statuses that mean "this host does not serve this resource".  A 404 from
 #: an application is still uninformative for *path discovery*, which is all
@@ -92,6 +118,29 @@ _FRAMEWORK_MARKERS: Final[tuple[str, ...]] = (
 #: an answer from a real service.
 _ERROR_KEYS: Final[frozenset[str]] = frozenset(
     {"error", "errors", "detail", "message", "status", "statuscode", "code"}
+)
+
+#: Statuses that mean "the application is up and wants credentials".  A 401 or
+#: 403 is an auth wall, not an absent host: the routing layer answered.  They
+#: are deliberately *not* in ``_DEAD_STATUSES``, and before the auth branch
+#: existed they fell through to the marker check -- where
+#: ``{"error":"unauthorized"}``, a JSON object whose only key is in
+#: ``_ERROR_KEYS``, has no marker and counted as "uninformative".  Six paths
+#: behind one login wall were then enough to declare a live target absent and
+#: refuse every later call to it (report WEB-3).
+_AUTH_STATUSES: Final[frozenset[int]] = frozenset({401, 403})
+
+#: The same signal when the tool hides the status line (plain ``curl -s``
+#: prints only the body), so the body has to carry the verdict.  Kept narrow on
+#: purpose: only phrases that say "authenticate first".  Generic failures
+#: (``not found``, ``internal error``) must still count as uninformative.
+_AUTH_BODY_RE: Final = re.compile(
+    r"\b(?:unauthori[sz]ed|forbidden|not authenticated|authentication required"
+    r"|login required|please (?:log|sign) ?in|access denied"
+    r"|invalid credentials"
+    r"|(?:invalid|missing|expired) (?:api[ _-]?)?(?:key|token|credentials)"
+    r"|token (?:expired|required))\b",
+    re.IGNORECASE,
 )
 
 #: Same URL shape the other guards use; stops at shell/JSON punctuation.
@@ -146,6 +195,62 @@ def _origin_and_path(args: str) -> tuple[str, str] | None:
     if not parts.scheme or not parts.netloc:
         return None
     return f"{parts.scheme}://{parts.netloc}".lower(), parts.path or "/"
+
+
+#: Fallbacks for the tcp tools' arguments when the blob is not clean JSON.
+#: Argument blobs are model-written, and a truncated blob is common enough
+#: that a strict ``json.loads``-or-nothing would silently drop the guard.
+_TCP_HOST_RE: Final = re.compile(r'"host"\s*:\s*"([^"]*)"')
+_TCP_PORT_RE: Final = re.compile(r'"port"\s*:\s*(\d{1,5})')
+
+
+def _tcp_origin(args: str) -> str | None:
+    """Return ``host:port`` for a ``tcp`` / ``tcp_batch`` argument blob.
+
+    Unlike an http URL, a raw socket target has no path and no scheme: the
+    unit is exactly ``(host, port)``, and that pair is what the verdict is
+    scoped to.  ``127.0.0.1:1337`` and ``127.0.0.1:1338`` are different
+    targets, and one being closed says nothing about the other.
+
+    Args:
+        args: the raw tool-argument blob.
+
+    Returns:
+        A lowercase ``host:port`` key (IPv6 bracketed), or ``None`` when the
+        blob does not name both a host and an in-range port.
+    """
+    if not args:
+        return None
+    host = ""
+    port: int | None = None
+    try:
+        data = json.loads(args)
+    except (TypeError, ValueError):
+        data = None
+    if isinstance(data, dict):
+        raw_host = data.get("host")
+        if isinstance(raw_host, str):
+            host = raw_host.strip()
+        raw_port = data.get("port")
+        if isinstance(raw_port, int) and not isinstance(raw_port, bool):
+            port = raw_port
+        elif isinstance(raw_port, str) and raw_port.strip().isdigit():
+            port = int(raw_port.strip())
+    if not host:
+        match = _TCP_HOST_RE.search(args)
+        if match is not None:
+            host = match.group(1).strip()
+    if port is None:
+        match = _TCP_PORT_RE.search(args)
+        if match is not None:
+            port = int(match.group(1))
+    if not host or port is None or not 0 < port < 65536:
+        return None
+    key = host.lower()
+    if ":" in key and not key.startswith("["):
+        # Bare IPv6 literal: bracket it so ``host:port`` stays unambiguous.
+        key = f"[{key}]"
+    return f"{key}:{port}"
 
 
 def _status_of(text: str) -> int | None:
@@ -245,6 +350,29 @@ def _has_app_marker(body: str) -> bool:
     return False
 
 
+def _is_auth_wall(status: int | None, body: str) -> bool:
+    """True when the answer says "authenticate first", not "nothing here".
+
+    An auth wall is a *live* application: the routing layer answered and asked
+    for credentials.  Counting it as an uninformative response lets six paths
+    behind one login wall declare a working target absent (report WEB-3).
+
+    Args:
+        status: the HTTP status when the tool printed one, else ``None``.
+        body: the response body as printed.
+
+    Returns:
+        True for a 401/403, or for an auth-shaped body when the status line is
+        hidden (plain ``curl -s``).  A status that is present but is not an
+        auth status decides on its own -- the body is not consulted.
+    """
+    if status in _AUTH_STATUSES:
+        return True
+    if status is not None:
+        return False
+    return _AUTH_BODY_RE.search(body) is not None
+
+
 def _body_hash(body: str) -> str:
     """Hash the body exactly; identical bodies are the whole point."""
     return hashlib.sha1(body.encode("utf-8", "replace")).hexdigest()
@@ -282,6 +410,15 @@ class TargetAbsentGuard:
         self._paths: dict[str, dict[str, set[str]]] = {}
         #: Origins that answered 2xx/3xx at least once.  Never fire there.
         self._alive: set[str] = set()
+        #: ``host:port`` -> failure kind -> count (see ``nonweb.tcp_connect_state``).
+        self._tcp_fail: dict[str, dict[str, int]] = {}
+        #: Origins whose tcp tools are now refused outright.
+        self._tcp_dead: set[str] = set()
+        #: Subset of ``_tcp_dead`` whose verdict is host-level (DNS), so its
+        #: message may say "report as absent" rather than "try another port".
+        self._tcp_final: set[str] = set()
+        #: The ``TargetAbsent`` reason when the trip came from tcp, else "".
+        self._tcp_stop_note: str = ""
         self._answer_recorded: bool = False
         self.tripped_origin: str | None = None
         self.observations: int = 0
@@ -316,6 +453,29 @@ class TargetAbsentGuard:
         self.blocked_calls += 1
         return self._blocked_error()
 
+    def tcp_refusal(self, tool_name: str, args: str) -> str | None:
+        """Return the hard error when this tcp call targets a dead ``host:port``.
+
+        Separate from :meth:`refusal` because the key is ``host:port`` parsed
+        out of tool arguments, not a URL scraped from a probe payload -- the
+        two share no code path, and folding them together is how the http
+        rule "six paths, one body" would end up applied to sockets.
+
+        Args:
+            tool_name: registered tool name.
+            args: the raw tool-argument blob.
+
+        Returns:
+            The short error text, or ``None`` when the call may run.
+        """
+        if tool_name not in NETWORK_TOOLS:
+            return None
+        origin = _tcp_origin(args)
+        if origin is None or origin not in self._tcp_dead:
+            return None
+        self.blocked_calls += 1
+        return self._tcp_blocked_error(origin)
+
     def finish(self, tool_name: str, args: str, result: Any) -> str | None:
         """Classify one probe result.
 
@@ -328,6 +488,8 @@ class TargetAbsentGuard:
             The hard error on the call that crosses the threshold, else
             ``None``.
         """
+        if tool_name in NETWORK_TOOLS:
+            return self._tcp_finish(tool_name, args, result)
         if self.tripped or self._answer_recorded or not is_probe_tool(tool_name):
             return None
         where = _origin_and_path(args)
@@ -362,6 +524,16 @@ class TargetAbsentGuard:
         body = _body_of(text)
         if status is None and not body:
             return None
+        if _is_auth_wall(status, body):
+            # An auth wall is a live application.  Latch it like a 2xx: an
+            # application asking for credentials is never "absent", and a
+            # later run of identical 404s from the same host must not
+            # resurrect the verdict.  Stopping the *probing* behind that wall
+            # is journey_guard's job (`_WARN_AFTER` / `_HARD_AFTER` payloads),
+            # not this guard's -- the two signals were being conflated.
+            self._alive.add(origin)
+            self._paths.pop(origin, None)
+            return None
         if status not in _DEAD_STATUSES and _has_app_marker(body):
             # A marker body means a real application answered.  When the tool
             # hides the status line (plain ``curl -s`` -- the ``exec_command``
@@ -379,12 +551,101 @@ class TargetAbsentGuard:
             return self._blocked_error()
         return None
 
+    def _tcp_finish(self, tool_name: str, args: str, result: Any) -> str | None:
+        """Classify one ``tcp`` / ``tcp_batch`` result.
+
+        The http rule in :meth:`finish` needs six distinct *paths*.  Sockets
+        have no paths, so the repeatable unit is the connection attempt itself:
+        the counter lives on ``host:port`` and is keyed by what the attempt did
+        (``nonweb.tcp_connect_state``), because a timeout and a refused port are
+        different evidence even though both mean "no service there right now".
+
+        Two outcomes carry different weight and get different verdicts:
+
+        - **DNS failure** is host-level.  Nothing on that name can answer, so
+          three of them end the round via ``tripped_origin`` -- the same hook
+          ``agent.py`` already watches for the http verdict.
+        - **Refused / timed out / unreachable** is port-level.  The box may be
+          up with the real service on another port, so the origin is refused
+          and the round keeps running.  Calling that "target absent" would be
+          the same kind of lie this guard exists to remove.
+
+        Args:
+            tool_name: registered tool name (already known to be a network tool).
+            args: the raw tool-argument blob.
+            result: whatever the tool returned.
+
+        Returns:
+            The hard error on the call that crosses a threshold, else ``None``.
+        """
+        if self.tripped or self._answer_recorded:
+            return None
+        text = result if isinstance(result, str) else str(result)
+        origin = _tcp_origin(args)
+        if origin is None:
+            return None
+        state = tcp_connect_state(text)
+        if state is None:
+            # Argument errors ("host is empty", "invalid port", "payloads is
+            # empty") never reached the network.  Counting them would let a
+            # malformed call kill a host that was never dialled.
+            return None
+        self.observations += 1
+        if state == "live":
+            # A completed handshake clears the origin outright -- including the
+            # TLS/send failures the classifier calls live, since those only
+            # happen on a socket that did connect.
+            self._tcp_fail.pop(origin, None)
+            self._tcp_dead.discard(origin)
+            self._tcp_final.discard(origin)
+            return None
+
+        counts = self._tcp_fail.setdefault(origin, {})
+        counts[state] = counts.get(state, 0) + 1
+        attempts = sum(counts.values())
+        if state == "dns" and counts["dns"] >= TCP_DNS_STOPS:
+            self._tcp_dead.add(origin)
+            self._tcp_final.add(origin)
+            self.tripped_origin = origin
+            self._tcp_stop_note = (
+                f"target absent: {origin[:60]} did not resolve as a hostname on "
+                f"{counts['dns']} tcp attempts -- a DNS failure is host-level, "
+                "so no port on it can answer"
+            )
+            return self._tcp_blocked_error(origin)
+        if attempts >= TCP_DEAD_CONNECTS:
+            self._tcp_dead.add(origin)
+            return self._tcp_blocked_error(origin)
+        return None
+
     def stop_detail(self) -> str:
         """One-line reason for the ``TargetAbsent`` exception."""
+        if self._tcp_stop_note:
+            # The http wording below -- "the same uninformative response on N
+            # distinct paths" -- is false for a socket: there were no paths and
+            # no response.  A stop reason that misdescribes its own evidence is
+            # what this guard is supposed to prevent, not produce.
+            return self._tcp_stop_note
         origin = self.tripped_origin or "target"
         return (
             f"target absent: {origin} answered the same uninformative response "
             f"on {self.threshold}+ distinct paths with no 2xx/3xx"
+        )
+
+    def _tcp_blocked_error(self, origin: str) -> str:
+        """Build the short hard-reject message for a dead ``host:port``."""
+        short = origin[:60]
+        if origin in self._tcp_final:
+            return (
+                f"ERROR: [TCP UNREACHABLE] {short} did not resolve as a hostname "
+                f"on {TCP_DNS_STOPS} attempts. DNS is host-level: no port on this "
+                "host can answer. Stop probing it and report the target as absent."
+            )
+        return (
+            f"ERROR: [TCP UNREACHABLE] {short} never accepted a connection on "
+            f"{TCP_DEAD_CONNECTS} attempts. Stop probing this host:port. If the "
+            "task names a different port, use that one; otherwise report this "
+            "service as down."
         )
 
     def _blocked_error(self) -> str:
@@ -422,6 +683,8 @@ def install() -> TargetAbsentGuard:
 
         async def invoke(ctx: Any, raw_input: str) -> Any:
             refusal = guard.refusal(raw_input)
+            if refusal is None:
+                refusal = guard.tcp_refusal(tool.name, raw_input)
             if refusal is not None:
                 # Hard block: the tool never runs again for this origin.
                 return refusal

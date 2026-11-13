@@ -17,7 +17,9 @@
 * 本地 ``ls`` / 读文件不是探针，不能计入（否则守卫天天响，模型学会忽略）；
 * 没有机制标记的普通 GET 不配一个类别——猜出来的类别比缺失更糟；
 * 硬停（完全相同的响应）优先于类别提示：盲注可以合法地重复同一机制，
-  但不能合法地重复同一个响应。
+  但不能合法地重复同一个响应；
+* 广度扫描（一个目录一个新名字）也算同一个"信息收集"假设，但**已知路径的重试
+  不算**——盲注是"一个端点、几百个 payload"，它必须继续被允许。
 """
 
 from __future__ import annotations
@@ -173,3 +175,87 @@ def test_guard_does_not_fire_below_the_shared_threshold():
 
 def test_threshold_is_not_a_new_budget():
     assert eg._CLASS_STREAK_AFTER == eg._STALL_AFTER
+
+
+# ---- 广度扫描：每个名字各成一族时，旧规则全都看不见 ----------------------
+#
+# ``_path_family`` 按**目录**切族，所以一次跨目录扫描（``/api/zone-a/index``、
+# ``/api/zone-b/index``……）每个名字各成一族、各只有一片叶子：族内叶数门槛永远
+# 凑不满，指纹与响应每次都新，``counts`` / ``stall`` / ``class_streak`` 三套计数
+# 全部清零。RT-3 指的就是这条：所有停止判据都挂在"同一响应"或"同一族"上，
+# 广度扫描两者都不产生。修法是运行级路径集合：连续两条**本 run 没请求过**、
+# 且不带机制语法的路径，同样记入信息收集类，让类别连击开始累加。
+
+_BREADTH_WORDS = ("alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel")
+
+
+def _scan(guard, words, tail="index", status="404"):
+    hints = []
+    for word in words:
+        args = _probe(f"https://x.test/api/zone-{word}/{tail}")
+        hint = guard.finish(guard.begin("http_probe", args), f"[HTTP {status}] no route {word}")
+        if hint:
+            hints.append(hint)
+    return hints
+
+
+def test_cross_directory_scan_fires_the_mechanism_guard():
+    guard = eg.EnumerationGuard()
+    hints = _scan(guard, _BREADTH_WORDS)
+    assert guard.new_path_streak == len(_BREADTH_WORDS)
+    assert any("[MECHANISM GUARD]" in h for h in hints), hints
+    assert any("information-collection" in h for h in hints), hints
+
+
+def test_one_unseen_path_is_navigation_not_a_class():
+    """一条新路径是"导航"的常态写法，不能一上来就给类别。"""
+    guard = eg.EnumerationGuard()
+    guard.finish(guard.begin("http_probe", _probe("https://x.test/api/zone-only/index")), "[HTTP 200] ok")
+    assert guard.new_path_streak == 1
+    assert guard.class_streak == 0
+    assert not guard.mechanisms
+
+
+def test_revisiting_a_known_path_resets_the_breadth_streak():
+    guard = eg.EnumerationGuard()
+    _scan(guard, _BREADTH_WORDS[:2])
+    assert guard.new_path_streak == 2
+    guard.finish(guard.begin("http_probe", _probe("https://x.test/api/zone-alpha/index")), "[HTTP 404] again")
+    assert guard.new_path_streak == 0
+
+
+def test_single_endpoint_payload_sweep_never_reaches_the_breadth_rule():
+    """盲注的形态：同一个端点、几十个 payload。路径没换，广度规则不许计入。
+
+    ``_request_path`` 去掉 query，所以 40 次请求是**同一条** ``/api/search``：
+    第一次记 1，第二次起都是已知路径，连击回到 0。峰值必须是 1，否则第 3 条
+    payload 就会把整轮盲注标成"信息收集"。
+    """
+    guard = eg.EnumerationGuard()
+    peak = 0
+    hints = []
+    for i in range(40):
+        args = _probe(f"https://x.test/api/search?q={i}")
+        hint = guard.finish(guard.begin("http_probe", args), f"[HTTP 200] row {i}")
+        peak = max(peak, guard.new_path_streak)
+        if hint:
+            hints.append(hint)
+    assert peak == 1
+    assert guard.new_path_streak == 0
+    assert not any("[MECHANISM GUARD]" in h for h in hints), hints
+    assert not guard.blocked
+
+
+def test_the_same_path_on_another_host_is_a_new_path():
+    guard = eg.EnumerationGuard()
+    guard.finish(guard.begin("http_probe", _probe("https://x.test/api/zone-alpha/index")), "[HTTP 404] x")
+    guard.finish(guard.begin("http_probe", _probe("https://y.test/api/zone-alpha/index")), "[HTTP 404] y")
+    assert guard.new_path_streak == 2
+
+
+def test_recording_an_answer_clears_the_run_path_set():
+    guard = eg.EnumerationGuard()
+    _scan(guard, _BREADTH_WORDS[:3])
+    guard.note_answer()
+    guard.finish(guard.begin("http_probe", _probe("https://x.test/api/zone-alpha/index")), "[HTTP 404] x")
+    assert guard.new_path_streak == 1

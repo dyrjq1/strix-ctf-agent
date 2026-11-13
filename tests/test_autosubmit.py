@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import json
+import re
 from typing import Any
 
 import pytest
@@ -20,15 +21,31 @@ from ctf_strix.autosubmit import AutoSubmitter
 from ctf_strix.flag_extract import FLAG_RE, is_placeholder
 
 
-def _mk(questions: list[dict[str, Any]]) -> tuple[AutoSubmitter, list[dict[str, Any]]]:
+def _mk(
+    questions: list[dict[str, Any]], *, run_mode: str = "instance"
+) -> tuple[AutoSubmitter, list[dict[str, Any]]]:
     """造一个 submitter，``_questions`` 返回给定列表，``_post`` 记录所有请求。"""
-    sub = AutoSubmitter("https://example.invalid", "inst-1", "tok")
+    sub = AutoSubmitter(
+        "https://example.invalid",
+        "inst-1" if run_mode == "instance" else "",
+        "tok",
+        run_mode=run_mode,
+        challenge_id="chal-1",
+        competition_id="comp-1",
+    )
     sent: list[dict[str, Any]] = []
 
     sub._questions = lambda: questions  # type: ignore[method-assign]
 
+    check_ok: set[str] = set()
+    sub.check_ok = check_ok  # type: ignore[attr-defined]
+
     def fake_post(path: str, body: dict[str, Any]) -> dict[str, Any]:
         sent.append(body)
+        if path.endswith("/check"):
+            # /check 契约与 /submissions 不同：passed + timed_out + question_id。
+            qid = str(body.get("question_id") or "")
+            return {"passed": qid in check_ok, "timed_out": False, "question_id": qid}
         # 只有交 "right" 才算对，其余判错
         return {"correct": body["answer"] == "right", "question_id": body["question_id"]}
 
@@ -69,6 +86,33 @@ def test_no_candidate_sends_nothing() -> None:
     assert verdict["note"]
 
 
+def test_checker_question_probes_check_channel_without_any_answer() -> None:
+    """B-26：deface/outage 类题没有答案字符串，summary 里也没有候选。
+
+    run3 SAMPLE-006 实录：banner 已篡改，收工时 summary 没写 ANSWER 行，
+    submit() 在"没有任何答案候选"处提前返回，/check 一次都没发。
+    """
+    sub, sent = _mk([{"id": "deface", "mode": "checker"}])
+    sub.check_ok.add("deface")  # type: ignore[attr-defined]
+
+    verdict = sub.submit('{"executive_summary": "Banner defaced and verified."}')
+
+    assert sent == [{"question_id": "deface"}]
+    assert verdict["correct"] == ["deface=<checker>"]
+    assert verdict["challenge_fully_solved"] is True
+
+
+def test_checker_probe_still_needs_a_checker_question() -> None:
+    """反向：纯 dynamic 题无候选时仍不该发任何请求（空答案污染账本）。"""
+    sub, sent = _mk([{"id": "flag", "mode": "dynamic"}])
+
+    verdict = sub.submit("I looked around and found nothing.")
+
+    assert sent == []
+    assert verdict["tried"] == []
+    assert "没有任何答案候选" in str(verdict.get("note") or "")
+
+
 def test_answered_correctly_does_not_block_submission() -> None:
     """``answered_correctly=true`` **不该**挡住提交。
 
@@ -88,13 +132,17 @@ def test_answered_correctly_does_not_block_submission() -> None:
     assert verdict["tried"], verdict
 
 
-def test_checker_question_is_skipped() -> None:
-    """checker 走 ``/check`` 通道，往 ``/submissions`` 交只会得到 correct:false。"""
+def test_checker_question_probes_check_channel() -> None:
+    """checker 题只走 ``/check``；没有映射答案时不往 ``/submissions`` 交值。
+
+    B-17：平台流水实证 checker 题的正确记录是 ``claimed="<checker>"``
+    （``/check`` 记账），而交值一律 correct=false。
+    """
     sub, sent = _mk([{"id": "outage", "mode": "checker"}])
     verdict = sub.submit("FLAG{abc}")
-    assert sent == []
-    # 提示里要说明是"只有非 flag 类 question"，不能笼统说"没有 flag 类"
-    assert "非 flag 类" in verdict["note"], verdict
+    assert all("answer" not in b for b in sent), sent
+    assert [b["question_id"] for b in sent] == ["outage"]
+    assert verdict["correct"] == []
 
 
 def test_correct_answer_stops_trying_more_candidates() -> None:
@@ -117,6 +165,31 @@ def test_correct_answer_stops_trying_more_candidates() -> None:
     q1_calls = [b for b in sent if b["question_id"] == "q1"]
     assert len(q1_calls) == 1
     assert verdict["correct"] == ["q1=FLAG{right_here}"]
+
+
+def test_missing_attempts_remaining_is_capped_at_platform_limit() -> None:
+    """平台不给 ``attempts_remaining`` 时按每题上限记账，而不是"不限次数"。
+
+    实例式 question 的元数据里通常**没有**这个字段。旧代码把"没这个字段"当成
+    无限次，一道题的 6 个候选会一次打光：第 6 次起平台直接拒绝，而正确的答案
+    如果排在最后就没机会交。这里锁死两条：请求不超过 5 次、日志里说清"不是没
+    答案，是次数用完了"。
+    """
+    sub, sent = _mk([{"id": "q1", "mode": "dynamic"}])
+    # 预检不可用 → 每个候选都真的走一次 /submissions（这就是要设闸的那条路）
+    sub._verify = lambda *a, **k: None  # type: ignore[method-assign]
+    verdict = sub.submit(" ".join(f"FLAG{{aaa{i:02d}}}" for i in range(6)))
+    assert len(sent) == 5, sent
+    assert any("platform attempt cap 5 reached" in s for s in verdict["skipped"]), verdict
+    assert any("1 candidates untried" in s for s in verdict["skipped"]), verdict
+
+
+def test_platform_attempt_cap_does_not_apply_to_qa() -> None:
+    """qa 通道的 3 次闸门不能被平台 5 次上限顶掉（两套通道两套上限）。"""
+    sub, sent = _mk([{"id": "q1", "mode": "dynamic"}], run_mode="qa")
+    verdict = sub.submit(" ".join(f"FLAG{{bbb{i:02d}}}" for i in range(6)))
+    assert len(sent) == 3, sent
+    assert any("qa attempt cap 3 reached" in s for s in verdict["skipped"]), verdict
 
 
 def test_http_error_does_not_raise() -> None:
@@ -298,21 +371,55 @@ def test_non_ascii_flag_body_is_not_placeholder() -> None:
     assert AutoSubmitter.candidates("answer: FLAG{测试}") == ["FLAG{测试}"]
 
 
+
+def test_explicit_answer_line_is_extracted_from_json_args() -> None:
+    """raw_input 是 JSON 参数串：值内换行是 ``\\n`` 字面量，行锚定正则
+    直接扫原文打不中。先解码再扫，显式行才能成为候选——否则 slug 型题
+    收工时零候选可交。
+    """
+    raw = (
+        '{"executive_summary": "solved\\nanswer: token-4f2ab9", '
+        '"methodology": "m", "technical_analysis": "t", "recommendations": "r"}'
+    )
+    cands = AutoSubmitter.candidates(raw)
+    assert cands and cands[0] == "token-4f2ab9", cands
+
+
+def test_explicit_answer_ranks_between_flags_and_bare_hex() -> None:
+    """优先级：flag 形态 > 显式 ``answer:`` 行 > 裸 hex（hex 常是噪声）。"""
+    cands = AutoSubmitter.candidates(
+        "FLAG{r34l_fl4g_9f2a}\nanswer: s3cr3t-value 6420f7ff74fc44616ecf891691049580"
+    )
+    assert cands == [
+        "FLAG{r34l_fl4g_9f2a}",
+        "s3cr3t-value",
+        "6420f7ff74fc44616ecf891691049580",
+    ], cands
+
+#: 经典前缀。只用于"镜像里有没有历史示例/诱饵"这一条测试：生产代码不再
+#: 枚举前缀（标签式），这里留着是因为它正是那类示例串的写法。
+_CLASSIC_LABEL_RE = re.compile(r"(?i)(?:CTFY|FLAG|CTF)\{")
+
+
 def test_image_source_has_no_extractable_placeholder() -> None:
-    """镜像会把这些目录打进去，里面不许出现任何 ``FLAG_RE`` 命中。
+    """镜像会把这些目录打进去，里面不许出现"经典前缀 + 非模板体"的字面量。
 
     ``docker/Dockerfile`` 直接 ``COPY src/``，agent 读自己的源码时会把注释里
     的示例当成「检索到的证据」。2026-11-06 的假 solved 就是这么来的。
 
-    当前窄集命中数是 0，所以判据是"零命中"而不是"零占位符"——后者放过了
-    ``MetaCTF{fake_banner_flag_here}`` 这种 ``is_placeholder`` 认不出的示例串。
-    ``FLAG{...}``（点）这种宽集才命中的写法抽不出候选、进不了证据链，
-    最后一道 ``candidates()`` 也会用 ``is_placeholder`` 挡掉，所以文档里
-    保留它是安全的（``test_*placeholder*`` 覆盖那一层）。
+    ⚠️ 2026-11-12：前缀改成标签式之后，"零命中"不再可维持——源码里的
+    f-string（``agent-{name}``）和 LaTeX（``frame_{width}``）与真 flag 同形，
+    全仓几十处，形态层无法区分（``div{margin}`` 就是已知代价）。这类误判交给
+    平台 verify-answer 预检兜底，见 ``scripts/batch_eval.py``。
+
+    这里保留的是原来**真正在防的那件事**：不许有 ``MetaCTF{...}`` 这种
+    "经典前缀 + 看着像真答案"的示例串。``FLAG{...}``（点）这类占位符由
+    ``is_placeholder`` 放行——文档里就是靠它说明 flag 形状的；``${x}`` /
+    ``{{x}}`` 这类由 ``is_code_template`` 放行。
     """
     from pathlib import Path
 
-    from ctf_strix.flag_extract import FLAG_RE, is_placeholder
+    from ctf_strix.flag_extract import FLAG_RE, is_code_template, is_placeholder
 
     repo = Path(__file__).resolve().parents[1]
     # 与 docker/Dockerfile 的 COPY 清单对齐：src / vendor/src / config / docker。
@@ -338,10 +445,56 @@ def test_image_source_has_no_extractable_placeholder() -> None:
         text = data.decode("utf-8")
         scanned += 1
         for lineno, line in enumerate(text.splitlines(), 1):
-            # 当前镜像内窄集命中数为 0，所以任何命中都算回归：既能抓
-            # ``FLAG{xxxx}`` 这类占位符，也能抓 ``MetaCTF{fake_banner_flag_here}``
-            # 这种"看着像真答案的示例"（``is_placeholder`` 认不出它）。
+            # 经典前缀（FLAG / CTF / CTFY）是历史示例与诱饵的写法；标签式
+            # 前缀下任意 ``word{var}`` 都会命中，那部分只能靠预检兜底。
             for match in FLAG_RE.finditer(line):
-                offenders.append(f"{path}:{lineno}: {match.group(0)}")
+                hit = match.group(0)
+                if not _CLASSIC_LABEL_RE.search(hit):
+                    continue
+                if is_placeholder(hit) or is_code_template(hit):
+                    continue
+                offenders.append(f"{path}:{lineno}: {hit}")
     assert not offenders, "镜像源码里仍有占位串：\n" + "\n".join(offenders)
     assert scanned > 200, f"实际只扫到 {scanned} 个文本文件，范围不对"
+
+
+
+# ---------------------------------------------------------------- B-4 契约行
+def test_mapped_checker_answer_is_submitted() -> None:
+    """``/check`` 不过时，契约行的值仍要交（counter 类 judge 语义）。
+
+    2026-11-13 08:33 平台流水：SAMPLE-019 ``claimed="3" correct=true``——
+    带值的 checker 题（match: judge）就是靠提交值判分。
+    """
+    sub, sent = _mk([{"id": "counter", "mode": "checker", "attempts_remaining": 5}])
+    verdict = sub.submit('{"executive_summary": "counter is 3\\nANSWER[counter]=right"}')
+    answers = [b["answer"] for b in sent if "answer" in b]
+    assert answers == ["right"]
+    assert verdict["correct"] == ["counter=right"]
+
+
+def test_mapped_answer_goes_first_for_whitelisted_question() -> None:
+    """契约行答案排在宽集候选之前：模型点名了归属就别再让噪声先上。"""
+    sub, sent = _mk([{"id": "q1", "mode": "dynamic"}])
+    verdict = sub.submit("ANSWER[q1]=right FLAG{noise}")
+    # sent 里混着 verify 预检体（无 instance_id）；真提交按 instance_id 区分。
+    posts = [b for b in sent if "instance_id" in b]
+    assert [b["answer"] for b in posts] == ["right"]
+    assert verdict["correct"] == ["q1=right"]
+
+
+def test_checker_without_mapped_answer_is_still_skipped() -> None:
+    """没写契约行时 checker 题只探 /check，不拿宽集候选去交值。"""
+    sub, sent = _mk([{"id": "outage", "mode": "checker"}])
+    verdict = sub.submit("ANSWER[other]=3")
+    assert all("answer" not in b for b in sent), sent
+    assert verdict["tried"] == []
+
+
+def test_checker_check_pass_wins_without_submitting_a_value() -> None:
+    """``/check`` 通过即记 ``<checker>``——SAMPLE-006/007/008 的正解通道。"""
+    sub, sent = _mk([{"id": "persist", "mode": "checker"}])
+    sub.check_ok.add("persist")  # type: ignore[attr-defined]
+    verdict = sub.submit("ANSWER[persist]=whatever")
+    assert verdict["correct"] == ["persist=<checker>"]
+    assert all("answer" not in b for b in sent), sent

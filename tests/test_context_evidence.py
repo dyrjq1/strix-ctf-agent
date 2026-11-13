@@ -265,6 +265,32 @@ def test_head_window_content_is_not_repeated_in_block():
     assert TOKEN in block
 
 
+def test_head_and_tail_windows_snap_to_line_boundaries() -> None:
+    """RISK 10：封顶后头/尾窗口都是整行，不再出现半行。"""
+    lines = [f"line-{i:03d}-" + "x" * 12 for i in range(600)]
+    text = "\n".join(lines)
+    out = ctx_mod._cap_text(text, limit=2_000, head=1_200, tail=600, evidence=False)
+    # 折叠行内嵌被删字符数（数字在 "[... " 与 "chars" 之间），按前缀切。
+    head_part, _, rest = out.partition("\n\n[... ")
+    # 头窗口 = 前 k 条完整行（结尾不悬半行）。
+    k = head_part.count("\n") + 1 if head_part else 0
+    assert k > 0 and head_part == "\n".join(lines[:k])
+    # 尾窗口 = 后 m 条完整行（开头不悬半行）。
+    tail_part = rest.partition("]\n\n")[2]
+    m = tail_part.count("\n") + 1
+    assert m > 0 and tail_part == "\n".join(lines[-m:])
+
+
+def test_line_snap_guard_keeps_single_blob_char_cut() -> None:
+    """窗口里没有可保的行结构时（换行在前 1/12 处），保持字符切。"""
+    text = "x" * 100 + "\n" + "y" * 9_900
+    out = ctx_mod._cap_text(text, limit=2_000, head=1_200, tail=600, evidence=False)
+    head_part = out.partition("\n\n[...")[0]
+    # 唯一换行在第 100 字符：收口会把 1,200 的窗口缩到 100，守卫不放行。
+    assert len(head_part) == 1_200
+    assert head_part == "x" * 100 + "\n" + "y" * 1_099
+
+
 def test_small_limits_never_exceed_limit():
     """P1-4：limit 四档都必须满足 len(out) <= limit（旧公式在 500 时输出 555）。"""
     text = _big_payload()

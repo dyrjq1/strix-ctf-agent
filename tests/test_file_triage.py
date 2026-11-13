@@ -67,13 +67,17 @@ def test_text_file_reports_flag_and_next_command(tmp_path: Path, monkeypatch) ->
     assert "next: 1) `cat" in out
 
 
-def test_high_entropy_note_names_a_command_the_image_has(
+def test_high_entropy_note_names_only_tools_this_image_can_run(
     tmp_path: Path, monkeypatch
 ) -> None:
-    """The entropy note used to say "run binwalk", which is not installed.
+    """The note must describe *this* image, and fall back to what always works.
 
-    Same defect class as ``_NEXT``: a hint that cannot be executed costs a
-    turn and teaches nothing (docs/27 C2).
+    It used to be a fixed sentence claiming binwalk/7z were absent, while
+    ``docker/Dockerfile`` installs both -- the mirror image of the old
+    "run binwalk" line that named a missing binary (REVIEW-20261112 REV-5 /
+    FMT-2, docs/27 C2).  It is now gated on ``shutil.which``: the fallback
+    (``xxd`` + stdlib) is always runnable, and binwalk is named only when the
+    binary is really on ``PATH``.
     """
     target = tmp_path / "blob.bin"
     target.write_bytes(bytes(range(256)) * 16)
@@ -82,12 +86,24 @@ def test_high_entropy_note_names_a_command_the_image_has(
         return "data" if argv[0] == "file" else ""
 
     monkeypatch.setattr(ft, "_run", fake)
+
+    def note_of(out: str) -> str:
+        # Only the entropy note is under test.  The ``next:`` decision table for
+        # the unknown family names binwalk unconditionally and correctly -- the
+        # image installs it -- so scoping the assertion to the note is what
+        # makes it assert the gating rather than the table.
+        return next(line for line in out.splitlines() if line.startswith("note: 熵 >7.2"))
+
     monkeypatch.setattr(ft.shutil, "which", lambda name: None)
-    out = ft.file_triage(str(target))
-    assert "熵 >7.2" in out
-    assert "binwalk" not in out
-    assert "xxd" in out
-    assert "blob.bin" in out.split("熵 >7.2")[-1]
+    note = note_of(ft.file_triage(str(target)))
+    assert "binwalk" not in note
+    assert "xxd" in note
+    assert "blob.bin" in note
+
+    monkeypatch.setattr(ft.shutil, "which", lambda name: "/usr/bin/" + name)
+    note = note_of(ft.file_triage(str(target)))
+    assert "binwalk" in note
+    assert "xxd" in note
 
 
 def test_elf_suggests_static_analysis_not_execution(tmp_path: Path, monkeypatch) -> None:
@@ -101,11 +117,12 @@ def test_elf_suggests_static_analysis_not_execution(tmp_path: Path, monkeypatch)
     monkeypatch.setattr(ft.shutil, "which", lambda name: None)
     out = ft.file_triage(str(target))
     assert "family: elf" in out
-    # Every hint must be runnable in this image.  ``checksec`` and ``r2`` are
-    # not installed (docker/Dockerfile), so suggesting them sent the model at a
-    # missing binary on its first call -- docs/27 C2.
-    assert "checksec" not in out
-    assert "r2" not in out
+    # Every hint must be runnable in this image.  ``checksec`` and ``r2`` ship
+    # in the image and are probed at build time (docker/check_toolchain.sh), so
+    # the table is expected to name them; what it must not do is tell the model
+    # to execute the challenge binary first (REVIEW-20261112 REV-5).
+    assert "checksec" in out
+    assert "r2" in out
     assert "readelf" in out
     assert "别一上来跑它" in out
 
@@ -114,16 +131,29 @@ def test_elf_suggests_static_analysis_not_execution(tmp_path: Path, monkeypatch)
 # P18-4: the triage answer is a decision table, not a pointer to a skill.
 # ---------------------------------------------------------------------------
 
-#: Shell programs the image really has.  ``binutils``/``file``/``xxd``/``unzip``
-#: come from the Dockerfile apt line; the rest ship with ``python:3.12-slim``.
-_IMAGE_BINARIES = frozenset(
+#: Binaries the build probe proves are present.  Derived from
+#: ``docker/check_toolchain.sh`` (the same source ``test_offline_index``
+#: compares against) so this list cannot drift from the image; the probe keys
+#: are labels, and radare2's CLI is called ``r2``.
+_PROBED_CLI = frozenset(
+    {"r2" if name == "radare2" else name for name in re.findall(
+        r'"([A-Za-z0-9_.-]+)": \(',
+        (ROOT / "docker" / "check_toolchain.sh").read_text(encoding="utf-8"),
+    )}
+)
+
+#: Base-image utilities the probe does not bother to enumerate:
+#: ``binutils``/``file``/``xxd``/``unzip`` come from the Dockerfile apt line,
+#: the rest ship with ``python:3.12-slim``.
+_BASE_BINARIES = frozenset(
     {
-        "cat", "cp", "file", "find", "gdb", "git", "grep", "gunzip", "gzip",
-        "head", "jq", "less", "ls", "ltrace", "mv", "nc", "objdump", "od",
-        "ps", "python3", "readelf", "rm", "sed", "sort", "strace", "strings",
-        "tar", "uniq", "unzip", "wc", "wget", "xxd", "zcat", "zip",
+        "cat", "cp", "find", "git", "grep", "gunzip", "gzip", "head", "jq",
+        "less", "ls", "ltrace", "mv", "od", "ps", "python3", "rm", "sed",
+        "sort", "strace", "tar", "uniq", "unzip", "wc", "wget", "zcat", "zip",
     }
 )
+
+_IMAGE_BINARIES = _PROBED_CLI | _BASE_BINARIES
 
 #: Tool names this module is allowed to recommend.  Anything else in a backtick
 #: span must be a shell command, checked against the image above.
@@ -140,9 +170,11 @@ def _spans(family: str) -> list[str]:
 def test_decision_table_only_names_binaries_the_image_installs() -> None:
     """Every bare command in ``_NEXT`` must resolve inside this container.
 
-    The first call of a Misc challenge is the most expensive one to waste:
-    ``checksec``/``r2``/``binwalk``/``zsteg``/``exiftool``/``tshark`` were all
-    suggested here before and none is installed (docs/27 C2).
+    The first call of a Misc challenge is the most expensive one to waste, so
+    the table may only name binaries the build probe proves are present.
+    ``checksec``/``r2``/``binwalk``/``exiftool``/``tshark`` qualify and are
+    expected here; Ruby-only helpers such as ``zsteg`` do not
+    (REVIEW-20261112 REV-5 / FMT-2).
     """
     dockerfile = (ROOT / "docker" / "Dockerfile").read_text(encoding="utf-8")
     for package in ("binutils", "file", "xxd", "unzip", "zip", "gdb", "curl"):

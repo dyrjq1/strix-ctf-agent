@@ -144,7 +144,20 @@ def test_prompt_stays_inside_the_web_budget():
     # edit, but a tool section cannot slip in unnoticed.
     # L3b: 6,605 -> 6,680 (+75) for the stage-2 CLI names in the Environment
     # bullet and ctf-web Prerequisites (impacket/flask-unsign/RsaCtfTool).
-    assert size < 6700, f"web prompt grew to {size} chars"
+    # 2026-11-13: one ceiling, two growth sources.  Measured split of the
+    # delivered prompt: prose (core + tool sections + hypothesis) 4,984, skill
+    # index 1,978, total 6,962.  The 2026-11-07 prompt.py, run in-process
+    # against today's index, already measures 6,690 -- 10 chars of headroom --
+    # so the overflow is the index, not B0's 13 chars of new prose.
+    # ``_skills_block()`` has no cache, so this split is the same number the
+    # test above measures, not an estimate.
+    index = len(prompt._skills_block())
+    prose = size - index
+    # 2026-11-13 B-14（台账 §4.165）：收工序言教 ANSWER[<qid>]=<value>
+    # 契约行（非 flag 题的唯一交付通道），prose 实测 4,984 -> 5151。阈值
+    # 与实测的距离保持 ~100（一次单行改动的余量），工具段仍插不进来。
+    assert prose < 5251, f"web prompt prose grew to {prose} chars (index {index})"
+    assert index < 2050, f"skill index grew to {index} chars (prose {prose})"
 
 
 def test_activate_defaults_to_web_so_unit_tests_keep_working():
@@ -186,3 +199,22 @@ def test_load_skill_line_points_at_registered_readers():
     assert "read_file" not in line
     assert "exec_command" in line
     assert "view_image" in line
+
+
+def test_tcp_gets_the_offline_cve_lookup_but_not_the_ai_probes():
+    """A banner names the component; only the lookup can use it (AI-5).
+
+    ``ai_fingerprint``/``ai_quick_scan`` probe an HTTP target and stay
+    web-only.  ``ai_cve_lookup`` reads a bundled rule base and needs neither
+    a target nor the network, so a tcp challenge can use it and a file
+    challenge still cannot.
+    """
+    from ctf_strix import catalogue
+
+    tcp_names = {info.name for info in catalogue.for_kind("tcp")}
+    assert "ai_cve_lookup" in tcp_names
+    assert "ai_fingerprint" not in tcp_names
+    assert "ai_quick_scan" not in tcp_names
+
+    file_names = {info.name for info in catalogue.for_kind("file")}
+    assert "ai_cve_lookup" not in file_names

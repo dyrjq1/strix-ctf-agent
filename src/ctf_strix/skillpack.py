@@ -2,16 +2,18 @@
 
 ## 为什么需要这一层，而不是直接 ``register_skill_dir(PACK_DIR)``
 
-技能包里 194 个 md，但**只有 13 个是技能**——每个分类一个索引 ``<分类>/<分类>.md``，
-其余 181 个多为索引指向的参考子文件（含 10 个 SKILL.md 维护文档），除索引外都不注册。
+技能包里两层 md 实测 139 个、递归共 236 个，但**只有 13 个是技能**——
+每个分类一个索引 ``<分类>/<分类>.md``，其余 126 个两层文件是索引指向的参考子文件，
+除索引外都不注册。
 
 strix 的 ``get_available_skills()`` 会把注册目录里**每一层 ``<分类>/*.md``**
 都当成技能，逐条写进 system prompt 的 ``<available_skills>`` 块。实测：
 
-- 注册整包：149 条进 prompt（历史实测 145 条 ≈ 8.5k 字符 × 每次 LLM 调用 × 每个 agent；口径差 4 条为此后新增 md）；
+- 注册整包：139 条进 prompt（历史实测 145 条 ≈ 8.5k 字符 × 每次 LLM 调用 × 每个 agent；
+  此后 +4 条新增、−10 个 SKILL.md 副本，净 −6）；
 - 只注册 13 个索引：13 条（历史实测 12 条 ≈ 3k 字符）。
 
-prompt 是**每个 agent、每次调用**都要付的成本，而多出来的 136 条对模型毫无信息量
+prompt 是**每个 agent、每次调用**都要付的成本，而多出来的 126 条对模型毫无信息量
 （名字就是文件名，描述为空）。所以这里只暴露索引，子文件走 ``read_file``。
 
 ## 代价与补偿
@@ -32,6 +34,7 @@ from __future__ import annotations
 
 import re
 import tempfile
+from collections.abc import Collection
 from pathlib import Path
 from typing import Any
 
@@ -117,8 +120,8 @@ _EXCLUDED: frozenset[str] = frozenset({"ctf-similar-search"})
 def index_skills(pack: Path | None = None) -> list[tuple[str, str, Path]]:
     """列出所有**索引**技能。
 
-    约定：每个分类目录里有且只有一个 ``<分类>/<分类>.md``。用它当索引，而不是
-    ``SKILL.md``——有些分类两种都有，``SKILL.md`` 是上游遗留的重复文件。
+    约定：每个分类目录里有且只有一个 ``<分类>/<分类>.md``，它就是该分类的
+    索引；上游原有的 ``SKILL.md`` 副本不再随包分发（见 ``THIRD_PARTY.md``）。
 
     Args:
         pack: 技能包根目录，默认 :data:`PACK_DIR`。
@@ -133,8 +136,8 @@ def index_skills(pack: Path | None = None) -> list[tuple[str, str, Path]]:
     for category in sorted(p for p in root.iterdir() if p.is_dir()):
         if category.name in _EXCLUDED:
             continue
-        # 只认 <分类>/<分类>.md。SKILL.md / README.md 一律跳过：前者是重复索引，
-        # 后者是包说明，两者进 prompt 都只是噪音。
+        # 只认 <分类>/<分类>.md。README.md 之类的其余文件一律跳过：进 prompt
+        # 只是噪音。SKILL.md 副本已从包里删除，这里也不为它留通配。
         candidate = category / f"{category.name}.md"
         if candidate.is_file():
             out.append((category.name, category.name, candidate))
@@ -157,8 +160,67 @@ def _hint(ref: str, category: str) -> str:
     )
 
 
+#: 索引正文里的相对链接 ``[摘要](相对路径)``。只取括号里的目标。
+_INDEX_LINK = re.compile(r"\[[^\]]*\]\(([^)\s]+)\)")
+
+#: 子文件清单块的起始标记。测试与调用方靠它判断清单在不在。
+_FILES_MARK = "> 子文件清单"
+
+#: 清单块的内联预算（字符）。超出就退化成 ``ls`` 指引。
+#:
+#: 这个数不是拍脑袋：块必须整段落在 ``context.py`` 的 head 窗口
+#: （``HEAD_CHARS`` 4,800）内，而 frontmatter（实测 547–986）+ 路径提示
+#: （200）已经占掉 747–1,186。实测最坏是 ctf-crypto：72 个子文件、块长 2,039，
+#: 加前两者共 2,786 字符——留 2,014 的余量给索引后续增长。超过预算的清单
+#: 一律不进提示：半截名单会让模型以为"文件就这些"，比不给更糟。
+_FILES_MAX_CHARS = 2_400
+
+
+def _files_index(text: str, ref: str, category: str) -> str:
+    """从索引正文抽出它引用的子文件清单。
+
+    **为什么需要这一块**：``context.py`` 对注入的索引做头尾封顶
+    （head 4,800 / tail 2,400，``CAP_CHARS`` 8,000）。13 个索引里 8 个超过
+    8,000 字符，而"子文件链接表"恰好长在中段——crypto 49,524 字符、160 条链接
+    里 133 条落在被折叠区。模型于是只知道有 "crypto" 这个方向，不知道下面有
+    哪些文件、该读哪一个。清单紧跟路径提示，落在 head 区间，封顶裁不到；
+    实测最坏占用 2,786 字符，仍低于 head 4,800。
+
+    只收本地 ``.md`` 目标（保留相对写法，锚点去掉），按出现顺序去重：
+    ``../ctf-misc/ctf-misc.md`` 这类跨方向链接照样收，它是有效路径。
+
+    Args:
+        text: 索引正文（应为已剥掉 frontmatter 的部分）。
+        ref: 技能包运行期根路径，用于超预算时的 ``ls`` 指引。
+        category: 分类名，同上。
+
+    Returns:
+        以空行结尾的 markdown 块；索引没引用任何本地 md 时返回空串。
+    """
+    files: list[str] = []
+    for line in text.split("\n"):
+        for m in _INDEX_LINK.finditer(line):
+            target = m.group(1).split("#", 1)[0].strip()
+            if not target.endswith(".md") or "://" in target or target.startswith("mailto:"):
+                continue
+            if mask_flags(target) != target:
+                # RISK 8：清单从未遮蔽的正文抽取（mask_flags 只作用于 body），
+                # 名字本身带 flag 形态的文件不列：遮蔽会给出一个读不到的假路径，
+                # 比不列更糟；模型要找仍可 ls。
+                continue
+            if target not in files:
+                files.append(target)
+    if not files:
+        return ""
+    listed = " ".join(f"`{name}`" for name in files)
+    if len(listed) > _FILES_MAX_CHARS:
+        # 名单装不下就不装：指向目录本身，一个 ls 拿到同样的信息。
+        return f"{_FILES_MARK}（{len(files)} 个，超出内联预算）：`ls {ref}/{category}/`。\n\n"
+    return f"{_FILES_MARK}（{len(files)}）：{listed}\n\n"
+
+
 def render(path: Path, ref: str, category: str) -> str:
-    """读索引文件并插入路径提示（frontmatter 保持原位）。
+    """读索引文件并插入路径提示与子文件清单（frontmatter 保持原位）。
 
     Args:
         path: 索引文件路径。
@@ -174,10 +236,11 @@ def render(path: Path, ref: str, category: str) -> str:
     text = path.read_text(encoding="utf-8")
     m = _FRONTMATTER.match(text)
     if m is None:
-        return _hint(ref, category) + text
+        return _hint(ref, category) + _files_index(text, ref, category) + text
     head = text[: m.end()]
     body = text[m.end() :]
-    return head + _hint(ref, category) + mask_flags(body)
+    prefix = _hint(ref, category) + _files_index(body, ref, category)
+    return head + prefix + mask_flags(body)
 
 
 def stage(ref: str | None = None, pack: Path | None = None) -> Path:
@@ -185,7 +248,6 @@ def stage(ref: str | None = None, pack: Path | None = None) -> Path:
 
     Args:
         ref: 子文件根路径，默认 :func:`ref_root`。
-        kind: 题型（web/file/tcp/...）；只渲染该题型能执行的工具方向。
         pack: 技能包根目录，默认 :data:`PACK_DIR`。
 
     Returns:
@@ -232,11 +294,44 @@ def register(registry: Path | None = None, register_fn: Any | None = None) -> li
     return names
 
 
+#: ``user_instructions`` 路由段的出口上限（字符）。
+#:
+#: 通道所有权（CROSS-CHECK 3 落账）：``user_instructions`` 没有下游封顶——
+#: ``context._cap_item`` 只分派 ``function_call_output`` / ``function_call``
+#: 两类 item，从不处理 user 文本。这条通道由各生产者自律：
+#: :data:`ctf_strix.method_cards.MAX_CHARS` 自律 1,200；``routing.render``
+#: 有意不截断（静默丢路线 = 死方向，见 ``tests/test_routing.py`` 模块注释），
+#: 其 3,000 预算由测试在开发期守；本模块的 :func:`prompt_hint` 是路由段
+#: **运行期出口封顶**，上限取两个付费预算之和。今天实测最坏 2,834，不触发。
+HINT_MAX_CHARS = 4_200
+
+#: 超限截断标记：可见，不是静默——模型需要知道尾部被切了。
+_HINT_CAPPED_MARK = "\n[routing hint capped] 超出上限，尾部按行截断。"
+
+
+def _cap_hint(text: str) -> str:
+    """出口封顶：低于上限逐字节原样；超限按行边界截断并留可见标记。
+
+    按行而不是字符硬切：半行会把一条完整判据切成两截（``context.py`` 对
+    工具输出的同类封顶因字符硬切被审查点名为 RISK 10，不重蹈）。单行文本
+    超限的极端情况才退化为字符截断——没有行结构可保，保线无意义。
+    """
+    if len(text) <= HINT_MAX_CHARS:
+        return text
+    mark = _HINT_CAPPED_MARK
+    room = HINT_MAX_CHARS - len(mark)
+    cut = text.rfind("\n", 0, room + 1)
+    if cut <= 0:
+        return text[:room] + mark
+    return text[:cut].rstrip() + mark
+
+
 def prompt_hint(
     names: list[str] | None = None,
     ref: str | None = None,
     kind: str | None = None,
     tags: list[str] | None = None,
+    available: Collection[str] | None = None,
 ) -> str:
     """生成写进 ``user_instructions`` 的路由契约。
 
@@ -252,18 +347,22 @@ def prompt_hint(
         ref: 子文件根路径，默认 :func:`ref_root`。
         kind: 题型（web/file/tcp/...）；只渲染该题型能执行的工具方向。
         tags: 题目 tags；只用于方法卡求交集，原文不进提示。
+        available: 本进程实际注册的工具名；方法卡点名了未注册的工具就剔卡。
+            ``None`` 关闭过滤（单测、或工具面未知时）。
 
     Returns:
         多行指令；路由与方法卡都为空时返回空串。
         方法卡只看 tags 与 kind，不依赖技能包是否存在。
+        合并结果经 :func:`_cap_hint` 出口封顶（:data:`HINT_MAX_CHARS`）：低于
+        上限逐字节不变；超限按行截断并留可见标记。
     """
     from ctf_strix import method_cards
     from ctf_strix import routing
 
     skill_names = names if names is not None else [f"{c}/{n}" for c, n, _ in index_skills()]
     routing_text = routing.render(skill_names, ref or ref_root(), kind=kind) if skill_names else ""
-    cards_text = method_cards.render(tags, kind=kind)
-    return "\n\n".join(part for part in (routing_text, cards_text) if part)
+    cards_text = method_cards.render(tags, kind=kind, available=available)
+    return _cap_hint("\n\n".join(part for part in (routing_text, cards_text) if part))
 
 
 def tags_of(task: dict | None) -> list[str]:

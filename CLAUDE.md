@@ -57,7 +57,7 @@
 | `agents_allowed` | true | 允许 agent 参赛 |
 | `agent_internet` | **deny** | agent 进程无外网，下载/查资料/调第三方 API 全部失败 |
 | `internet_policy` | allow | 人类选手可以上网（我们不行） |
-| `max_instances_per_team_effective` | **1** | 同一时刻只能 1 个实例 → **必须串行轮转** |
+| `max_instances_per_team_effective` | **1** | 练习套同一时刻只能 1 个实例 → **练习赛必须串行轮转**（正式套件实测为 3，见 §3.2） |
 | `format` | questions | 按答案字符串判分 |
 | `eval_standard` | false | 练习赛不走平台标准评测 |
 | `session_end_mode` | delete，grace 900s | 会话结束即删实例，宽限 15 分钟 |
@@ -76,7 +76,7 @@
 | 范围 | `challenge_scope=catalog`；**智能体赛道出题方向仅限在线交互类**（web/pwn/AI 安全）——crypto/rev/misc 离线附件类在出题侧被排除，解题侧卷面待初选赛实证 |
 | 运行 | 镜像经平台注册（已注册 v1）；正式赛设 authoring_windows（11-21 10–12/14–16/18–20 UTC+8 三个 2h 窗口）→ **agent 需出题能力，当前空白** |
 | 交付 | 按 CTFY-0001：读 `task.json`，写 `result.json` |
-| 并发 | 平台实例配额 1；QA#26 的「≤3」是**上限许可**，不是能力保证 |
+| 并发 | 正式套件实例配额**实测为 3**（2026-11-10 platform API 抓取 `max_instances_per_team_effective`，与 QA#26 的「≤3」一致）；练习套 CTFARENA 仍是 1。⚠️ 并行的前提是**清理按所有权收敛**——旧 `reap_orphans` 全账号清理会互杀兄弟车道实例，靶面退成 19 字节 Go 404（台账 §4.113） |
 | 计分 | QA#29 动态积分：0/1 解 = 1000 分，随解题队伍数下降；无血分；早解有优势 |
 | 断网 | `internet_policy=deny` + `agent_internet=deny`（2026-11-03 起**人类选手也断网**，此前为 allow） |
 
@@ -414,7 +414,7 @@ curl -sS https://ctfy.tsinghua.edu.cn/api/v1/mcp/ \
 - 不包装 gdb（exec_command 已能跑 gdb -batch）
 - 不改 vendor/，不 fork strix
 - 不引入需要外网的工具或 API（agent 运行时无外网）
-- 暂不做多 agent 并发：平台实例配额 1，先保证单实例串行轮转稳定
+- 暂不做多 agent 架构（隔壁队自证协调税：重派烧 26 万 token、跨轮 8×95k）；实例配额正式套实测 3，跑批可三车道并行，但清理必须按所有权收敛（台账 §4.113）
 
 ## 17. 已知盲区（别当成已覆盖）
 

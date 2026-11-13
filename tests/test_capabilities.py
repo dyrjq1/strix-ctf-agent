@@ -76,4 +76,6 @@ def test_soft_deadline_builds_guard(monkeypatch):
     assert isinstance(guard, FakeGuard)
     assert captured["soft"] == 300
     assert captured["turns"] == 25
-    assert captured["stall"] == 100
+    # 硬上限仍由这里给（soft*2）；停滞/宽限的阈值不归子进程管，已随
+    # should_kill() 一起删除，判定只在父进程看门狗里有一份。
+    assert captured["wall"] == 600

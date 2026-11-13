@@ -141,8 +141,6 @@ class UrlGuard:
 
     Attributes:
         allow_hosts: 允许的 ``host:port`` 集合，取自题面声明的服务端点。
-        allow_private: 是否放行私网。仅当 ``allow_hosts`` 为空且调用方
-            明确知道自己在做什么时才应为 True。
 
     Example:
         >>> g = UrlGuard(allow_hosts={"10.0.0.5:11434"})
@@ -155,18 +153,18 @@ class UrlGuard:
     """
 
     allow_hosts: set[str] = field(default_factory=set)
-    allow_private: bool = False
 
     @classmethod
     def from_env(cls) -> UrlGuard:
         """从 ``CTF_AISEC_ALLOW`` 读取放行清单（逗号分隔的 ``host:port``）。
 
-        评测脚本会把本题的 ``host:port`` 写进这个环境变量，
-        agent 改不了（它在沙箱里，父进程的环境读不到也写不进）。
+        变量由本进程的入口在注册工具后写入（``tools.allow_targets``，输入是
+        题面声明的端点）。它不经过工具参数，模型无法把自己想打的地址塞进来。
+        变量缺失时清单为空，闸门退化为「只允许公网」。
         """
         raw = os.environ.get("CTF_AISEC_ALLOW", "")
         hosts = {h.strip() for h in raw.split(",") if h.strip()}
-        return cls(allow_hosts=hosts, allow_private=not hosts)
+        return cls(allow_hosts=hosts)
 
     @staticmethod
     def _is_denied(ip: str) -> bool:
@@ -189,7 +187,7 @@ class UrlGuard:
             2. 主机名是云元数据服务 → 拒
             3. 命中白名单 host:port → 放行（此时信任调用方，私网也允许）
             4. 未命中白名单 → 解析后任一地址落在禁网段就拒
-            5. 白名单为空且未开 allow_private → 只允许公网地址
+            5. 白名单为空 → 只允许公网地址（特殊用途段一并拒）
 
         第 3 步必须排在网段检查**前面**：CTF 靶机本身就是私网地址，
         如果先检查网段，白名单里合法的 ``10.0.0.5:11434`` 也会被拦，
@@ -219,8 +217,6 @@ class UrlGuard:
         # 元数据服务是硬拒绝，不进任何白名单讨论
         if host in _METADATA_HOSTS or host.rstrip(".") in _METADATA_HOSTS:
             raise BlockedTarget(f"{host} 是云元数据服务，禁止访问")
-        if host.rstrip(".") in _METADATA_HOSTS:
-            raise BlockedTarget(f"{host} 是云元数据服务，禁止访问")
 
         key = f"{host}:{port}"
         if key in self.allow_hosts:
@@ -238,10 +234,13 @@ class UrlGuard:
             raise BlockedTarget(
                 f"{key} 不在本题放行清单内（{sorted(self.allow_hosts)}）"
             )
-        if not self.allow_private:
-            for ip in infos:
-                if not ipaddress.ip_address(ip).is_global:
-                    raise BlockedTarget(f"{host} 解析到非公网地址 {ip}，未显式放行")
+        # 白名单之外只允许公网地址。_is_denied 覆盖主要私网段，is_global 再兜住
+        # 其余特殊用途段（TEST-NET、192.88.99.0/24 等）——那些段不在私网名单里，
+        # 少了这道检查就按公网放行了。循环无条件执行：以前它挂在已经死掉的
+        # allow_private 下，清单为空时整段跳过。
+        for ip in infos:
+            if not ipaddress.ip_address(ip).is_global:
+                raise BlockedTarget(f"{host} 解析到非公网地址 {ip}，未显式放行")
         return urllib.parse.urlunsplit((p.scheme, p.netloc, p.path or "/", p.query, ""))
 
 

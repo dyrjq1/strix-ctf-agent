@@ -1,4 +1,4 @@
-"""运行时收工守卫：没有 flag 就不许结束 run。
+"""运行时收工守卫：没有可交付的答案就不许结束 run。
 
 ## 为什么必须硬拦
 
@@ -11,7 +11,9 @@
 是同一个教训：写在 prompt 里的自我检查会随轮次衰减。**
 
 `finish_scan` 是 root agent 的终止工具，调用它 = 整个 run 结束。CTF 里
-没有 flag 就没有完成，所以这里直接拒绝：返回符合它自身契约的
+没有可交付的答案就没有完成——flag 形态，或模型在 summary 里显式写下的
+``answer:`` 行（slug / token 型题没有 ``tag{...}`` 长相）——所以这里直接
+拒绝：返回符合它自身契约的
 ``{"success": False, "error": ...}``，把控制权交回模型。
 
 ## 为什么只拦 root 的 finish_scan，不拦子 agent 的 agent_finish
@@ -33,7 +35,13 @@ import threading
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
-from ctf_strix.flag_extract import FLAG_RE, is_placeholder
+from ctf_strix.flag_extract import (
+    FLAG_RE,
+    explicit_answer_values,
+    is_code_template,
+    is_placeholder,
+    per_question_answers,
+)
 
 if TYPE_CHECKING:
     from agents import FunctionTool
@@ -50,7 +58,7 @@ _MAX_REFUSALS = 3
 _REFUSAL = {
     "success": False,
     "error": (
-        "REFUSED: this summary contains no flag, so the run is not complete. "
+        "REFUSED: this summary contains no answer, so the run is not complete. "
         "finish_scan terminates everything — there is no next turn after it. "
         "Do not summarize, do not write a report, go back and get the flag.\n"
         "Concretely, in this order:\n"
@@ -70,7 +78,19 @@ _REFUSAL = {
         "for fetch/axios/API URL strings — the endpoint is usually named there. "
         "Route discovery tools exist for exactly this; use them instead of more "
         "manual guesses.\n"
-        "Call finish_scan again only once the flag string is in this summary."
+        "  5. The answer is not always a `tag{...}` flag: some challenges grade a "
+        "slug, a token, or a plain string. If that is what you are holding, do not "
+        "keep hunting for a flag that does not exist — deliver it as its own line "
+        "inside the executive_summary, exactly as `answer: <the exact string>`. "
+        "That line is what the submission layer reads; prose around it is not.\n"
+        "  6. Quote the answer exactly as the target emitted it. The tag in front "
+        "of the braces belongs to the challenge: if the output shows `utflag{...}`, "
+        "`HTB{...}`, `HackTheBox{...}` or any tag you have not seen before, that IS "
+        "the answer. Do not rename it to a better-known tag, do not lowercase or "
+        "re-case it, do not invent a normalized alias, do not add or drop "
+        "characters. A correct body under a rewritten tag scores zero.\n"
+        "Call finish_scan again only once the answer is in this summary: the flag "
+        "string itself, or an explicit `answer:` line."
     ),
 }
 
@@ -122,7 +142,7 @@ def _echo_refusal(flags: list[str]) -> dict[str, Any]:
 
 
 class FinishGuard:
-    """拦下"没有 flag 的收工"。"""
+    """拦下「没有任何可交付答案」的收工。"""
 
     def __init__(
         self,
@@ -133,9 +153,9 @@ class FinishGuard:
         checker: Callable[[], bool] | None = None,
     ) -> None:
         """Args:
-            require_flag: 是否要求 summary 里有 flag。engagement（报告交付）
-                与 checker（副作用交付）题没有 flag，必须传 False，否则每一次
-                正常收工都会被拦三次。
+            require_flag: 是否要求 summary 里有可交付答案（flag 形态，或显式
+                ``answer:`` 行）。engagement（报告交付）与 checker（副作用交付）
+                题没有答案，必须传 False，否则每一次正常收工都会被拦三次。
             success: structured success ledger, wired by the entrypoint.
             evidence: optional ``EvidenceLedger`` recording every flag seen in
                 this run's tool output.  When supplied, a flag-shaped summary
@@ -212,6 +232,19 @@ class FinishGuard:
                     self.success.observe_answer(supported[0], source="finish_guard")
                 self.allowed += 1
                 return None, False, []
+        # 非 flag 形态答案（slug / token / 任意串）：模型在 summary 里显式
+        # 写下的 ``answer:`` 行，与 ``AutoSubmitter.candidates`` 的候选抽取
+        # 同源（``flag_extract.explicit_answer_values``）。这类答案没有
+        # ``tag{...}`` 长相，``EvidenceLedger``（FLAG_RE 口径）永远无法背书，
+        # 所以这里放行**不**调 ``observe_answer``：平台裁决（autosubmit 的
+        # verify 预检 / 提交回执）才是 solved 的唯一权威；候选噪声由
+        # verify-answer 预检兜住，判错不消耗提交次数。
+        if explicit_answer_values(raw_input) or per_question_answers(raw_input):
+            # B-4 契约行：``ANSWER[<qid>]=<value>`` 与 ``answer:`` 行同判——
+            # 都是模型显式写下的交付。守卫拦它只会让非 flag 题在收工门口
+            # 撞满三次拒收后交白卷；solved 的权威仍在平台裁决。
+            self.allowed += 1
+            return None, False, []
         return None, True, echo_only
 
     def _probe_taken(self, result: bool, note: str) -> None:
@@ -231,13 +264,58 @@ class FinishGuard:
             self._probe_started = True
             return True
 
-    def _after_probe(self, echo_only: list[str] | None = None) -> dict[str, Any] | None:
+    def _giveup_answer(self, raw_input: str, echo_only: list[str] | None = None) -> str:
+        """拒满放行时从 summary 原文里取最可信的 flag 形状候选。
+
+        放行这一次不是「通过」，只是不再撞墙；但如果 summary 里本来就有一个
+        非占位的 flag 形状串，不记下来就等于交白卷（实测有整条 run 因为这里
+        返回 ``None`` 而零提交）。优先取有工具输出证据支持、且不是自回声的串。
+
+        **扫描用窄集 ``_FLAG_RE``，不是宽集 ``CANDIDATE_RE``。** 这条路径的产物会
+        被上游写成主答案并交给平台提交，属于"判分件"；绑宽集等于把 summary 里的
+        ``div{margin:0}`` / ``style{color:red}`` 这类配置与模板串当 flag 交上去，
+        白耗一次提交机会。窄集也是 accept 路径（``_evaluate_policy``）与
+        ``EvidenceLedger`` 记录证据用的那条——两条正则分叉时，守卫会认出一个证据链
+        永远记录不到的答案。
+
+        已知残余：无标点的 ``div{margin}`` 这类 ``word{word}`` 形态仍能过窄集，
+        与 accept 路径共享同一处代价（见 ``flag_extract.FLAG_RE`` 的 docstring）。
+
+        这里刻意不调用 ``evidence.reject()``：放行路径不该再留下拒绝记录。
+        """
+        seen: list[str] = []
+        for cand in _FLAG_RE.findall(raw_input or ""):
+            if is_placeholder(cand) or is_code_template(cand):
+                continue
+            if cand not in seen:
+                seen.append(cand)
+        if not seen:
+            return ""
+        echoed = set(echo_only or [])
+        if self.evidence is not None:
+            for cand in seen:
+                if cand not in echoed and self.evidence.supports(cand):
+                    return cand
+        for cand in seen:
+            if cand not in echoed:
+                return cand
+        return seen[0]
+
+    def _after_probe(
+        self,
+        echo_only: list[str] | None = None,
+        raw_input: str = "",
+    ) -> dict[str, Any] | None:
         if self._probe_result:
             if self.success is not None and not getattr(self.success, "solved", False):
                 self.success.mark("checker", "finish guard probe")
             self.allowed += 1
             return None
         if self.refusals >= _MAX_REFUSALS:
+            if self.success is not None and not getattr(self.success, "solved", False):
+                best = self._giveup_answer(raw_input, echo_only)
+                if best:
+                    self.success.observe_answer(best, source="finish_guard_giveup")
             self.allowed += 1
             self.gave_up = True
             return None
@@ -266,7 +344,7 @@ class FinishGuard:
         if refusal is not None or not needs_probe:
             return refusal
         if self.checker is None:
-            return self._after_probe(echo_only)
+            return self._after_probe(echo_only, raw_input)
         if self._probe_claim():
             try:
                 if inspect.iscoroutinefunction(self.checker):
@@ -283,7 +361,7 @@ class FinishGuard:
         elif not self._probe_ready.is_set():
             # Another finish call is probing; wait without blocking the loop.
             await asyncio.to_thread(self._probe_ready.wait)
-        return self._after_probe(echo_only)
+        return self._after_probe(echo_only, raw_input)
 
     def check(self, raw_input: str) -> dict[str, Any] | None:
         """Synchronous policy evaluation for legacy callers and unit tests.
@@ -303,7 +381,7 @@ class FinishGuard:
         refusal, needs_probe, echo_only = self._evaluate_policy(raw_input)
         if refusal is not None or not needs_probe:
             return refusal
-        return self._after_probe(echo_only)
+        return self._after_probe(echo_only, raw_input)
 
     def stats(self) -> dict[str, int]:
         """收工守卫的计数快照，供 result.json 事后归因。"""

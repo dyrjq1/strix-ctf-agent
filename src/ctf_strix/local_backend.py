@@ -50,6 +50,18 @@ _SEQ = itertools.count()
 _ACTIVE_ROOT: str | None = None
 
 
+def workspace_root() -> Path | None:
+    """本次 run 的沙箱工作目录（绝对路径）；尚未建档时返回 ``None``。
+
+    权限层之外的**路径口径**入口：shell 的 CWD 就是这个目录
+    （``unix_local._resolved_exec_context`` 把 ``cwd`` 和 ``HOME`` 都设在这里），
+    但提示层与工具都用 ``/workspace/...`` 或进程 CWD 说话，三方不一致（FMT-3）。
+    ``file_triage`` / ``nonweb`` 通过本函数把相对路径与 ``/workspace/x`` 统一解析
+    到同一处，读到的就是 agent 在 shell 里看到的那份文件。
+    """
+    return Path(_ACTIVE_ROOT) if _ACTIVE_ROOT else None
+
+
 #: strix 写死注入的代理变量，指向容器内的 Caido sidecar
 #: （``session_manager.py:308-314``，``http://127.0.0.1:<caido_port>``）。
 #:

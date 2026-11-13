@@ -1,0 +1,13 @@
+*** Begin Patch
+*** Update File: src/ctf_strix/agent.py
+@@
+-#: 平台自己写进工作目录的文件，永远不算题目附件。
+-_RESERVED_WORK_FILES = frozenset({"task.json", "result.json", "mcp.json"})
++#: 平台自己写进工作目录的文件，永远不算题目附件。
++#:
++#: ``README.md`` 是平台放的选手 API 说明（``test_attachment_fetch`` 的 fixture
++#: 就是这个形态），不是题目材料；题目真的只发一份 README 时应当在
++#: ``task.json.attachments`` 里显式声明。``.txt`` 不在此列——SAMPLE-011 的
++#: ``README.txt`` 就是货真价实的附件。
++_RESERVED_WORK_FILES = frozenset({"task.json", "result.json", "mcp.json", "README.md"})
+*** End Patch

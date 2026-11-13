@@ -17,10 +17,18 @@ Two hard properties, both covered by tests:
 
 Every name inside backticks is a registered tool in :mod:`ctf_strix.catalogue`;
 ``tests/test_method_cards.py`` scans the whole table so a typo cannot ship.
+
+A card is also dropped when this run did not install a tool it names: telling
+the model to call ``ai_quick_scan`` on a run without it costs a turn and
+teaches it to distrust the block.  ``available=None`` disables that filter
+(the card table itself is still checked by the scan above, which is what
+catches a typo in a card nobody happens to hit).
 """
 
 from __future__ import annotations
 
+import re
+from collections.abc import Collection
 from dataclasses import dataclass
 from typing import Iterable
 
@@ -46,9 +54,9 @@ PLAYBOOK = (
     "1 指纹：`http_probe` 打根路径与一条随机路径；全路径同体=死站，记录后停止。\n"
     "  版本用 `web_cve_lookup` 对一次；没版本就按框架结构打。\n"
     "2 枚举：`route_map` 一次列真实路由，`method_sweep` 打最好的两条。\n"
-    "  备份与编码变体交 `path_variants`；每轮最多 3 条新线索。\n"
-    "3 验证：先写证伪条件再发 payload，一次只改一个变量。\n"
-    "  两次同响应=机制错，换攻击类，不加大字典。\n"
+    "  备份与编码变体交 `path_variants`；从命中里选一条最像 flag 出口的，交给 3。\n"
+    "3 深挖：先写证伪条件，把 2 选中的面推到利用成功——读到行/文件/命令回显才算完。\n"
+    "  一次只改一个变量；新名字加不出新攻击类就换机制，换类不换名字。\n"
     "4 收口：flag 在响应体/头/上传文件里；落盘再 grep，不整包打印。\n"
     "  拿到即原样提交；无逐字输出依据就写未验证。"
 )
@@ -131,11 +139,11 @@ CARDS: tuple[Card, ...] = (
     ),
     _card(
         "idor,broken_access_control,mass_assignment,2fa_bypass,account_merge",
-        "越权：两个账号互换同名资源 id，看是否 200 且内容不同；`traffic_list` 回看已发请求里的 id/role 字段。",
+        "越权：两个账号互换同名资源 id，看是否 200 且内容不同；`traffic_list` 回看已发请求里的 id/role 字段。两个账号放两个具名会话（session 参数分别写 alice 与 bob），否则后登录的会把前一个的 cookie 覆盖掉。",
     ),
     _card(
         "weak_password,default_credentials,brute_force,authentication_bypass,password_reset",
-        "弱口令/认证：先试默认口令一组，再试登录处 SQLi 绕过；`http_probe` 一组一发，控制频率。",
+        "弱口令/认证：先试默认口令一组，再试登录处 SQLi 绕过；`http_probe` 一组一发，控制频率。登录成功后会话按 host 自动保留，直接打下一个路径——别自己抄 cookie，也别重发登录请求。",
     ),
     _card(
         "debug_endpoint,information_disclosure,secret_exposure,secret_leak,sourcemap",
@@ -196,34 +204,75 @@ def _keys(tags: Iterable[str] | None) -> set[str]:
     return {t.strip().lower() for t in (tags or ()) if isinstance(t, str) and t.strip()}
 
 
-def select(tags: Iterable[str] | None, kind: str | None, limit: int = MAX_CARDS) -> list[Card]:
+#: A tool name is a lowercase identifier inside backticks.  The table-wide scan
+#: in ``tests/test_method_cards.py`` guarantees every such span is a catalogue
+#: entry, so this cannot pick up prose or a shell flag (``--flag`` starts with
+#: a dash) by accident.
+_TOOL_REF = re.compile(r"`([a-z][a-z0-9_]*)`")
+
+
+def tools_named(text: str) -> frozenset[str]:
+    """Every tool a card asks the model to call, in backtick order.
+
+    Args:
+        text: card body (or any prose that names tools in backticks).
+
+    Returns:
+        The distinct names; empty when the text names none.
+    """
+    return frozenset(_TOOL_REF.findall(text))
+
+
+def select(
+    tags: Iterable[str] | None,
+    kind: str | None,
+    limit: int = MAX_CARDS,
+    available: Collection[str] | None = None,
+) -> list[Card]:
     """Cards whose key set intersects ``tags``, in table (priority) order.
 
-    Returns an empty list for any kind that has no web surface: a file or tcp
-    challenge must not pay for a web playbook.
+    Args:
+        tags: challenge tags; only used for the key intersection.
+        kind: challenge kind; anything without a web surface gets nothing.
+        limit: maximum number of cards.
+        available: tool names registered in this run.  A card naming a tool
+            outside this set is skipped -- see the module docstring.  ``None``
+            disables the filter (the caller cannot see the registry).
+
+    Returns:
+        Matching cards; empty for a kind with no web surface, no tags, or no
+        card whose tools are all installed.
     """
     if kind not in WEB_KINDS:
         return []
     wanted = _keys(tags)
     if not wanted:
         return []
+    known = None if available is None else frozenset(available)
     out: list[Card] = []
     for card in CARDS:
-        if card.keys & wanted and card not in out:
-            out.append(card)
-            if len(out) >= limit:
-                break
+        if not (card.keys & wanted) or card in out:
+            continue
+        if known is not None and not tools_named(card.text) <= known:
+            continue
+        out.append(card)
+        if len(out) >= limit:
+            break
     return out
 
 
-def render(tags: Iterable[str] | None, kind: str | None = None) -> str:
+def render(
+    tags: Iterable[str] | None,
+    kind: str | None = None,
+    available: Collection[str] | None = None,
+) -> str:
     """Render the block for ``user_instructions``; empty string when nothing hits.
 
     Cards are appended in priority order and the loop stops before the block
     would exceed :data:`MAX_CHARS`, so the lowest-priority cards are the ones
     dropped.  A run with no matching card injects nothing at all.
     """
-    cards = select(tags, kind)
+    cards = select(tags, kind, available=available)
     if not cards:
         return ""
     lines = [PLAYBOOK]

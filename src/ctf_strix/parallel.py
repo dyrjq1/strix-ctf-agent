@@ -26,11 +26,10 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import re
 import threading
 from typing import Any
 
-from ctf_strix.flag_extract import is_placeholder
+from ctf_strix.flag_extract import CANDIDATE_RE, is_placeholder
 
 logger = logging.getLogger(__name__)
 
@@ -39,7 +38,9 @@ logger = logging.getLogger(__name__)
 #: deliberately a constant, not an environment-tunable budget.
 MAX_SUBAGENTS = 2
 
-_FLAG_RE = re.compile(r"(?:FLAG|flag|CTF|ctf|CTFY|ctfy)\{[^}\s]{2,}\}")
+#: 取宽集（``CANDIDATE_RE``）：这里只判"子 agent 的输出里有没有答案形状"，
+#: 宽一点不会漏掉竞速取胜的机会；窄集留给落盘与提交。
+_FLAG_RE = CANDIDATE_RE
 _LOCK = threading.Lock()
 _INSTALLED = False
 #: Strong references to race-stop tasks.  ``asyncio`` keeps only a weak

@@ -36,9 +36,9 @@ exercised. Without the proxy flag the two servers never see each other's traffic
   - [Fast Path: Zero to Flag](#fast-path-zero-to-flag)
 - [When to Use Burp MCP vs curl vs Playwright MCP](#when-to-use-burp-mcp-vs-curl-vs-playwright-mcp)
 
-For interacting with the CTF *platform* itself (reading challenges, downloading
-attachments, submitting flags) see
-[../solve-challenge/SKILL.md](../solve-challenge/SKILL.md#ctf-platform-interaction-via-playwright-mcp).
+Platform interaction (reading challenges, downloading attachments, submitting
+flags) is the agent runtime's job, not this pack's -- there is no chapter for it
+here.
 
 ---
 

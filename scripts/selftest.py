@@ -116,14 +116,31 @@ def test_enum_guard() -> None:
     check("shell 变量不撕裂 host", g1 is not None and "abc.ctfy.run" in str(g1), str(g1))
 
     # v2 判据：只有**响应完全一样**才算重复（AFL 覆盖率思维）。
+    # 硬封还要求同一族里试过多个不同叶子：重复打同一个 URL 更像网络抖动重试，
+    # 不是枚举。所以这里按设计给三个叶子，否则第 5 次不该升级成硬封。
     g = EnumerationGuard()
     same = '{"cmd":"curl https://abc.ctfy.run/api/coins/x"}'
-    seq = [g.observe("exec_command", same, "[HTTP 404] not found") for _ in range(6)]
+    leaves = [
+        f'{{"cmd":"curl https://abc.ctfy.run/api/coins/{leaf}"}}'
+        for leaf in ("a", "b", "c")
+    ]
+    seq = [
+        g.observe("exec_command", leaves[i % 3], "[HTTP 404] not found")
+        for i in range(5)
+    ]
     check("第 3 次同响应起警告", "ENUMERATION GUARD" in (seq[2] or ""), str(seq[2])[:60])
-    check("第 5 次升级硬指令", "Stop now" in (seq[4] or ""), str(seq[4])[:60])
-    fresh = g.observe("exec_command", same, '[HTTP 200] {"ok":true,"n":7}')
+    check("第 5 次升级硬指令", "this family is blocked" in (seq[4] or ""), str(seq[4])[:60])
+
+    # 被封的格子会一直回硬封文案（并发情况下 begin 与 finish 之间也会被封），
+    # 所以下面两条「签名判定」用新守卫，避免把封禁文案当成签名比较结果。
+    sig_guard = EnumerationGuard()
+    same = '{"cmd":"curl https://abc.ctfy.run/api/coins/x"}'
+    sig_guard.observe("exec_command", same, "[HTTP 404] not found")
+    fresh = sig_guard.observe("exec_command", same, '[HTTP 200] {"ok":true,"n":7}')
     check("新响应不算重复", fresh is None, str(fresh)[:40])
-    path_echo = g.observe("exec_command", same, "[HTTP 404] not found for /api/coins/x")
+    path_echo = sig_guard.observe(
+        "exec_command", same, "[HTTP 404] not found for /api/coins/x"
+    )
     check("换路径的回显共同指纹", path_echo is None, str(path_echo)[:40])
 
 

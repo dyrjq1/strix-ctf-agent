@@ -31,6 +31,8 @@ finish 被拒 1-3 次 → 在低产出路径上空转 → attempt 预算打满 �
 
 from __future__ import annotations
 
+from ctf_strix.tool_notes import append_note
+
 import logging
 import math
 import threading
@@ -171,7 +173,7 @@ def install() -> "TurnBudgetGuard":
                 logger.warning("turn budget guard observe failed", exc_info=True)
                 return result
             if hint:
-                return f"{result}{hint}"
+                return append_note(result, hint)
             return result
 
         tool.on_invoke_tool = invoke

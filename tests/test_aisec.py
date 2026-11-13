@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -169,7 +170,7 @@ def mocks() -> Any:
 
 
 def _allow(*urls: str) -> UrlGuard:
-    """把 mock 地址放进白名单（模拟评测脚本写 CTF_AISEC_ALLOW）。"""
+    """把 mock 地址放进白名单（模拟入口按题面声明写 CTF_AISEC_ALLOW）。"""
     hosts: set[str] = set()
     for u in urls:
         p = urllib_parse(u)
@@ -253,6 +254,26 @@ def test_header_version(rulebook: Path, mocks: dict[str, str]) -> None:
     assert dify["confidence"] == "high"
 
 
+def test_lookup_rule_file_path_is_absolute_and_readable(
+    rulebook: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """N-8：ai_cve_lookup 输出的规则文件路径必须绝对且真实存在。
+
+    相对路径在 agent 的 cwd 下不可读，「可直接读取该文件」就成了空头支票。
+    """
+    from ctf_strix.aisec import tools as aisec_tools
+
+    monkeypatch.setenv("CTF_AISEC_DATA", str(rulebook))
+    rel = rulebook / "vuln" / "ollama" / "CVE-2024-37032.yaml"
+    rel.parent.mkdir(parents=True, exist_ok=True)
+    rel.write_text("details:\n  - bug\n", encoding="utf-8")
+    out = asyncio.run(aisec_tools.ai_cve_lookup("ollama", "0.1.29"))
+    line = next(ln for ln in out.splitlines() if "规则文件" in ln)
+    loc = line.split("规则文件:")[1].strip()
+    p = Path(loc)
+    assert p.is_absolute() and p.is_file(), loc
+
+
 def test_lookup_filters_by_version(rulebook: Path) -> None:
     """CVE 查询按版本约束过滤：旧版本多命中，新版本一条都没有。"""
     old = aig_probe.lookup("ollama", "0.1.29")
@@ -334,6 +355,75 @@ def test_ssrf_guard_default_denies_private() -> None:
     with pytest.raises(BlockedTarget):
         g.check("http://10.0.0.5:11434/")
     assert g.check("http://8.8.8.8/")
+
+
+def test_ssrf_guard_rejects_special_use_range_without_whitelist() -> None:
+    """白名单为空时，禁网段之外的特殊用途段也必须拒。
+
+    ``_DENY_NETS`` 覆盖主要私网，但 TEST-NET（192.0.2.0/24）、192.88.99.0/24
+    这类段不在其中，只能靠 ``is_global`` 兜住。旧实现把这段检查挂在
+    ``allow_private`` 下，清单为空时该字段为 True（``from_env`` 的取值），
+    整段循环被跳过——等于给这些段开了口子。删掉该字段后循环恒执行。
+    """
+    g = UrlGuard()
+    with pytest.raises(BlockedTarget):
+        g.check("http://192.0.2.1/")
+    assert g.check("http://8.8.8.8/")
+
+
+def test_entrypoint_allowlist_is_built_from_declared_endpoints(monkeypatch) -> None:
+    """AI-1：入口登记放行清单，三个 AI 工具才真的能打到靶机。
+
+    旧实现里 ``allow_for()`` 只有模块 ``__main__`` 一个调用点，``agent.py``
+    与 ``scripts/run_strix_ctf.py`` 都不写 ``CTF_AISEC_ALLOW``，运行时清单
+    恒空，私网靶机在网段检查那一步就被拒——工具在真题上永远返回
+    「目标被拒绝」，等于没装。
+    """
+    from ctf_strix import agent as agent_mod
+    from ctf_strix.aisec import tools as aisec_tools
+
+    monkeypatch.setenv("CTF_AISEC_ALLOW", "")
+    monkeypatch.delenv("CTFY_TARGET_URL", raising=False)
+    task = {
+        "target_endpoints": [{"url": "http://172.16.15.2:31313/", "type": "http"}]
+    }
+    allowed = aisec_tools.allow_targets(agent_mod._targets_from(task))
+    assert allowed == ["172.16.15.2:31313"]
+    assert os.environ["CTF_AISEC_ALLOW"] == "172.16.15.2:31313"
+    assert aisec_tools._guard().check("http://172.16.15.2:31313/api/tags") == (
+        "http://172.16.15.2:31313/api/tags"
+    )
+
+
+def test_entrypoint_allowlist_stays_at_host_port_granularity(monkeypatch) -> None:
+    """放行的是端点，不是整台主机，更不是整段网络。"""
+    from ctf_strix import agent as agent_mod
+    from ctf_strix.aisec import tools as aisec_tools
+
+    monkeypatch.setenv("CTF_AISEC_ALLOW", "")
+    monkeypatch.delenv("CTFY_TARGET_URL", raising=False)
+    task = {
+        "target_endpoints": [{"url": "http://172.16.15.2:31313/", "type": "http"}]
+    }
+    aisec_tools.allow_targets(agent_mod._targets_from(task))
+    g = aisec_tools._guard()
+    for bad in (
+        "http://172.16.15.2:8080/",  # 同主机别的端口
+        "http://172.16.15.3:31313/",  # 邻居主机
+        "http://169.254.169.254/latest/meta-data",
+    ):
+        with pytest.raises(BlockedTarget):
+            g.check(bad)
+
+
+def test_allow_targets_ignores_non_endpoint_targets(monkeypatch) -> None:
+    """网段与空值不能变成 host:port：``10.20.0.0/16`` 不是可放行的端点。"""
+    from ctf_strix.aisec import tools as aisec_tools
+
+    monkeypatch.setenv("CTF_AISEC_ALLOW", "")
+    assert aisec_tools.allow_targets([]) == []
+    assert aisec_tools.allow_targets(["", "10.20.0.0/16"]) == []
+    assert aisec_tools.allow_targets(["10.20.0.0:22"]) == ["10.20.0.0:22"]
 
 
 def test_regex_bomb_is_bounded() -> None:
@@ -454,3 +544,49 @@ def test_tool_blocks_out_of_scope_target() -> None:
     # 不用 pytest-asyncio：这两条本来就没有并发语义，少一个测试期依赖。
     out = asyncio.run(ai_fingerprint("http://169.254.169.254/latest/meta-data"))
     assert "拒绝" in out, out
+
+
+def test_aisec_offline_covers_a_tcp_challenge(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A tcp challenge has no page to fingerprint but can still name a version.
+
+    ``wants_aisec`` stays False there -- the three HTTP probes are still
+    withheld; only the offline lookup is offered (AI-5).
+    """
+    from ctf_strix.capabilities import aisec_offline, wants_aisec
+
+    monkeypatch.delenv("CTF_AISEC", raising=False)
+    task = {
+        "challenge": {"description": "an ollama service on a raw socket"},
+        "tags": ["agentic_ai"],
+    }
+    assert wants_aisec("tcp", task)[0] is False
+    on, reason = aisec_offline("tcp", task)
+    assert on is True, reason
+    assert "agentic_ai" in reason
+    assert aisec_offline("file", task)[0] is False
+    assert aisec_offline("tcp", {"tags": ["pwn"]})[0] is False
+
+
+def test_aisec_offline_honours_the_env_veto(monkeypatch: pytest.MonkeyPatch) -> None:
+    """CTF_AISEC=0 must kill the offline lookup too, not just the probes."""
+    from ctf_strix.capabilities import aisec_offline
+
+    monkeypatch.setenv("CTF_AISEC", "0")
+    task = {"tags": ["agentic_ai"]}
+    assert aisec_offline("tcp", task) == (False, "CTF_AISEC=0")
+    monkeypatch.setenv("CTF_AISEC", "1")
+    assert aisec_offline("tcp", task)[0] is True
+
+
+def test_register_offline_registers_only_the_lookup() -> None:
+    """The offline group is one tool: no probe, no allowlist, no HTTP schema."""
+    from ctf_strix.aisec import tools as aisec_tools
+
+    assert aisec_tools.OFFLINE_TOOLS == (aisec_tools.ai_cve_lookup,)
+    assert set(aisec_tools.OFFLINE_TOOLS) <= set(aisec_tools.TOOLS)
+
+    calls: list[object] = []
+    names = aisec_tools.register_offline(lambda *tools: calls.extend(tools))
+    assert names == ["ai_cve_lookup"]
+    assert len(calls) == 1
+    assert getattr(calls[0], "name", "") == "ai_cve_lookup"

@@ -18,8 +18,8 @@ ARG APT_MIRROR=""
 ARG PIP_INDEX_URL=""
 
 # agent 会在容器里开 shell 干活，工具链必须现成。
-# 缺 nmap/sqlmap 这类专用工具不致命（agent 会用 python 手写），
-# 缺 curl/python3/pip 则会直接把整题卡死。
+# 专用扫描器（nmap/sqlmap/ffuf/r2）在下面的 stage 里装齐：运行期断网，装不上
+# 就是没有，agent 只能手写一遍，等于白花轮次。缺 curl/python3/pip 则直接卡死。
 RUN set -eux; \
     if [ -n "$APT_MIRROR" ]; then \
         sed -i "s|deb.debian.org|${APT_MIRROR}|g" /etc/apt/sources.list.d/debian.sources 2>/dev/null || \

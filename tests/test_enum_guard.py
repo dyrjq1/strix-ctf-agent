@@ -584,3 +584,159 @@ def test_request_path_strips_json_and_shell_residue():
     }
 
     assert paths == {"/api/x/1"}
+
+
+# ---------------------------------------------------------------------------
+# WEB-3 / WEB-6: a block covers one request cell, not the whole path family
+# ---------------------------------------------------------------------------
+#
+# The key used to be ``tool|host|family``, so once a GET family was blocked
+# every method on it -- and every future call carrying a session -- was refused
+# before the tool ran.  "This route has no new information" was being read as
+# "this route may never be used again", which is false the moment the request
+# changes method or identity.
+
+
+def _block_notes_family(wrapped) -> None:
+    """Drive one unauthenticated GET family past the hard threshold."""
+    for index in range(enum_guard._HARD_REPEATS + 1):
+        _run(wrapped, BLOCK_PATHS[index % len(BLOCK_PATHS)])
+
+
+def test_switching_method_reopens_a_blocked_family(factory):
+    """Same URL, different verb: the block was counted on a different request."""
+    tool = FakeTool("exec_command", "[HTTP 404] 404 page not found")
+    guard, (wrapped,) = _install(factory, [tool])
+    _block_notes_family(wrapped)
+    assert guard.blocked
+
+    assert _run(wrapped, BLOCK_PATHS[0]).startswith("ERROR: [ENUMERATION GUARD]")
+    calls = tool.calls
+
+    out = _run(wrapped, '{"cmd": "curl -s -X POST https://x.test/api/notes/note_a"}')
+
+    assert not out.startswith("ERROR: [ENUMERATION GUARD]")
+    assert tool.calls == calls + 1, "a different method is a different request"
+
+
+def test_bringing_a_session_reopens_a_blocked_family(factory):
+    """Same URL and verb, but authenticated: a new identity gets a fresh count."""
+    tool = FakeTool("exec_command", "[HTTP 404] 404 page not found")
+    guard, (wrapped,) = _install(factory, [tool])
+    _block_notes_family(wrapped)
+    assert guard.blocked
+    calls = tool.calls
+
+    out = _run(
+        wrapped, '{"cmd": "curl -s -b jar.txt https://x.test/api/notes/note_a"}'
+    )
+
+    assert not out.startswith("ERROR: [ENUMERATION GUARD]")
+    assert tool.calls == calls + 1
+
+
+def test_the_same_unauthenticated_method_stays_blocked(factory):
+    """Reverse control: widening the key must not lift the original block."""
+    tool = FakeTool("exec_command", "[HTTP 404] 404 page not found")
+    guard, (wrapped,) = _install(factory, [tool])
+    _block_notes_family(wrapped)
+    calls = tool.calls
+
+    for _ in range(2):
+        refused = _run(wrapped, BLOCK_PATHS[0])
+        assert refused.startswith("ERROR: [ENUMERATION GUARD]")
+
+    assert tool.calls == calls, "an unchanged request must still be refused"
+
+
+@pytest.mark.parametrize(
+    ("tool_name", "args", "expected"),
+    [
+        # shell form: method from an explicit flag, then from what a body flag
+        # implies, then from a head flag.
+        ("exec_command", BLOCK_ARGS, "exec_command|x.test|GET|anon|notes"),
+        (
+            "exec_command",
+            '{"cmd": "curl -s -X POST https://x.test/api/notes/note_a"}',
+            "exec_command|x.test|POST|anon|notes",
+        ),
+        (
+            "exec_command",
+            '{"cmd": "curl -s -d a=b https://x.test/api/notes/note_a"}',
+            "exec_command|x.test|POST|anon|notes",
+        ),
+        (
+            "exec_command",
+            '{"cmd": "curl -s -G -d a=b https://x.test/api/notes/note_a"}',
+            "exec_command|x.test|GET|anon|notes",
+        ),
+        (
+            "exec_command",
+            '{"cmd": "curl -s -I https://x.test/api/notes/note_a"}',
+            "exec_command|x.test|HEAD|anon|notes",
+        ),
+        # wget's ``-X`` is --exclude-directories, not a request method.
+        (
+            "exec_command",
+            '{"cmd": "wget -q -X /tmp https://x.test/api/notes/note_a"}',
+            "exec_command|x.test|GET|anon|notes",
+        ),
+        (
+            "exec_command",
+            '{"cmd": "wget -q --method=PUT https://x.test/api/notes/note_a"}',
+            "exec_command|x.test|PUT|anon|notes",
+        ),
+        # session carried by a cookie jar, and by an explicit header
+        (
+            "exec_command",
+            '{"cmd": "curl -s -b jar.txt https://x.test/api/notes/note_a"}',
+            "exec_command|x.test|GET|auth|notes",
+        ),
+        (
+            "exec_command",
+            '{"cmd": "curl -s -H \'Cookie: sid=abc\' https://x.test/api/notes/note_a"}',
+            "exec_command|x.test|GET|auth|notes",
+        ),
+        # http_probe takes method/cookies/headers_json as parameters, not flags
+        (
+            "http_probe",
+            '{"url": "https://x.test/api/notes/note_a", "method": "POST"}',
+            "http_probe|x.test|POST|anon|notes",
+        ),
+        (
+            "http_probe",
+            '{"url": "https://x.test/api/notes/note_a", "cookies": "sid=abc"}',
+            "http_probe|x.test|GET|auth|notes",
+        ),
+        (
+            "http_probe",
+            '{"url": "https://x.test/api/notes/note_a",'
+            ' "headers_json": "{\\"Cookie\\": \\"sid=abc\\"}"}',
+            "http_probe|x.test|GET|auth|notes",
+        ),
+        # a sweep over several methods is its own cell, not the first method's
+        (
+            "http_probe",
+            '{"url": "https://x.test/api/notes/note_a", "methods": "POST,GET"}',
+            "http_probe|x.test|GET+POST|anon|notes",
+        ),
+    ],
+)
+def test_fingerprint_names_the_request_cell(tool_name, args, expected):
+    """Family stays last so every ``rsplit``/``endswith`` on the key still works."""
+    key = enum_guard._fingerprint(tool_name, args)
+
+    assert key == expected
+    assert key.rsplit("|", 1)[-1] == "notes"
+
+
+def test_blocked_error_reads_the_family_from_the_key_tail():
+    """The widened key must not leak method/auth segments into the error text."""
+    key = "exec_command|127.0.0.1|POST|auth|api/login"
+
+    assert "'api/login'" in enum_guard.EnumerationGuard._blocked_error(key)
+    assert "127.0.0.1" not in enum_guard.EnumerationGuard._blocked_error(key)
+
+    guard = enum_guard.EnumerationGuard()
+    guard.exhausted_family = key
+    assert "'api/login'" in guard.exhausted_detail()

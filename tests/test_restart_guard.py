@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
+import json
 import re
 import sys
 from pathlib import Path
+from typing import Any
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "src"))
@@ -80,21 +83,76 @@ def test_fourth_l1_request_is_refused_without_injection() -> None:
     assert guard.requests(rg.L1) == 4
 
 
-def test_l1_policy_hard_refuses_a_repeat_of_the_refuted_mechanism() -> None:
+def test_l1_policy_advises_but_never_refuses_a_repeat_of_the_refuted_mechanism() -> None:
     guard = _guard()
     _stall(guard)
     assert guard.request_injection(rg.L1)
 
-    refusal = guard.check_call(
-        "exec_command", "curl -s http://target/robots.txt"
-    )
-    assert refusal is not None and refusal.startswith("ERROR:")
-    assert "[RESTART GUARD]" in refusal
+    note = guard.check_call("exec_command", "curl -s http://target/robots.txt")
+    assert note is not None
+    assert "[RESTART GUARD L1]" in note
+    assert not note.startswith("ERROR:")
+    assert "advisory" in note
 
-    allowed = guard.check_call(
+    # The first classified probe consumes the policy, so the note is shown once.
+    again = guard.check_call("exec_command", "curl -s http://target/robots.txt")
+    assert again is None
+
+
+def test_l1_policy_is_silent_when_the_probe_uses_an_unused_class() -> None:
+    guard = _guard()
+    _stall(guard)
+    assert guard.request_injection(rg.L1)
+
+    unused = guard.check_call(
         "exec_command", "curl -s 'http://target/api?id=1 union select 1'"
     )
-    assert allowed is None
+    assert unused is None
+
+    # Consumed here too: a later repeat draws no note either.
+    assert guard.check_call("exec_command", "curl -s http://target/robots.txt") is None
+
+
+def test_l1_policy_survives_an_unclassifiable_call() -> None:
+    guard = _guard()
+    _stall(guard)
+    assert guard.request_injection(rg.L1)
+
+    assert guard.check_call("exec_command", "pwd") is None
+
+    note = guard.check_call("exec_command", "curl -s http://target/robots.txt")
+    assert note is not None and "[RESTART GUARD L1]" in note
+
+
+class _FakeTool:
+    """Minimal stand-in for ``agents.FunctionTool`` at the attach layer."""
+
+    def __init__(self) -> None:
+        self.name = "exec_command"
+        self.calls = 0
+        self.on_invoke_tool = self._invoke
+
+    async def _invoke(self, ctx: Any, raw_input: str) -> str:
+        self.calls += 1
+        return "OUTPUT"
+
+
+def test_attach_runs_the_probe_and_appends_the_note(monkeypatch) -> None:
+    guard = _guard()
+    _stall(guard)
+    assert guard.request_injection(rg.L1)
+    monkeypatch.setattr(rg, "current", lambda: guard)
+
+    tool = rg.attach(_FakeTool())
+    result = asyncio.run(
+        tool.on_invoke_tool(
+            None, json.dumps({"command": "curl -s http://target/robots.txt"})
+        )
+    )
+
+    assert tool.calls == 1
+    assert result.startswith("OUTPUT")
+    assert "[RESTART GUARD L1]" in result
 
 
 def _ledger() -> list[Exchange]:

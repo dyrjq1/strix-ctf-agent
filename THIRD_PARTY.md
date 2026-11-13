@@ -9,7 +9,7 @@
 - 上游：https://github.com/ljagiello/ctf-skills
 - 版权：Copyright (c) 2026 Lukasz Jagiello
 - 许可证：MIT，全文见 `LICENSES/ctf-skills-MIT.txt`（副本亦在 `src/ctf_strix/skills_strix/LICENSE`）
-- 修改内容：`build_skill_pack.py` 将各技能目录下的 `SKILL.md` 额外复制一份为 `<分类>/<分类>.md`，以符合 strix 加载器的 `<分类>/<名字>.md` 硬编码路径约定；未改动任何原文内容。
+- 修改内容：上游各技能目录下的 `SKILL.md` 正文改写为 `<分类>/<分类>.md`（strix 加载器硬编码只认 `<分类>/<名字>.md`）。本包**不再分发 `SKILL.md` 副本**，同一份正文只保留索引一个真相。正文已做离线化改写（去掉联网安装步骤、把镜像里不存在的工具从「可直接运行」降级为文字说明），因此「未改动任何原文内容」不再成立。
 - 本地基线 commit：`2388a3b`
 
 `ctf-triage/` 与 `ctf-ai-infra/` 两个技能为本项目自建，不在上述 MIT 授权范围内。

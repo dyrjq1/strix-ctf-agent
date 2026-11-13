@@ -44,6 +44,17 @@ from typing import Any, Callable, Iterable, Mapping
 MAX_ATTACHMENT_BYTES = 16 * 1024 * 1024
 MAX_RESPONSE_BYTES = 24 * 1024 * 1024
 
+#: A *declared* attachment may be far larger than the inline cap: challenge
+#: images and real binaries are routinely over 16 MiB, and refusing them at the
+#: download step used to leave a run with zero readable attachments (FMT-1).
+#: The relaxed cap only applies when the listing declares a size -- a file of
+#: unknown size keeps MAX_ATTACHMENT_BYTES, so "no size" cannot smuggle in an
+#: unbounded stream.  MAX_BINARY_BYTES stays a hard ceiling even then.
+MAX_BINARY_BYTES = 256 * 1024 * 1024
+_DOWNLOAD_TIMEOUT_CAP = 120.0
+#: Conservative LAN floor used to turn a declared volume into a time allowance.
+_MIN_DOWNLOAD_BYTES_PER_SEC = 4 * 1024 * 1024
+
 _USER_AGENT = "ctfy-agent"
 _HTTP_TIMEOUT_FLOOR = 0.1
 _EXPAND = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
@@ -140,6 +151,32 @@ def _timeout(deadline: float) -> float:
 
 def _budget_spent(deadline: float) -> bool:
     return time.monotonic() >= deadline
+
+
+def _binary_limit(spec: FileSpec) -> int:
+    """Per-file download cap; relaxed only for a declared size.
+
+    ``MAX_ATTACHMENT_BYTES`` stays in force for anything the listing does not
+    size, and ``MAX_BINARY_BYTES`` is the hard ceiling above that.
+    """
+    declared = spec.size
+    if declared is None or declared <= MAX_ATTACHMENT_BYTES:
+        return MAX_ATTACHMENT_BYTES
+    return min(declared, MAX_BINARY_BYTES)
+
+
+def _download_deadline(deadline: float, declared_total: int) -> float:
+    """Extend the wall clock only when the listing declares a big payload.
+
+    The attachment budget is sized for a few MiB; a declared 200 MiB image
+    would be cut off mid-download even with the byte cap raised.  The extra
+    time is derived from the declared volume, capped, and never shortens what
+    the caller already granted.
+    """
+    if declared_total <= MAX_ATTACHMENT_BYTES:
+        return deadline
+    estimated = 5.0 + declared_total / _MIN_DOWNLOAD_BYTES_PER_SEC
+    return max(deadline, time.monotonic() + min(estimated, _DOWNLOAD_TIMEOUT_CAP))
 
 
 def _read_limited(response: Any, limit: int) -> bytes:
@@ -263,7 +300,7 @@ def _download_rest(
         url = f"{base}/{urllib.parse.quote(name, safe='')}"
         try:
             status, _headers, blob = _http(
-                url, headers, timeout=_timeout(deadline), limit=MAX_ATTACHMENT_BYTES
+                url, headers, timeout=_timeout(deadline), limit=_binary_limit(spec)
             )
         except Exception as exc:  # noqa: BLE001 - one file must not stop the rest
             result.errors.append(f"{name}: {type(exc).__name__}: {_clip(exc)}")
@@ -318,17 +355,23 @@ def _fetch_rest(
         names = [spec.name for spec in listing]
 
     specs: dict[str, FileSpec] = {}
+    if result.listed:
+        # Carry the declared size through: it is both the download cap and the
+        # integrity check, and dropping it here used to disable both.
+        for spec in result.files:
+            specs.setdefault(spec.name, spec)
     for name in names:
         specs.setdefault(name, FileSpec(name=name))
     if not result.listed:
         # Names came from task.json or from a previous channel; keep them so
         # the caller can see what it asked for even when nothing downloaded.
         result.files = list(specs.values())
+    declared_total = sum(spec.size or 0 for spec in specs.values())
     _download_rest(
         base,
         specs,
         should_skip=should_skip,
-        deadline=deadline,
+        deadline=_download_deadline(deadline, declared_total),
         token=token,
         result=result,
     )

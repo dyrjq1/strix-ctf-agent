@@ -188,7 +188,7 @@ def test_soft_path_unwinds_main_then_cancel_is_safe(tmp_path, monkeypatch):
 
 
 # b. Hard path: main is still alive after the soft window, so a subprocess
-#    must write the fallback and exit 233.
+#    must write the fallback, log the hard stop, and exit 0.
 def _run_watchdog_script(tmp_path: Path, body: str) -> subprocess.CompletedProcess:
     script = f"""
 import json, os, signal, threading, time
@@ -214,7 +214,7 @@ result = Path(os.environ["WD_RESULT"])
     )
 
 
-def test_hard_path_writes_fallback_and_exits_233(tmp_path):
+def test_hard_path_writes_fallback_and_exits_zero(tmp_path):
     proc = _run_watchdog_script(
         tmp_path,
         """
@@ -225,11 +225,22 @@ assert deadline.install(
 time.sleep(10)
 """,
     )
+    # exit code no longer discriminates the hard path from a normal
+    # finish (both are 0 per CTFY-0001); the log line is what proves the
+    # hard stage fired.
+    assert "[ctfy] wallclock hard stop" in proc.stderr
     assert proc.returncode == deadline.HARD_EXIT_CODE, proc.stderr
     payload = json.loads((tmp_path / "result.json").read_text(encoding="utf-8"))
     assert payload["stop_reason"] == "wallclock_hard"
     assert payload["answers"] == {}
     assert payload["schema_version"] == 3
+
+
+def test_hard_exit_code_is_zero_per_platform_contract():
+    """CTFY-0001: nonzero exit is judged a failed run, so the hard stop must
+    deliver its fallback result with exit status 0 (regression pin against
+    the retired 233 code, which the platform booked as a crash)."""
+    assert deadline.HARD_EXIT_CODE == 0
 
 
 def test_hard_path_without_sigalrm_attribute(tmp_path):
@@ -289,7 +300,7 @@ agent.main()
 
 
 def test_hard_path_never_overwrites_a_result_written_during_the_window(tmp_path):
-    """c. A finished run is left alone: real result kept, no exit 233."""
+    """c. A finished run is left alone: real result kept, no hard stop."""
     proc = _run_watchdog_script(
         tmp_path,
         """

@@ -17,6 +17,7 @@ from ctf_strix.agent import (
     _record_answer,
     _round_note,
     _scope_note,
+    _submittable_answers,
     _target_endpoints,
     _target_specs,
     _targets_from,
@@ -170,6 +171,48 @@ def test_needs_value_treats_a_mirror_as_open() -> None:
     derived = {"xhr_token"}
     assert _needs_value(answers, ["flag", "xhr_token"], derived) is True
     assert _needs_value(answers, ["flag"], derived) is False
+
+
+def test_only_a_platform_confirmed_mirror_reaches_the_payload() -> None:
+    """A mirror is submitted only when the platform accepted that exact value.
+
+    Ledger 4.9 needs the second id to carry the same flag; P0-0 item 2 needs
+    the platform not to spend an attempt on a guess.  Both hold together only
+    for ``value == confirmed``.
+    """
+    answers: dict[str, str] = {}
+    derived: set[str] = set()
+    _record_answer(
+        answers, ["flag", "xhr_token"], "CTFY{confirmed}", "flag", derived=derived
+    )
+    assert _submittable_answers(answers, derived, "CTFY{confirmed}") == {
+        "flag": "CTFY{confirmed}",
+        "xhr_token": "CTFY{confirmed}",
+    }
+
+
+def test_a_mirror_the_platform_never_confirmed_is_dropped() -> None:
+    """Six candidates, one accepted: only the evidence value is submitted.
+
+    The platform charges one wrong-answer attempt per key it finds in
+    ``payload["answers"]``.  The mirror was the run's own guess, and the
+    platform accepted a different string (or none), so it must not ship.
+    """
+    answers = {"flag": "CTFY{evidence}", "xhr_token": "CTFY{guess}"}
+    derived = {"xhr_token"}
+    assert _submittable_answers(answers, derived, "CTFY{evidence}") == {
+        "flag": "CTFY{evidence}"
+    }
+
+
+def test_without_any_platform_verdict_no_mirror_is_submitted() -> None:
+    """An offline run still reports its real answer, but not its guess."""
+    answers = {"flag": "CTFY{x}", "xhr_token": "CTFY{x}"}
+    derived = {"xhr_token"}
+    assert _submittable_answers(answers, derived, "") == {"flag": "CTFY{x}"}
+    # No mirrors at all: the map must survive untouched (single-id challenges,
+    # and the qa/file kinds, all take this path).
+    assert _submittable_answers(answers, set(), "") == answers
 
 
 def test_a_later_guess_does_not_overwrite_an_earlier_real_answer() -> None:
@@ -337,6 +380,45 @@ def test_ctfy_target_url_does_not_duplicate_endpoint(monkeypatch: pytest.MonkeyP
     assert _targets_from(task) == [url]
 
 
+def test_web_endpoint_without_scheme_is_normalized(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """WEB-8：type 说 http 而 url 缺 scheme 时按 type 补，不是原样塞进目标。"""
+    monkeypatch.delenv("CTFY_TARGET_URL", raising=False)
+    task: dict[str, Any] = {
+        "run_mode": "instance",
+        "scope": [],
+        "target_endpoints": [{"label": "web", "type": "http", "url": "box.ctfy.example:80"}],
+    }
+    assert _targets_from(task) == ["http://box.ctfy.example:80"]
+
+
+def test_web_endpoint_https_type_gets_https_prefix(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """WEB-8：type=https 的裸地址补 https://，别一律按 http 打。"""
+    monkeypatch.delenv("CTFY_TARGET_URL", raising=False)
+    task: dict[str, Any] = {
+        "run_mode": "instance",
+        "scope": [],
+        "target_endpoints": [{"label": "web", "type": "https", "url": "box.ctfy.example:443"}],
+    }
+    assert _targets_from(task) == ["https://box.ctfy.example:443"]
+
+
+def test_schemeless_env_url_dedups_against_schemed_endpoint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """WEB-8：环境变量裸地址归一后与端点去重——一个地址不当两台机器打。"""
+    monkeypatch.setenv("CTFY_TARGET_URL", "box.ctfy.example:80")
+    task: dict[str, Any] = {
+        "run_mode": "instance",
+        "scope": [],
+        "target_endpoints": [{"label": "web", "type": "http", "url": "http://box.ctfy.example:80"}],
+    }
+    assert _targets_from(task) == ["http://box.ctfy.example:80"]
+
+
 def test_target_endpoints_keep_tcp_port(monkeypatch: pytest.MonkeyPatch) -> None:
     """``type: tcp`` 的端点进 scope 时不能丢端口——TCP 题全靠它。"""
     monkeypatch.delenv("CTFY_TARGET_URL", raising=False)
@@ -428,3 +510,41 @@ def test_declared_attachments_still_win(monkeypatch, tmp_path) -> None:
         "attachments": ["vaultsvc"],
     }
     assert _challenge_kind(task, tmp_path) == "file"
+
+
+def test_checker_kind_needs_every_question_to_say_so(monkeypatch) -> None:
+    """一个 checker 题 + 一个没写 mode 的题：后者可能是真要交 flag 的那道。
+
+    旧实现把没有 ``mode`` 的 question 直接丢掉，于是集合只剩 ``{checker}``，
+    整题判成 checker → ``require_flag=False`` → 真 flag 题可以无 flag 收工
+    （报告 WEB-11）。缺省 mode 是"未知"，未知不能替它放弃 flag。
+    """
+    monkeypatch.delenv("CTFY_TARGET_URL", raising=False)
+    task: dict[str, Any] = {
+        "run_mode": "instance",
+        "scope": ["https://a.test"],
+        "questions": [{"id": "a", "mode": "checker"}, {"id": "b"}],
+    }
+    assert _challenge_kind(task) == "web"
+
+
+def test_a_blank_mode_is_not_a_checker_declaration(monkeypatch) -> None:
+    """``mode: " "`` 与没写 mode 一样是未知，不是"我是 checker"。"""
+    monkeypatch.delenv("CTFY_TARGET_URL", raising=False)
+    task: dict[str, Any] = {
+        "run_mode": "instance",
+        "scope": ["https://a.test"],
+        "questions": [{"id": "a", "mode": "checker"}, {"id": "b", "mode": " "}],
+    }
+    assert _challenge_kind(task) == "web"
+
+
+def test_all_checker_questions_still_short_circuit_the_flag_guard(monkeypatch) -> None:
+    """收紧不能过头：每个 question 都声明 checker 时仍然让收工守卫让路。"""
+    monkeypatch.delenv("CTFY_TARGET_URL", raising=False)
+    task: dict[str, Any] = {
+        "run_mode": "instance",
+        "scope": ["https://a.test"],
+        "questions": [{"id": "a", "mode": "checker"}, {"id": "b", "mode": "Checker"}],
+    }
+    assert _challenge_kind(task) == "checker"

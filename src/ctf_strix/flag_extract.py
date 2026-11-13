@@ -17,17 +17,31 @@
 
 from __future__ import annotations
 
+import json
 import re
 from dataclasses import dataclass
 
-#: flag 形态。不设长度下限——CTFY 的 flag 是 32 位 hex，但别的平台可能更短，
-#: 卡长度会漏掉合法 flag。改用"排除模板"来挡 ``FLAG{...}`` 这类占位符。
+#: flag 形态。**标签式前缀**：任何 2–16 位的字母数字/点/横线标签，紧跟
+#: ``{...}``，不枚举 ``FLAG`` / ``CTF`` 之类的固定前缀。
 #:
-#: ⚠️ 前缀必须覆盖平台真实出现的形态。HANDOFF 的交付示例写的是 ``ctfy{…}``，
-#: 而这里原来只认大写 ``FLAG``——同一个包里三个模块（本模块、``deadline_guard``、
-#: ``autosubmit``）对"什么算答案"各有一套正则，收工守卫认不出的答案会被判成
-#: "没拿到 flag"。现在统一成同一组前缀。
-FLAG_RE = re.compile(r"(?:FLAG|flag|CTF|ctf|CTFY|ctfy)\{[0-9a-zA-Z_\-]{2,}\}")
+#: 为什么不枚举前缀：平台题面**不声明** flag 格式（description 里没有任何
+#: "flag format" 字样），真答案的前缀可以完全不在白名单里（实测出现过
+#: ``HTB{…}`` 这种）。白名单一旦漏项，抽取层就整题失明 → 零提交；反过来
+#: 白名单里的 ``flag{…}`` / ``ctfy{…}`` 又恰恰是诱饵，交了判 false。
+#: 前缀不可枚举，所以只约束"长相"：标签 + 花括号体。
+#:
+#: 体字符集与长度门槛保持不变（``[0-9a-zA-Z_\-]{2,}``）：窄集挡得住自由文本
+#: 里的乱码；宽集留给 :data:`CANDIDATE_RE`。
+#:
+#: 已知代价（接受，不修）：LaTeX / 日志里的 ``word{var}`` 也会命中，例如
+#: ``div{margin}``——``is_placeholder`` / ``is_code_template`` 都挡不住。
+#: 下游靠平台的 verify-answer 预检（提交前先问判分器）拦这类误判，见
+#: ``scripts/batch_eval.py`` 的 ``Client.verify``。
+#:
+#: ⚠️ 不许引入捕获组：``AutoSubmitter.candidates()`` 用
+#: ``m.group(1) if pat.groups else m.group(0)`` 决定取哪一段，多一个括号就会
+#: 把错误片段当答案。
+FLAG_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.\-]{1,15}\{[0-9a-zA-Z_\-]{2,}\}")
 
 #: 「提交层认的答案形态」——**唯一真相**。``autosubmit`` 的候选抽取、
 #: ``skillpack.mask_flags`` 的装载遮蔽、``scripts/scrub_flags.py`` 的磁盘清理
@@ -37,7 +51,27 @@ FLAG_RE = re.compile(r"(?:FLAG|flag|CTF|ctf|CTFY|ctfy)\{[0-9a-zA-Z_\-]{2,}\}")
 #: ``[0-9a-zA-Z_-]``（防止把自由文本里的乱码当答案），这里放宽到
 #: ``[^}\s]{2,}``——writeup 里的历史 flag 常带 ``!``、``'``、``#``、``\``，
 #: 窄集抽不到，但 ``read_file`` 会原样喂给模型，被当成"检索到的证据"。
-CANDIDATE_RE = re.compile(r"(?:FLAG|flag|CTF|ctf|CTFY|ctfy)\{[^}\s]{2,}\}")
+CANDIDATE_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.\-]{1,15}\{[^}\s]{2,}\}")
+
+#: 模型显式声明的答案行：行首 ``answer: xxx`` / ``flag=xxx``（允许
+#: markdown 装饰前缀与 ``final`` 前缀）。**唯一真值**：``autosubmit`` 的
+#: 候选抽取与 ``finish_guard`` 的放行判据都从这里取，不要再各写一份。
+#:
+#: 为什么需要它：``seeded`` / slug 型题的答案既不是 ``tag{...}`` 形态也
+#: 不一定是 hex，自由文本里猜不出哪一串是答案；模型自己写下的显式
+#: ``answer:`` 行是机器可读的交付。噪声由平台 verify-answer 预检兜住
+#: （判错的候选不消耗提交次数，见 ``autosubmit``）。
+#:
+#: 值下限 6→1（平台试跑 2026-11-13 实录）：counter/checker 类题的正确答案
+#: 就是 1–4 位十进制数，6 字符下限把整类题永久挡在门外——agent 第一次
+#: finish 就写对仍被连拒，拒信还把它推去猎不存在的 flag，答案越改越错。
+#: 行锚 + 显式前缀本身已是噪声闸（自由文本里的 ``the``/``yes`` 没有行首
+#: ``answer:`` 引导，扫不到）；短值最终过 verify-answer 预检兜底。
+#:
+#: ⚠️ 只有一个捕获组且是值本身：调用方一律按 ``m.group(1)`` 取值。
+EXPLICIT_ANSWER_RE = re.compile(
+    r"""(?im)^[\s>*`-]*(?:final\s+)?(?:answer|flag)\s*[:=]\s*[`'"]?([^\s`'"]{1,200})"""
+)
 
 #: 判为"模板/占位符"的形态（大小写不敏感）：
 #:
@@ -62,9 +96,11 @@ CANDIDATE_RE = re.compile(r"(?:FLAG|flag|CTF|ctf|CTFY|ctfy)\{[^}\s]{2,}\}")
 _PLACEHOLDER_BODY = re.compile(r"(?:\.{2,}|[xX]{2,}|<[^<>]*>|\*{3,})")
 
 #: 前缀单独拿出来：双花括号要按"整个花括号部分"判断，先切前缀更好写。
-#: 长前缀必须排在前面：``re`` 的交替是最左优先，``CTF`` 会先吃掉 ``CTFY``
-#: 的三个字符，``rest`` 变成 ``Y{...}``，占位符判定直接失效（CodeBuddy P0）。
-_PREFIX_RE = re.compile(r"^(?:CTFY|FLAG|CTF)(?=\{)", re.IGNORECASE)
+#: 标签式前缀，与 :data:`FLAG_RE` 同形（2–16 位字母数字/点/横线 + ``{``）。
+#: 它只用于 ``match.end()`` 切出花括号体，不参与"这是不是 flag"的判断——
+#: 所以放宽前缀不会让占位符判定失效，也不用再关心交替顺序。字符集已含
+#: 大小写，不再挂 ``re.IGNORECASE``。
+_PREFIX_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.\-]{1,15}(?=\{)")
 
 def is_placeholder(flag: str) -> bool:
     """这个字符串是不是模板占位符（纯点 / 纯 x / 尖括号 / 双花括号 / 纯星号）。
@@ -139,6 +175,86 @@ def is_code_template(flag: str) -> bool:
         return False
     body = text[brace + 1 :]
     return any(pat.match(body) for pat in _CODE_BODY_PATTERNS)
+
+
+def explicit_answer_values(raw_input: str) -> list[str]:
+    """取模型显式声明的答案值（去重保序）。
+
+    ⚠️ ``raw_input`` 是 finish_scan 这类工具的 **JSON 参数串**：字符串字段
+    值里的换行在原文中是 ``\\n`` 字面量，行锚定的 :data:`EXPLICIT_ANSWER_RE`
+    直接扫原文永远打不中（实测：slug 型题答案已写进 summary，抽取层却
+    看不见，收工时 ``answers_ok`` 为空、整题判错）。所以先 ``json.loads``，
+    把字符串字段值用真换行拼起来再扫；解析失败（纯文本调用方 / 单测）
+    退回扫原文，行为与旧路径一致。
+
+    取值口径与 ``AutoSubmitter.candidates`` 完全一致：``m.group(1)``、
+    ``rstrip(".,;:)]")``、占位符过滤（剥 markdown 装饰后判）。
+
+    Args:
+        raw_input: 工具原始参数串（JSON 或纯文本）。
+
+    Returns:
+        去重保序的显式答案值列表；没有显式行返回空。
+    """
+    text = raw_input or ""
+    try:
+        parsed = json.loads(text)
+    except (TypeError, ValueError):
+        parsed = None
+    if isinstance(parsed, dict):
+        text = "\n".join(v for v in parsed.values() if isinstance(v, str))
+    out: list[str] = []
+    for m in EXPLICIT_ANSWER_RE.finditer(text):
+        v = (m.group(1) or "").rstrip(".,;:)]")
+        if v and not is_placeholder(v.strip("*_`#> ")) and v not in out:
+            out.append(v)
+    return out
+
+
+#: ``ANSWER[<qid>]=<value>`` 契约行：带问题 id 的显式交付契约（B-4）。
+#: 与 :data:`EXPLICIT_ANSWER_RE` 同族的显式行，多一个 qid 捕获组；多题 /
+#: 非 flag 类任务里 ``answer:`` 行分不清答案归属，只有这行能。
+#:
+#: B-16：不再行锚定。模型经常写成 ``**Answer:** `ANSWER[counter]=3` ``，
+#: 行锚定会把这行整个漏掉（SAMPLE-019 实测：fmt 对、内容对、零提交）。
+#: 只保留左侧边界——ANSWER 前不能是字母数字，避免命中更长标识符。
+_ANSWER_LINE_RE = re.compile(
+    r"""(?i)(?<![A-Za-z0-9_])ANSWER\s*\[\s*([^\]\s]+)\s*\]\s*[:=]\s*[`'"]?([^\s`'"]{1,200})"""
+)
+
+
+def per_question_answers(raw_input: str) -> dict[str, str]:
+    """取模型按问题 id 显式交付的答案（``ANSWER[<qid>]=<value>`` 行）。
+
+    与 :func:`explicit_answer_values` 同一条链：显式、行锚定、不猜自由
+    文本、先 ``json.loads`` 解 JSON 参数串（finish_scan 的换行在原文里
+    是 ``\\n`` 字面量）。区别只在多一个 qid——提交层按它把答案对到
+    具体 question；checker / counter 这类非 flag 题的答案（往往就一两个
+    字符）只能靠这条通道交上来。
+
+    取值口径与 :func:`explicit_answer_values` 一致（``rstrip`` + 占位符
+    过滤）；同一 qid 多行时**取最后一行**（模型改主意后的终稿在后）。
+
+    Args:
+        raw_input: 工具原始参数串（JSON 或纯文本）。
+
+    Returns:
+        qid → 值 的有序映射；没有契约行返回空 dict。
+    """
+    text = raw_input or ""
+    try:
+        parsed = json.loads(text)
+    except (TypeError, ValueError):
+        parsed = None
+    if isinstance(parsed, dict):
+        text = "\n".join(v for v in parsed.values() if isinstance(v, str))
+    out: dict[str, str] = {}
+    for m in _ANSWER_LINE_RE.finditer(text):
+        qid = (m.group(1) or "").strip()
+        v = (m.group(2) or "").rstrip(".,;:)]")
+        if qid and v and not is_placeholder(v.strip("*_`#> ")):
+            out[qid] = v
+    return out
 
 
 #: ``ctf_recon.md`` 头里的靶机 URL，形如 ``# CTF Recon — https://host/``。

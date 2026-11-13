@@ -297,3 +297,124 @@ def test_real_burst_still_hits_hard() -> None:
 
     assert summary is not None
     assert summary[1] >= SWEEP_HARD
+
+
+# --- AI-6：规模估算器的静默失效 + shell 计数循环 + 词表驱动 -------------------
+#
+# 修前 `_RANGE_RE` 是 ``range\(\s*\d*\s*,?\s*(\d{2,7})\s*\)``：捕获取前面的贪婪
+# ``\d*`` 先把数字吃光再回溯，``range(3000)`` 分出 ``"00"``（=0），于是规模恒为 0、
+# `_generated_sweep` 恒定 None。**守卫装着等于没装**——这是本模块第三次。
+
+
+def test_python_range_scale_is_not_lost_to_the_capture_group() -> None:
+    """``range(3000)`` 的规模必须是 3000，不是 0。
+
+    旧正则把它分成 ``"00"``；这是"写法上认了 range、实际一次也没报过"的根因。
+    """
+    import json
+
+    cmd = ("python3 -c \"import requests\n"
+           "for i in range(3000):\n"
+           "    requests.get(f'http://x.test/api/u/{i}')\"")
+
+    summary = sweep_summary(json.dumps({"cmd": cmd}))
+
+    assert summary is not None
+    family, count = summary
+    assert family == "generated"
+    assert count == 3000
+
+
+def test_range_start_and_step_keep_the_upper_bound() -> None:
+    """``range(1, 3000)`` / ``range(0, 5000, 2)`` 都取上界。
+
+    第三个参数（步长）不能把上界挤掉，也不能被当成上界。
+    """
+    import json
+
+    two_arg = 'python3 -c "[requests.get(\'http://x.test/api/%d\' % i) for i in range(1, 3000)]"'
+    three_arg = 'python3 -c "[requests.get(\'http://x.test/api/%d\' % i) for i in range(0, 5000, 2)]"'
+
+    assert sweep_summary(json.dumps({"cmd": two_arg}))[1] == 3000
+    assert sweep_summary(json.dumps({"cmd": three_arg}))[1] == 5000
+
+
+def test_a_small_range_of_known_size_stays_silent() -> None:
+    """``range(3)`` 是三次请求，不是扫描——修规模估算不许把阈值弄丢。"""
+    import json
+
+    cmd = 'python3 -c "[requests.get(\'http://x.test/api/%d\' % i) for i in range(3)]"'
+
+    assert sweep_summary(json.dumps({"cmd": cmd})) is None
+
+
+def test_shell_brace_and_seq_ranges_are_counted() -> None:
+    """shell 的计数循环：``{1..2000}`` / ``seq 1 4000`` / ``seq 2000``。
+
+    `_COMBINE_RE` 里原有的 `range(` 只覆盖 Python；这三种写法在 `curl` 前面
+    同样是"一次调用里发 N 个请求"，而且 N 是**参数里写明的**，必须精确计数。
+    """
+    import json
+
+    cases = {
+        "for i in {1..2000}; do curl -s http://x.test/$i; done": 2000,
+        "for i in $(seq 1 4000); do curl -s http://x.test/$i; done": 4000,
+        "for i in $(seq 2000); do curl -s http://x.test/$i; done": 2000,
+    }
+
+    for cmd, expected in cases.items():
+        summary = sweep_summary(json.dumps({"cmd": cmd}))
+        assert summary is not None, cmd
+        assert summary[0] == "generated", cmd
+        assert summary[1] == expected, cmd
+
+
+def test_shell_loop_over_listed_words_stays_silent() -> None:
+    """反例：``for w in apple banana cherry`` 只有三次，不能算规模未知的爆破。"""
+    import json
+
+    cmd = "for w in apple banana cherry; do curl -s http://x.test/$w; done"
+
+    assert sweep_summary(json.dumps({"cmd": cmd})) is None
+
+
+def test_wordlist_driven_burst_is_flagged_without_inventing_a_count() -> None:
+    """词表在文件里：必须报，但**不许编数字**。
+
+    `while read` / `xargs` / `ffuf` / `gobuster` 的候选数量在参数文本里根本不存在。
+    守卫能做的是说"你正在刷一个未确认的名字空间"，不能假装看见 2000。
+    """
+    import json
+
+    from ctf_strix.sweep_guard import SWEEP_WARN as WARN
+
+    cases = [
+        "while IFS= read -r p; do curl -s http://x.test/$p; done < paths.txt",
+        "cat paths.txt | xargs -P 20 -I{} curl -s 'http://x.test/{}'",
+        "ffuf -w paths.txt -u http://x.test/api/FUZZ -mc 200",
+        "gobuster dir -u http://x.test -w list.txt",
+        "python3 -c \"import requests\nfor p in open('w.txt'):\n    requests.post('http://x.test/api/i', data=p)\"",
+    ]
+
+    for cmd in cases:
+        summary = sweep_summary(json.dumps({"cmd": cmd}))
+        assert summary is not None, cmd
+        assert summary == ("wordlist-run", WARN), cmd
+        hint = hint_for(*summary) or ""
+        assert "WORD LIST" in hint, cmd
+        # 提示里不能出现"扫了 N 个"这种编出来的具体数字。
+        assert f"{WARN} distinct" not in hint, cmd
+        assert "2000" not in hint, cmd
+
+
+def test_curl_status_code_flag_is_not_a_wordlist_sweep() -> None:
+    """反例：``curl -w '%{http_code}'`` 不是词表。
+
+    这正是不把裸 ``-w`` 收进 `_FILE_SWEEP_RE` 的原因——那样每一次带状态码的
+    探测都会被标成爆破，提示立刻退化成噪声。
+    """
+    import json
+
+    cmd = "curl -s -o /dev/null -w '%{http_code}' http://x.test/api/login"
+
+    assert sweep_summary(json.dumps({"cmd": cmd})) is None

@@ -20,9 +20,12 @@ so there is exactly one clock.  At the deadline it:
   ``signal.pthread_kill`` on POSIX, a process-global flag elsewhere;
 * then waits :data:`error_policy.WALL_RESERVE_SECONDS` for that to happen;
 * if the main thread is still alive, writes a minimal fallback
-  ``result.json`` and calls ``os._exit(233)``.  When a complete result from
-  this run is already on disk it leaves the process alone instead: killing
-  a finished run would turn it into a spurious "crash" (exit 233).
+  ``result.json`` and exits with status 0.  CTFY-0001 judges any nonzero
+  exit a failed run, so the old dedicated crash code was retired: the
+  fallback file plus ``stop_reason=wallclock_hard`` beats it, and
+  attribution lives in the ``[ctfy] wallclock hard stop`` log line.  When a
+  complete result from this run is already on disk it leaves the process
+  alone instead: killing a finished run would misreport it.
 
 The fallback payload is deliberately minimal: the daemon thread cannot see
 ``main()``'s local ``answers``/turn counters, and a file with an empty answer
@@ -42,9 +45,12 @@ from typing import Any
 
 from ctf_strix import error_policy
 
-#: Process exit status for the hard kill.  Distinct from 0 (normal result)
-#: and from a platform SIGKILL so a run's death is attributable.
-HARD_EXIT_CODE = 233
+#: Process exit status for the hard kill.  CTFY-0001 judges any nonzero
+#: exit a failed run (the platform would book the old 233 as a crash), so
+#: the hard stop exits 0 with the fallback ``result.json`` already on disk.
+#: Attribution is carried by the ``[ctfy] wallclock hard stop`` stderr line
+#: and ``stop_reason=wallclock_hard`` in the fallback payload, not the code.
+HARD_EXIT_CODE = 0
 
 #: Fallback ``stop_reason``.  Kept apart from ``wallclock``: the soft path
 #: ran ``main()``'s cleanup and may carry answers; this one did not.
@@ -317,7 +323,7 @@ def _run(
         return
     if not threading.main_thread().is_alive():
         # main() already ended; there is no stuck thread to kill, and turning
-        # a normal exit into 233 would misreport the run.
+        # a normal exit into a hard stop would misreport the run.
         return
 
     protected = False
@@ -330,7 +336,7 @@ def _run(
                 return
             if not should_write_fallback(result_path, before_install):
                 # A complete result from this run is already on disk.  The run
-                # is finished, not stuck: exit 233 would report a crash.
+                # is finished, not stuck: a hard-stop exit would misreport it.
                 protected = True
                 return
             wrote = write_fallback_result(

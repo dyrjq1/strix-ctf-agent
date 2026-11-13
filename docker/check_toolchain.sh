@@ -270,6 +270,19 @@ PROBES = {
     "zbarimg": ("zbarimg", "--version"),
     "radare2": ("r2", "-v"),
     "rabin2": ("rabin2", "-v"),
+    # 下面这一组是系统提示 Environment 段逐个点名的 CLI。提示里说「装了」的
+    # 东西必须在这里探测过：否则改一次 base image 就会让提示开始说假话，
+    # 而模型只会花轮次去发现工具不存在（REVIEW-20261112 PWN-10 / RT-1）。
+    "checksec": ("checksec", "--help"),  # pwntools 4.15 的 console script
+    "ROPgadget": ("ROPgadget", "--help"),  # requirements.lock: ropgadget==7.7
+    "gdb": ("gdb", "--version"),
+    "objdump": ("objdump", "--version"),
+    "readelf": ("readelf", "--version"),
+    "file": ("file", "--version"),
+    "strings": ("strings", "--version"),
+    "xxd": ("xxd", "-v"),
+    "nc": ("nc", "-h"),  # netcat-openbsd：用法打在 stderr 且退出码非零，只看输出
+    "curl": ("curl", "--version"),  # 提示把 curl 列为 HTTP 后备，必须证明装了
 }
 for label, argv in PROBES.items():
     exe = shutil.which(argv[0])

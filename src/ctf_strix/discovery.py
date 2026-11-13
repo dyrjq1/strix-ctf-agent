@@ -33,6 +33,7 @@ tail -c 7000 NXz3x3fk.js
 
 from __future__ import annotations
 
+import json
 import re
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -41,6 +42,9 @@ from urllib.parse import urljoin, urlparse
 
 import requests
 import urllib3
+
+from ctf_strix import traffic
+from ctf_strix.http_probe import session_cookies
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
@@ -52,6 +56,10 @@ _MAX_ROUTES: Final = 30
 _MAX_ROWS: Final = 40
 #: 单次请求超时。发现阶段要快，慢的端点留给 http_probe 单独打。
 _TIMEOUT: Final = 8.0
+#: route_map 往台账里存的前缀长度。默认 16 KB 只能存下 bundle 的头几十行，
+#: 而"从 bundle 里读路由"这件事的全部价值在中后段——存半截等于没存。
+#: 12 个 chunk × 64 KB ≈ 768 KB，是这个工具能接受的上限。
+_BUNDLE_KEEP: Final = 64 * 1024
 
 #: HTML 里三种引用脚本的写法。Nuxt 用 modulepreload，Vite 用 script type=module，
 #: 老站点用 <script src>。三种都要吃。
@@ -180,12 +188,33 @@ async def route_map(base_url: str, max_chunks: int = _MAX_CHUNKS) -> str:
     if not base_url.startswith(("http://", "https://")):
         return "[route_map] base_url 必须带 scheme，如 https://host/"
 
+    # 每一次出网都入台账，和 http_probe / method_sweep 同一口径：id 在发送**前**
+    # 预留，失败也记一条（"这个 URL 连不上"本身就是证据）。报告 WEB-9 的直接
+    # 要求——route_map 抓回来的 bundle 原文必须能被 traffic_list/traffic_view
+    # 看见；否则下面那句"不要再读 bundle"就只是一句没有出路的话。
+    home_id = traffic.ledger().next_id()
+    started = time.time()
     try:
         home = _get(base_url)
     except Exception as exc:  # noqa: BLE001
-        return f"[route_map] 首页取不到：{type(exc).__name__}: {exc}。先用 http_probe 确认可达。"
+        traffic.record(
+            request_id=home_id, method="GET", url=base_url,
+            phase=type(exc).__name__, elapsed=time.time() - started,
+            note=f"{type(exc).__name__}: {exc}"[:300],
+        )
+        return (
+            f"[route_map] 首页取不到：{type(exc).__name__}: {exc}。"
+            f"先用 http_probe 确认可达（本条已记台账 {home_id}）。"
+        )
+    home_text = home.text or ""
+    traffic.record(
+        request_id=home_id, method="GET", url=base_url,
+        status=home.status_code, resp_headers=dict(home.headers),
+        resp_body=home_text, size=len(home.content or b""),
+        elapsed=time.time() - started, body_keep=_BUNDLE_KEEP,
+    )
 
-    html = home.text or ""
+    html = home_text
     refs: list[str] = []
     for m in _SCRIPT_RE.finditer(html):
         ref = next((g for g in m.groups() if g), "")
@@ -199,16 +228,34 @@ async def route_map(base_url: str, max_chunks: int = _MAX_CHUNKS) -> str:
     counts: dict[str, int] = {}
     origin: dict[str, str] = {}
     blobs: list[str] = []
+    #: chunk 名字 -> 台账 id。列表下面要按名字指路，否则模型知道"有这个文件"
+    #: 却不知道该读哪一条，最后还是会去重下（WEB-9）。
+    chunk_ids: dict[str, str] = {}
     fetched = 0
     for ref in refs:
+        request_id = traffic.ledger().next_id()
+        started = time.time()
         try:
             resp = _get(ref)
-        except Exception:  # noqa: BLE001 — 单个 chunk 失败不该毁掉整张图
+        except Exception as exc:  # noqa: BLE001 — 单个 chunk 失败不该毁掉整张图
+            traffic.record(
+                request_id=request_id, method="GET", url=ref,
+                phase=type(exc).__name__, elapsed=time.time() - started,
+                note=f"{type(exc).__name__}: {exc}"[:300],
+            )
             continue
         fetched += 1
         name = ref.rsplit("/", 1)[-1]
-        blobs.append((resp.text or "")[:200_000])
-        for m in _ROUTE_RE.finditer(resp.text or ""):
+        text = resp.text or ""
+        blobs.append(text[:200_000])
+        chunk_ids[name] = request_id
+        traffic.record(
+            request_id=request_id, method="GET", url=ref,
+            status=resp.status_code, resp_headers=dict(resp.headers),
+            resp_body=text, size=len(resp.content or b""),
+            elapsed=time.time() - started, body_keep=_BUNDLE_KEEP,
+        )
+        for m in _ROUTE_RE.finditer(text):
             path = m.group(1).rstrip("/")
             if not path or _NOT_ROUTE.search(path):
                 continue
@@ -226,7 +273,8 @@ async def route_map(base_url: str, max_chunks: int = _MAX_CHUNKS) -> str:
         return (
             f"[route_map] {base_url} 抓到 {fetched} 个脚本，但没提到路径字面量。\n"
             "next: 说明路由不在前端 bundle 里（服务端渲染或全是动态拼接）。"
-            "改用 method_sweep 打已知路径，或直接读首页 HTML 里的表单 action。"
+            "改用 method_sweep 打已知路径，或直接读首页 HTML 里的表单 action"
+            f"（原文在台账 {home_id}，traffic_view(\"{home_id}\") 可取回）。"
         )
 
     def score(item: tuple[str, int]) -> tuple[int, int, int]:
@@ -236,6 +284,10 @@ async def route_map(base_url: str, max_chunks: int = _MAX_CHUNKS) -> str:
         return (_weight(path), n, -abs(depth - 2))
 
     ranked = sorted(counts.items(), key=score, reverse=True)[:_MAX_ROUTES]
+    ids_hint = (
+        "、".join(f"{name}={rid}" for name, rid in list(chunk_ids.items())[:4])
+        or "本次没取到 chunk"
+    )
     lines = [
         f"[route_map] {base_url} | html {len(html)}B | chunks {fetched}/{len(refs)} | "
         f"候选 {len(counts)} 条（列前 {len(ranked)} 条）",
@@ -244,7 +296,12 @@ async def route_map(base_url: str, max_chunks: int = _MAX_CHUNKS) -> str:
         # 用 cat/head 逐段读（第 17-21 次调用）。工具给了答案但没拦住旧习惯，
         # 于是答案被自己的"再看看"覆盖掉了。提示语放末尾没有用——模型读完
         # 列表就动手了，不会回头读最后一行。
+        #
+        # 但"不要读"必须配一条"要读就读这里"：bundle 原文已经随本次调用进了
+        # 台账（WEB-9），traffic_view 能按 id 分页读完，不需要再下一次。
         "⚠️ 上面就是全部路由，不要再下载或阅读 bundle 原文。下一步：method_sweep。",
+        f"（首页={home_id}；bundle 原文已在台账：{ids_hint}；"
+        "用 traffic_view(id, offset=N) 分页读，不要重下）",
         *[f"{i}. {p}  x{n}  ({origin.get(p, '?')})" for i, (p, n) in enumerate(ranked, 1)],
     ]
     if len(counts) > len(ranked):
@@ -255,7 +312,8 @@ async def route_map(base_url: str, max_chunks: int = _MAX_CHUNKS) -> str:
         lines.extend(f"  ? {p}" for p in derived)
     lines.append(
         "next: 把这些路径（含上面的 ? 候选）喂给 method_sweep——同一个路径换 POST/PUT "
-        "是最容易撞出未文档化入口的动作。不要再去读 bundle 原文。"
+        "是最容易撞出未文档化入口的动作。不要再去读 bundle 原文："
+        f"要看原文用 traffic_view(\"{home_id}\") 或 traffic_list(url_contains=…) 取台账。"
     )
     return "\n".join(lines)
 
@@ -265,6 +323,8 @@ async def method_sweep(
     base_url: str = "",
     methods: str = "OPTIONS,GET,POST,PUT,PATCH",
     concurrency: int = 6,
+    headers_json: str = "",
+    session: str = "auto",
 ) -> str:
     """对一批路径换方法各打一遍，只回报有信息量的组合。
 
@@ -274,6 +334,12 @@ async def method_sweep(
         base_url: 相对路径的前缀，如 https://host 。全部路径都是绝对 URL 时可留空。
         methods: 逗号分隔的方法列表，默认 OPTIONS,GET,POST,PUT,PATCH。
         concurrency: 并发数，默认 6。别开太大——目标是比赛靶机，不是压测对象。
+        headers_json: 额外请求头，JSON 字符串，写法与 ``http_probe`` 的同名
+            参数一致，如 ``{"Authorization": "Bearer x"}``。
+        session: 会话选择，与 ``http_probe`` 同口径。默认 ``auto``：把
+            ``http_probe`` 在同一靶机上登录得到的 cookie 附到本批每个请求
+            （登录态对扫描生效）；``off`` 完全匿名。扫描期间的 Set-Cookie
+            不回写会话。
 
     Returns:
         命中的组合（状态码 + 方法 + 路径 + 长度 + body 片段），按信息量排序；
@@ -288,6 +354,13 @@ async def method_sweep(
     raw = [u.strip() for u in re.split(r"[\s,]+", urls or "") if u.strip()]
     if not raw:
         return "[method_sweep] urls 为空。传换行分隔的路径，如 /api/plugins/stats"
+
+    try:
+        extra_headers = json.loads(headers_json) if headers_json.strip() else {}
+    except json.JSONDecodeError as exc:
+        return f"[method_sweep] headers_json 不是合法 JSON：{exc}"
+    if not isinstance(extra_headers, dict):
+        return "[method_sweep] headers_json 必须是 JSON 对象（花括号），不能是数组或字符串。"
 
     targets: list[str] = []
     for u in raw:
@@ -312,8 +385,13 @@ async def method_sweep(
         url, method = pair
         wants_body = method in ("POST", "PUT", "PATCH")
         headers = {"Connection": "close"}
-        if wants_body:
+        headers.update(extra_headers)
+        if wants_body and not any(k.lower() == "content-type" for k in headers):
             headers["Content-Type"] = "application/json"
+        snap = carried.get(url) or {}
+        sent_headers = dict(headers)
+        if snap:
+            sent_headers["Cookie"] = "; ".join(f"{k}={v}" for k, v in snap.items())
 
         # 为什么最多试三次、且最后一次不带 body：
         # 靶机在参数校验失败时常常"不等请求体读完就回包并关连接"，
@@ -324,29 +402,58 @@ async def method_sweep(
         attempts: list[bytes | None] = [b"{}", b"{}", None] if wants_body else [None, None, None]
         last: Exception | None = None
         r = None
+        sent: bytes | None = None
+        # 和 http_probe 同一条规则：id 在**发请求前**预留。失败组合也入台账，
+        # 因为"这条路上这个方法被拒了"本身就是终止重复尝试的观测。
+        request_id = traffic.ledger().next_id()
+        started = time.time()
         for index, body in enumerate(attempts):
             try:
+                sent = body
                 r = requests.request(
                     method, url, timeout=_TIMEOUT, verify=False,
-                    allow_redirects=False, headers=headers, data=body,
+                    allow_redirects=False, headers=headers, cookies=snap or None,
+                    data=body,
                 )
                 break
             except Exception as exc:  # noqa: BLE001
                 last = exc
                 if index + 1 < len(attempts):
                     time.sleep(0.1 * (index + 1))
+        elapsed = time.time() - started
         if r is None:
+            note = f"{type(last).__name__} after {len(attempts)} tries"
+            traffic.record(
+                request_id=request_id, method=method, url=url, req_headers=sent_headers,
+                req_body=sent.decode("utf-8", "replace") if sent else "",
+                phase=type(last).__name__, elapsed=elapsed, note=note,
+            )
             return {
                 "method": method, "url": url, "status": 0,
-                "note": f"{type(last).__name__} after {len(attempts)} tries",
+                "note": note, "id": request_id,
             }
         allow = r.headers.get("allow", "")
-        text = (r.text or "").replace("\n", " ")[:160]
+        try:
+            body_text = r.text or ""
+        except Exception:  # noqa: BLE001 - 解码失败不影响这条证据本身
+            body_text = ""
+        traffic.record(
+            request_id=request_id, method=method, url=url, req_headers=sent_headers,
+            req_body=sent.decode("utf-8", "replace") if sent else "",
+            status=r.status_code, resp_headers=dict(r.headers), resp_body=body_text,
+            size=len(r.content or b""), elapsed=elapsed,
+        )
+        text = body_text.replace("\n", " ")[:160]
         return {
             "method": method, "url": url, "status": r.status_code,
             "size": len(r.content or b""), "allow": allow, "body": text,
+            "id": request_id,
         }
 
+    # WEB-1：扫描沿用 http_probe 的登录态。Session 不是线程安全的，所以
+    # 不共享 Session 对象，只把 jar 里匹配各目标 host 的 cookie 拍快照随请求
+    # 附带（扫描只读，Set-Cookie 不回写会话）。
+    carried = {t: session_cookies(session, t) for t in targets}
     pairs = [(t, m) for t in targets for m in mlist]
     with ThreadPoolExecutor(max_workers=max(1, min(12, int(concurrency)))) as pool:
         results = [r for r in pool.map(probe, pairs) if r]
@@ -389,15 +496,22 @@ async def method_sweep(
         f"[method_sweep] {len(targets)} 路径 × {len(mlist)} 方法 = {len(pairs)} 请求 | "
         f"有信息量 {len(kept)} 条（列前 {len(shown)}）"
     ]
+    if any(carried.values()):
+        n_auth = sum(1 for v in carried.values() if v)
+        lines.append(
+            f"auth: {n_auth}/{len(targets)} 个目标带上了会话 cookie"
+            "（http_probe 的登录态对本批生效；扫描不回写会话）"
+        )
     for r in shown:
         status = int(r["status"])
+        rid = str(r.get("id", ""))
         if status == 0:
-            lines.append(f"ERR {r['method']:7} {r['url']} | {r.get('note', '')}")
+            lines.append(f"{rid:<5} ERR {r['method']:7} {r['url']} | {r.get('note', '')}")
             continue
         extra = f" allow={r['allow']}" if r.get("allow") else ""
         body = str(r.get("body") or "")
         lines.append(
-            f"{status} {str(r['method']):7} {r['url']} | {r.get('size', 0)}B{extra}"
+            f"{rid:<5} {status} {str(r['method']):7} {r['url']} | {r.get('size', 0)}B{extra}"
             + (f" | {body}" if body else "")
         )
     if len(kept) > len(shown):
@@ -427,6 +541,19 @@ async def method_sweep(
             "next: 所有组合都是 404/405。别再换方法，换路径族"
             "（这条线上已经没有未文档化入口了）。"
         )
+
+    # 一次批量探索只回摘要：完整响应留在台账里，行首 id 就是取回的 key。
+    # 这一行无条件出现——404 组合虽然不占行，但同样在台账里，"我试过它"
+    # 这条证据要能被读回来，否则同一批组合会被反复重发。
+    example = str(shown[0].get("id", "")) if shown else (
+        str(results[0].get("id", "")) if results else ""
+    )
+    lines.append(
+        "next: 上面每一行、以及被省略的组合都已进流量台账（行首 id = request_id）"
+        + (f"，例如 traffic_view(\"{example}\") 可重读完整 body" if example else "")
+        + "。不要为了再看一眼 body 重发同一个请求；"
+        "某个路径到底试过哪些方法，用 traffic_list(url_contains=\"<路径>\") 找回。"
+    )
     return "\n".join(lines)
 
 
