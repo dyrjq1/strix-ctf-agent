@@ -2389,6 +2389,50 @@ def _last_marker_facts(markers: Path | None) -> list[str]:
     ]
 
 
+def _activity_fact(guard: dict) -> str:
+    """把守卫计数压成一行「这一轮把时间花在哪」。
+
+    为什么需要：``wallclock`` / ``turn_capped`` 这类收场本身不含任何方向
+    信息，重试提示只剩「上一轮超时」——模型下一轮会原样重来。2026-11-13
+    CYBENCH-037 实测：52 次工具调用、92 次请求、23 个端点键、finish 被拒
+    2 次，全程没建立已认证会话，而失败的 ``failure_path`` 只有一行
+    「收场：wallclock」。
+
+    只搬计数布尔，不搬任何目标字符串——不构成对着失败日志写死提示。
+
+    Args:
+        guard: 记录里的 ``guard`` 字典。
+
+    Returns:
+        一行不超过 140 字符的事实；计数太少时返回空串。
+    """
+    if not isinstance(guard, dict) or not guard:
+        return ""
+    bits: list[str] = []
+
+    def _n(key: str) -> int:
+        try:
+            return int(guard.get(key) or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    reach, keys, dup = _n("reach"), _n("enum_keys"), _n("negative_groups")
+    refused = _n("finish_refused")
+    if reach:
+        bits.append(f"{reach} 次请求")
+    if keys:
+        bits.append(f"{keys} 个端点键")
+    if dup:
+        bits.append(f"{dup} 组重复响应")
+    if refused:
+        bits.append(f"finish 被拒 {refused} 次")
+    if guard.get("journey_authed") is False and (_n("journey_created") or _n("journey_wall")):
+        bits.append("未取得已认证会话")
+    if len(bits) < 2:
+        return ""
+    return ("轨迹：" + " / ".join(bits))[:140]
+
+
 def _failure_facts(rec: dict, markers: Path | None) -> list[str]:
     """把一次失败压成 1–3 行结构化事实，供调度器落盘并注入下一次重试。
 
@@ -2402,6 +2446,9 @@ def _failure_facts(rec: dict, markers: Path | None) -> list[str]:
         facts.append(f"异常：{str(rec['error'])[:120]}")
     elif rec.get("stop_reason"):
         facts.append(f"收场：{rec['stop_reason']}")
+    activity = _activity_fact(rec.get("guard") or {})
+    if activity:
+        facts.append(activity)
     rejected = rec.get("answers_rejected")
     if isinstance(rejected, dict) and rejected:
         shown = "、".join(f"{k}={v}" for k, v in list(rejected.items())[:3])
