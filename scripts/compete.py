@@ -102,6 +102,8 @@ _UNSOLVED_PENALTY = -100
 _FAIL_PENALTY = 90
 #: 门控题：前置问题全部被我们解过 → 优先（解一个解锁一串）。
 _GATING_BONUS = 40
+#: QA 题库题（is_qa_only）：不占实例配额、通常几分钟出结果，给一点优先。
+_QA_BONUS = 30
 
 
 def challenge_score(
@@ -115,7 +117,7 @@ def challenge_score(
         my_solved: 我们已解出的 challenge id 集合。
     """
     cid = str(chal.get("id") or "")
-    if not cid or chal.get("closed") or chal.get("is_qa_only"):
+    if not cid or chal.get("closed"):
         return None
     rec = state.get(cid) or {}
     if rec.get("status") == SOLVED or cid in my_solved:
@@ -124,6 +126,10 @@ def challenge_score(
     score += _CATEGORY_WEIGHT.get(str(chal.get("category") or ""), 0)
     solves = int(chal.get("solves_count") or 0)
     score += _SOLVABLE_BONUS if solves > 0 else _UNSOLVED_PENALTY
+    if chal.get("is_qa_only"):
+        # 2026-11-13 实测：qa_only 题（SAMPLE-005/020）此前被直接判 None，
+        # 从未派过单。它们不占实例配额，走 batch_eval 的 QA 分支。
+        score += _QA_BONUS
     score -= _FAIL_PENALTY * int(rec.get("fails") or 0)
     requires: set[str] = set()
     for q in (chal.get("questions") or []):
@@ -362,6 +368,8 @@ def build_plan_item(
     item: dict[str, Any] = {
         "id": cid,
         "difficulty": chal.get("difficulty") or "medium",
+        # QA 题库题：batch_eval 走无实例分支（不 launch，/qa/submissions 交付）。
+        "qa_only": bool(chal.get("is_qa_only")),
     }
     if allow_pools:
         # 练习场自测专用：SAMPLE-* 在封存/烧毁池里，不显式放行 batch_eval
@@ -444,7 +452,13 @@ def _failure_lines(rec: dict[str, Any]) -> list[str]:
         lines.append("checker 未过：" + ",".join(map(str, checked))[:80])
     stalled = rec.get("failure_path")
     if isinstance(stalled, list):
-        lines.extend(str(x)[:140] for x in stalled[:2])
+        # batch_eval 的 failure_path 与这里第一段同源（都含「收场：X」），
+        # 直接 extend 会把同一行写两遍（SAMPLE-001 实测
+        # "收场：unknown；收场：unknown"）。去重后保留信息量更大的几条。
+        for item in stalled[:2]:
+            line = str(item)[:140]
+            if line and line not in lines:
+                lines.append(line)
     return lines[:3]
 
 

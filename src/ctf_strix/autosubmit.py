@@ -803,10 +803,38 @@ class AutoSubmitter:
         path = os.environ.get("CTF_SUBMIT_PATH")
         if not path:
             return
+        # 一次 run 里 finish 可能被调用多次：先 ACCEPTED、后一次候选全错
+        # 也发生过（SAMPLE-001 实测）。如果直接覆盖，父进程读到的是最后
+        # 那次"全错"的裁决，把已解出的题判成 FAIL。所以按「最好结果」
+        # 合并：任何一次答对都保留，fully_solved 取或，unlocked 取并集。
+        merged = dict(verdict)
+        try:
+            with open(path, encoding="utf-8") as fh:
+                prev = json.load(fh)
+        except (OSError, ValueError):
+            prev = {}
+        if isinstance(prev, dict) and prev:
+            old_correct = [str(x) for x in (prev.get("correct") or [])]
+            new_correct = [str(x) for x in (verdict.get("correct") or [])]
+            seen: set[str] = set()
+            merged["correct"] = [
+                x for x in old_correct + new_correct
+                if not (x.split("=", 1)[0] in seen or seen.add(x.split("=", 1)[0]))
+            ]
+            merged["challenge_fully_solved"] = bool(
+                prev.get("challenge_fully_solved")
+            ) or bool(verdict.get("challenge_fully_solved"))
+            merged["unlocked"] = sorted(
+                {str(x) for x in (prev.get("unlocked") or [])}
+                | {str(x) for x in (verdict.get("unlocked") or [])}
+            )
+            merged["tried"] = list(prev.get("tried") or []) + list(
+                verdict.get("tried") or []
+            )
         try:
             tmp = f"{path}.tmp"
             with open(tmp, "w", encoding="utf-8") as fh:
-                json.dump(verdict, fh, ensure_ascii=False)
+                json.dump(merged, fh, ensure_ascii=False)
             os.replace(tmp, path)  # 原子替换：父进程随时读都是完整 JSON
         except OSError:
             pass

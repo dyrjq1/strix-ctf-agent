@@ -102,3 +102,76 @@ def test_failure_facts_capture_rejected_answer() -> None:
     assert any("no_signal" in x for x in facts)
     assert any("counter=7" in x for x in facts)
     assert batch_eval._failure_facts({"correct": True}, None) == []
+
+
+def test_answer_values_split_on_json_escaped_newline() -> None:
+    """run.log 里 finish_scan 的参数是原始 JSON，换行是字面 ``\\n``。
+
+    SAMPLE-007 实测：``ANSWER[outage]=true\\n\\nAn availability ...`` 被旧
+    正则整段吞成答案提交，平台判否；正确答案只有 ``true``。
+    """
+    raw = (
+        r'TOOL finish_scan {"executive_summary":"answer: true\n'
+        r'ANSWER[outage]=true\n\nAn availability assessment of the app..."}'
+    )
+    assert batch_eval._answer_values(raw) == {"outage": "true"}
+
+
+# ---------------------------------------------------------------- 裁决 sidecar
+import json  # noqa: E402
+
+from ctf_strix.autosubmit import AutoSubmitter  # noqa: E402
+
+
+def test_persist_keeps_best_verdict(monkeypatch, tmp_path) -> None:
+    """先 ACCEPTED、后一次候选全错时，sidecar 不能丢掉已经答对的那次。
+
+    这是 SAMPLE-001 的实测形态：run 内先解出 slug+flag，收尾又试了一批
+    错候选。若直接覆盖，父进程读到的就是"全错"，已解出的题被判 FAILED。
+    """
+    path = tmp_path / "submit.json"
+    monkeypatch.setenv("CTF_SUBMIT_PATH", str(path))
+    sub = AutoSubmitter.__new__(AutoSubmitter)
+    sub._persist({
+        "tried": [{"qid": "slug", "correct": True}],
+        "correct": ["slug=abc"],
+        "challenge_fully_solved": True,
+        "unlocked": ["flag"],
+    })
+    sub._persist({
+        "tried": [{"qid": "flag", "correct": False}],
+        "correct": [],
+        "challenge_fully_solved": False,
+    })
+    data = json.loads(path.read_text(encoding="utf-8"))
+    assert data["challenge_fully_solved"] is True
+    assert data["correct"] == ["slug=abc"]
+    assert data["unlocked"] == ["flag"]
+    assert len(data["tried"]) == 2
+
+
+def test_persist_noops_without_env(monkeypatch, tmp_path) -> None:
+    monkeypatch.delenv("CTF_SUBMIT_PATH", raising=False)
+    sub = AutoSubmitter.__new__(AutoSubmitter)
+    sub._persist({"correct": ["x=1"], "challenge_fully_solved": True})
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_read_submit_sidecar_tolerates_missing(tmp_path) -> None:
+    assert batch_eval._read_submit_sidecar(tmp_path / "nope.json") == {}
+    p = tmp_path / "bad.json"
+    p.write_text("{not json", encoding="utf-8")
+    assert batch_eval._read_submit_sidecar(p) == {}
+
+
+# ---------------------------------------------------------------- qa_only
+import compete  # noqa: E402
+
+
+def test_qa_only_enters_queue_and_plan() -> None:
+    chal = {
+        "id": "SAMPLE-020", "difficulty": "easy", "category": "misc",
+        "solves_count": 0, "is_qa_only": True, "questions": [],
+    }
+    assert compete.challenge_score(chal, {}, set()) is not None
+    assert compete.build_plan_item("SAMPLE-020", chal)["qa_only"] is True

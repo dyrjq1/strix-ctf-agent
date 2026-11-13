@@ -818,6 +818,28 @@ class Client:
         )
         return r.json()
 
+    def qa_submit(self, challenge_id: str, qid: str, answer: str) -> dict:
+        """QA 题库题提交（无实例）。``POST /api/v1/qa/submissions``。
+
+        平台原文（CTFY-0001 §2）：qa 模式没有实例，答案走这条路由，
+        body 必须带 ``challenge_id`` + ``competition_id`` + ``question_id``。
+        """
+        try:
+            r = self.s.post(
+                f"{PLATFORM}/api/v1/qa/submissions",
+                json={
+                    "challenge_id": challenge_id,
+                    "competition_id": self.competition_id,
+                    "question_id": qid,
+                    "answer": answer,
+                },
+                timeout=60,
+            )
+            body = r.json()
+        except (requests.RequestException, ValueError) as exc:
+            return {"error": f"{type(exc).__name__}: {str(exc)[:120]}"}
+        return body if isinstance(body, dict) else {}
+
     def check(self, iid: str, qid: str) -> dict:
         """让侧车按靶机当前状态裁决一道 checker 题（"Verify exploit"）。
 
@@ -1388,6 +1410,21 @@ def _guard_state_path(name: str, root: str | Path | None = None) -> Path:
     return base / name / "guard_state.json"
 
 
+def _submit_sidecar_path(name: str, root: str | Path | None = None) -> Path:
+    """autosubmit 裁决 sidecar 的宿主路径（与 ``CTF_SUBMIT_PATH`` 同源）。"""
+    base = Path(root) if root is not None else Path(_BOX_ROOT)
+    return base / name / "submit.json"
+
+
+def _read_submit_sidecar(path: Path) -> dict:
+    """回读 in-run autosubmit 的裁决；读不到返回空字典。"""
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
 def _stall_markers_path(name: str, root: str | Path | None = None) -> Path:
     """停滞标记文件路径，与 :func:`_fresh_box` 的沙箱规则一致。
 
@@ -1841,6 +1878,17 @@ def _answer_values(text: str) -> dict[str, str]:
         Mapping of question id to the last answer seen for that question.
     """
     pairs: dict[str, str] = {}
+    # 日志里 finish_scan 的参数是**原始 JSON 串**：真实换行被转义成两个字
+    # 符 ``\n``。正则里的 ``\s`` 不认它，于是 ``ANSWER[outage]=true\n\nAn
+    # availability ...`` 会把后面整段说明吞成答案（SAMPLE-007 实测：
+    # 提交 ``true\n\nAn`` 被判否，正确答案就是 ``true``）。先还原转义再扫。
+    text = (
+        (text or "")
+        .replace("\\r\\n", "\n")
+        .replace("\\n", "\n")
+        .replace("\\r", "\n")
+        .replace("\\t", " ")
+    )
     pattern = re.compile(
         r"ANSWER\[([A-Za-z0-9_.-]+)\]\s*=\s*[`'\"]?([^\s*`'\"]+)"
     )
@@ -2179,6 +2227,72 @@ def _resume_steer(markers: Path, reason: str, sample_no: int) -> str:
     )
 
 
+def run_qa_item(
+    client: Any,
+    cid: str,
+    name: str,
+    turns: int,
+    wallclock: int,
+) -> dict:
+    """QA 题库题（``is_qa_only``）：无实例、无靶机，直接读题作答。
+
+    2026-11-13 实测：playground 的 SAMPLE-005/020 是 qa_only，compete 的
+    ``challenge_score`` 直接把这类题判成 None——整整一类题型从未进入过
+    派单。这里走独立路径：不 launch、不建桥，agent 只读题面/选项，答案
+    经 ``/qa/submissions`` 提交。
+    """
+    detail = client.detail(cid)
+    brief = _challenge_brief(detail)
+    quiz = (
+        "## QA 题库题（无靶机）\n"
+        "本题没有实例、没有可攻击的目标：**不要**扫描或请求任何地址。"
+        "直接依据题面与选项作答。每个问题单独一行 "
+        "`ANSWER[<问题id>]=<答案>`；选择题只用给定字母，多选可写 `A,C`。\n"
+    )
+    brief = f"{brief}\n\n{quiz}" if brief else quiz
+    # 给一个必然拒绝的本机端口：网络工具瞬时失败，模型不会把预算耗在探测上。
+    log, wall = run_agent("http://127.0.0.1:1", turns, wallclock, name, extra=brief)
+    rec: dict[str, Any] = {
+        "samples_used": 1,
+        "agent_s": round(wall, 1),
+        "tool_calls": log.count(" TOOL "),
+        "usage": _parse_usage(log),
+        "stop_reason": _stop_reason_of(log),
+        "qa_only": True,
+    }
+    pairs = _answer_values(log)
+    questions = [
+        q for q in (detail.get("questions") or [])
+        if isinstance(q, dict) and q.get("id")
+    ]
+    submitted: dict[str, bool] = {}
+    rejected: dict[str, str] = {}
+    from ctf_strix.autosubmit import fits_choices
+
+    for q in questions:
+        qid = str(q["id"])
+        value = pairs.get(qid)
+        if not value:
+            continue
+        choices = [str(c) for c in (q.get("choices") or [])]
+        if not fits_choices(value, str(q.get("mode") or ""), choices):
+            continue
+        res = client.qa_submit(cid, qid, value)
+        ok = bool(res.get("correct"))
+        submitted[qid] = ok
+        rec.setdefault("answers_submitted", {})[qid] = value
+        if not ok:
+            rejected[qid] = value
+    rec["answers_ok"] = submitted
+    if rejected:
+        rec["answers_rejected"] = rejected
+    rec["correct"] = (
+        bool(submitted) and all(submitted.values()) and len(submitted) == len(questions)
+    )
+    rec["failure_path"] = _failure_facts(rec, None)
+    return rec
+
+
 def run_agent(
     target: str,
     turns: int,
@@ -2233,6 +2347,11 @@ def run_agent(
         # 每次 LLM 调用后原子落盘。进程被墙钟 SIGKILL 时，run_strix_ctf 末尾那行
         # `[usage]` 永远不会打印——两条 A/B 臂就这么丢了 token 数（只能记 n/a）。
         "CTF_USAGE_PATH": str(box / "usage.json"),
+        # run 内 autosubmit 的裁决落盘。没有它，父进程只能从 run.log 里
+        # 重解析 ANSWER 行；而 gated / checker / 选择题的正确答案往往是
+        # 子进程在 finish 时自己提交掉的，父进程看不到 → 已解出也记 FAILED，
+        # 调度器重派同一题，白烧配额与墙钟（SAMPLE-001 实测）。
+        "CTF_SUBMIT_PATH": str(_submit_sidecar_path(name)),
         # 停滞标记（host + path family + 机制类 + 响应签名）落到本次样本的
         # 沙箱里。父进程重开下一轮时要读它生成换向提示——子进程无从知道
         # 父进程把这次 run 的目录放在哪，所以路径由启动方显式给，两边共用
@@ -2457,6 +2576,23 @@ def main() -> int:
         bridge = None
         tunnel = None
         svc_port = ""
+        if item.get("qa_only"):
+            # QA 题库题：独立路径，不占实例配额、不 launch。
+            try:
+                rec.update(run_qa_item(client, cid, run_id, turns, wallclock))
+            except Exception as exc:  # noqa: BLE001
+                rec["error"] = f"{type(exc).__name__}: {exc}"
+                rec["correct"] = False
+                print(f"  -> ERROR {rec['error']}", flush=True)
+            rec["total_s"] = round(time.time() - rec["started"], 1)
+            with out.open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+            print(
+                f"  -> {'SOLVED' if rec.get('correct') else 'FAILED'}  "
+                f"tools={rec.get('tool_calls', 0)} agent={rec.get('agent_s', 0)}s",
+                flush=True,
+            )
+            continue
         try:
             t0 = time.time()
             iid = client.launch(cid)
@@ -2768,6 +2904,26 @@ def main() -> int:
                         rec["solve_rank"] = verdict.get("solve_rank")
                         if not rec["correct"]:
                             rec.setdefault("answers_rejected", {})["flag"] = value
+            # 回读 run 内 autosubmit 的裁决：平台自己说的「全解了」优先于
+            # 父进程事后重放（实例已被 delete，事后路径天然看不见已提交项）。
+            side = (
+                _read_submit_sidecar(_submit_sidecar_path(sample_names[-1]))
+                if sample_names else {}
+            )
+            if side:
+                rec["autosubmit_verdict"] = {
+                    "tried": len(side.get("tried") or []),
+                    "correct": [str(x)[:120] for x in (side.get("correct") or [])][:5],
+                    "fully_solved": bool(side.get("challenge_fully_solved")),
+                    "unlocked": [str(x) for x in (side.get("unlocked") or [])],
+                    "skipped": side.get("skipped"),
+                }
+                if side.get("challenge_fully_solved") and not rec.get("correct"):
+                    rec["correct"] = True
+                    rec["solved_by"] = "in_run_autosubmit"
+                    ok = rec.setdefault("answers_ok", {})
+                    for item in side.get("correct") or []:
+                        ok.setdefault(str(item).split("=", 1)[0], True)
             # 失败路径落盘：下一轮由调度器注入（见 --retry-notes）。
             rec["failure_path"] = _failure_facts(
                 rec,
