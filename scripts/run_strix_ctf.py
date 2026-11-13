@@ -192,6 +192,24 @@ _EMPTY_ENDPOINTS: dict[str, int] = {
 }
 
 
+def _arg_display_limit(arg_text: str) -> int:
+    """工具参数在 run.log 里的显示上限。
+
+    默认 400 字符是为了日志可读；但只要参数里**带着答案**，就一个字符都
+    不能切。答案有两条通道：flag 本身（``FLAG{``）和结构化答案标记
+    （``ANSWER[<qid>]=<value>``，QA/选择题用）。
+
+    2026-11-13 SECQA 实测：模型把 ``ANSWER[answer]=D`` 写在
+    ``finish_scan(executive_summary=...)`` 里，摘要前 300 字符是解释、
+    标记落在 400 字符之后，被切成 ``ANSWER[answer]… <truncated>``——父进程
+    提取不到值，于是「答对了」在账本上记成「没作答」（3/6 假失败）。
+    截断一个候选 token 会误导模型；截断带答案的参数则直接吞掉正确答案。
+    """
+    if "FLAG{" in arg_text or "ANSWER[" in arg_text:
+        return 4000
+    return 400
+
+
 def _endpoint_sources() -> dict[str, int]:
     """Endpoint-source counters from the process-wide restart guard.
 
@@ -649,7 +667,7 @@ async def main() -> int:
             # 同理：finish_scan 的 executive_summary 里就写着 flag，切到 220
             # 字符会把答案切断（CTFARENA-013 的摘要只剩 "**Flag: FLAG{b9"）。
             arg_text = str(arguments)
-            arg_limit = 4000 if "FLAG{" in arg_text else 400
+            arg_limit = _arg_display_limit(arg_text)
             arg_body = arg_text if len(arg_text) <= arg_limit else arg_text[:arg_limit] + "… <truncated>"
             print(f"  [{agent_id}] TOOL {name} {arg_body}")
         elif kind == "tool_call_output_item":
