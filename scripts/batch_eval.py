@@ -1729,6 +1729,17 @@ def _endpoints_brief(
     return "\n".join(lines)
 
 
+def _retry_notes_brief(path: str) -> str:
+    """读取调度器给的重试失败路径（同题、显式文件），限长后拼进题面。"""
+    if not path:
+        return ""
+    try:
+        text = Path(path).read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
+    return text[:900]
+
+
 def _challenge_brief(detail: dict) -> str:
     """把平台题目详情压成一段"题面简报"，拼进 agent 的指令。
 
@@ -1762,6 +1773,30 @@ def _challenge_brief(detail: dict) -> str:
         lines.append("tags: " + ", ".join(tags[:12]) + "\n")
     if desc:
         lines.append(desc[:1500] + ("\n" if len(desc) <= 1500 else "…\n"))
+    # 选择题（single_select / multi_select）：选项必须在题面里，否则 agent
+    # 只能自由发挥；平台对越界值直接 refused，答对也白答。
+    choice_lines: list[str] = []
+    for q in questions:
+        opts = [str(c) for c in (q.get("choices") or []) if str(c).strip()]
+        if not opts:
+            continue
+        multi = str(q.get("mode") or "").strip().lower() == "multi_select"
+        verb = "选出**全部**正确项（写成 `A,C` 或 `A C`）" if multi else "只选一个"
+        choice_lines.append(
+            f"- `{q['id']}`：{verb}；可选值（逐字使用，大小写敏感）："
+            f"{', '.join(opts)}\n"
+        )
+    if choice_lines:
+        lines.append("## 选择题选项（平台提供）\n" + "".join(choice_lines))
+    # 题型适配（2026-11-13 试跑教训）：判分方式不同，交付方式必须提前说清，
+    # 否则 agent 用 flag 题的直觉提交非 flag 题，答案对也拿不到分。
+    modes = {str(q.get("mode") or "").strip().lower() for q in questions}
+    if "checker" in modes:
+        lines.append(
+            "⚠️ 本题含 **checker** 题型：判分器直接读靶机状态，verify-answer "
+            "可能恒判否（别据此认定答案错）。拿到结果就按 "
+            "`ANSWER[<问题id>]=<值>` 单独一行交付，评测脚本会用 /check 复核。\n"
+        )
     # 多问题题：不写清楚会让 agent 答完第一个就收工。001 实测就是这样——它交了
     # flag，`xhr_token` 那一问空着，平台按"未完全解出"记，一分没有。
     if len(questions) > 1:
@@ -1779,7 +1814,8 @@ def _challenge_brief(detail: dict) -> str:
         # 保持原样，不给它塞「不一定是 flag」的误导。
         qid = str(questions[0]["id"])
         lines.append(
-            f"⚠️ 本题的答案不一定是 `FLAG{{...}}` 形态。拿到答案就立刻用"
+            f"⚠️ 本题的答案不一定是 `FLAG{{...}}` 形态——数字、短字符串、"
+            f"路径、布尔值都可能是答案，按题目要求原样交付。拿到答案就立刻用"
             f"**单独一行**写成 `ANSWER[{qid}]=<答案>`（例如 `ANSWER[{qid}]=3`），"
             "并保持这个值不再改动——评测脚本只按这个格式取答案，"
             "写在摘要段落里等于没交。\n"
@@ -2054,6 +2090,54 @@ def _resample_allowed(reason: str) -> bool:
     return reason in _RESAMPLE_REASONS
 
 
+def _last_marker_facts(markers: Path | None) -> list[str]:
+    """读停滞标记的最后一行，取 host/family/mechanism/stage 四元组。"""
+    if markers is None:
+        return []
+    try:
+        lines = markers.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return []
+    last: dict = {}
+    for line in reversed(lines):
+        if line.strip():
+            try:
+                parsed = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(parsed, dict):
+                last = parsed
+                break
+    return [
+        f"{key}={last[key]}"
+        for key in ("host", "family", "mechanism", "stage")
+        if str(last.get(key) or "").strip()
+    ]
+
+
+def _failure_facts(rec: dict, markers: Path | None) -> list[str]:
+    """把一次失败压成 1–3 行结构化事实，供调度器落盘并注入下一次重试。
+
+    只带机器可读的收场值与停滞四元组，不搬日志正文：重试提示里塞正文
+    会过拟合，也会把无关内容带进下一轮上下文。
+    """
+    if rec.get("correct"):
+        return []
+    facts: list[str] = []
+    if rec.get("error"):
+        facts.append(f"异常：{str(rec['error'])[:120]}")
+    elif rec.get("stop_reason"):
+        facts.append(f"收场：{rec['stop_reason']}")
+    rejected = rec.get("answers_rejected")
+    if isinstance(rejected, dict) and rejected:
+        shown = "、".join(f"{k}={v}" for k, v in list(rejected.items())[:3])
+        facts.append(f"提交被判否：{shown[:140]}")
+    tried = _last_marker_facts(markers)
+    if tried:
+        facts.append("探到：" + " ".join(tried)[:140])
+    return facts[:3]
+
+
 def _resume_steer(markers: Path, reason: str, sample_no: int) -> str:
     """用上一轮落盘的停滞事实生成换向提示。
 
@@ -2296,6 +2380,10 @@ def main() -> int:
         help="每题最多跑几次；>1 时仅在无进展收场（stop_reason）后换策略重开，"
              "solved/error/wallclock 不重开。默认 1 = 每题一次机会",
     )
+    p.add_argument(
+        "--retry-notes", default="",
+        help="重试注入：上一轮失败路径文件（由 compete 按题生成，只含同题事实）",
+    )
     args = p.parse_args()
 
     plan = json.loads(Path(args.plan).read_text(encoding="utf-8"))
@@ -2452,6 +2540,12 @@ def main() -> int:
             )
             if extra_endpoints:
                 brief = f"{brief}\n\n{extra_endpoints}" if brief else extra_endpoints
+            # 重试失败路径（用户 11-13 定调）：调度器把同一道题上一轮的结构化
+            # 失败事实写进显式文件，这里只做拼接，不读 digest/别的题。
+            retry_brief = _retry_notes_brief(args.retry_notes)
+            if retry_brief:
+                brief = f"{brief}\n\n{retry_brief}" if brief else retry_brief
+                rec["retry_notes_chars"] = len(retry_brief)
             rec["brief_chars"] = len(brief)
             # 每题默认一次机会；--max-samples>1 时，只有「有证据的早停」才
             # 换策略重开（见 _resample_allowed）。判据与重开决定都在 harness
@@ -2614,6 +2708,19 @@ def main() -> int:
                         flag if qid == "flag" else None,
                         low if qid == "flag" else None,
                     )
+                    q_choices = [
+                        str(c) for q in (challenge_detail.get("questions") or [])
+                        if isinstance(q, dict) and str(q.get("id")) == qid
+                        for c in (q.get("choices") or []) if str(c).strip()
+                    ]
+                    if q_choices:
+                        from ctf_strix.autosubmit import fits_choices
+
+                        q_mode = q_modes.get(qid, "")
+                        candidates = [
+                            c for c in candidates
+                            if fits_choices(c, q_mode, q_choices)
+                        ]
                     if not candidates:
                         continue
                     if _should_precheck(q_modes.get(qid, "")):
@@ -2635,6 +2742,8 @@ def main() -> int:
                     verdict = client.submit(iid, value, qid)
                     submitted[qid] = bool(verdict.get("correct"))
                     rec.setdefault("answers_submitted", {})[qid] = value
+                    if not submitted[qid]:
+                        rec.setdefault("answers_rejected", {})[qid] = value
                     if qid == "flag":
                         rec["flag_submitted"] = value
                     if verdict.get("solve_time_s") is not None:
@@ -2657,6 +2766,13 @@ def main() -> int:
                         rec["correct"] = bool(verdict.get("correct"))
                         rec["solve_time_s"] = verdict.get("solve_time_s")
                         rec["solve_rank"] = verdict.get("solve_rank")
+                        if not rec["correct"]:
+                            rec.setdefault("answers_rejected", {})["flag"] = value
+            # 失败路径落盘：下一轮由调度器注入（见 --retry-notes）。
+            rec["failure_path"] = _failure_facts(
+                rec,
+                _stall_markers_path(sample_names[-1]) if sample_names else None,
+            )
             print(f"  -> {'SOLVED' if rec['correct'] else 'FAILED'}  "
                   f"tools={rec['tool_calls']} agent={rec['agent_s']}s", flush=True)
         except CompetitionPausedError as exc:

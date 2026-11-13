@@ -74,6 +74,36 @@ _MAX_CANDIDATES = 6
 #: 正确解排在第 4 位以后就永远交不上，日志里还看不出发生过什么。
 _QA_ATTEMPT_CAP = 3
 
+
+def fits_choices(answer: Any, mode: str, choices: list[str]) -> bool:
+    """答案是否落在平台给出的 ``choices`` 里（CTFY-0002 v2 逐字规则）。
+
+    单选：值必须**逐字**等于某个 choice（大小写敏感，``A`` 不是 ``a``）。
+    多选：允许 list，或按逗号/空白切分的字符串；每部分都必须属于 choices。
+    没有 choices 的题型（dynamic/static/checker）一律放行。
+
+    Args:
+        answer: 候选答案（字符串 / list）。
+        mode: 平台 question mode。
+        choices: 平台给出的可选值列表。
+
+    Returns:
+        是否符合；无 choices 恒 True。
+    """
+    if not choices:
+        return True
+    if isinstance(answer, (list, tuple, set)):
+        parts = [str(x).strip() for x in answer if str(x).strip()]
+    else:
+        text = str(answer if answer is not None else "").strip()
+        if not text:
+            return False
+        if str(mode or "").strip().lower() in ("multi_select", "multi-select"):
+            parts = [p for p in re.split(r"[,\s]+", text) if p]
+        else:
+            parts = [text]
+    return bool(parts) and all(part in choices for part in parts)
+
 #: 平台对每题的作答上限。实例式 question 的元数据里通常**没有**
 #: ``attempts_remaining``，旧代码把"没这个字段"当成"不限次数"，于是一道
 #: 题的 6 个候选会一次打光——第 6 次起平台直接拒绝，而真正正确的答案如果
@@ -540,7 +570,13 @@ class AutoSubmitter:
         # 这类题会被判成"只有非 flag 类 question"，答案是静默丢掉的。
         pending = [
             q for q in questions
-            if q.get("mode") in ("dynamic", "static", "seeded")
+            # single_select / multi_select 是 CTFY-0002 v2 的选择题模式
+            # （2026-11-13 平台实测：SAMPLE-020 三问分别为 single_select /
+            # multi_select / static）。旧白名单只认三模式，选择题答案会被
+            # 静默丢掉——和当初 seeded 被漏掉是同一类断链。
+            if q.get("mode") in (
+                "dynamic", "static", "seeded", "single_select", "multi_select",
+            )
             # B-17：checker 题的交付是靶机副作用（deface / outage / persist），
             # 平台在 POST /instances/{id}/check 里裁决并记 "<checker>"。没有
             # 答案字符串也要给它一次机会——SAMPLE-006 就是这样零提交的。
@@ -626,12 +662,22 @@ class AutoSubmitter:
                                 "checker", "passed via /check", answer="<checker>"
                             )
                         break
-                whitelisted = q.get("mode") in ("dynamic", "static", "seeded")
+                whitelisted = q.get("mode") in (
+                    "dynamic", "static", "seeded", "single_select", "multi_select",
+                )
                 first = mapped.get(str(qid))
                 probe_skip = first is not None and not whitelisted
                 q_cands = ([first] if first is not None else []) + (
                     cands if whitelisted else []
                 )
+                # 选择题：不在 choices 里的候选直接丢弃。平台对越界值返回
+                # refused（不计次数但也不得分），发出去只会污染台账。
+                q_choices = [str(c) for c in (q.get("choices") or [])]
+                if q_choices:
+                    q_cands = [
+                        a for a in q_cands
+                        if fits_choices(a, str(q.get("mode") or ""), q_choices)
+                    ]
                 for pos, ans in enumerate(q_cands):
                     # 先问不记账的判分器。它正确 → 只写一条提交记录；
                     # 它不可用（旧平台 / 网络抖动）→ 退回直接提交。

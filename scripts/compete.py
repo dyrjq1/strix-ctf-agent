@@ -12,10 +12,12 @@
    ``--state-dir``（state.json 简账 + digest.md 一行一题 + runs/<qid>/
    详报）。题内 agent 上下文零注入；要看跨题记忆只有两级接口——
    digest 的简略描述，或 runs/ 下单题详报（由人/调度器读）。
-4. **并发**：``--lanes``（默认 3 = 平台实例配额）个 batch_eval 子进程
-   同时各占一个题目实例。⚠️ 冒烟已知：需要 VPN/隧道的 TCP 题并行车道
-   会共享子网路由互踩（vpn.py 单 wg 接口）；遇到路由型失败先降
-   ``--lanes 1``。
+4. **并发**：``--lanes``（默认 2 = 配额 3 留 1 个余量）个 batch_eval
+   子进程同时各占一个题目实例。run3 实测：3 车道与配额相等时零余量，
+   任何「停止中/重试中」实例都会挤掉别人的槽位（SAMPLE-001 连撞 5 次
+   429），墙钟求和几乎等于经过时间（并发度≈1）。⚠️ 需要 VPN/隧道的
+   TCP 题并行车道会共享子网路由互踩（vpn.py 单 wg 接口）；遇到路由型
+   失败先降 ``--lanes 1``。
 
 选题策略（纯函数 ``rank_queue``，全部可单测）：
 
@@ -370,9 +372,17 @@ def build_plan_item(
 
 
 def _spawn(
-    chal: dict[str, Any], args: argparse.Namespace, state_dir: Path
+    chal: dict[str, Any],
+    args: argparse.Namespace,
+    state_dir: Path,
+    failure_path: list[str] | None = None,
 ) -> subprocess.Popen:
-    """派一个 batch_eval 子进程跑单题（agent 上下文从零开始）。"""
+    """派一个 batch_eval 子进程跑单题（agent 上下文从零开始）。
+
+    ``failure_path`` 只来自同一道题**本进程自己**的失败记录（state.json
+    里按 cid 存放），经显式 ``--retry-notes`` 文件交界面注入，绝不从
+    digest/别的题读——题间隔离不变量保持不变。
+    """
     cid = str(chal["id"])
     runs = state_dir / "runs"
     runs.mkdir(parents=True, exist_ok=True)
@@ -395,8 +405,47 @@ def _spawn(
     ]
     if args.competition:
         cmd += ["--competition-id", args.competition]
+    if failure_path:
+        notes = runs / f"retry-notes-{cid}.txt"
+        notes.write_text(
+            "## 上一轮失败路径（本队自己的调试记录，不是平台提示）\n"
+            + "\n".join(f"- {line}" for line in failure_path[-3:])
+            + "\n\n上面这些路径已证明走不通或没有产生新观测；换机制类别，"
+            "不要复读同一组探测。\n",
+            encoding="utf-8",
+        )
+        cmd += ["--retry-notes", str(notes)]
     log = open(runs / f"{cid}.stdout.log", "a", encoding="utf-8")
     return subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT)
+
+
+def _failure_lines(rec: dict[str, Any]) -> list[str]:
+    """把一次失败的结果记录压成 1–3 行人读的失败路径。
+
+    只取结构化事实（stop_reason / error / 被判否的答案 / checker 预检 /
+    子进程落盘的停滞事实），不搬日志正文——重试提示里塞正文会过拟合，
+    也会把无关内容带进下一轮上下文。
+    """
+    lines: list[str] = []
+    err = str(rec.get("error") or "")
+    reason = str(rec.get("stop_reason") or "")
+    if rec.get("skipped"):
+        lines.append(f"基础设施跳过：{err or reason}")
+    elif err:
+        lines.append(f"异常收场：{err[:140]}")
+    elif reason:
+        lines.append(f"收场：{reason}")
+    rejected = rec.get("answers_rejected")
+    if isinstance(rejected, dict) and rejected:
+        shown = "、".join(f"{qid}={val}" for qid, val in list(rejected.items())[:3])
+        lines.append(f"提交后被判否：{shown[:180]}")
+    checked = rec.get("checker_checked")
+    if isinstance(checked, list) and checked:
+        lines.append("checker 未过：" + ",".join(map(str, checked))[:80])
+    stalled = rec.get("failure_path")
+    if isinstance(stalled, list):
+        lines.extend(str(x)[:140] for x in stalled[:2])
+    return lines[:3]
 
 
 def _collect(
@@ -420,11 +469,19 @@ def _collect(
     elif rec.get("correct"):
         status = SOLVED
         state_rec["one_line"] = "solved"
+        state_rec.pop("failure_path", None)
     else:
         status = FAILED
         state_rec["fails"] = int(state_rec.get("fails") or 0) + 1
         # 真跑了一次（哪怕失败）说明接入已恢复，skip 连击清零。
         state_rec["skips"] = 0
+        if not rec.get("skipped"):
+            fp = _failure_lines(rec)
+            if fp:
+                hist = list(state_rec.get("failure_path") or [])
+                hist.append("；".join(fp)[:300])
+                state_rec["failure_path"] = hist[-3:]
+                state_rec["one_line"] = state_rec["failure_path"][-1][:80]
     state_rec["status"] = status
     return status
 
@@ -434,10 +491,20 @@ def main() -> int:
     p.add_argument("--token", required=True)
     p.add_argument("--competition", required=True, help="competition id")
     p.add_argument("--state-dir", default="~/compete-state")
-    p.add_argument("--lanes", type=int, default=3, help="并发车道（平台配额 3）")
+    p.add_argument(
+        "--lanes",
+        type=int,
+        default=2,
+        help="并发车道（默认 2：平台配额 3，留 1 个余量给停止中/重试实例）",
+    )
     p.add_argument("--turns", type=int, default=25)
     p.add_argument("--wallclock", type=int, default=900)
     p.add_argument("--until", default="", help="ISO 时间，到点收工（空=一直跑）")
+    p.add_argument(
+        "--ignore-platform-solves",
+        action="store_true",
+        help="练习场重跑用：不把平台已解回灌成 solved（正式赛禁用）",
+    )
     p.add_argument("--dry-run", action="store_true", help="只打印队列，不派单")
     p.add_argument("--once", action="store_true", help="排一轮队跑完就退出（冒烟用）")
     p.add_argument("--poll", type=float, default=10.0, help="车道轮询间隔（秒）")
@@ -456,14 +523,15 @@ def main() -> int:
         if _rec.get("status") == RUNNING:
             _rec["status"] = ACTIVE
             _rec["one_line"] = "orphaned run reset"
-    try:
-        synced = merge_platform_solves(
-            state, fetch_my_solves(args.token, args.competition)
-        )
-        if synced:
-            print(f"[compete] 平台已解回灌：{', '.join(synced)}", flush=True)
-    except requests.RequestException as exc:
-        print(f"[compete] 已解列表拉取失败（忽略，用本地 state）：{exc}", flush=True)
+    if not args.ignore_platform_solves:
+        try:
+            synced = merge_platform_solves(
+                state, fetch_my_solves(args.token, args.competition)
+            )
+            if synced:
+                print(f"[compete] 平台已解回灌：{', '.join(synced)}", flush=True)
+        except requests.RequestException as exc:
+            print(f"[compete] 已解列表拉取失败（忽略，用本地 state）：{exc}", flush=True)
     my_solved = {cid for cid, r in state.items() if r.get("status") == SOLVED}
     running: dict[str, subprocess.Popen] = {}
     stop = False
@@ -503,7 +571,7 @@ def main() -> int:
                     "solves_count_seen": int(chal.get("solves_count") or 0),
                     "one_line": "",
                 }
-        if time.time() - last_solve_sync >= 60:
+        if time.time() - last_solve_sync >= 60 and not args.ignore_platform_solves:
             # B-28：赛中在浏览器/别处解出的题，60s 内同步进账，避免重派。
             last_solve_sync = time.time()
             try:
@@ -536,8 +604,11 @@ def main() -> int:
         while len(running) < args.lanes and queue:
             chal = queue.pop(0)
             cid = str(chal["id"])
-            state.setdefault(cid, {})["status"] = RUNNING
-            running[cid] = _spawn(chal, args, state_dir)
+            rec = state.setdefault(cid, {})
+            rec["status"] = RUNNING
+            running[cid] = _spawn(
+                chal, args, state_dir, failure_path=rec.get("failure_path")
+            )
             print(
                 f"[compete] 派单 {cid}（{len(running)}/{args.lanes} 车道）",
                 flush=True,
