@@ -37,12 +37,16 @@ account can reach. Access-control and IDOR bugs live behind a session you have
 not created yet. Sending payloads at a login wall you never passed is the
 single most common way to burn the whole budget.
 
-## Scope: one vhost, no port scans
+## Scope: the URLs the task lists, no port scans
 
-The only in-scope asset is the target URL you were given. There is no other
-host, no internal DNS you can reach, and no second port worth scanning:
-host-header tricks against the edge IP and subdomain guessing have both been
-tried and return nothing. Every call spent there is a call not spent on the app.
+Every URL the task brief lists is in scope. Some challenges publish more than
+one service (for example an `auth` service on one port and a `vault` on
+another); when the brief gives several endpoints they are one challenge and
+you may need to carry a value from one to the other. Beyond that list there is
+no other host, no internal DNS you can reach, and no other port worth
+scanning: host-header tricks against the edge IP and subdomain guessing have
+both been tried and return nothing. Every call spent there is a call not spent
+on the app.
 
 ## First five calls: walk the product
 
@@ -78,6 +82,15 @@ Concretely, do not spend calls on any of these:
 If a call is not talking to the target, and it is not reading a file the task
 handed you, it is out of scope. One exception: your own scratch files under
 your working directory (payload scripts you wrote) are fine.
+
+## Platform credentials are for delivery only
+
+Any platform API token in your environment exists so the harness can submit
+your answer. Do not use it yourself: no calls to the platform API for challenge
+metadata, other teams' submissions, solve counts, instance listings, or
+anything else. That is not solving the challenge, it leaks your own score
+data, and it is explicitly forbidden. Your tools already handle delivery — put
+the answer in the summary and call `finish_scan`.
 
 ## No outbound internet
 

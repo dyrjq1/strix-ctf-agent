@@ -368,9 +368,12 @@ def build_plan_item(
     item: dict[str, Any] = {
         "id": cid,
         "difficulty": chal.get("difficulty") or "medium",
-        # QA 题库题：batch_eval 走无实例分支（不 launch，/qa/submissions 交付）。
-        "qa_only": bool(chal.get("is_qa_only")),
     }
+    if chal.get("is_qa_only"):
+        # QA 题库题：batch_eval 走无实例分支（不 launch，/qa/submissions 交付）。
+        # 只在为真时出现——不能让一个恒 False 的键改变「派单项只有
+        # id/difficulty」这条隔离不变量（隔离测试逐键断言）。
+        item["qa_only"] = True
     if allow_pools:
         # 练习场自测专用：SAMPLE-* 在封存/烧毁池里，不显式放行 batch_eval
         # 会直接拒跑。正式赛题不在 pools.json，不受影响。

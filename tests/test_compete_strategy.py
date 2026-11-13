@@ -36,7 +36,13 @@ def _chal(cid: str, **kw) -> dict:
     return base
 
 
-def test_solved_closed_and_qa_only_are_not_queued() -> None:
+def test_solved_closed_are_not_queued_but_qa_only_is() -> None:
+    """qa_only 是**可交付**题型（/qa/submissions），不再被排除。
+
+    2026-11-13 夜：平台 questions 带 mode=single_select/multi_select/static，
+    QA 题库题没有实例但有题面；旧码在入口把 is_qa_only 直接判 None，
+    整类题从未进过队列。已由 batch_eval 的无实例分支接管。
+    """
     chals = [
         _chal("A"),
         _chal("B", closed=True),
@@ -44,7 +50,8 @@ def test_solved_closed_and_qa_only_are_not_queued() -> None:
         _chal("D"),
     ]
     queue, _ = compete.rank_queue(chals, {}, {"D"})
-    assert [c["id"] for c in queue] == ["A"]
+    # QA 题有 +30 权重（不占实例、无启动开销），同档位排在前面。
+    assert [c["id"] for c in queue] == ["C", "A"]
 
 
 def test_easier_difficulty_ranks_first() -> None:
