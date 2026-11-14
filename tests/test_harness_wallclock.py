@@ -34,7 +34,10 @@ BE_SRC = (ROOT / "scripts" / "batch_eval.py").read_text(encoding="utf-8")
 def test_hard_watchdog_install_is_sourced_from_agent() -> None:
     """安装必须复用 agent 侧实现（同源），预算按进程启动时刻扣减。"""
     assert "agent_mod._install_hard_deadline(" in RUN_SRC
-    assert "result_path=None" in RUN_SRC
+    # 2026-11-14：硬墙钟不再固定 result_path=None——三条 lane 被打死时
+    # 什么都没落，归因只能靠猜。路径由 --result-out 给出；缺省仍为 None，
+    # 老调用方行为不变（见 test_result_out_defaults_to_none）。
+    assert "result_path=Path(args.result_out) if args.result_out else None" in RUN_SRC
     # 预算三项：父墙钟 - 启动耗时 - agent 同一 headroom 常量。
     assert "int(args.wall_deadline)" in RUN_SRC
     assert "_since_start" in RUN_SRC

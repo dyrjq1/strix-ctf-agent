@@ -347,6 +347,41 @@ def test_shipped_entrypoint_installs_autosubmit() -> None:
     assert "engagement" in src and "checker" in src
 
 
+# --------------------------------------------------------------------------
+# competition defaults live in the image entrypoint, not in the code
+# --------------------------------------------------------------------------
+
+ENTRYPOINT = ROOT / "docker" / "entrypoint.sh"
+
+
+def test_shipped_entrypoint_sets_competition_defaults() -> None:
+    """Two deployment decisions have no other home: the platform injects only a
+    fixed ``CTFY_*`` set (docs/08), so a custom env var never reaches the box.
+
+    Both come from measurement (ledger §4.184: the competition gateway 400s
+    every request that omits ``max_tokens``; §4.186: the viability probe loses
+    a same-model ablation, 2/4 solves at 77 tool calls vs 4/4 at 39), and both
+    stay out of the code defaults on purpose -- the code default is what the
+    eval harness and the next experiment read.
+    """
+    text = ENTRYPOINT.read_text(encoding="utf-8")
+    for line in (
+        'export LLM_MAX_TOKENS="${LLM_MAX_TOKENS:-8192}"',
+        'export CTF_VIABILITY="${CTF_VIABILITY:-0}"',
+    ):
+        assert line in text, f"entrypoint lost its deployment default: {line}"
+
+    # After the launch line they would be inert.
+    launch_at = text.index("python3 /app/src/ctf_strix/agent.py")
+    assert text.index("export LLM_MAX_TOKENS=") < launch_at
+    assert text.index("export CTF_VIABILITY=") < launch_at
+
+    # ``:-`` (not ``:=`` and not a bare assignment) is what lets an operator
+    # override on the day; a clobbering form would eat a tournament hotfix.
+    assert "LLM_MAX_TOKENS:=" not in text
+    assert "CTF_VIABILITY:=" not in text
+
+
 def test_finish_guard_is_installed_once_after_the_probe_object() -> None:
     """One install site, and the probe must exist before the guard is wired.
 

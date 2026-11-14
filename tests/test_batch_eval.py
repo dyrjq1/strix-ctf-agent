@@ -301,6 +301,44 @@ def test_run_agent_passes_deadline_args_to_child(monkeypatch, workdir: Path) -> 
     assert argv[argv.index("--wall-deadline") + 1] == "600"
 
 
+def test_run_agent_forwards_llm_and_ablation_switches(monkeypatch, workdir: Path) -> None:
+    """子进程 env 是白名单：不转发的开关在 agent 里永远看不到。
+
+    2026-11-14 两次事故：网关冒烟没转发 LLM_MAX_TOKENS（每次调用仍 400）；
+    P0-4 消融臂没转发 CTF_VIABILITY=0（两条臂实际是同一条）。
+    """
+    import batch_eval
+
+    captured: dict = {}
+
+    class _Proc:
+        returncode = 0
+
+        def wait(self, timeout=None):  # noqa: ANN001, ARG002
+            return 0
+
+    def fake_popen(argv, **kwargs):  # noqa: ANN001, ANN003
+        captured["kwargs"] = kwargs
+        return _Proc()
+
+    monkeypatch.setattr(batch_eval, "_fresh_box", lambda n: (workdir, workdir / "run.log"))
+    monkeypatch.setattr(batch_eval.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(batch_eval, "_private_tmp_available", lambda: False)
+    monkeypatch.setattr(batch_eval, "_archive_run", lambda *a, **k: workdir)
+    monkeypatch.setattr(batch_eval, "_answer_values", lambda text: {})
+    monkeypatch.setenv("LLM_MAX_TOKENS", "8192")
+    monkeypatch.setenv("CTF_VIABILITY", "0")
+
+    batch_eval.run_agent(
+        "https://example.test/", turns=30, timeout_s=600, name="t-env",
+        archive_dir=None, model="openai/deepseek-chat",
+    )
+
+    env = captured["kwargs"]["env"]
+    assert env["LLM_MAX_TOKENS"] == "8192"
+    assert env["CTF_VIABILITY"] == "0"
+
+
 def test_suite_for_uses_static_table_without_network(monkeypatch):
     """快路径不许发请求：批测里每题都要路由，多一次 HTTP 就是多一次抖动源。"""
     import batch_eval

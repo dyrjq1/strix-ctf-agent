@@ -23,6 +23,7 @@ def test_installs_all_capabilities():
         variants_register=lambda: ["path_variants"],
         traffic_register=lambda: ["list_requests", "view_request"],
         web_cve_register=lambda: ["web_cve_lookup"],
+        viability_register=lambda: ["viability_probe"],
     )
 
     assert errors == []
@@ -32,6 +33,7 @@ def test_installs_all_capabilities():
         "variants": ["path_variants"],
         "traffic": ["list_requests", "view_request"],
         "web_cve": ["web_cve_lookup"],
+        "viability": ["viability_probe"],
     }
 
 
@@ -45,6 +47,7 @@ def test_one_failure_does_not_skip_the_other():
         variants_register=lambda: ["path_variants"],
         traffic_register=lambda: ["list_requests", "view_request"],
         web_cve_register=lambda: ["web_cve_lookup"],
+        viability_register=lambda: ["viability_probe"],
     )
 
     assert installed["http_probe"] == []
@@ -52,6 +55,7 @@ def test_one_failure_does_not_skip_the_other():
     assert installed["variants"] == ["path_variants"]
     assert installed["traffic"] == ["list_requests", "view_request"]
     assert installed["web_cve"] == ["web_cve_lookup"]
+    assert installed["viability"] == ["viability_probe"]
     assert len(errors) == 1
     assert "registry closed" in errors[0]
 

@@ -441,3 +441,195 @@ def test_main_leaves_non_auth_4xx_as_error(tmp_path, monkeypatch):
         import os
 
         os.environ.pop("CTFY_SOFT_DEADLINE", None)
+
+
+# ---------------------------------------------------------------------------
+# Transport-failure breaker (2026-11-14): an endpoint that stopped answering
+# must cost ~2 requests, not two full retry ladders (~22 minutes per run).
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def _clean_breaker():
+    """Breaker state is module-global; a failed assert must not leak it."""
+    error_policy.reset_breaker()
+    yield
+    error_policy.reset_breaker()
+
+
+def test_breaker_needs_both_failures_and_a_window():
+    assert error_policy.note_network_failure(now=0.0) is False
+    # Second failure inside the window: still a flaky provider, keep trying.
+    assert error_policy.note_network_failure(now=error_policy.NETWORK_BREAKER_SECONDS - 1) is False
+    # Same streak, now past the window: the endpoint is gone.
+    assert error_policy.breaker_open(error_policy.NETWORK_BREAKER_SECONDS + 1) is True
+
+
+def test_a_single_failure_never_opens_the_breaker():
+    error_policy.reset_breaker()
+
+    error_policy.note_network_failure(now=0.0)
+
+    assert error_policy.breaker_open(now=10_000.0) is False
+    error_policy.reset_breaker()
+
+
+def test_a_served_response_clears_the_streak():
+    error_policy.reset_breaker()
+    error_policy.note_network_failure(now=0.0)
+
+    error_policy.note_model_ok()
+
+    assert error_policy.note_network_failure(now=10_000.0) is False
+    error_policy.reset_breaker()
+
+
+def test_retry_policy_stops_retrying_an_unreachable_endpoint(monkeypatch):
+    """The breaker wins over a large retry budget."""
+    monkeypatch.setattr(error_policy, "remaining_wall", lambda: None)
+    error_policy.reset_breaker()
+    error_policy.note_network_failure(now=0.0)
+    error_policy.note_network_failure(now=error_policy.NETWORK_BREAKER_SECONDS + 1)
+
+    decision = _decide(_context(httpx.ConnectError("Connection error."), network=True))
+
+    assert decision.retry is False
+    assert decision.reason == "endpoint_unreachable"
+    error_policy.reset_breaker()
+
+
+def test_retry_policy_keeps_retrying_a_flaky_endpoint(monkeypatch):
+    """One transport failure is not an outage."""
+    monkeypatch.setattr(error_policy, "remaining_wall", lambda: None)
+    error_policy.reset_breaker()
+
+    decision = _decide(_context(httpx.ConnectError("Connection reset."), network=True))
+
+    assert decision.retry is True
+    error_policy.reset_breaker()
+
+
+def test_the_success_hook_clears_the_streak_off_the_sdk_path(monkeypatch):
+    """M4: 清零挂在 ``ReportUsageHooks.on_llm_end`` 上，不依赖遥测安装。
+
+    以前的用例都直接调 ``note_model_ok()``，所以「钩子到底有没有包上去」
+    永远测不到——这正是上一轮审码指出的、让计数器只有加号的盲区。
+    """
+    from strix.core import hooks as strix_hooks
+
+    calls = {"n": 0}
+
+    async def stub(self, context, agent, response):  # noqa: ANN001, ANN202
+        calls["n"] += 1
+        return "ok"
+
+    monkeypatch.setattr(strix_hooks.ReportUsageHooks, "on_llm_end", stub)
+    assert error_policy._install_success_hook() is True
+
+    error_policy.note_network_failure(now=0.0)
+    error_policy.note_network_failure(now=error_policy.NETWORK_BREAKER_SECONDS + 1)
+    assert error_policy.breaker_open(now=error_policy.NETWORK_BREAKER_SECONDS + 2) is True
+
+    asyncio.run(strix_hooks.ReportUsageHooks.on_llm_end(object(), None, None, None))
+
+    assert calls["n"] == 1
+    # 连击被清零：下一次失败从 1 重新数，而不是立刻开闸。
+    assert (
+        error_policy.note_network_failure(now=error_policy.NETWORK_BREAKER_SECONDS + 3)
+        is False
+    )
+
+
+def test_the_success_hook_is_idempotent(monkeypatch):
+    from strix.core import hooks as strix_hooks
+
+    async def stub(self, context, agent, response):  # noqa: ANN001, ANN202
+        return "ok"
+
+    monkeypatch.setattr(strix_hooks.ReportUsageHooks, "on_llm_end", stub)
+
+    assert error_policy._install_success_hook() is True
+    first = strix_hooks.ReportUsageHooks.on_llm_end
+    assert error_policy._install_success_hook() is True
+
+    assert strix_hooks.ReportUsageHooks.on_llm_end is first
+
+
+# ---------------------------------------------------------------------------
+# Statusless invalid-parameter errors (2026-11-14): the gateway rejects a
+# missing ``max_tokens`` inside the SSE stream, so the SDK raises an
+# ``APIError`` with no status_code.  The old rule replayed that deterministic
+# 400 eighteen times (837 s) before the run gave up.
+# ---------------------------------------------------------------------------
+
+
+def _midstream_invalid_parameter():
+    from openai import APIError
+
+    request = httpx.Request("POST", "http://gateway.test/v1/chat/completions")
+    return APIError(
+        "<400> InternalError.Algo.InvalidParameter: Range of max_tokens should be [1, 8192]",
+        request=request,
+        body={"error": {"message": "invalid_parameter_error"}},
+    )
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "<400> InternalError.Algo.InvalidParameter: Range of max_tokens should be [1, 8192]",
+        '{"code": "invalid_parameter_error", "message": "bad param"}',
+        '{"error": {"type": "invalid_request_error"}}',
+    ],
+)
+def test_statusless_invalid_parameter_is_a_client_error(message):
+    """请求形状本身被拒：重放同一请求只会得到同一答案。"""
+    from openai import APIError
+
+    request = httpx.Request("POST", "http://gateway.test/v1/chat/completions")
+    exc = APIError(message, request=request, body=None)
+
+    assert getattr(exc, "status_code", None) is None
+    assert error_policy.classify_error(exc) == "client_error"
+
+    decision = _decide(_context(exc, attempt=1))
+    assert decision.retry is False
+    assert decision.reason == "client_error"
+
+
+def test_genuine_statusless_provider_errors_stay_transient():
+    """没有 invalid-parameter 签名的无状态 provider 错误仍是瞬时错误。"""
+    from openai import APIError
+
+    request = httpx.Request("POST", "http://gateway.test/v1/chat/completions")
+    quota = APIError("stream ended: free quota exhausted", request=request, body=None)
+
+    assert error_policy.classify_error(quota) == "transient"
+    assert _decide(_context(quota, attempt=1)).retry is True
+
+
+def test_marker_text_on_a_non_provider_exception_is_not_reclassified():
+    """工具层异常文字里碰巧带签名也不许改分类（只认 provider APIError）。"""
+    exc = RuntimeError("tool said: invalid_request_error in output")
+
+    assert error_policy._is_permanent_request_error(exc) is False
+    assert error_policy.classify_error(exc) == "fatal"
+
+
+def test_turn_replay_refuses_a_permanent_request_error(monkeypatch):
+    """外层 turn replay 不许把确定性 400 再放行——哪怕墙钟还剩很多。"""
+    from strix.core import execution
+
+    original = execution._is_transient_model_error
+    was_guarded = error_policy._turn_guard_installed
+    monkeypatch.setattr(error_policy, "_clock", lambda: 100.0)
+    try:
+        error_policy._turn_guard_installed = False
+        assert error_policy.install_turn_replay_guard() is True
+        error_policy.set_wall_deadline(100.0 + 600.0)
+
+        assert execution._is_transient_model_error(_midstream_invalid_parameter()) is False
+    finally:
+        error_policy.clear_wall_deadline()
+        execution._is_transient_model_error = original
+        error_policy._turn_guard_installed = was_guarded

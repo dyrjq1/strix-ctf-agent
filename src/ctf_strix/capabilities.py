@@ -157,6 +157,7 @@ def install_web_capabilities(
     variants_register: RegisterFn | None = None,
     traffic_register: RegisterFn | None = None,
     web_cve_register: RegisterFn | None = None,
+    viability_register: RegisterFn | None = None,
 ) -> tuple[dict[str, list[str]], list[str]]:
     """Install the structured HTTP and route-discovery primitives.
 
@@ -167,6 +168,8 @@ def install_web_capabilities(
         traffic_register: Test seam; defaults to ``ctf_strix.traffic.register``.
         web_cve_register: Test seam; defaults to
             ``ctf_strix.aisec.tools.register_web_cve``.
+        viability_register: Test seam; defaults to
+            ``ctf_strix.viability.register``.
 
     Returns:
         ``(installed, errors)``.  ``installed`` maps capability name to the
@@ -183,6 +186,8 @@ def install_web_capabilities(
         from ctf_strix.traffic import register as traffic_register
     if web_cve_register is None:
         from ctf_strix.aisec.tools import register_web_cve as web_cve_register
+    if viability_register is None:
+        from ctf_strix.viability import register as viability_register
 
     installed: dict[str, list[str]] = {}
     errors: list[str] = []
@@ -197,7 +202,29 @@ def install_web_capabilities(
     # Apache/WordPress box gets it too.  It is installed separately so a
     # missing snapshot cannot take the HTTP primitives down with it.
     _install("web_cve", web_cve_register, installed, errors)
+    # 可行性探针（三条 ladder 一次调用出三态裁决）。它是本能力自带的预算，
+    # 不是可以单独调的参数：CTF_VIABILITY=0 只做消融/回滚，不关别的工具。
+    viability_on, _reason = wants_viability()
+    if viability_on:
+        _install("viability", viability_register, installed, errors)
     return installed, errors
+
+
+def wants_viability() -> tuple[bool, str]:
+    """Decide whether the ``viability_probe`` ladder tool is installed.
+
+    The tool ships on with the web surface.  ``CTF_VIABILITY=0`` is the
+    ablation and the rollback path; there is no positive override because a
+    value other than ``0/false/no`` would be a second, unmeasured default.
+
+    Returns:
+        ``(enabled, reason)``, phrased like :func:`wants_aisec` so the run log
+        can tell "off on purpose" from "never offered".
+    """
+    forced = os.environ.get("CTF_VIABILITY", "").strip().lower()
+    if forced in ("0", "false", "no"):
+        return False, "CTF_VIABILITY=0"
+    return True, "default on"
 
 
 def install_soft_deadline(soft_seconds: float, turns: int):

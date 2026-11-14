@@ -71,6 +71,21 @@ if [ -z "${LLM_API_KEY:-}" ] && [ -z "${STRIX_LLM:-}" ]; then
   echo "[ctfy] WARNING: neither LLM_API_KEY nor STRIX_LLM is set; agent cannot run" >&2
 fi
 
+# ---- 部署默认值 -------------------------------------------------------------
+# 平台只注入固定的一批 CTFY_* 变量，不接受自定义 env（docs/08 协议原文），
+# 所以「部署侧默认值」只能落在镜像入口上。`:-` 语义：外部显式给值优先。
+#
+# LLM_MAX_TOKENS：比赛网关（dashscope.llm.ctfy.io）要求每个 chat/completions
+#   请求显式携带 max_tokens，缺参回 400「Range of max_tokens should be
+#   [1, 8192]」——文案误导，实测是缺参（台账 §4.184）。8192 就是网关自己的
+#   上界；llm_compat 只在 model_settings.max_tokens 为 None 时注入，不覆盖
+#   调用方显式值。上游模型若更严，改这一个变量即可。
+# CTF_VIABILITY=0：viability_probe 预注册判据未过，同模型消融方向不利
+#   （probe-ON 2/4 解出、工具中位 77 次 / probe-OFF 4/4、39 次）。只关部署
+#   默认，代码默认值不动，等更大样本再判（台账 §4.186）。
+export LLM_MAX_TOKENS="${LLM_MAX_TOKENS:-8192}"
+export CTF_VIABILITY="${CTF_VIABILITY:-0}"
+
 cd "$WORK" 2>/dev/null || cd /
 # 用模块文件路径而不是 -m：-m 要求包可导入，而 PYTHONPATH 一旦被平台覆盖
 # （它会给容器注入自己的 env），-m 会在 import 阶段就崩，连"我崩了"都写不出来。

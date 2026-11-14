@@ -29,6 +29,11 @@ _BASE_URL_KEYS = ("LLM_BASE_URL", "OPENAI_BASE_URL", "ANTHROPIC_BASE_URL")
 #: 但 ANTHROPIC_AUTH_TOKEN 走的是 bearer，Anthropic **兼容**端点只认这个。
 _KEY_KEYS = ("LLM_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY")
 
+#: Public alias.  The startup probe must read the same names the bridge
+#: accepts, otherwise "no key" and "key bridged" can disagree and the probe
+#: refuses a run that would have worked (2026-11-14 Codex review N4).
+KEY_ENV_NAMES = _KEY_KEYS
+
 
 def _first_set(keys: tuple[str, ...]) -> str | None:
     """返回第一个非空环境变量的值。空字符串按未设置处理（§1.1 的约定）。"""

@@ -46,6 +46,7 @@ from typing import Any
 
 from ctf_strix import deadline
 from ctf_strix import error_policy
+from ctf_strix import llm_preflight
 from ctf_strix import platform_attach as attach
 from ctf_strix.flag_extract import FLAG_RE
 from ctf_strix.success_stop import RecoveryExhausted
@@ -1893,6 +1894,17 @@ def main() -> int:
     if env_applied:
         print(f"[ctfy] env bridged: {env_applied}", flush=True)
 
+    # Attribution line (2026-11-14 outage): one run was pointed at a host the
+    # box could not reach and nothing in the log said which endpoint it used --
+    # the model only appeared in strix.log, which the killed run never flushed.
+    endpoint = llm_preflight.describe()
+    if endpoint is not None:
+        print(
+            f"[ctfy] llm endpoint model={endpoint.model} host={endpoint.host} "
+            f"key={'set' if endpoint.key_present else 'missing'}",
+            flush=True,
+        )
+
     started = time.time()
     # 墙钟兜底（接线修复，背景见 _WALL_TIERS）：此前时间限制只在评测
     # harness 里生效，本入口没有。软截止同步设为墙钟的 75%（与 harness
@@ -1903,6 +1915,9 @@ def main() -> int:
     # 让墙钟异常在还剩收尾余量时抛进 main；日志仍报原始预算。
     budget_for_stop = _budget_for_stop(wall_budget)
     error_policy.set_wall_deadline(_llm_wall_deadline(budget_for_stop))
+    # Breaker state is process-wide; an embedded caller runs main() more than
+    # once, and a previous run's dead endpoint must not fail this one.
+    error_policy.reset_breaker()
     if budget_for_stop > 0:
         os.environ.setdefault("CTFY_SOFT_DEADLINE", str(max(int(budget_for_stop * 0.75), 1)))
         if _install_hard_deadline(
@@ -1938,6 +1953,16 @@ def main() -> int:
             stop_reason = "dry_run"
             error = None
         else:
+            # 先确认模型端点真的能应答：2026-11-14 三条 lane 打到不可达的
+            # 主机，两套重试梯度各烧 20 分钟，墙钟杀掉时连 result.json 都没有。
+            # 预检把这种"整轮零产出"压到十几秒。失败也照常写 result.json，
+            # 只是 stop_reason 换成 llm_unreachable——让赛后归因看得出这是
+            # 端点问题而不是能力问题。**不做**自动换端点重派：这个值不在
+            # ``batch_eval._RESAMPLE_REASONS`` 里，重开只会重复烧同样的钱。
+            preflight = llm_preflight.guard()
+            diag["llm_preflight"] = preflight.as_dict()
+            if not preflight.ok:
+                raise llm_preflight.LlmUnreachable(preflight.summary(), kind=preflight.kind)
             # 平台不一定把附件投进工作目录，task.json 的 ``attachments`` 也可能是
             # 空数组。先按题从选手 API 拉一遍，让 kind 判定能看到附件；失败只是
             # warning，维持原来的 no_target 路径。
@@ -2145,12 +2170,42 @@ def main() -> int:
             "agent_id": info.get("agent_id"),
         }
         print(f"[ctfy] {exc}", flush=True)
+    except llm_preflight.LlmUnreachable as exc:
+        # The startup probe proved the endpoint cannot serve this run.  Not a
+        # crash: the run is healthy and simply had nowhere to send a prompt.
+        error = str(exc)
+        # Only a dead host is worth re-dispatching; a dead key or a wrong
+        # path answers the same way on every endpoint.
+        stop_reason = {
+            "credential": "credential_failure",
+            "misconfigured": "misconfigured",
+        }.get(getattr(exc, "kind", ""), "llm_unreachable")
+        print(f"[ctfy] {exc}", flush=True)
     except BaseException as exc:  # noqa: BLE001 - every failure must land in result.json
         error = f"{type(exc).__name__}: {exc}"
         # A credential rejection can escape the attempt loop when it happens
         # outside a model call (for example during provider setup).  Mark it
         # the same way, so a dead key is never reported as a generic crash.
-        if error_policy.classify_error(exc) == "credential_failure":
+        if error_policy.take_unreachable() and error_policy.is_connect_error(exc):
+            # The retry policy abandoned this endpoint mid-run.  Consumed
+            # once, so an unrelated crash on a later run cannot inherit it --
+            # and the raise itself must look like a transport failure: a
+            # dropped exception (vendor's non-interactive path swallows them)
+            # could otherwise leave the flag armed for the next, unrelated
+            # crash 400 s later (Codex N1).
+            stop_reason = "llm_unreachable"
+            diag.setdefault("llm_errors", []).append(
+                {
+                    "reason": "endpoint_unreachable",
+                    "error_type": type(exc).__name__,
+                    "message": str(exc)[:500],
+                    "retryable": True,
+                }
+            )
+            # Still print: the traceback is the only way to see what was
+            # actually raised, and mislabelling is worse than a noisy log.
+            traceback.print_exc()
+        elif error_policy.classify_error(exc) == "credential_failure":
             stop_reason = "credential_failure"
             detail = error_policy.credential_failure(exc)
             if detail is not None:
@@ -2203,6 +2258,12 @@ def main() -> int:
             # without parsing the free-text writeup.
             payload["llm_errors"] = llm_errors
         output_budget = diag.get("output_budget") if isinstance(diag, dict) else None
+        preflight_diag = diag.get("llm_preflight") if isinstance(diag, dict) else None
+        if preflight_diag:
+            # Which endpoint this run aimed at, and what the probe saw.  The
+            # 2026-11-14 outage cost three runs precisely because this was
+            # only inferable from a log line.
+            payload["llm_preflight"] = preflight_diag
         if output_budget:
             # Same reason as llm_errors: a stop caused by one runaway call must
             # be queryable without parsing the writeup.
@@ -2710,6 +2771,7 @@ def install_toolset(task: dict[str, Any], kind: str) -> tuple[str, list[str]]:
     groups = ["base"]
     try:
         from ctf_strix import context as ctf_context
+        from ctf_strix import llm_compat
         from ctf_strix import prompt as ctf_prompt
 
         # Tell the prompt which kind is running *before* the first render, so
@@ -2719,10 +2781,15 @@ def install_toolset(task: dict[str, Any], kind: str) -> tuple[str, list[str]]:
         ctf_prompt.activate(kind, tuple(groups), _registered_names())
         ctf_prompt.install()
         capper = ctf_context.install()
+        # 网关端点要求请求显式携带 max_tokens（2026-11-14 冒烟实测缺参全 400）。
+        # LLM_MAX_TOKENS 未设置时代理是纯转发，行为不变。
+        llm_compat.install()
+        explicit = llm_compat.max_tokens_from_env()
         print(
             f"[ctx] prompt installed kind={kind} groups={','.join(groups)} "
             f"({len(ctf_prompt.build({}))} chars); "
-            f"content cap={capper.cap_chars} chars/output, {capper.arg_cap} chars/args",
+            f"content cap={capper.cap_chars} chars/output, {capper.arg_cap} chars/args"
+            + (f"; max_tokens={explicit}" if explicit is not None else ""),
             flush=True,
         )
     except Exception as exc:  # noqa: BLE001 — 上下文改造失败必须回落到原行为
@@ -2907,7 +2974,14 @@ def _run_agent(
     """
     import asyncio
 
+    from ctf_strix.engagement import challenge_id_of
     from ctf_strix.local_backend import install as install_backend
+
+    # ``challenge_id_of`` 是提交链接线要的题号（G1 gated 刷新）。2026-11-14
+    # 官方入口实测：本函数里两次调用它却没有导入，NameError 被下面的 except
+    # 吞成一行 "autosubmit unavailable"——解出 flag、写对了 result.json，
+    # 但一次都没提交。评测链路（run_strix_ctf.py）自带那份导入，所以冒烟
+    # 一路全绿；只有真跑官方入口才看得见。
 
     # One process can host more than one run (tests / embedded callers).  A
     # trip from the previous run must not refuse this run's first paid call.

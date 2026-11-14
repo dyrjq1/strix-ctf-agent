@@ -156,6 +156,14 @@ def _write(record: dict[str, Any]) -> None:
 
 
 def _record(context: Any, agent: Any, response: Any) -> None:
+    # A served response proves the endpoint is alive, so it clears the
+    # transport-failure streak that error_policy's breaker counts.
+    try:
+        from ctf_strix import error_policy
+
+        error_policy.note_model_ok()
+    except Exception:  # noqa: BLE001 - telemetry must never break a call
+        pass
     with _lock:
         pending = _pending.pop(_key(context, agent), None)
     usage = getattr(response, "usage", None)

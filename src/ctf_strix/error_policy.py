@@ -23,11 +23,51 @@ from __future__ import annotations
 import sys
 import time
 from collections.abc import Iterator
-from typing import Any
+from typing import Any, Final
 
 
 #: A rejected key cannot recover inside one run, so it is a distinct class.
 AUTH_STATUSES = frozenset({401, 403})
+
+#: Provider error-body codes that mean "this request is malformed", not "the
+#: provider is flaky".  DashScope-style backends answer a missing ``max_tokens``
+#: with ``InternalError.Algo.InvalidParameter`` and OpenAI-style backends use
+#: ``invalid_parameter_error``/``invalid_request_error``.  When such an error
+#: arrives as a mid-stream SSE event the SDK raises an ``APIError`` with **no**
+#: ``status_code``, so the statusless-provider-error rule below would replay the
+#: identical request forever -- the 2026-11-14 gateway smoke burned 837 s on 18
+#: replays of one deterministic 400.  These markers say replaying cannot help.
+_PERMANENT_REQUEST_MARKERS: Final[frozenset[str]] = frozenset(
+    {
+        "invalidparameter",
+        "invalid_parameter",
+        "invalid_request_error",
+    }
+)
+
+
+def _is_permanent_request_error(exc: BaseException) -> bool:
+    """Statusless provider error whose body marks the request itself as invalid.
+
+    Only applies to statusless errors (``status_code`` missing): errors that
+    carry a status already route through the 4xx/5xx branches above, and only
+    to provider API errors, so a tool-level exception whose text happens to
+    contain a marker is not reclassified.
+    """
+    if status_code_of(exc) is not None:
+        return False
+    for candidate in _iter_chain(exc):
+        try:
+            import openai
+
+            if not isinstance(candidate, openai.APIError):
+                continue
+        except Exception:  # noqa: BLE001 - optional dependency
+            continue
+        lowered = str(candidate).lower()
+        if any(marker in lowered for marker in _PERMANENT_REQUEST_MARKERS):
+            return True
+    return False
 
 #: Statuses that mean "the provider is temporarily unavailable" or "back off".
 TRANSIENT_STATUSES = frozenset(
@@ -58,6 +98,14 @@ MAX_DELAY_SECONDS = 60.0
 #: Leave this much wall clock for writing ``result.json`` and tearing down.
 WALL_RESERVE_SECONDS = 20.0
 
+#: Transport failures in a row, and how long that streak may last, before the
+#: policy stops retrying.  Sized from the 2026-11-14 outage: one failed request
+#: against a black-holed endpoint took 40-120 s, so two failures plus the
+#: 45 s window open the breaker after roughly 1.5-2 minutes -- instead of the
+#: 22 minutes two retry ladders spent grinding a dead host.
+NETWORK_BREAKER_MIN_FAILURES = 2
+NETWORK_BREAKER_SECONDS = 45.0
+
 #: Fallback for the full turn-replay ladder (2+4+8+16+32).  The real value is
 #: read from the vendored module so a ladder change cannot silently drift.
 TURN_REPLAY_TOTAL_FALLBACK_SECONDS = 62.0
@@ -79,12 +127,102 @@ _NETWORK_CLASS_NAMES = frozenset(
     }
 )
 
+#: Transport failures that mean *nothing answered*.  Timeouts are deliberately
+#: absent: a slow provider is what the retry ladders are for, and a 300 s
+#: ``LLM_TIMEOUT`` twice in a row must not read as "the host is gone".
+_CONNECT_CLASS_NAMES = frozenset(
+    {
+        "APIConnectionError",
+        "ConnectError",
+        "ReadError",
+        "WriteError",
+        "RemoteProtocolError",
+        "ProxyError",
+        "NetworkError",
+    }
+)
+_TIMEOUT_CLASS_NAMES = frozenset(
+    {"APITimeoutError", "TimeoutException", "ConnectTimeout", "ReadTimeout", "WriteTimeout"}
+)
+
 _installed = False
 _turn_guard_installed = False
 _deadline: float | None = None
 
 #: Indirection so tests can drive the clock without sleeping.
 _clock = time.monotonic
+
+#: Transport-failure breaker state (see :func:`note_network_failure`).
+_net_streak_started: float | None = None
+_net_streak_count = 0
+#: Set when the retry policy actually gave up on an unreachable endpoint.
+#: ``main()`` consumes it to label that run; nothing else may read it, because
+#: "the breaker once opened" is not evidence about *this* exception.
+_unreachable_pending = False
+
+
+def note_model_ok() -> None:
+    """Clear the transport-failure streak after a request the provider served.
+
+    Called from :mod:`ctf_strix.llm_telemetry` on every completed response, so
+    a single dropped connection followed by healthy traffic never accumulates
+    toward the breaker.
+    """
+    global _net_streak_started, _net_streak_count  # noqa: PLW0603 - process state
+    _net_streak_started = None
+    _net_streak_count = 0
+
+
+def note_network_failure(now: float | None = None) -> bool:
+    """Record one transport failure and report whether the breaker is open.
+
+    A streak opens the breaker once it has lasted
+    :data:`NETWORK_BREAKER_SECONDS` **and** counts at least
+    :data:`NETWORK_BREAKER_MIN_FAILURES` requests.  The window matters as much
+    as the count: successive requests against a dead host are expensive, while
+    a burst of fast failures minutes apart is a normal flaky provider.
+
+    Args:
+        now: Injected clock for tests; defaults to the policy clock.
+
+    Returns:
+        ``True`` when the run should stop retrying the endpoint.
+    """
+    global _net_streak_started, _net_streak_count  # noqa: PLW0603 - process state
+    moment = _clock() if now is None else float(now)
+    if _net_streak_started is None:
+        _net_streak_started = moment
+    _net_streak_count += 1
+    return breaker_open(moment)
+
+
+def breaker_open(now: float | None = None) -> bool:
+    """Whether the transport-failure streak has tripped the breaker."""
+    if _net_streak_started is None:
+        return False
+    if _net_streak_count < NETWORK_BREAKER_MIN_FAILURES:
+        return False
+    moment = _clock() if now is None else float(now)
+    return (moment - _net_streak_started) >= NETWORK_BREAKER_SECONDS
+
+
+def note_unreachable() -> None:
+    """Record that the retry policy abandoned the endpoint (consume-once)."""
+    global _unreachable_pending  # noqa: PLW0603 - process state
+    _unreachable_pending = True
+
+
+def take_unreachable() -> bool:
+    """Consume the "gave up on an unreachable endpoint" evidence."""
+    global _unreachable_pending  # noqa: PLW0603 - process state
+    seen, _unreachable_pending = _unreachable_pending, False
+    return seen
+
+
+def reset_breaker() -> None:
+    """Forget breaker state; ``main()`` calls this so runs cannot inherit it."""
+    note_model_ok()
+    take_unreachable()
 
 
 def set_wall_deadline(deadline_monotonic: float | None) -> None:
@@ -184,6 +322,43 @@ def is_network_error(exc: BaseException | None) -> bool:
     return False
 
 
+def is_connect_error(exc: BaseException | None) -> bool:
+    """Whether ``exc`` says nothing answered (a timeout does not count).
+
+    The retry ladders and the breaker want different questions answered:
+    "should I wait?" (any transport failure) versus "is this host gone?"
+    (only refused/reset/unresolvable connections).
+    """
+    for candidate in _iter_chain(exc):
+        name = type(candidate).__name__
+        if isinstance(candidate, TimeoutError) or name in _TIMEOUT_CLASS_NAMES:
+            continue
+        if isinstance(candidate, ConnectionError):
+            return True
+        try:
+            import httpx
+
+            if isinstance(candidate, httpx.TimeoutException):
+                continue
+            if isinstance(candidate, httpx.TransportError):
+                return True
+        except Exception:  # noqa: BLE001 - optional dependency
+            pass
+        try:
+            import openai
+
+            # ``APITimeoutError`` subclasses ``APIConnectionError``: ask first.
+            if isinstance(candidate, openai.APITimeoutError):
+                continue
+            if isinstance(candidate, openai.APIConnectionError):
+                return True
+        except Exception:  # noqa: BLE001 - optional dependency
+            pass
+        if name in _CONNECT_CLASS_NAMES:
+            return True
+    return False
+
+
 def _is_statusless_provider_error(exc: BaseException) -> bool:
     """Provider errors with no status are the SDK's existing transient class."""
     for candidate in _iter_chain(exc):
@@ -232,6 +407,8 @@ def classify_error(
         return "transient"
     if network or timeout:
         return "transient"
+    if status is None and _is_permanent_request_error(exc):
+        return "client_error"
     if status is None and _is_statusless_provider_error(exc):
         return "transient"
     return "fatal"
@@ -278,6 +455,16 @@ def retry_policy(context: Any) -> Any:
         return RetryDecision(retry=False, reason="aborted")
     if kind in {"credential_failure", "client_error", "fatal"}:
         return RetryDecision(retry=False, reason=kind)
+
+    # A transport failure that keeps repeating is an unreachable endpoint, not
+    # a slow provider: further attempts only spend the wall clock.  This check
+    # sits before the retry counter so the breaker wins over a large budget.
+    # Only *connect-class* failures count: ``LLM_TIMEOUT`` is 300 s, and two of
+    # those against a merely busy provider must not read as "the host is gone".
+    if kind == "transient" and is_connect_error(context.error) and note_network_failure():
+        note_unreachable()
+        return RetryDecision(retry=False, reason="endpoint_unreachable")
+
     if context.attempt > context.max_retries:
         return RetryDecision(retry=False, reason="max_retries")
 
@@ -365,6 +552,15 @@ def install_turn_replay_guard() -> bool:
     threshold = WALL_RESERVE_SECONDS + _turn_replay_total_delay(execution)
 
     def wall_aware(exc: BaseException) -> bool:
+        # An open breaker means the endpoint is unreachable, not flaky: the
+        # 2/4/8/16/32 s replay ladder would only repeat the same failure.
+        if breaker_open():
+            return False
+        # A malformed request (e.g. the gateway's missing-``max_tokens`` 400
+        # raised as a statusless mid-stream APIError) is deterministic: replay
+        # burns the wall clock without ever changing the answer.
+        if _is_permanent_request_error(exc):
+            return False
         remaining = remaining_wall()
         if remaining is not None and remaining <= threshold:
             return False
@@ -393,6 +589,7 @@ def install() -> bool:
         # The retry bindings are already ours, but a module reload in an
         # embedded caller could have restored the vendored replay hook.
         install_turn_replay_guard()
+        _install_success_hook()
         return True
     try:
         settings = build_retry_settings()
@@ -410,4 +607,30 @@ def install() -> bool:
     inputs.DEFAULT_MODEL_RETRY = settings
     _installed = True
     install_turn_replay_guard()
+    _install_success_hook()
+    return True
+
+
+def _install_success_hook() -> bool:
+    """Clear the transport streak from the SDK hook, not from telemetry.
+
+    The streak's "+" lives on the retry path, which is always installed; its
+    "-" must not depend on an optional sink.  ``llm_telemetry`` also clears it,
+    but that module is wrapped by ``usage_meter`` and its failure is only a
+    warning -- a run with telemetry off would count failures forever.
+    """
+    try:
+        from strix.core import hooks as strix_hooks
+    except Exception:  # noqa: BLE001 - a missing runtime is not our problem
+        return False
+    original = getattr(strix_hooks.ReportUsageHooks, "on_llm_end", None)
+    if not callable(original) or getattr(original, "_ctf_streak_cleared", False):
+        return callable(original)
+
+    async def on_llm_end(self: Any, context: Any, agent: Any, response: Any, *args: Any, **kwargs: Any) -> Any:
+        note_model_ok()
+        return await original(self, context, agent, response, *args, **kwargs)
+
+    on_llm_end._ctf_streak_cleared = True  # type: ignore[attr-defined]
+    strix_hooks.ReportUsageHooks.on_llm_end = on_llm_end  # type: ignore[method-assign]
     return True

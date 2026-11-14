@@ -116,6 +116,12 @@ CATALOGUE: Final[tuple[ToolInfo, ...]] = (
         "web",
     ),
     ToolInfo(
+        "viability_probe",
+        "three mechanism ladders in one call, each hit/dead/unknown",
+        WEB_KINDS,
+        "web",
+    ),
+    ToolInfo(
         "traffic_list",
         "list this run exchanges plus ids the target returned that nobody "
         "fetched yet; read-only, no network",

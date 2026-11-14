@@ -1383,6 +1383,12 @@ def _crash_error(log: str) -> tuple[str, str] | None:
             return f"transport:{etype}", detail
         return f"crash:{etype}", detail
     if m_rc:
+        if int(m_rc.group(1)) == _preflight_exit_rc() and _PREFLIGHT_MARK in log:
+            # 「没跑起来」不是崩溃。rc=3 已经由 _stop_reason_of 归因为
+            # llm_unreachable / credential_failure / misconfigured；这里再
+            # 写一条 agent-exit:rc3，下一轮提示就会读到「异常：agent-exit:rc3」，
+            # 把拒绝出跑重新说成代码炸了（Codex 复核 N3）。
+            return None
         return f"agent-exit:rc{m_rc.group(1)}", ""
     return None
 
@@ -2501,6 +2507,36 @@ _RESAMPLE_REASONS = frozenset(
 )
 
 
+def _preflight_exit_rc() -> int | None:
+    """启动预检的退出码，取不到时返回 ``None``（归因退回原判据）。
+
+    ``run_strix_ctf`` 与 ``batch_eval`` 分属两个进程，共享这个数只能靠约定；
+    把它收在一处，免得 ``_stop_reason_of`` 认 3、``_crash_error`` 不认 3，
+    同一条记录既写 ``stop_reason=llm_unreachable`` 又写 ``error=agent-exit:rc3``
+    （Codex 复核 N3 实测）。
+    """
+    try:
+        from ctf_strix import llm_preflight
+
+        return int(llm_preflight.EXIT_CODE)
+    except Exception:  # noqa: BLE001 - 归因失败只能是「没有这项归因」
+        return None
+
+
+#: 日志里证明「这一轮是被预检拒绝出跑」的那一行。退出码单独不足以判定：
+#: 3 是 ``llm_preflight.EXIT_CODE``，但将来任何以 3 退出的真崩溃也会撞上，
+#: 那时 ``error=None`` + ``llm_unreachable`` 就是把「炸了」说成套话（Codex 三轮）。
+_PREFLIGHT_MARK = "[llm] preflight ok=False"
+
+#: 预检拒绝出跑时，``kind`` → 结果表的 stop_reason。死 key 与错路径换个
+#: 端点还是同一个答案，不能和「主机不在」共用一个归因（Codex 复核 N2）。
+_PREFLIGHT_KIND_REASONS = {
+    "credential": "credential_failure",
+    "misconfigured": "misconfigured",
+    "unreachable": "llm_unreachable",
+}
+
+
 def _stop_reason_of(log: str) -> str:
     """从一次 run 的日志里读出它是怎么收场的。
 
@@ -2536,7 +2572,18 @@ def _stop_reason_of(log: str) -> str:
         if "MaxTurnsExceeded" in m_err.group(1):
             return "turn_capped"
         return "error"
-    if re.search(r"^\[agent-exit\] rc=", log, re.M):
+    m_rc = re.search(r"^\[agent-exit\] rc=(-?\d+)$", log, re.M)
+    if m_rc:
+        # 启动预检拒绝出跑（端点不可达）有自己的退出码。它既不是崩溃也不是
+        # 「跑了没解出」，混进 error 会让归因重新变成猜——2026-11-14 三条
+        # lane 就是这么把 66 分钟记成「能力不行」的。
+        if int(m_rc.group(1)) == _preflight_exit_rc() and _PREFLIGHT_MARK in log:
+            # 退出码把三种死因压成了同一个数，``kind`` 只留在日志行里：
+            # 死 key / 错路径换端点也救不回来，和不达标的处置方向相反。
+            m_kind = re.search(r"^\[llm\] preflight ok=False .*kind=(\w+)", log, re.M)
+            if m_kind:
+                return _PREFLIGHT_KIND_REASONS.get(m_kind.group(1), "preflight_refused")
+            return "preflight_refused"
         return "error"
     return "unknown"
 
@@ -2859,6 +2906,12 @@ def run_agent(
         "LLM_API_KEY": os.environ.get("LLM_API_KEY", ""),
         "LLM_API_BASE": os.environ.get("LLM_API_BASE", ""),
         "STRIX_LLM": model or os.environ.get("STRIX_LLM", ""),
+        # 网关端点要求请求显式携带 max_tokens（缺失时全 400，2026-11-14 冒烟
+        # 实测）。子进程 env 是白名单，不转发等于 agent 里永远看不到开关。
+        "LLM_MAX_TOKENS": os.environ.get("LLM_MAX_TOKENS", ""),
+        # 能力消融开关同理：批跑验证「关掉探针」的对照臂必须能传进去，否则
+        # 两条臂实际是同一条（2026-11-14 P0-4 消融臂事故）。
+        "CTF_VIABILITY": os.environ.get("CTF_VIABILITY", ""),
         "STRIX_TELEMETRY": "false",
         # 每次 LLM 调用后原子落盘。进程被墙钟 SIGKILL 时，run_strix_ctf 末尾那行
         # `[usage]` 永远不会打印——两条 A/B 臂就这么丢了 token 数（只能记 n/a）。
@@ -2887,6 +2940,10 @@ def run_agent(
         # 守卫遥测的落盘路径必须由启动方显式给：子进程 stdout 被重定向到
         # run.log，它自己无从知道父进程把这次 run 的目录放在哪里。
         "--guard-state", str(_guard_state_path(name)),
+        # 硬墙钟兜底落盘。不给这个路径，watchdog 就以 result_path=None 装表：
+        # 2026-11-14 三条 lane 被打死时 box 里连骨架 result.json 都没有，
+        # 赛后只能从日志反推它们一次模型调用都没成功。
+        "--result-out", str(box / "result.json"),
         *_deadline_args(timeout_s),
     ]
     if files_dir is not None:

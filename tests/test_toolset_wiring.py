@@ -50,6 +50,35 @@ def registry():
     return run
 
 
+def test_official_entry_resolves_challenge_id_of():
+    """``main()`` 里每个名字都必须能解析，尤其提交链要的 ``challenge_id_of``。
+
+    2026-11-14 实测：``main()`` 的 autosubmit 分支用了 ``challenge_id_of(task)``
+    却没有导入，两次都抛 NameError、被 except 吞成一行 "autosubmit
+    unavailable"——解出 flag、写对了 result.json，但一次都没提交。
+    评测链路（run_strix_ctf.py）自带那份导入，所以冒烟一路全绿；只有真跑
+    官方入口才看得见。这类"用了但没导入"的疏漏，字节码层面一抓一个准：
+    它必然以 LOAD_GLOBAL 出现，而正确导入后是 LOAD_FAST。
+    """
+    import dis
+    import inspect
+
+    from ctf_strix import agent as agent_mod
+
+    source = inspect.getsource(agent_mod._run_agent)
+    assert "challenge_id_of(task)" in source, "提交链不再取题号？同步更新本测试"
+
+    globals_used = {
+        instr.argval
+        for instr in dis.get_instructions(agent_mod._run_agent)
+        if instr.opname == "LOAD_GLOBAL"
+    }
+    assert "challenge_id_of" not in globals_used, (
+        "_run_agent() 把 challenge_id_of 当全局用了——漏了函数内导入，"
+        "autosubmit 会被 except 静默吞掉"
+    )
+
+
 def test_file_challenge_registers_attachment_tools_but_no_http(registry):
     names, groups, text = registry("file")
     assert "file_triage" in names
@@ -74,6 +103,33 @@ def test_web_challenge_registers_http_and_not_attachment_tools(registry):
     for file_tool in ("file_triage", "decode_blob", "unpack_archive"):
         assert file_tool not in names
         assert f"`{file_tool}`" not in text
+
+
+def test_web_challenge_registers_viability_probe(registry):
+    """The ladder tool must be in the real web registry, not just importable.
+
+    It is the one call that turns "this direction is dead" into an engine-side
+    verdict, so a version that exists in ``viability.py`` but never registers
+    is indistinguishable from a model that chose not to use it.
+    """
+    names, groups, text = registry("web", {"challenge": {"description": "a login page"}})
+    assert "viability_probe" in names
+    assert "`viability_probe`" in text
+
+
+def test_viability_probe_disappears_when_ablated(registry, monkeypatch):
+    """``CTF_VIABILITY=0`` must remove both the tool and its prompt line.
+
+    The prompt reads the measured registry, so this also pins that the
+    catalogue row cannot promise a tool the registry refused.
+    """
+    monkeypatch.setenv("CTF_VIABILITY", "0")
+    names, groups, text = registry("web", {"challenge": {"description": "a login page"}})
+    assert "viability_probe" not in names
+    assert "`viability_probe`" not in text
+    # The ablation is scoped to one capability: the rest of the surface stays.
+    assert "http_probe" in names
+    assert "`http_probe`" in text
 
 
 def test_tcp_challenge_registers_socket_tools(registry):

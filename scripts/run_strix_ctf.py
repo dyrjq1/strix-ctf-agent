@@ -155,6 +155,25 @@ def parse_args() -> argparse.Namespace:
             "in the current working directory (which is the run's own box)."
         ),
     )
+    p.add_argument(
+        "--result-out",
+        default="",
+        help=(
+            "Where the hard watchdog writes its fallback result.json. Empty "
+            "disables it. The launcher points this at the run's own output "
+            "directory: a hard-stopped run used to leave no file at all, so a "
+            "wall-clock kill could not be told from a crash."
+        ),
+    )
+    p.add_argument(
+        "--skip-preflight",
+        action="store_true",
+        help=(
+            "Skip the one-token startup probe of the model endpoint. Only for "
+            "offline debugging; a skipped probe means a dead endpoint costs the "
+            "whole wall budget again."
+        ),
+    )
     return p.parse_args()
 
 
@@ -270,9 +289,54 @@ def _guard_state_payload(
 async def main() -> int:
     args = parse_args()
 
+    # 端点预检必须在所有 guard 之前：2026-11-14 三条 lane 打到了不可达的主机，
+    # 两套重试梯度各烧 20 分钟，墙钟杀掉时 result.json 都没落。一次 1-token
+    # 请求把这种整轮零产出压到十几秒，并让父进程拿到可读的退出码 3。
+    from ctf_strix import llm_preflight
+
+    # 平台给的是 LLM_MODEL / LLM_BASE_URL，strix 读的是 STRIX_LLM / LLM_API_BASE。
+    # agent.main 早就做了这一步，本脚本没有——于是在「只注入了平台名字」的
+    # 环境里归属行会打不出来、预检会走上「没配端点」的放行分支（Codex N4 的
+    # 同族问题）。normalise 只填空缺、不覆盖已有值，先于归属行执行。
+    from ctf_strix.platform_env import normalise as _normalise_env
+
+    _normalise_env()
+
+    if not getattr(args, "skip_preflight", False):
+        endpoint = llm_preflight.describe()
+        if endpoint is not None:
+            # flush：这两行是给「被整组杀掉的 run」留的，缓冲会把它们一起吞掉。
+            print(
+                f"[llm] endpoint model={endpoint.model} host={endpoint.host} "
+                f"key={'set' if endpoint.key_present else 'missing'}",
+                flush=True,
+            )
+        preflight = llm_preflight.guard()
+        print(
+            f"[llm] preflight ok={preflight.ok} reason={preflight.reason} "
+            f"kind={preflight.kind}",
+            flush=True,
+        )
+        if not preflight.ok:
+            print(f"[llm] {preflight.summary()}", flush=True)
+            return llm_preflight.EXIT_CODE
+
     from ctf_strix.local_backend import install
 
     install()
+
+    # 重试策略与断网断路器：``agent.main`` 早就装了，但 lane 走的是**本脚本**，
+    # 以前这里没有这一行 —— 于是比赛中真正跑的路径上 ``DEFAULT_MODEL_RETRY``
+    # 一直是 vendor 原值，``note_network_failure()`` 从不被调用，断路器永不
+    # 打开（2026-11-14 Codex 复核 N0）。启动预检只覆盖「开局就死」，这一行才
+    # 覆盖「跑到中途才死」。必须在 ``run_strix_scan`` 之前装：它 patch 的是
+    # ``strix.config.models`` 与 ``strix.core.inputs`` 两个模块级绑定。
+    from ctf_strix import error_policy as _error_policy
+
+    # 打一行结果：安装失败时 lane 日志里否则什么都看不出来（异常分支才往
+    # stderr 写）。与 hard watchdog 的 ``[guard] … armed=…`` 对齐。
+    _retry_installed = _error_policy.install()
+    print(f"[llm] retry policy installed={_retry_installed}", flush=True)
 
     # token 计量：统计本次 run 全部 LLM 调用的用量。批测里被墙钟杀掉是常态，
     # 计数器必须由当前进程持有，退出前打进 stdout 让父进程解析。
@@ -413,7 +477,8 @@ async def main() -> int:
             1,
         )
         hard_watchdog = agent_mod._install_hard_deadline(
-            _hard_budget, result_path=None
+            _hard_budget,
+            result_path=Path(args.result_out) if args.result_out else None,
         )
         print(
             f"[guard] hard watchdog installed (budget={_hard_budget}s, "
@@ -615,6 +680,7 @@ async def main() -> int:
     # 提交镜像跑的是旧提示"那种测量/实现分裂（capabilities.py 就是为此存在）。
     try:
         from ctf_strix import context as ctf_context
+        from ctf_strix import llm_compat
         from ctf_strix import prompt as ctf_prompt
 
         # Filter by measured tool names, not by group: one installer can fail
@@ -632,10 +698,17 @@ async def main() -> int:
         ctf_prompt.activate(args.target_kind, tuple(groups), present)
         ctf_prompt.install()
         capper = ctf_context.install()
+        # 与官方入口同一处接缝（2026-11-14 冒烟：网关端点要求请求显式携带
+        # max_tokens，缺参全 400）。这一段此前只加在 ctf_strix.agent 里，
+        # 评测链路走的是本脚本，两边分裂——正是上面注释要防的那种情况。
+        # LLM_MAX_TOKENS 未设置时代理纯转发，行为不变。
+        llm_compat.install()
+        explicit = llm_compat.max_tokens_from_env()
         print(
             f"[ctx] prompt installed kind={args.target_kind} groups={','.join(groups)} "
             f"({len(ctf_prompt.build({}))} chars); "
             f"content cap={capper.cap_chars} chars/output, {capper.arg_cap} chars/args"
+            + (f"; max_tokens={explicit}" if explicit is not None else "")
         )
     except Exception as e:  # noqa: BLE001 — 失败必须回落到原来的行为
         print(f"[ctx] install failed: {type(e).__name__}: {e}")
