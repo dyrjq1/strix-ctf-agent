@@ -20,6 +20,7 @@ import argparse
 import contextlib
 import json
 import os
+import random
 import re
 import secrets
 import shutil
@@ -205,6 +206,28 @@ def _ledger_forget(iid: str) -> None:
         inst.pop(iid, None)
 
     _ledger_update(_mut)
+
+
+def _ledger_live_owners() -> set[str]:
+    """台账里**主人进程还活着**的实例 id（= 别的车道正在用）。"""
+    try:
+        data = json.loads(_ledger_path().read_text("utf-8"))
+    except (OSError, ValueError):
+        return set()
+    inst = data.get("instances") if isinstance(data, dict) else None
+    if not isinstance(inst, dict):
+        return set()
+    live: set[str] = set()
+    for iid, meta in inst.items():
+        if not isinstance(meta, dict):
+            continue
+        try:
+            pid = int(meta.get("pid") or 0)
+        except (TypeError, ValueError):
+            pid = 0
+        if pid != os.getpid() and _pid_alive(pid):
+            live.add(iid)
+    return live
 
 
 def _ledger_dead_ids() -> set[str]:
@@ -394,6 +417,15 @@ _PAUSED_WAIT_CAP = 1800
 _PAUSED_DEFAULT_S = 600
 
 
+class LaunchError(RuntimeError):
+    """实例起不来（平台过载/配额/5xx）——基础设施故障，不是题目失败。
+
+    开赛 02:02Z 实测：5 题里 2 题在启动阶段连撞 503 platform_busy，被记成
+    「题目失败」，两题后即被调度器 defer。它必须走 skip 口径（B-23），
+    否则平台一抖动就把题表整片判死。
+    """
+
+
 class CompetitionPausedError(RuntimeError):
     """平台处于暂停时段，且超出本轮可等待上限。"""
 
@@ -445,6 +477,48 @@ def _paused_retry_after(r: object) -> int | None:
         except (TypeError, ValueError):
             return _PAUSED_DEFAULT_S
     return _PAUSED_DEFAULT_S
+
+
+#: ``503 platform_busy`` 的可等待上限（秒）。开赛瞬间几百支队伍同时抢实例，
+#: 平台会连续吐 503 长达十几分钟；这是平台过载，不是题目失败，也不是本进程
+#: 该放弃的理由。超过这个上限才回到普通重试预算。
+_BUSY_WAIT_CAP = 1800
+
+
+def _busy_retry_after(r: object) -> int | None:
+    """把 503 ``platform_busy`` 解析成需要等待的秒数。
+
+    实测响应体::
+
+        {"code": "platform_busy",
+         "detail": {"message": "...Send it again in 7 seconds.",
+                    "retry_after_s": 7}}
+
+    开赛 02:02Z 首题就撞上：5 次普通重试（10/20/40/60s）共 190 秒全部落在
+    过载窗口里，题目被判 failed，两题就被调度器 defer 掉。平台自己给了
+    ``retry_after_s``，照它等、且**不消耗重试预算**才是对的。
+
+    Args:
+        r: ``requests`` 响应。
+
+    Returns:
+        需要等待的秒数；不是 platform_busy 时返回 None。
+    """
+    if getattr(r, "status_code", 0) != 503:
+        return None
+    try:
+        body = r.json()
+    except Exception:  # noqa: BLE001 -- 非 JSON 的 503 走普通重试
+        return None
+    if not isinstance(body, dict) or body.get("code") != "platform_busy":
+        return None
+    detail = body.get("detail")
+    if isinstance(detail, dict):
+        try:
+            return max(1, int(float(detail.get("retry_after_s") or 0)))
+        except (TypeError, ValueError):
+            return 10
+    return 10
 
 
 #: 私有 DNS 后缀。这些域名只在题目容器的网络里能解析。
@@ -547,6 +621,64 @@ class Client:
         #: 非空时 launch 的 payload 直接用它、不走 suite_for()：playground
         #: 这类 competition 不是 /api/v1/suites 能解析到的普通 suite。
         self.competition_id = os.environ.get("CTFY_COMPETITION_ID", "").strip()
+        #: ``CTF_REUSE=1``：建不到新实例时接管本队已存在的 ready 实例。
+        #: 正式赛开赛 02:02Z 起写接口连续 503，队里 3 个 ready 实例把配额
+        #: 占满又删不掉——不接管就只能干等 3 小时 TTL。
+        self.reuse = os.environ.get("CTF_REUSE", "").strip().lower() not in ("", "0", "false")
+
+    def adopt(self, challenge_id: str, competition_id: str) -> str | None:
+        """接管一个本队已存在、无人持有的 ready 实例。
+
+        判据（全部来自平台自述 + 本机台账，不猜）：
+        - 同 ``challenge_id``、``status == ready``；
+        - 剩余 TTL > 15 分钟（否则跑一半就到期的实例等于陷阱）；
+        - 台账里**没有活进程**持有它（兄弟车道在用的不能抢）。
+
+        Args:
+            challenge_id: 题号。
+            competition_id: 竞赛 id；空则按题号走 suite 解析。
+
+        Returns:
+            接管的实例 id；没有可接管的返回 None。
+        """
+        params = {"competition_id": competition_id} if competition_id else {}
+        try:
+            r = self.s.get(f"{PLATFORM}/api/v1/instances", params=params, timeout=60)
+        except requests.RequestException as exc:
+            print(f"  [reuse] 实例列表拉取失败：{exc}", flush=True)
+            return None
+        if r.status_code != 200:
+            return None
+        try:
+            items = r.json().get("items") or []
+        except ValueError:
+            return None
+        live = _ledger_live_owners()
+        now = time.time()
+        for it in items:
+            if not isinstance(it, dict):
+                continue
+            iid = str(it.get("id") or "")
+            if not iid or iid in self.owned or iid in live:
+                continue
+            if str(it.get("challenge_id") or "") != challenge_id:
+                continue
+            if str(it.get("status") or "") != "ready":
+                continue
+            try:
+                left = float(it.get("expires_at") or 0) - now
+            except (TypeError, ValueError):
+                continue
+            if left < 900:
+                continue
+            self.owned.add(iid)
+            _ledger_record(iid)
+            print(
+                f"  [reuse] 接管已存在实例 {iid}（剩 {left/60:.0f} 分钟）",
+                flush=True,
+            )
+            return iid
+        return None
 
     def launch(self, challenge_id: str, attempts: int = 5) -> str:
         """起一个实例。先兜底清理残留，再启动，平台故障时退避重试。
@@ -572,10 +704,15 @@ class Client:
         """
         self.reap_orphans()
         competition_id = self.competition_id or suite_for(challenge_id, self.token)
+        if self.reuse:
+            adopted = self.adopt(challenge_id, competition_id)
+            if adopted:
+                return adopted
         payload = {"challenge_id": challenge_id, "competition_id": competition_id}
         last = ""
         tries = 0
         cap_waited = 0.0
+        busy_waited = 0.0
         while tries < attempts:
             r = self.s.post(f"{PLATFORM}/api/v1/instances", json=payload, timeout=120)
             if r.status_code < 400:
@@ -595,6 +732,23 @@ class Client:
                     flush=True,
                 )
                 time.sleep(paused + 5)
+                continue
+            busy = _busy_retry_after(r)
+            if busy is not None and busy_waited < _BUSY_WAIT_CAP:
+                # 开赛过载：照平台给的 retry_after_s 等，不消耗重试预算。
+                # 只有累计等待超过 _BUSY_WAIT_CAP 才退回普通重试/放弃。
+                #
+                # 下限 20s + 抖动：几百支队伍都在按 retry_after_s 打同一个
+                # 写接口，跟着平台给的秒数精确重试等于参与踩踏。拉长间隔
+                # 反而更容易排上（02:22Z 那次成功就是隔了更久）。
+                wait = min(120, max(busy, 20) + random.uniform(0, 8))
+                busy_waited += wait
+                print(
+                    f"  [busy] 平台过载（platform_busy），等 {wait}s 再试"
+                    f"（累计 {busy_waited:.0f}s/{_BUSY_WAIT_CAP}，不消耗重试）",
+                    flush=True,
+                )
+                time.sleep(wait)
                 continue
             if r.status_code not in (429, 500, 502, 503, 504):
                 r.raise_for_status()
@@ -622,7 +776,7 @@ class Client:
             time.sleep(wait)
             tries += 1
         msg = f"启动实例失败（重试 {attempts} 次）：{last}"
-        raise RuntimeError(msg)
+        raise LaunchError(msg)
 
     def reap_orphans(self, include_stale: bool = False) -> list[str]:
         """清理**本进程**留下的实例，返回被删的 id。
@@ -733,8 +887,16 @@ class Client:
             )
             if r.status_code == 200:
                 return r.text
-        except requests.RequestException:
-            pass
+            # 别把「平台过载」和「这题真没 profile」混成一句空串：正式赛
+            # 开赛期间 5xx 很常见，判据必须能自证是哪种（否则只能靠猜，
+            # 02:22Z 就是这么丢掉一整道的）。
+            print(
+                f"  [vpn] profile 端点 HTTP {r.status_code}"
+                f"：{r.text[:120]}",
+                flush=True,
+            )
+        except requests.RequestException as exc:
+            print(f"  [vpn] profile 拉取异常：{exc}", flush=True)
         return ""
 
     def instance(self, iid: str) -> dict:
@@ -818,10 +980,20 @@ class Client:
                         if is_private_service(svc):
                             # service 级 access 不是唯一证据：实例级 /vpn-config
                             # 非空同样说明隧道可用（052 的 access=null，profile 有 277B）。
-                            if (
-                                str(svc.get("access") or "").lower() in _VPN_ACCESS
-                                or self.vpn_config(iid).strip()
-                            ):
+                            #
+                            # ⚠️ profile 是 **ready 之后几秒** 才签发的（B-20）。
+                            # 2026-11-14 02:13Z 实测：本处只读一眼，空就 continue，
+                            # 整题被判「无可直连地址」跳过——而 _attach 里同一份
+                            # profile 有 6×5s 重试。两处必须同口径，否则正式赛
+                            # 的 vpn 题会被自己的判据整类丢掉。
+                            vpn_ok = str(svc.get("access") or "").lower() in _VPN_ACCESS
+                            if not vpn_ok:
+                                for _ in range(12):
+                                    if self.vpn_config(iid).strip():
+                                        vpn_ok = True
+                                        break
+                                    time.sleep(5)
+                            if vpn_ok:
                                 self.endpoints = list(services)
                                 return svc
                             continue
@@ -1114,13 +1286,36 @@ class Client:
         return out
 
     def teardown(self, iid: str) -> None:
-        try:
-            self.s.delete(f"{PLATFORM}/api/v1/instances/{iid}", timeout=90)
-        except requests.RequestException:
-            pass  # 删不掉不算错，TTL 会兜底
-        finally:
-            self.owned.discard(iid)
+        """删实例。5xx 重试；**删成功才注销台账**。
+
+        实测踩过（2026-11-14 02:13–02:21Z）：收尾时平台 503，旧实现无论
+        成败都 ``_ledger_forget``。于是正式赛积累出 3 个 ready 僵尸实例，
+        正好占满配额 3，而台账里一条记录都没有——下一次 ``reap_orphans``
+        无从回收，只能等 3 小时 TTL。台账是所有权凭据，不能在没删掉时丢。
+
+        Args:
+            iid: 实例 id。
+        """
+        ok = False
+        for attempt in range(6):
+            try:
+                r = self.s.delete(f"{PLATFORM}/api/v1/instances/{iid}", timeout=90)
+                if r.status_code < 400 or r.status_code == 404:
+                    ok = True
+                    break
+                if r.status_code < 500 and r.status_code != 429:
+                    break  # 4xx 不是抖动，重试也不会变
+            except requests.RequestException:
+                pass
+            time.sleep(min(20, 5 * (attempt + 1)))
+        self.owned.discard(iid)
+        if ok:
             _ledger_forget(iid)
+            return
+        print(
+            f"  [teardown] {iid} 删除未确认（平台 5xx/网络），保留台账待下次回收",
+            flush=True,
+        )
 
 
 #: 传输层异常的判定词：限定名里出现这些子串即视为 LLM 链路/socket 级崩溃。
@@ -1379,6 +1574,21 @@ def _proxy_blackhole(target: str) -> dict[str, str]:
     allowed.extend(
         h.strip() for h in os.environ.get("CTF_NO_PROXY_EXTRA", "").split(",") if h.strip()
     )
+    # 宿主机出站坏掉时的兜底：``CTF_EGRESS_PROXY`` 指向一个带白名单的中转
+    # 代理（只有靶场/LLM/平台能过，其余 403），语义仍是「无外网」，只是把
+    # 直连换成经宿主转发。此时 NO_PROXY 只能留回环——靶机与 LLM 也要走代理，
+    # 否则又退回那条坏掉的直连。
+    relay = os.environ.get("CTF_EGRESS_PROXY", "").strip()
+    if relay:
+        no_proxy = "localhost,127.0.0.1,::1"
+        return {
+            "HTTP_PROXY": relay,
+            "HTTPS_PROXY": relay,
+            "http_proxy": relay,
+            "https_proxy": relay,
+            "NO_PROXY": no_proxy,
+            "no_proxy": no_proxy,
+        }
     no_proxy = ",".join(dict.fromkeys(allowed))
     dead = "http://127.0.0.1:9"
     return {
@@ -1404,6 +1614,9 @@ def _allow_platform_in_no_proxy(env: dict[str, str], platform: str) -> None:
     """
     from urllib.parse import urlsplit
 
+    if os.environ.get("CTF_EGRESS_PROXY", "").strip():
+        # 走中转代理时白名单在代理端判，NO_PROXY 里加平台反而会退回坏直连。
+        return
     host = (urlsplit(platform).hostname or "").strip()
     if not host:
         return
@@ -1834,11 +2047,15 @@ def _attach(
 
             # B-20：profile 有同一竞态——ready 后过几秒才签发。短重试，
             # 一次读空就判死等于把 estate 题整类跳过。
+            #
+            # 2026-11-14 开赛实测：这个端点在平台拥塞时和写接口一起 503，
+            # 一挂就是半小时（02:02Z 起）。跳过 vpn 题 = 0 分，等 120 秒
+            # 换一次可能解出的机会是划算的。
             profile = client.vpn_config(iid)
-            for _ in range(6):
+            for _ in range(12):
                 if profile.strip():
                     break
-                time.sleep(5)
+                time.sleep(10)
                 profile = client.vpn_config(iid)
             if not profile.strip():
                 msg = f"{iid} 声明 vpn 但 /vpn-config 为空（{host}）"
@@ -3263,6 +3480,14 @@ def main() -> int:
             )
             print(f"  -> {'SOLVED' if rec['correct'] else 'FAILED'}  "
                   f"tools={rec['tool_calls']} agent={rec['agent_s']}s", flush=True)
+        except LaunchError as exc:
+            # 实例起不来 = 平台侧故障（过载/配额/5xx），不是能力缺口。
+            # 记 skip 走 B-23 口径：不烧「连败」，但计入 skip 连击，
+            # 平台持续不可用时仍会收敛（连续两次 skip → defer）。
+            rec["error"] = f"SKIPPED(实例启动失败): {exc}"
+            rec["correct"] = False
+            rec["skipped"] = True
+            print("  -> SKIP 实例启动失败（平台侧），跳过", flush=True)
         except CompetitionPausedError as exc:
             # B-24：暂停不是题目失败。记 skip 让调度器按 infra 处理
             # （B-23 口径单独计数），不烧「连败」预算。

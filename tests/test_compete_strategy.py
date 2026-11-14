@@ -317,3 +317,26 @@ def test_wall_tier_matches_batch_eval() -> None:
     """派单判窗用的放大倍数必须与 batch_eval 的 tiers 一致。"""
     for diff, wall_mult in (("easy", 1.0), ("medium", 1.5), ("hard", 2.3)):
         assert compete._WALL_TIER[diff] == wall_mult
+
+def test_each_lane_gets_its_own_vpn_relay_ports(monkeypatch) -> None:
+    """三车道并行时中转端口必须互不相同。
+
+    共用一套端口 = B 车道把 A 车道的 target 覆盖掉，隧道握手成功却打在
+    别人实例上——最隐蔽的"打错地方"。这里钉住端口随车道线性错开。
+    """
+    monkeypatch.delenv("CTF_VPN_RELAY_BASE", raising=False)
+    envs = [compete._lane_env(i) for i in range(3)]
+    relays = [e["CTF_VPN_RELAY"] for e in envs]
+    controls = [e["CTF_VPN_RELAY_CONTROL"] for e in envs]
+    assert len(set(relays)) == 3
+    assert len(set(controls)) == 3
+    assert set(relays) & set(controls) == set()
+    assert relays[0].endswith(":47444")
+    assert controls[0].endswith(":47445")
+    assert relays[2].endswith(":47448")
+
+
+def test_lane_relay_base_is_overridable(monkeypatch) -> None:
+    monkeypatch.setenv("CTF_VPN_RELAY_BASE", "50000")
+    assert compete._lane_env(1)["CTF_VPN_RELAY"].endswith(":50002")
+    assert compete._lane_env(1)["CTF_VPN_RELAY_CONTROL"].endswith(":50003")

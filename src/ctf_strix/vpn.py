@@ -47,11 +47,14 @@ denied``——``dmesg`` 里能看到 ``apparmor="DENIED" profile="wg"``。实测
 from __future__ import annotations
 
 import configparser
+import ipaddress
 import logging
 import os
 import shutil
+import socket
 import subprocess
 import tempfile
+import time
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -59,6 +62,52 @@ logger = logging.getLogger(__name__)
 
 #: 需要 root 才能改网络栈的子命令。只放行这四个，sudoers 白名单与之对齐。
 _PRIVILEGED = {"ip", "wg", "wg-quick", "dig", "ctfvpn-wg"}
+
+
+def resolve_endpoint(endpoint: str, *, timeout: float = 5.0) -> str:
+    """把 ``host:port`` 形式的端点换成 ``ip:port``。
+
+    为什么必须自己解析：``wg setconf`` 里写主机名时，``wg`` 会在自己的
+    进程里做一次 getaddrinfo。实例端点是每实例生成的 ``nodeN.tpctf...``
+    域名，解析慢的时候这一步实测吃掉 15 秒（先解析成 IP 再 setconf 只要
+    0.017 秒），而 ``_setconf`` 的硬超时是 20 秒——DNS 再慢一点，隧道
+    就直接被判失败，整题按"环境不可用"跳过。自己在外面解析并把时间上限
+    压到 5 秒，既快又不会把 setconf 拖挂。
+
+    Args:
+        endpoint: ``host:port``；已经是 IP 字面量时原样返回。
+        timeout: 解析最长时间（秒）。
+
+    Returns:
+        ``ip:port``；解析失败时原样返回 ``endpoint``，让 ``wg`` 自己去解析
+        （错误来自真实调用，而不是我们凭空拒绝）。
+    """
+    host, _, port = str(endpoint).rpartition(":")
+    if not host or not port.isdigit():
+        return endpoint
+    try:
+        ipaddress.ip_address(host.strip("[]"))
+        return endpoint
+    except ValueError:
+        pass
+    getent = shutil.which("getent")
+    if not getent:
+        return endpoint
+    try:
+        proc = subprocess.run(
+            [getent, "hosts", host], capture_output=True, text=True, timeout=timeout
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return endpoint
+    for line in (proc.stdout or "").splitlines():
+        parts = line.split()
+        if len(parts) >= 2 and parts[1] == host:
+            try:
+                ipaddress.ip_address(parts[0])
+            except ValueError:
+                continue
+            return f"{parts[0]}:{port}"
+    return endpoint
 
 
 def _needs_root(argv: list[str]) -> bool:
@@ -185,6 +234,66 @@ class VpnTunnel:
         )
 
     # ------------------------------------------------------------------ 启停
+    @staticmethod
+    def _push_relay_target(control: str, real: str) -> None:
+        """把真实端点推给宿主机中转的控制端口（``host:port`` 形式）。"""
+        host, _, port = control.rpartition(":")
+        try:
+            with socket.create_connection((host, int(port)), timeout=3.0) as sock:
+                sock.sendall(f"{real.replace(':', ' ')}\n".encode())
+                sock.recv(64)
+        except (OSError, ValueError) as exc:
+            logger.warning("vpn relay control %s failed: %s", control, exc)
+
+    def _endpoint_candidates(self) -> list[tuple[str, str]]:
+        """可以尝试的 (路径名, 端点) 组合，直连排前面。
+
+        ``CTF_VPN_RELAY=<host:port>`` 存在时追加一条宿主机 UDP 中转路径：
+        把真实端点推给中转，配置里换成中转地址。实测同一份 profile 在
+        同一分钟内直连 0 B received、经中转 92 B received（换成另一个
+        节点又反过来），**两条路都不稳定**，所以两条都试，谁先握手成功
+        就用谁。
+
+        Returns:
+            ``[(label, endpoint)]``；没有配置中转时只有直连一条。
+        """
+        real = resolve_endpoint(self.endpoint)
+        relay = os.environ.get("CTF_VPN_RELAY", "").strip()
+        if relay:
+            # 中转排前面：端点域名由宿主机解析（VM 自己的 DNS 时不时解析
+            # 不出来，`wg setconf` 就会在它自己的 getaddrinfo 上挂满 20 秒
+            # 硬超时，隧道直接失败）。
+            return [("relay", relay), ("direct", real)]
+        return [("direct", real)]
+
+    def _push_target(self, real: str) -> None:
+        """把真实端点告诉中转进程（控制端口优先，其次目标文件）。"""
+        control = os.environ.get("CTF_VPN_RELAY_CONTROL", "").strip()
+        if control:
+            self._push_relay_target(control, real)
+            return
+        target_file = os.environ.get("CTF_VPN_RELAY_TARGET_FILE", "").strip()
+        if target_file:
+            host, _, port = real.rpartition(":")
+            tmp = Path(target_file + ".tmp")
+            tmp.write_text(f"{host} {port}\n", encoding="utf-8")
+            os.replace(tmp, target_file)
+
+    def _handshake_ok(self, timeout: float = 10.0) -> bool:
+        """等一次握手完成（``wg show`` 的 latest-handshakes 非 0）。
+
+        Returns:
+            timeout 内是否握手成功。
+        """
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            proc = _run(["wg", "show", self.iface, "latest-handshakes"], timeout=5)
+            parts = (proc.stdout or "").split()
+            if len(parts) >= 2 and parts[-1] not in ("0", ""):
+                return True
+            time.sleep(1.0)
+        return False
+
     def up(self) -> bool:
         """建接口、配地址、加路由。
 
@@ -192,12 +301,29 @@ class VpnTunnel:
             是否成功。失败时只记日志——调用方据此把"环境不可达"和
             "agent 没解出"分开记。
         """
+        candidates = self._endpoint_candidates()
+        # 推给中转的用 profile 原始端点（可以是域名）：解析交给宿主机，
+        # 不依赖 VM 侧的 DNS。
+        real = self.endpoint if any(lbl == "relay" for lbl, _ in candidates) else candidates[0][1]
+        for label, endpoint in candidates:
+            if label == "relay":
+                self._push_target(real)
+            if self._bring_up(endpoint) and self._handshake_ok():
+                logger.info("vpn %s up via %s (%s)", self.iface, label, endpoint)
+                self.up_ok = True
+                return True
+            logger.warning("vpn %s: no handshake via %s (%s)", self.iface, label, endpoint)
+            _run(["ip", "link", "del", self.iface])
+        return False
+
+    def _bring_up(self, endpoint: str) -> bool:
+        """建接口、setconf、配地址、加路由（一次尝试，不等握手）。"""
         cfg = (
             "[Interface]\n"
             f"PrivateKey = {self.private_key}\n\n"
             "[Peer]\n"
             f"PublicKey = {self.peer_key}\n"
-            f"Endpoint = {self.endpoint}\n"
+            f"Endpoint = {endpoint}\n"
             f"AllowedIPs = {self.allowed}\n"
             "PersistentKeepalive = 25\n"
         )
@@ -209,7 +335,6 @@ class VpnTunnel:
             logger.warning("vpn add failed: %s", (proc.stderr or proc.stdout).strip())
             return False
         if not self._setconf(cfg):
-            _run(["ip", "link", "del", self.iface])
             return False
         for argv in (
             ["ip", "-4", "addr", "add", self.address, "dev", self.iface],
@@ -224,19 +349,20 @@ class VpnTunnel:
                 logger.warning(
                     "vpn step failed: %s: %s", argv, (proc.stderr or proc.stdout).strip()
                 )
-                _run(["ip", "link", "del", self.iface])
                 return False
         for route in self.routes:
             if ":" in route:  # IPv6 网段不走 -4 路由（该隧道只配了 v4 地址）
                 continue
-            proc = _run(["ip", "-4", "route", "add", route, "dev", self.iface])
-            if proc.returncode != 0 and "File exists" not in (proc.stderr or ""):
+            # ``replace`` 而不是 ``add``：上一条崩溃/换题留下的隧道可能已经
+            # 占了同一个网段。``add`` 会报 File exists，旧实现把它当成功，
+            # 于是新隧道的流量被**指向死接口**的旧路由黑洞掉——实测
+            # SAMPLE-006 就这样：握手成功、estate DNS 全超时，整题被跳过。
+            proc = _run(["ip", "-4", "route", "replace", route, "dev", self.iface])
+            if proc.returncode != 0:
                 logger.warning(
                     "vpn route failed: %s: %s", route, (proc.stderr or proc.stdout).strip()
                 )
-                _run(["ip", "link", "del", self.iface])
                 return False
-        self.up_ok = True
         return True
 
     def _setconf(self, cfg: str) -> bool:

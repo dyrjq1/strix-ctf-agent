@@ -462,11 +462,36 @@ def build_plan_item(
     return item
 
 
+def _lane_env(lane: int) -> dict[str, str]:
+    """给第 ``lane`` 条车道的子进程分配**独立**的 VPN 中转端口。
+
+    宿主机的中转是「一个端口 = 一条车道 = 一套 target」。共用一套端口时，
+    B 车道建的隧道会被推到 A 车道刚设的端点上：隧道能通、握手也成功，
+    agent 却打在别人的实例上。这是并行跑批最容易踩、也最难看出来的坑，
+    所以端口分配在派单处就固定下来，不靠运行时猜。
+
+    ``CTF_VPN_RELAY_BASE`` 默认 47444，车道 i 用 ``BASE+2i``（控制口 +1）。
+
+    Args:
+        lane: 车道序号（0 起）。
+
+    Returns:
+        追加给子进程的环境变量。
+    """
+    base = int(os.environ.get("CTF_VPN_RELAY_BASE", "47444"))
+    port = base + 2 * lane
+    return {
+        "CTF_VPN_RELAY": f"192.168.38.1:{port}",
+        "CTF_VPN_RELAY_CONTROL": f"192.168.38.1:{port + 1}",
+    }
+
+
 def _spawn(
     chal: dict[str, Any],
     args: argparse.Namespace,
     state_dir: Path,
     failure_path: list[str] | None = None,
+    lane: int = 0,
 ) -> subprocess.Popen:
     """派一个 batch_eval 子进程跑单题（agent 上下文从零开始）。
 
@@ -507,7 +532,8 @@ def _spawn(
         )
         cmd += ["--retry-notes", str(notes)]
     log = open(runs / f"{cid}.stdout.log", "a", encoding="utf-8")
-    return subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT)
+    env = {**os.environ, **_lane_env(lane)}
+    return subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT, env=env)
 
 
 def _failure_lines(rec: dict[str, Any]) -> list[str]:
@@ -631,6 +657,8 @@ def main() -> int:
             print(f"[compete] 已解列表拉取失败（忽略，用本地 state）：{exc}", flush=True)
     my_solved = {cid for cid, r in state.items() if r.get("status") == SOLVED}
     running: dict[str, subprocess.Popen] = {}
+    #: 题 → 车道号。车道号决定 VPN 中转端口（见 _lane_env）。
+    lane_of: dict[str, int] = {}
     stop = False
     last_solve_sync = 0.0
 
@@ -757,11 +785,15 @@ def main() -> int:
             session_warned = False
             rec = state.setdefault(cid, {})
             rec["status"] = RUNNING
+            used = set(lane_of.values())
+            lane = next(i for i in range(args.lanes) if i not in used)
             running[cid] = _spawn(
-                chal, args, state_dir, failure_path=rec.get("failure_path")
+                chal, args, state_dir, failure_path=rec.get("failure_path"), lane=lane
             )
+            lane_of[cid] = lane
             print(
-                f"[compete] 派单 {cid}（{len(running)}/{args.lanes} 车道）",
+                f"[compete] 派单 {cid}（{len(running)}/{args.lanes} 车道，"
+                f"lane={lane} 中转 {_lane_env(lane)['CTF_VPN_RELAY']}）",
                 flush=True,
             )
         save_state(state_dir, state)
@@ -787,6 +819,7 @@ def main() -> int:
                 if proc.poll() is None:
                     continue
                 del running[cid]
+                lane_of.pop(cid, None)
                 status = _collect(cid, state, state_dir)
                 if status == SOLVED:
                     my_solved.add(cid)

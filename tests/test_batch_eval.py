@@ -1,4 +1,4 @@
-"""P0：跑批的测量可信度。
+﻿"""P0：跑批的测量可信度。
 
 这三条断言对应今天发现的三个污染源，任何一个回退都会让后续所有 A/B 变成假数据。
 """
@@ -899,3 +899,161 @@ def test_pause_beyond_cap_surfaces_as_paused_error(monkeypatch) -> None:
 
     assert caught.value.retry_after_s == 99999
     assert session.posts == 1
+
+# ---------------------------------------------------------------------------
+# 2026-11-14 开赛实测：503 platform_busy 是平台过载信号，不是题目失败。
+# ---------------------------------------------------------------------------
+
+
+def test_platform_busy_waits_without_burning_retries(monkeypatch) -> None:
+    """busy → 等 retry_after → 重试成功；attempts=1 也不该被 busy 吃光。"""
+    session = _ScriptedSession(
+        [
+            _PausedResp(503, {"code": "platform_busy",
+                              "detail": {"retry_after_s": 7}}),
+            _PausedResp(503, {"code": "platform_busy",
+                              "detail": {"retry_after_s": 9}}),
+            _PausedResp(200, {"id": "iid-busy"}),
+        ]
+    )
+    client = _client_with(session)
+    slept: list[float] = []
+    monkeypatch.setattr(batch_eval.time, "sleep", lambda s: slept.append(s))
+
+    iid = client.launch("AUTHORED-000000", attempts=1)
+
+    assert iid == "iid-busy"
+    assert session.posts == 3  # busy 两次都没消耗尝试预算
+    assert len(slept) == 2
+    assert all(s >= 20 for s in slept)  # 抖动下限，别跟着平台秒数一起踩踏
+
+
+def test_busy_retry_after_only_reads_platform_busy() -> None:
+    class _R:
+        def __init__(self, code: int, body: dict) -> None:
+            self.status_code = code
+            self._body = body
+
+        def json(self):
+            return self._body
+
+    assert batch_eval._busy_retry_after(
+        _R(503, {"code": "platform_busy", "detail": {"retry_after_s": 4}})
+    ) == 4
+    assert batch_eval._busy_retry_after(_R(503, {"code": "other"})) is None
+    assert batch_eval._busy_retry_after(_R(403, {"code": "platform_busy"})) is None
+
+
+def test_launch_error_is_an_infra_skip_not_a_challenge_failure() -> None:
+    """LaunchError 必须能被 batch_eval 的收场分支识别为 skip 口径。"""
+    assert issubclass(batch_eval.LaunchError, RuntimeError)
+    assert not issubclass(batch_eval.LaunchError, batch_eval.CompetitionPausedError)
+
+
+# ---------------------------------------------------------------------------
+# 接管已存在实例：写接口拥塞时不要干等（配额被自己的僵尸占满）
+# ---------------------------------------------------------------------------
+
+
+class _GetSession(_ScriptedSession):
+    def __init__(self, responses: list, get_body: dict) -> None:
+        super().__init__(responses)
+        self._get_body = get_body
+        self.gets = 0
+
+    def get(self, url, params=None, timeout=0):  # noqa: ANN001, ARG002
+        self.gets += 1
+
+        class _R:
+            status_code = 200
+
+            @staticmethod
+            def json():
+                return self._get_body
+
+        return _R()
+
+
+def _inst(iid: str, chal: str, *, status: str = "ready", left_s: float = 7200.0) -> dict:
+    import time as _t
+
+    return {
+        "id": iid,
+        "challenge_id": chal,
+        "status": status,
+        "expires_at": _t.time() + left_s,
+    }
+
+
+def test_adopt_takes_a_ready_instance_of_the_same_challenge(monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv("CTF_INSTANCE_LEDGER", str(tmp_path / "ledger.json"))
+    session = _GetSession(
+        [], {"items": [_inst("iid-other", "OTHER-1"), _inst("iid-ok", "Q-1")]}
+    )
+    client = _client_with(session)
+    client.reuse = True
+
+    assert client.adopt("Q-1", "comp") == "iid-ok"
+    assert "iid-ok" in client.owned
+
+
+def test_adopt_skips_wrong_state_short_ttl_and_foreign_challenge(monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv("CTF_INSTANCE_LEDGER", str(tmp_path / "ledger.json"))
+    session = _GetSession(
+        [],
+        {
+            "items": [
+                _inst("iid-error", "Q-1", status="error"),
+                _inst("iid-short", "Q-1", left_s=300),
+                _inst("iid-other", "Q-2"),
+            ]
+        },
+    )
+    client = _client_with(session)
+
+    assert client.adopt("Q-1", "comp") is None
+
+
+def test_adopt_never_steals_an_instance_a_live_process_owns(
+    monkeypatch, tmp_path
+) -> None:
+    import os as _os
+
+    ledger = tmp_path / "ledger.json"
+    ledger.write_text(
+        json.dumps({"instances": {"iid-live": {"pid": _os.getpid() + 1, "ts": 9e9}}}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(batch_eval, "_pid_alive", lambda pid: True)
+    monkeypatch.setenv("CTF_INSTANCE_LEDGER", str(ledger))
+    session = _GetSession([], {"items": [_inst("iid-live", "Q-1")]})
+    client = _client_with(session)
+
+    assert client.adopt("Q-1", "comp") is None
+
+
+def test_teardown_keeps_the_ledger_entry_when_the_delete_never_lands(
+    monkeypatch, tmp_path
+) -> None:
+    """删不掉就不能注销台账——否则实例变僵尸且失去踪迹（11-14 实测 3 个）。"""
+    ledger = tmp_path / "ledger.json"
+    monkeypatch.setenv("CTF_INSTANCE_LEDGER", str(ledger))
+    batch_eval._ledger_record("iid-z")
+
+    class _Sess:
+        def delete(self, url, timeout=0):  # noqa: ANN001, ARG002
+            class _R:
+                status_code = 503
+                text = "platform_busy"
+
+            return _R()
+
+    monkeypatch.setattr(batch_eval.time, "sleep", lambda s: None)
+    client = batch_eval.Client("tok")
+    client.s = _Sess()
+    client.owned.add("iid-z")
+
+    client.teardown("iid-z")
+
+    data = json.loads(ledger.read_text(encoding="utf-8"))
+    assert "iid-z" in (data.get("instances") or {})
