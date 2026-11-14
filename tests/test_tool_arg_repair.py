@@ -187,6 +187,70 @@ def test_tools_without_schema_are_untouched(factory):
     assert guard.repaired == 0
 
 
+def test_real_sdk_tool_unwraps_before_pydantic_validation(factory):
+    """真 SDK 路径：``_parse_function_tool_json_input`` 与 pydantic 校验都在内层。
+
+    前面的用例用的是假工具，只证明"本层逻辑对"；这条把 ``agents.function_tool``
+    真正建出来的 ``FunctionTool`` 接进来，证明包装后**时序**也是对的：拆包发生在
+    SDK 解析/校验之前，否则模型仍然只会收到 ``Invalid JSON input``。
+    """
+    from types import SimpleNamespace
+
+    from agents import function_tool
+
+    seen: list[tuple[str, str, str, str]] = []
+
+    @function_tool(name_override="finish_scan")
+    def finish_scan(
+        executive_summary: str,
+        methodology: str,
+        technical_analysis: str,
+        recommendations: str,
+    ) -> str:
+        """Report the result of the engagement."""
+        seen.append((executive_summary, methodology, technical_analysis, recommendations))
+        return "ok"
+
+    guard = tool_arg_repair.install()
+    wrapped = factory._with_bounded_result(finish_scan)
+    ctx = SimpleNamespace(tool_name="finish_scan")
+
+    out = asyncio.run(wrapped.on_invoke_tool(ctx, json.dumps({"arguments": json.dumps(GOOD)})))
+
+    assert out == "ok"
+    assert seen == [("summary", "method", "analysis", "fix")]
+    assert guard.repaired == 1
+
+
+def test_real_sdk_tool_rejection_does_not_run_the_function(factory):
+    """真 SDK 路径的拒绝臂：函数一次都不能被调用，返回的是可纠正提示。"""
+    from types import SimpleNamespace
+
+    from agents import function_tool
+
+    ran: list[int] = []
+
+    @function_tool(name_override="finish_scan")
+    def finish_scan(
+        executive_summary: str,
+        methodology: str,
+        technical_analysis: str,
+        recommendations: str,
+    ) -> str:
+        """Report the result of the engagement."""
+        ran.append(1)
+        return "ok"
+
+    _guard = tool_arg_repair.install()
+    wrapped = factory._with_bounded_result(finish_scan)
+    ctx = SimpleNamespace(tool_name="finish_scan")
+
+    out = asyncio.run(wrapped.on_invoke_tool(ctx, json.dumps({"exec_command": "true"})))
+
+    assert ran == []
+    assert isinstance(out, str) and out.startswith("ARGUMENT ERROR — finish_scan did NOT run")
+
+
 def test_both_entrypoints_install_the_repair_layer():
     """两个入口必须都装：评测入口装过、交付入口没装，等于只测了个空壳。"""
     for rel in ("src/ctf_strix/agent.py", "scripts/run_strix_ctf.py"):
