@@ -540,6 +540,13 @@ async def main() -> int:
     dropped = install_ctf_toolset(drop_bookkeeping=not args.keep_bookkeeping)
     print(f"[trim] dropped {len(dropped)} tools: {', '.join(dropped)}")
 
+    # 参数修复层最外层：形状错误的工具调用在这里被拆包或换成可纠正的提示，
+    # 而不是让 SDK 回一句 "Invalid JSON input" 让模型原地重试。
+    from ctf_strix.tool_arg_repair import install as install_arg_repair
+
+    install_arg_repair()
+    print("[guard] tool argument repair installed")
+
     # AI 安全能力（指纹 + CVE 匹配）。走 strix 官方扩展点 register_agent_tools，
     # 不改 _BASE_TOOLS，vendor 保持原样。
     # 规则库缺失时不注册——挂一个必然报错的工具只会浪费轮次。

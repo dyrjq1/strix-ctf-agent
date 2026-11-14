@@ -3333,6 +3333,19 @@ def _run_agent(
     # the prompt describes cannot drift apart (docs/27 C3/C4).
     hint, groups = install_toolset(task, kind)
 
+    # 参数修复层必须**最后装**：后装的在最外层，下游守卫（finish/autosubmit/
+    # 各类计数器）看到的才是修好的参数串。实测 145 次 finish_scan 里 127 次
+    # 卡在「形状错误」而 SDK 只回一句 "Invalid JSON input"，模型无法自我纠正
+    # （CYBENCH-028 重试 82 次、33M token）。见 ctf_strix/tool_arg_repair.py。
+    try:
+        from ctf_strix.tool_arg_repair import install as install_arg_repair
+
+        install_arg_repair()
+        print("[ctfy] tool argument repair installed", flush=True)
+    except Exception as exc:  # noqa: BLE001 -- 修复层失效不能阻止跑题
+        print(f"[ctfy] tool argument repair failed: {type(exc).__name__}: {exc}", flush=True)
+        diag["arg_repair"] = "failed"
+
     # Every visible question id, resolved once per run.  ``qid`` stays the
     # primary (prompt + log line); ``all_qids`` is what answers are keyed by.
     all_qids = qids or [qid]
