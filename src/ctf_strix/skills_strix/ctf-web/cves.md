@@ -2,6 +2,28 @@
 
 Specific CVEs and vulnerability patterns. For Node.js CVEs (flatnest, Happy-DOM), see [node-and-prototype.md](node-and-prototype.md). For JWT algorithm confusion, see [auth-and-access.md](auth-and-access.md).
 
+## Adaptation procedure: version -> CVE -> controlled observation -> exploit (read first)
+
+Matching a version to a CVE is the easy half; failures cluster in "porting a public PoC to
+*this* target". Four steps, each with an exit:
+
+1. **Name three variable points.** (a) Entry path -- the PoC's URL may differ from the real
+   route (prefix, suffix, case, extension); (b) payload encoding and staging -- base64, gzip,
+   phar, chunked upload, or "write a file first, trigger later"; (c) observation oracle --
+   response echo, a file you can read back, timing, server log, or the error text itself.
+2. **Prove a controlled observation first.** With the smallest payload, make the target echo or
+   store a random string you chose (e.g. `ctfprobe7k2`). This validates encoding direction,
+   entry path and oracle in one shot; it is not an exploit attempt. If you cannot observe it,
+   change (a) or (b) now -- do not lengthen the payload.
+3. **Only then run the full exploit.** Change one variable point at a time; record the request
+   and response shape of each attempt. Two failures with the same shape = move to the next
+   variable point, not a tenth variation of the same one.
+4. **Exit:** command echo, file content, or flag; or a recorded counter-example for each of the
+   three variable points. The latter belongs in the final summary, not a bare "exploit failed".
+
+Blind case (no echo): swap the oracle to a readable timing difference or a dropped file, and
+validate it in step 2 -- do not discover in step 3 that you have no observation channel.
+
 ## Table of Contents
 - [CVE-2025-29927: Next.js Middleware Bypass](#cve-2025-29927-nextjs-middleware-bypass)
 - [CVE-2025-0167: Curl .netrc Credential Leakage](#cve-2025-0167-curl-netrc-credential-leakage)
