@@ -84,6 +84,12 @@ IMAGE_TOOLS = frozenset(
         # image bump silently turns the prompt into a lie.
         "checksec", "ROPgadget", "gdb", "objdump", "readelf", "file",
         "strings", "xxd", "nc", "curl",
+        # ripgrep is the recon workhorse for web (downloaded bundles,
+        # sourcemaps, response bodies) and node runs client-side JS; the
+        # prompt names both, so they are probed like everything else named
+        # there.  Added after the 389-run corpus showed 16 "rg: command not
+        # found" outputs (ledger §4.224).
+        "rg", "node",
     }
 )
 
