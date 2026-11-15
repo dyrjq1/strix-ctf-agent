@@ -67,9 +67,10 @@ def parse_args() -> argparse.Namespace:
         nargs="*",
         default=None,
         help=(
-            "Challenge tags as published by the platform. Used only to decide whether "
-            "the AI-security tools are worth their schema; never used as a hint about "
-            "how to solve the challenge."
+            "Challenge tags as published by the platform. They pick which AI-security "
+            "tools are worth their schema, and which method cards (tag -> one-line "
+            "procedure) go into the injected hint; they never name a challenge or a "
+            "concrete path."
         ),
     )
     p.add_argument(
