@@ -613,6 +613,10 @@ class AutoSubmitter:
         #: Last explicit platform answer for "is the whole challenge done?".
         #: ``None`` means the platform never said.
         platform_flag: bool | None = None
+        #: Platform said ``correct`` but echoed no question id we know. That
+        #: is evidence of a right answer with a broken echo — not of a wrong
+        #: one — so it may still complete a single-question challenge.
+        unnamed_correct = False
         skipped: list[str] = []
         with self._lock:
             for q in pending:
@@ -732,6 +736,7 @@ class AutoSubmitter:
                         # The platform said correct but did not name the
                         # question; keep it visible without marking the run.
                         self.last_error = "correct response had no matching question_id"
+                        unnamed_correct = True
                         break  # this question already has the right answer
                     if isinstance(left, int):
                         left -= 1
@@ -769,10 +774,18 @@ class AutoSubmitter:
         # A single correct answer on a multi-question challenge is progress,
         # not a complete solve.  The platform's own flag wins when present;
         # otherwise all pending ids answered is the only local evidence.
-        if not multiple or platform_flag is True:
+        #
+        # 单题分支曾经写成 ``if not multiple: fully_solved = True``——只要交过
+        # 就记解出，平台回 ``correct=false`` 也算。2026-11-15 审计：209 条
+        # 「解出」里 16 条（4.1pt）是这么来的假阳性（``correct: []``、
+        # ``flags_found: []``，最差一条 ``flag_shaped_tokens: 0``）。单题与
+        # 多题必须同一口径：平台明确 True，或至少有一个被接受的答案。
+        if platform_flag is True:
             fully_solved = True
-        else:
+        elif multiple:
             fully_solved = platform_flag is not False and len(correct) == len(pending)
+        else:
+            fully_solved = bool(correct) or unnamed_correct
         if unlocked:
             # 新解锁的问题一个都没答，这轮当然不算完全解出（G1）。
             fully_solved = False

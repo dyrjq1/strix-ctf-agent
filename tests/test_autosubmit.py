@@ -498,3 +498,55 @@ def test_checker_check_pass_wins_without_submitting_a_value() -> None:
     verdict = sub.submit("ANSWER[persist]=whatever")
     assert verdict["correct"] == ["persist=<checker>"]
     assert all("answer" not in b for b in sent), sent
+
+
+def test_single_question_rejected_answer_is_not_a_solve() -> None:
+    """2026-11-15 审计：单题交过≠解出，平台回 correct=false 时不得记 fully_solved。
+
+    旧码 ``if not multiple: fully_solved = True`` 让 389 条可归因记录里 17 条
+    （4.4pt）变成假阳性：``correct: []`` / ``flags_found: []``，最差一条
+    ``flag_shaped_tokens: 0``。这里锁死反向——被拒的答案必须判否。
+    """
+    sub, sent = _mk([{"id": "flag", "mode": "dynamic"}])
+
+    def fake_post(path: str, body: dict[str, Any]) -> dict[str, Any]:
+        sent.append(body)
+        if path.endswith("/verify-answer"):
+            return {}  # 预检不可用 → 退回直接提交（旧平台/网络抖动）
+        if path.endswith("/submissions"):
+            return {"correct": False, "question_id": "flag"}
+        return {"passed": False, "timed_out": False, "question_id": body.get("question_id")}
+
+    sub._post = fake_post  # type: ignore[method-assign]
+    verdict = sub.submit("FLAG{wrong_guess}")
+
+    assert [b["answer"] for b in sent if "instance_id" in b] == ["FLAG{wrong_guess}"]
+    assert verdict["tried"] and verdict["tried"][-1]["correct"] is False, verdict
+    assert verdict["correct"] == []
+    assert verdict["challenge_fully_solved"] is False
+
+
+def test_single_question_correct_answer_is_a_solve() -> None:
+    """正向：单题且答案被平台接受时必须记 fully_solved（别把修复做成漏报）。"""
+    sub, sent = _mk([{"id": "q1", "mode": "dynamic"}])
+    verdict = sub.submit("ANSWER[q1]=right FLAG{noise}")
+
+    assert verdict["correct"] == ["q1=right"]
+    assert verdict["challenge_fully_solved"] is True
+
+
+def test_single_question_platform_true_flag_still_wins() -> None:
+    """平台明说 ``challenge_fully_solved=true`` 时照旧判解出（保持原有优先权）。"""
+    sub, sent = _mk([{"id": "q1", "mode": "dynamic"}])
+
+    def fake_post(path: str, body: dict[str, Any]) -> dict[str, Any]:
+        if path.endswith("/verify"):
+            return {"correct": True}
+        if path.endswith("/submissions"):
+            return {"correct": True, "question_id": "q1",
+                    "challenge_fully_solved": True}
+        return {"passed": False, "timed_out": False, "question_id": body.get("question_id")}
+
+    sub._post = fake_post  # type: ignore[method-assign]
+    verdict = sub.submit("ANSWER[q1]=right")
+    assert verdict["challenge_fully_solved"] is True
