@@ -2288,7 +2288,7 @@ def main() -> int:
         # Guard counters are the only evidence that separates "the guard warned
         # and the model ignored it" from "the guard never fired"; they used to
         # live in the snapshot but never reach the graded artifact.
-        for guard_key in ("finish_guard", "sweep_guard", "progress_guard"):
+        for guard_key in ("finish_guard", "fact_ledger", "sweep_guard", "progress_guard"):
             guard_diag = diag.get(guard_key) if isinstance(diag, dict) else None
             if guard_diag is not None:
                 payload[guard_key] = guard_diag
@@ -3157,6 +3157,13 @@ def _run_agent(
             question_modes=question_modes,
         )
 
+    # 事实台账：只观测工具输出（route_map 候选 + 探针状态），不改任何返回体；
+    # 收工被拒时由 finish guard 把 ≤15 行台账附在拒收文本后面。``ledger`` 在
+    # 上面已经是 EvidenceLedger（flag 出处），所以这里换名避免遮蔽。
+    from ctf_strix.fact_ledger import install as install_fact_ledger
+
+    fact_ledger = install_fact_ledger()
+
     # Finish guard: an answerless finish_scan is refused.  engagement and
     # checker-only challenges have no flag, so those kinds let it through.
     from ctf_strix.finish_guard import install as install_finish_guard
@@ -3166,6 +3173,7 @@ def _run_agent(
         success=success,
         evidence=ledger,
         checker=(checker_probe.check if checker_probe is not None else None),
+        ledger=fact_ledger,
     )
     if kind != "engagement":
         diag["checker_probe"] = "armed" if checker_probe is not None else "off"
@@ -4047,6 +4055,8 @@ def _run_agent(
             out_now["checker_probe_note"] = finish_guard.probe_note
         if finish_guard is not None:
             out_now["finish_guard"] = finish_guard.stats()
+        if fact_ledger is not None:
+            out_now["fact_ledger"] = fact_ledger.stats()
         if sweep_guard is not None:
             out_now["sweep_guard"] = sweep_guard.stats()
         out_now.update(diag)

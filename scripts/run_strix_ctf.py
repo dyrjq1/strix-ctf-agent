@@ -421,11 +421,16 @@ async def main() -> int:
 
     # 收工守卫：finish_scan 没有 flag 就拒绝。CTFARENA-013 只用了 260s/780s
     # 预算就收工，已注入成功却没去读 flag 文件——这是唯一能挡住它的手段。
+    from ctf_strix.fact_ledger import install as install_fact_ledger
     from ctf_strix.finish_guard import install as install_finish_guard
     from ctf_strix.sweep_guard import SWEEP_HARD, SWEEP_WARN
 
-    finisher = install_finish_guard()
-    print("[guard] finish guard installed (refuses flagless finish_scan, max 3)")
+    fact_ledger = install_fact_ledger()
+    finisher = install_finish_guard(ledger=fact_ledger)
+    print(
+        "[guard] finish guard installed (refuses flagless finish_scan, max 3; "
+        f"fact ledger {'on' if fact_ledger is not None else 'off'})"
+    )
 
     # 单次调用内部的扫描守卫。`enum_guard` 按**调用**去重，对"把几万个候选
     # 塞进一条 exec_command 的 Python 循环"完全无能为力——CTFARENA-050 实测

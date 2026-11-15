@@ -94,16 +94,31 @@ def test_fourth_call_is_allowed_and_marked_as_giving_up() -> None:
 
 def test_stats_tracks_refusals_allowed_and_give_up() -> None:
     guard = FinishGuard()
-    assert guard.stats() == {"refusals": 0, "allowed": 0, "gave_up": 0}
+    assert guard.stats() == {
+        "refusals": 0,
+        "allowed": 0,
+        "gave_up": 0,
+        "ledger_injections": 0,
+    }
 
     guard.check("nothing here")
     guard.check("nothing here")
-    assert guard.stats() == {"refusals": 2, "allowed": 0, "gave_up": 0}
+    assert guard.stats() == {
+        "refusals": 2,
+        "allowed": 0,
+        "gave_up": 0,
+        "ledger_injections": 0,
+    }
 
     guard.check("nothing here")
     assert guard.check("nothing here") is None
     guard.check('{"summary": "got FLAG{abc123}"}')
-    assert guard.stats() == {"refusals": 3, "allowed": 2, "gave_up": 1}
+    assert guard.stats() == {
+        "refusals": 3,
+        "allowed": 2,
+        "gave_up": 1,
+        "ledger_injections": 0,
+    }
 
 
 def test_engagement_and_checker_never_require_flag() -> None:

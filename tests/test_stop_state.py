@@ -288,7 +288,12 @@ def test_silent_stop_is_marked_when_a_run_ends_without_finish(
     payload = _payload(tmp_path)
     assert payload["stop_reason"] == "completed"
     assert payload["silent_stop"] is True
-    assert payload["finish_guard"] == {"refusals": 0, "allowed": 0, "gave_up": 0}
+    assert payload["finish_guard"] == {
+        "refusals": 0,
+        "allowed": 0,
+        "gave_up": 0,
+        "ledger_injections": 0,
+    }
 
 
 def test_silent_stop_absent_when_the_run_captured_a_flag(

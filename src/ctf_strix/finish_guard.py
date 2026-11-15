@@ -151,6 +151,7 @@ class FinishGuard:
         success: Any = None,
         evidence: Any = None,
         checker: Callable[[], bool] | None = None,
+        ledger: Any = None,
     ) -> None:
         """Args:
             require_flag: 是否要求 summary 里有可交付答案（flag 形态，或显式
@@ -169,6 +170,11 @@ class FinishGuard:
                 an answerless finish is refused, and its result is cached for
                 the rest of this run.  A solved probe marks ``success``; a
                 failed or unreachable one leaves the existing policy intact.
+            ledger: optional ``FactLedger``.  When supplied, each refusal
+                carries the compact fact/route ledger rendered from this run's
+                tool output, so the model is sent back with a concrete list
+                instead of a bare "go get the flag".  ``None`` leaves the
+                refusal text unchanged.
         """
         self.refusals = 0
         self.allowed = 0
@@ -181,6 +187,9 @@ class FinishGuard:
         self.success = success
         self.evidence = evidence
         self.checker = checker
+        self.ledger = ledger
+        #: 台账真正写进拒收文本的次数。A/B 的仪表自检读这个数（docs/32 §11.5）。
+        self.ledger_injections = 0
         self._probe_done = False
         self._probe_started = False
         self._probe_result = False
@@ -325,7 +334,20 @@ class FinishGuard:
             # 第 1 次已经把「回去拿 flag」说清楚了；第 2 次起必须要求换向，
             # 否则模型只会把同一份白卷再交一次。
             base["error"] = base["error"] + _REDIRECT
+        note = self._ledger_note()
+        if note:
+            self.ledger_injections += 1
+            base["error"] = base["error"].rstrip() + "\n\n" + note
         return base
+
+    def _ledger_note(self) -> str:
+        """渲染收工台账。台账自身出错绝不能改变收工策略。"""
+        if self.ledger is None:
+            return ""
+        try:
+            return str(self.ledger.render() or "")
+        except Exception:  # noqa: BLE001 - 台账是增强，不是判据
+            return ""
 
     async def check_async(self, raw_input: str) -> dict[str, Any] | None:
         """Async variant used by the tool wrapper.
@@ -389,6 +411,7 @@ class FinishGuard:
             "refusals": self.refusals,
             "allowed": self.allowed,
             "gave_up": int(self.gave_up),
+            "ledger_injections": self.ledger_injections,
         }
 
 
@@ -398,6 +421,7 @@ def install(
     success: Any = None,
     evidence: Any = None,
     checker: Callable[[], bool] | None = None,
+    ledger: Any = None,
 ) -> FinishGuard:
     """包装工具入口，给 finish_scan 装上收工守卫。
 
@@ -414,6 +438,7 @@ def install(
         success=success,
         evidence=evidence,
         checker=checker,
+        ledger=ledger,
     )
     original = factory._with_bounded_result
 
