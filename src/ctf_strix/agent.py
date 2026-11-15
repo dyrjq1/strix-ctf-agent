@@ -2564,6 +2564,66 @@ def _autosubmit_target(task: dict[str, Any]) -> tuple[str, str, str] | None:
     return platform, instance, token
 
 
+def _platform_tags(task: dict[str, Any]) -> list[str]:
+    """Ask the platform for this challenge's tags when ``task.json`` has none.
+
+    ``task.json`` carries ``challenge.{id,name,description,difficulty}`` and no
+    tags, so on the official entry every tag-keyed method card was unreachable:
+    the evaluation harness passes ``--tags`` but the competition path had
+    nothing to pass.  The detail endpoint is the same one the harness reads, so
+    the vocabulary is identical and nothing has to be derived from prose.
+
+    Best effort by design: a scored run must not stall or fail because metadata
+    was slow.  Any error, timeout or unexpected shape returns ``[]``, which is
+    exactly the behaviour before this existed.
+
+    Args:
+        task: parsed ``task.json`` (``challenge.id``; platform of record).
+
+    Returns:
+        The challenge's tags, or an empty list when they cannot be fetched.
+    """
+    try:
+        from ctf_strix.engagement import challenge_id_of
+        from ctf_strix.engagement import platform_of
+    except Exception:  # noqa: BLE001 -- metadata must never stop the run
+        return []
+    platform = platform_of(task)
+    challenge_id = challenge_id_of(task)
+    token = (
+        os.environ.get("CTFY_TOKEN")
+        or os.environ.get("CTF_PLATFORM_TOKEN")
+        or str(task.get("token") or "")
+    ).strip()
+    if not (platform and challenge_id and token):
+        return []
+    try:
+        import json as _json
+        import urllib.parse as _parse
+        import urllib.request as _request
+
+        url = (
+            f"{platform.rstrip('/')}/api/v1/challenges/"
+            f"{_parse.quote(challenge_id, safe='')}"
+        )
+        req = _request.Request(
+            url,
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Accept": "application/json",
+            },
+        )
+        with _request.urlopen(req, timeout=8) as resp:  # noqa: S310 -- platform URL
+            payload = _json.loads(resp.read(1 << 20).decode("utf-8", "replace"))
+    except Exception:  # noqa: BLE001 -- see docstring: [] is the old behaviour
+        return []
+    data = payload.get("data", payload) if isinstance(payload, dict) else {}
+    tags = data.get("tags") if isinstance(data, dict) else None
+    if not isinstance(tags, list):
+        return []
+    return [t.strip() for t in tags if isinstance(t, str) and t.strip()]
+
+
 def _qa_target(task: dict[str, Any]) -> tuple[str, str, str, str] | None:
     """解析 QA 轨的 ``(platform, token, challenge_id, competition_id)``。
 
@@ -2745,10 +2805,12 @@ def install_toolset(task: dict[str, Any], kind: str) -> tuple[str, list[str]]:
         # hint even when no index registered, so a broken pack still gets them.
         # The filter reads the live registry, so this runs after every installer
         # above (AI-5).
+        # task.json has no tags, so the official entry asks the platform for
+        # them once; the harness path already gets them on the command line.
         hint = skillpack.prompt_hint(
             names,
             kind=kind,
-            tags=skillpack.tags_of(task),
+            tags=skillpack.tags_of(task) or _platform_tags(task),
             available=live_tool_names() or None,
         )
         if names:
