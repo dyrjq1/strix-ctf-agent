@@ -54,6 +54,17 @@ class FakeTool:
 
 
 @pytest.fixture
+def shape_on(monkeypatch):
+    """Opt in to the shape-level stall rule.
+
+    It ships **off**: a 40-run live A/B on 2026-11-15 never emitted the hint
+    under either setting, so the rule is an experiment, not a default.  These
+    tests exist to keep the experiment runnable, not to claim it is shipped.
+    """
+    monkeypatch.setenv("CTF_STRUCT_SIG", "1")
+
+
+@pytest.fixture
 def factory(monkeypatch):
     """Give each test a clean mount point; install() creates a fresh guard."""
     pytest.importorskip("strix.agents")
@@ -818,7 +829,7 @@ def test_class_streak_peak_tracks_the_longest_single_mechanism_run():
 # ---------------------------------------------------------------------------
 # Stall keys on *shape*; blocking still keys on exact text
 # ---------------------------------------------------------------------------
-def test_same_shape_with_different_text_counts_as_a_stall():
+def test_same_shape_with_different_text_counts_as_a_stall(shape_on):
     """The change under test, stated as one line.
 
     Measured over 265 finished runs: solved runs produced a new response shape
@@ -839,7 +850,7 @@ def test_same_shape_with_different_text_counts_as_a_stall():
     assert guard.max_stall == 2
 
 
-def test_a_different_status_is_a_different_shape():
+def test_a_different_status_is_a_different_shape(shape_on):
     """Counter-example: 403 then 404 is information, not a repeat."""
     guard = enum_guard.EnumerationGuard()
 
@@ -849,7 +860,7 @@ def test_a_different_status_is_a_different_shape():
     assert guard.stall == 0
 
 
-def test_a_different_media_type_or_size_class_is_a_different_shape():
+def test_a_different_media_type_or_size_class_is_a_different_shape(shape_on):
     """A JSON API answer and an HTML error page are never the same observation."""
     guard = enum_guard.EnumerationGuard()
     body = "x" * 400
@@ -860,7 +871,7 @@ def test_a_different_media_type_or_size_class_is_a_different_shape():
     assert guard.stall == 0
 
 
-def test_shape_repeats_never_reach_the_block_path(factory):
+def test_shape_repeats_never_reach_the_block_path(factory, shape_on):
     """The block must keep the exact signature: a repeated *shape* is not proof.
 
     A paginated API or a blind extraction legitimately returns the same shape
@@ -880,7 +891,7 @@ def test_shape_repeats_never_reach_the_block_path(factory):
     assert tool.calls == enum_guard._HARD_REPEATS + 1
 
 
-def test_shell_output_without_a_status_falls_back_to_the_text_signature():
+def test_shell_output_without_a_status_falls_back_to_the_text_signature(shape_on):
     """No marker from the target: two same-length listings are not one page."""
     guard = enum_guard.EnumerationGuard()
 
@@ -893,9 +904,13 @@ def test_shell_output_without_a_status_falls_back_to_the_text_signature():
     assert guard.stall == 1, "an exact text repeat still counts, as before"
 
 
-def test_the_switch_restores_the_text_level_rule(monkeypatch):
-    """``CTF_STRUCT_SIG=0`` is the ablation arm: same shape no longer counts."""
-    monkeypatch.setenv("CTF_STRUCT_SIG", "0")
+def test_the_text_rule_is_the_shipped_default(monkeypatch):
+    """No env var: the shape rule is off, so different text is new information.
+
+    This is the state the live A/B left us in -- the shape rule never fired, so
+    the side that actually ships is the one that behaved identically anyway.
+    """
+    monkeypatch.delenv("CTF_STRUCT_SIG", raising=False)
     guard = enum_guard.EnumerationGuard()
 
     for index in range(3):
@@ -908,7 +923,7 @@ def test_the_switch_restores_the_text_level_rule(monkeypatch):
     assert guard.stall == 0, "text differs, so the old rule sees three new observations"
 
 
-def test_the_hint_names_what_was_actually_observed():
+def test_the_hint_names_what_was_actually_observed(shape_on):
     """A shape stall must not claim "same bodies" -- the bodies differed."""
     guard = enum_guard.EnumerationGuard()
 

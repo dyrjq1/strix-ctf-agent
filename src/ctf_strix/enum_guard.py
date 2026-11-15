@@ -724,8 +724,16 @@ def _structure_signature(result: Any) -> str | None:
 
 
 def _structure_enabled() -> bool:
-    """Ablation switch for the shape-level stall criterion (default on)."""
-    return os.environ.get("CTF_STRUCT_SIG", "1").strip().lower() not in {
+    """Opt-in switch for the shape-level stall criterion (default **off**).
+
+    Off is not caution for its own sake: the live A/B on 2026-11-15 ran 40
+    question-runs with both settings and the hint fired zero times either way
+    (deepest stall 0-2, threshold 6), so the shape rule changed no behaviour
+    and its +1 solve was noise.  Shipping the untested side of an inert switch
+    buys nothing; the code stays so a later experiment can retest it at a
+    different threshold, one env var away.
+    """
+    return os.environ.get("CTF_STRUCT_SIG", "0").strip().lower() not in {
         "0",
         "off",
         "false",
