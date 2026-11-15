@@ -2918,7 +2918,13 @@ def run_qa_item(
         brief += "\n\n## 附件（已放进你的工作目录）\n" + listing
     # 给一个必然拒绝的本机端口：网络工具瞬时失败，模型不会把预算耗在探测上。
     log, wall = run_agent(
-        "http://127.0.0.1:1", turns, wallclock, name, extra=brief, files=attachments
+        "http://127.0.0.1:1",
+        turns,
+        wallclock,
+        name,
+        extra=brief,
+        files=attachments,
+        tags=[t for t in (detail.get("tags") or []) if isinstance(t, str)],
     )
     rec: dict[str, Any] = {
         "samples_used": 1,
@@ -2961,6 +2967,28 @@ def run_qa_item(
     return rec
 
 
+#: Platform tags are identifiers (``ssrf``, ``software_supply_chain``).  The
+#: child process uses them only for card / AI-gate selection; they never reach
+#: prompt text (``method_cards`` intersects sets and renders literals).  Anything
+#: that could be read as a CLI flag is dropped here rather than trusted.
+_TAG_OK = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.+-]*")
+
+
+def _tags_arg(tags: list[str] | None) -> list[str]:
+    """``["--tags", *tags]`` for the child command line; empty when no tag survives.
+
+    Why this exists: ``run_strix_ctf.py`` has accepted ``--tags`` since the AI
+    gate landed, but this caller never passed it, so the tag-keyed method-card
+    block was never rendered in any batch run (ledger §4.209).
+    """
+    out: list[str] = []
+    for tag in tags or ():
+        text = str(tag).strip()
+        if text and _TAG_OK.fullmatch(text) and text not in out:
+            out.append(text)
+    return ["--tags", *out] if out else []
+
+
 def run_agent(
     target: str,
     turns: int,
@@ -2975,6 +3003,7 @@ def run_agent(
     token: str = "",
     challenge_id: str = "",
     files: dict[str, bytes] | None = None,
+    tags: list[str] | None = None,
 ) -> tuple[str, float]:
     """跑一次 strix，返回 (完整日志, 墙钟耗时)。
 
@@ -3088,6 +3117,9 @@ def run_agent(
         # 代理黑洞只放行靶机与 LLM 网关：平台域名不放行，提交请求会被
         # 黑洞代理吞成瞬时 connection refused——接线等于没接。
         _allow_platform_in_no_proxy(env, platform)
+    # 标签要进子进程，卡片才有输入：`run_strix_ctf.py` 的 --tags 此前只有
+    # aisec 闸门在用，方法卡在批跑里从未触发（台账 §4.209）。
+    cmd += _tags_arg(tags)
     started = time.time()
     # PYTHONPATH 是相对路径，必须配合 cwd=root 才能 import 到 ctf_strix，
     # 而沙箱隔离又要求 cwd=box——改成绝对路径，cwd 就能放心交给 box。
@@ -3603,6 +3635,9 @@ def main() -> int:
                     token=client.token,
                     challenge_id=cid,
                     files=attachments,
+                    tags=[
+                        t for t in (challenge_detail.get("tags") or []) if isinstance(t, str)
+                    ],
                 )
                 logs.append(sample_log)
                 total_wall += sample_wall
