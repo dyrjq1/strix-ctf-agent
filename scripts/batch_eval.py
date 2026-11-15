@@ -2804,6 +2804,47 @@ def _checker_passed(client: object, iid: str, qid: str, multiple: bool) -> bool:
     return check_verdict(body, qid, multiple=multiple)
 
 
+def _deliverable_questions(detail: dict, inst: dict) -> list[dict]:
+    """合并 challenge payload 与实例记录里的 question，只留现在能交付的那批。
+
+    ``requires`` 锁住的问题**只**出现在实例记录里：challenge payload 的
+    ``questions`` 里没有它们，解完之后也没有（2026-11-16 实测；两问都解完的
+    题同样如此）。而 ``GET /instances/{id}`` 的 ``questions`` 带 id / mode /
+    unlocked，正是 run 内 ``autosubmit`` 读的同一份列表。跑后提交链若只看
+    payload，这些问题的 qid 就从未进过 ``/check``——checker 题本来就没有答案
+    串，交付全在侧车，漏掉的直接后果是题级半解。
+
+    还锁着的（``unlocked`` 显式为 false）不进来：答案没解锁，交什么都是白烧
+    尝试次数；把它算进 ``multi`` 还会让同题的单 checker 问题在
+    ``challenge_fully_solved`` 上永远判否。
+
+    Args:
+        detail: challenge payload（可能只含未锁问题）。
+        inst: 实例记录；拿不到时传空字典，行为退回只看 payload。
+
+    Returns:
+        question 字典列表：payload 定顺序，实例的非空字段覆盖同名项；
+        同 id 合并为一项，``id`` 一律归一成字符串。
+    """
+    out: dict[str, dict] = {}
+    for source in (detail.get("questions"), inst.get("questions")):
+        for q in source or []:
+            if not isinstance(q, dict) or not q.get("id"):
+                continue
+            qid = str(q["id"])
+            cur = out.setdefault(qid, {})
+            cur["id"] = qid
+            for key, value in q.items():
+                if key == "id":
+                    continue
+                # 实例记录里的 choices=None / requires=[] / mode="" 是"这里
+                # 没有"，不是"覆盖 payload 的值"——空值一律跳过。
+                if value is None or value == [] or value == {} or value == "":
+                    continue
+                cur[key] = value
+    return [q for q in out.values() if q.get("unlocked") is not False]
+
+
 def _ranked_answers(*values: str | None, limit: int = 4) -> list[str]:
     """Candidate answers in priority order, deduplicated, at most ``limit``.
 
@@ -4035,10 +4076,19 @@ def main() -> int:
             # 多问题题：每个问题单独提交。平台按"全部正确"才算完全解出，
             # 只交 flag 等于白答（001 就吃过这个亏：flag 对了、另一问空着，
             # `my_fully_solved` 仍是 false）。
-            multi = [
-                str(q["id"]) for q in (challenge_detail.get("questions") or [])
-                if isinstance(q, dict) and q.get("id")
-            ]
+            # gated 问题只在实例记录里可见（见 ``_deliverable_questions``）。
+            # 读不到就退回 payload——多一次 GET，不能多一次失败。
+            inst_record: dict = {}
+            fetch_inst = getattr(client, "instance", None)
+            if callable(fetch_inst):
+                try:
+                    inst_record = fetch_inst(iid) or {}
+                except Exception:  # noqa: BLE001 — 拿不到按"没有额外信息"处理
+                    inst_record = {}
+                if not isinstance(inst_record, dict):
+                    inst_record = {}
+            questions = _deliverable_questions(challenge_detail, inst_record)
+            multi = [str(q["id"]) for q in questions]
             pairs = _answer_values(log)
             # 观测：日志里"flag 形状"的串有几条。只记数字——结果行会被贴进
             # 报告和 issue，正文（尤其是真答案）不能进去。
@@ -4048,8 +4098,7 @@ def main() -> int:
                 submitted: dict[str, bool] = {}
                 q_modes = {
                     str(q.get("id")): str(q.get("mode") or "")
-                    for q in (challenge_detail.get("questions") or [])
-                    if isinstance(q, dict) and q.get("id")
+                    for q in questions
                 }
                 multiple_q = len(multi) > 1
                 for qid in multi:
@@ -4073,8 +4122,8 @@ def main() -> int:
                         low if qid == "flag" else None,
                     )
                     q_choices = [
-                        str(c) for q in (challenge_detail.get("questions") or [])
-                        if isinstance(q, dict) and str(q.get("id")) == qid
+                        str(c) for q in questions
+                        if q.get("id") == qid
                         for c in (q.get("choices") or []) if str(c).strip()
                     ]
                     if q_choices:

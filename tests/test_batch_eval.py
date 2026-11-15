@@ -880,6 +880,123 @@ def test_postrun_checker_falls_back_to_value_when_check_fails(
     assert rec["correct"] is True
 
 
+# ---------------------------------------------------------------------------
+# gated 问题只在实例记录里：payload 里压根没有，跑后提交链必须补上。
+# ---------------------------------------------------------------------------
+
+
+def _gated_client(submit_log: list, check_log: list, detail_qs: list, inst_qs: list):
+    """payload 与实例记录给不同的 question 表，并记录 /check 的 qid。"""
+
+    class Fake:
+        def __init__(self, token: str) -> None:
+            self.token = token
+
+        def launch(self, cid: str, attempts: int = 5) -> str:
+            return "iid-1"
+
+        def wait_ready(self, iid: str, timeout: int = 180) -> str:
+            return "http://127.0.0.1:8082/"
+
+        def probe_reachable(self, url: str, attempts: int = 3) -> tuple[bool, str]:
+            return True, "ok"
+
+        def detail(self, cid: str) -> dict:
+            return {"questions": detail_qs}
+
+        def instance(self, iid: str) -> dict:
+            return {"questions": inst_qs}
+
+        def check(self, iid: str, qid: str) -> dict:
+            check_log.append(qid)
+            return {
+                "passed": True,
+                "timed_out": False,
+                "question_id": qid,
+                "challenge_fully_solved": True,
+            }
+
+        def teardown(self, iid: str) -> None:
+            return None
+
+        def submit(self, iid: str, answer: str, qid: str = "flag") -> dict:
+            submit_log.append((qid, answer))
+            return {"correct": True}
+
+    return Fake
+
+
+def test_postrun_checks_a_gated_checker_question_the_payload_hides(
+    workdir: Path, monkeypatch
+) -> None:
+    """第二问是 checker 且被 requires 锁在 payload 外：必须补一次 /check。
+
+    checker 题没有答案串，交付只在平台侧车；漏了 qid 就等于这题从没被问过，
+    平台按半解记账。
+    """
+    submitted: list = []
+    checked: list = []
+    client = _gated_client(
+        submitted,
+        checked,
+        detail_qs=[{"id": "flag", "mode": "dynamic"}],
+        inst_qs=[
+            {"id": "flag", "mode": "dynamic", "unlocked": True},
+            {"id": "deface", "mode": "checker", "unlocked": True},
+        ],
+    )
+    rec = _run_single(workdir, monkeypatch, client)
+
+    assert checked == ["deface"]
+    assert rec["checker_passed"] == ["deface"]
+    assert rec["answers_ok"] == {"flag": True, "deface": True}
+    assert rec["correct"] is True
+
+
+def test_postrun_skips_a_gated_question_that_is_still_locked(
+    workdir: Path, monkeypatch
+) -> None:
+    """答案还没解锁就不派：交什么都是白烧尝试次数，还会把全解判成否。"""
+    submitted: list = []
+    checked: list = []
+    client = _gated_client(
+        submitted,
+        checked,
+        detail_qs=[{"id": "flag", "mode": "dynamic"}],
+        inst_qs=[
+            {"id": "flag", "mode": "dynamic", "unlocked": True},
+            {"id": "slug", "mode": "dynamic", "unlocked": False},
+        ],
+    )
+    rec = _run_single(workdir, monkeypatch, client)
+
+    assert checked == []
+    assert submitted == [("flag", "HTB{the_right_0ne}")]
+    assert rec["answers_ok"] == {"flag": True}
+    assert rec["correct"] is True
+
+
+def test_deliverable_questions_merges_without_losing_payload_choices() -> None:
+    """实例记录里的空值是"这里没有"，不是"覆盖掉 payload"；同 id 只留一项。"""
+    merged = batch_eval._deliverable_questions(
+        {"questions": [{"id": "pick", "mode": "multi_select", "choices": ["a", "b"]}]},
+        {
+            "questions": [
+                {"id": "pick", "mode": "multi_select", "choices": None,
+                 "requires": [], "unlocked": True},
+                {"id": "extra", "mode": "checker", "unlocked": True},
+            ]
+        },
+    )
+    by_id = {q["id"]: q for q in merged}
+    assert list(by_id) == ["pick", "extra"]
+    assert by_id["pick"]["choices"] == ["a", "b"]
+    assert by_id["pick"]["unlocked"] is True
+    assert batch_eval._deliverable_questions({"questions": [{"id": "flag"}]}, {}) == [
+        {"id": "flag"}
+    ]
+
+
 def test_checker_passed_rejects_incomplete_verdict() -> None:
     """``/check`` 契约缺字段、超时、或没给 passed 都不算通过（fail-closed）。"""
 
