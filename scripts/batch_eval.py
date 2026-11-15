@@ -351,7 +351,8 @@ def suite_for(challenge_id: str, token: str = "") -> str:
         suite id。
 
     Raises:
-        KeyError: 静态表、缓存、平台自述三处都找不到该前缀。
+        RoutingError: 静态表、缓存、平台自述三处都找不到该前缀（``KeyError``
+            子类，调用方可按 skip 口径处理）。
     """
     key = (challenge_id or "").strip().upper()
     for prefix, sid in SUITES.items():
@@ -371,7 +372,7 @@ def suite_for(challenge_id: str, token: str = "") -> str:
         f"题号 {challenge_id} 的前缀不在已知 suite 表里（已知：{known}）。"
         "如果平台新增了套件，检查 /api/v1/suites 是否可达"
     )
-    raise KeyError(msg)
+    raise RoutingError(msg)
 
 
 #: 端口 → 服务形态。只用于**兜底**：平台的 ``service_type`` 优先。
@@ -423,6 +424,18 @@ class LaunchError(RuntimeError):
     开赛 02:02Z 实测：5 题里 2 题在启动阶段连撞 503 platform_busy，被记成
     「题目失败」，两题后即被调度器 defer。它必须走 skip 口径（B-23），
     否则平台一抖动就把题表整片判死。
+    """
+
+
+class RoutingError(KeyError):
+    """题号前缀三处都解析不出所属 suite——**选题崩了，不是题没做出来**。
+
+    台账 §4.29 的原话：这类"看起来是评测结果、其实是选题崩了"的数据比没有
+    数据更危险。它必须和实例起不来一样走 skip 口径（B-23），否则一道根本没
+    开跑的题会被记成一次失败，白烧调度器的连败预算。
+
+    仍是 ``KeyError`` 的子类：``docstring`` 里写明"解析不出来就抛 KeyError"的
+    契约、以及既有调用方（``_listed_detail`` 的兜底 ``except``）都不必改。
     """
 
 
@@ -1257,10 +1270,18 @@ class Client:
         has 115 challenges.
         """
         offset = 0
+        # 已显式给了 competition id 就不要再去猜前缀：开赛时前缀可能是新的
+        # （`/api/v1/suites` 又不一定可达），而父进程 `compete.py` 早就知道
+        # 这道题属于哪个竞赛。这是接线缺口，不是能力问题。
+        # 解析失败仍返回空表、由调用方退回单题详情接口——这条路只是锦上添花。
+        try:
+            suite_id = self.competition_id or suite_for(challenge_id, self.token)
+        except RoutingError:
+            return {}
         for _ in range(10):
             try:
                 r = self.s.get(
-                    f"{PLATFORM}/api/v1/competitions/{suite_for(challenge_id, self.token)}/challenges",
+                    f"{PLATFORM}/api/v1/competitions/{suite_id}/challenges",
                     params={"limit": 200, "offset": offset},
                     timeout=40,
                 )
@@ -3875,6 +3896,13 @@ def main() -> int:
             rec["correct"] = False
             rec["skipped"] = True
             print("  -> SKIP 实例未就绪，跳过", flush=True)
+        except RoutingError as exc:
+            # 题号前缀解析不出所属 suite：题**根本没开跑**，不是做不出来。
+            # 记 skip 走 B-23 口径（与实例起不来同档），不烧连败预算。
+            rec["error"] = f"SKIPPED(套件路由失败): {exc}"
+            rec["correct"] = False
+            rec["skipped"] = True
+            print(f"  -> SKIP 套件路由失败：{exc}", flush=True)
         except Exception as exc:  # noqa: BLE001
             rec["error"] = f"{type(exc).__name__}: {exc}"
             rec["correct"] = False

@@ -408,6 +408,63 @@ def test_suite_for_raises_with_known_list_when_unresolvable(monkeypatch):
     assert "CTFARENA" in str(exc.value)
 
 
+class _StubResp:
+    def __init__(self, payload: dict) -> None:
+        self.status_code = 200
+        self._payload = payload
+
+    def json(self) -> dict:
+        return self._payload
+
+
+def test_routing_error_stays_a_key_error(monkeypatch):
+    """路由失败仍是 KeyError 子类：既有调用方的 ``except`` 契约不能断。"""
+    monkeypatch.setattr(batch_eval, "_fetch_suite_map", lambda token="": {})
+    batch_eval._SUITE_CACHE.clear()
+
+    with pytest.raises(batch_eval.RoutingError) as exc:
+        batch_eval.suite_for("NOSUCHSUITE-001")
+
+    assert isinstance(exc.value, KeyError)
+    assert "NOSUCHSUITE-001" in str(exc.value)
+
+
+def test_listed_detail_prefers_the_explicit_competition_id(monkeypatch):
+    """已知竞赛时不再猜前缀——这是接线缺口，不是能力问题。"""
+    monkeypatch.setenv("CTFY_COMPETITION_ID", "comp-xyz")
+
+    def _boom(*_a, **_kw):
+        raise AssertionError("有了 competition id 还去走前缀路由")
+
+    monkeypatch.setattr(batch_eval, "suite_for", _boom)
+    client = batch_eval.Client("t")
+    urls: list[str] = []
+
+    class _S:
+        def get(self, url, **_kw):
+            urls.append(url)
+            return _StubResp({"items": [{"id": "NOSUCHSUITE-001"}]})
+
+    client.s = _S()
+    assert client._listed_detail("NOSUCHSUITE-001") == {"id": "NOSUCHSUITE-001"}
+    assert urls and "/competitions/comp-xyz/challenges" in urls[0]
+
+
+def test_listed_detail_degrades_instead_of_raising_when_routing_fails(monkeypatch):
+    """没有竞赛 id 且前缀解析不出时，这条路返回空表（退回单题详情），不抛。"""
+    monkeypatch.delenv("CTFY_COMPETITION_ID", raising=False)
+    monkeypatch.setattr(batch_eval, "_fetch_suite_map", lambda token="": {})
+    batch_eval._SUITE_CACHE.clear()
+    client = batch_eval.Client("t")
+
+    class _S:
+        def get(self, *_a, **_kw):
+            raise AssertionError("解析不出前缀时不该发请求")
+
+    client.s = _S()
+    assert client._listed_detail("NOSUCHSUITE-001") == {}
+
+
 def test_title_prefixes_normalises_title() -> None:
     from batch_eval import _title_prefixes
 
