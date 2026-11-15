@@ -65,6 +65,7 @@ from ctf_strix.tool_notes import append_note
 
 import hashlib
 import json
+import os
 import re
 from collections import Counter
 from typing import TYPE_CHECKING, Any, Final
@@ -664,6 +665,74 @@ def _obs_signature(result: Any, args: str) -> str:
     return hashlib.sha1(payload.encode("utf-8", "replace")).hexdigest()[:12]
 
 
+#: Markers that say "this result came from the target", not from the local
+#: shell.  Without one of these the result is not a response and is left out of
+#: the shape counter entirely.
+_RESPONSE_MARKER_RE = re.compile(
+    r"\[HTTP\s+(\d{3})\]|HTTP/1\.[01]\s+(\d{3})|phase=([A-Z][A-Z_]+)"
+)
+_TAG_RE = re.compile(r"<([a-zA-Z][a-zA-Z0-9]*)")
+#: Body bytes per size bucket.  200 is the page-cache-block scale: below it two
+#: pages of the same kind land in one bucket, above it they do not.
+_SIZE_BUCKET = 200
+
+
+def _structure_signature(result: Any) -> str | None:
+    """The *shape* of a response: status, media type, size bucket, tag vocabulary.
+
+    Why a second, coarser signature exists:
+
+    ``_obs_signature`` hashes the first 1500 normalised characters, which is the
+    right thing for the hard block (it must not refuse a call the model has a
+    real reason to repeat) and the wrong thing for "did that teach me anything".
+    Measured over 265 finished runs in ``/var/tmp/ctfbox`` (replayed from
+    ``.state/agents.db``, no tokens spent): solved runs produced a *new response
+    shape* on 73 % of their calls, burnt runs on 55 % -- roughly half of a
+    failing run's calls re-read the same kind of page with different words in
+    it.  The text-level detector saw 7 % of failures reach six repeats; the
+    shape-level one sees 30 %, at the cost of touching 7 % of solved runs with
+    one extra hint line.
+
+    Only markers from the target count (HTTP status, transport phase).  A shell
+    listing has no shape at all: two ``ls`` outputs of the same length are not
+    "the same page", so they fall back to the text signature.
+
+    Args:
+        result: 工具返回值。
+
+    Returns:
+        形态串；结果没有目标侧标记时返回 None。
+    """
+    text = result if isinstance(result, str) else str(result)
+    match = _RESPONSE_MARKER_RE.search(text[:400])
+    if match is None:
+        return None
+    status = next(group for group in match.groups() if group)
+    _, _, body = text.partition("\n")
+    low = body[:400].lower()
+    if "<html" in low or "<!doctype html" in low:
+        ctype = "html"
+    elif body.lstrip()[:1] in ("{", "["):
+        # ``in "{["`` would be true for the empty string -- an empty body is
+        # not JSON, and calling it JSON made a bodyless result look like an
+        # API answer.
+        ctype = "json"
+    else:
+        ctype = "text"
+    tags = len({tag.lower() for tag in _TAG_RE.findall(body[:4000])})
+    return f"{status}|{ctype}|{len(body) // _SIZE_BUCKET}|tags={tags}"
+
+
+def _structure_enabled() -> bool:
+    """Ablation switch for the shape-level stall criterion (default on)."""
+    return os.environ.get("CTF_STRUCT_SIG", "1").strip().lower() not in {
+        "0",
+        "off",
+        "false",
+        "no",
+    }
+
+
 class EnumExhausted(BaseException):
     """The model kept retrying a hard-blocked family instead of rerouting.
 
@@ -732,6 +801,19 @@ class EnumerationGuard:
         self._global: set[tuple[str | None, str]] = set()
         self.stall: int = 0
         self.stall_hits: int = 0
+        #: Deepest stall / longest same-class streak this run ever reached.
+        #: The hints only fire at ``_STALL_AFTER`` / ``_CLASS_STREAK_AFTER``, so
+        #: "hint never appeared" cannot distinguish "the model kept changing
+        #: mechanism" from "the guard never saw the repetition".  The peaks
+        #: answer which distance to the threshold a lost run actually got to,
+        #: and therefore whether the fix belongs in the threshold or in the
+        #: observation fingerprint (``_obs_signature``).
+        self.max_stall: int = 0
+        self.max_class_streak: int = 0
+        #: Whether the last counted stall was a *shape* repeat (response from the
+        #: target) or an exact text repeat (everything else).  The hint names what
+        #: was actually observed instead of claiming "same body" for both.
+        self._stall_from_shape: bool = False
         #: Probes per CAPEC mechanism class, for the "same hypothesis" hint.
         self.mechanisms: Counter[str] = Counter()
         #: Probes sent since the last *new* class was discovered.
@@ -800,6 +882,10 @@ class EnumerationGuard:
             "exhausted": self.exhausted,
             "exhausted_family": self.exhausted_family,
             "observe_calls": self.observe_calls,
+            "max_stall": self.max_stall,
+            "max_class_streak": self.max_class_streak,
+            "stall_hits": self.stall_hits,
+            "class_hits": self.class_hits,
         }
 
     def note_answer(self) -> None:
@@ -920,9 +1006,20 @@ class EnumerationGuard:
                 else:
                     self.new_path_streak = 0
         sig = _obs_signature(result, args)
-        fresh = (key, sig) not in self._global
-        self._global.add((key, sig))
+        # The stall counter asks "did that teach me anything", so it keys on the
+        # *shape* of the response; the warn/block counters below keep the exact
+        # signature, because refusing a call needs far stronger evidence than
+        # hinting about one (a paginated API legitimately repeats a shape).
+        # ``shape is None`` means the result never reached the target, so the
+        # text signature -- today's behaviour -- is used instead of guessing.
+        shape = _structure_signature(result) if _structure_enabled() else None
+        self._stall_from_shape = shape is not None
+        stall_sig = sig if shape is None else f"shape:{shape}"
+        fresh = (key, stall_sig) not in self._global
+        self._global.add((key, stall_sig))
         self.stall = 0 if fresh else self.stall + 1
+        if self.stall > self.max_stall:
+            self.max_stall = self.stall
 
         if key is None:
             return self._stall_hint()
@@ -977,6 +1074,8 @@ class EnumerationGuard:
                 self.class_streak = 0
             else:
                 self.class_streak += 1
+            if self.class_streak > self.max_class_streak:
+                self.max_class_streak = self.class_streak
             self.mechanisms[mechanism] += 1
             class_hint = self._class_hint(mechanism)
 
@@ -1062,9 +1161,19 @@ class EnumerationGuard:
         if (self.stall - _STALL_AFTER) % _STALL_REPEAT:
             return None
         self.stall_hits += 1
+        if self._stall_from_shape:
+            what = (
+                f"The last {self.stall} responses had the same shape: same status, "
+                "same media type, same size class, same page vocabulary. Their text "
+                "differed, the information did not."
+            )
+        else:
+            what = (
+                f"The last {self.stall} calls produced no new observation "
+                "(same bodies, same errors)."
+            )
         return (
-            f"\n\n[ENUMERATION GUARD] {self.stall} consecutive calls produced no new "
-            "observation (same bodies, same errors). Budget is burning without learning.\n"
+            f"\n\n[ENUMERATION GUARD] {what} Budget is burning without learning.\n"
             "Before the next request: (1) write down the single most promising fact you "
             "already have; (2) pick the mechanism that fact points at instead of probing "
             "more names."

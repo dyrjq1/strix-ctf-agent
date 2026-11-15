@@ -740,3 +740,228 @@ def test_blocked_error_reads_the_family_from_the_key_tail():
     guard = enum_guard.EnumerationGuard()
     guard.exhausted_family = key
     assert "'api/login'" in guard.exhausted_detail()
+
+
+# ---------------------------------------------------------------------------
+# Diagnostic peaks: "the hint never fired" has two very different causes
+# ---------------------------------------------------------------------------
+#: A family name the path regex recognises, pointing at a host that resolves to
+#: nothing real -- these calls never run.
+_NOTE = '{{"cmd": "curl -s https://x.test/api/notes/{leaf}"}}'
+_SAME_404 = "[HTTP 404] 404 page not found"
+
+
+def test_stall_peak_records_depth_a_lost_run_reached():
+    """Hint-free repetition must still leave a number behind.
+
+    ``_STALL_AFTER`` is 6, so a run that repeated three times says nothing at
+    run time.  Without the peak, "no ENUMERATION GUARD hint" was the only
+    evidence, and it cannot tell "the model kept changing mechanism" from
+    "the guard never recognised the repetition" -- opposite fixes.
+    """
+    guard = enum_guard.EnumerationGuard()
+
+    for leaf in "abc":
+        guard.observe("exec_command", _NOTE.format(leaf=leaf), _SAME_404)
+
+    assert guard.stall == 2
+    assert guard.max_stall == 2, "the peak must keep the depth after the streak moves"
+    assert guard.stall_hits == 0, "three repeats are below the hint threshold"
+
+    # A fresh observation resets the live streak but not the peak.
+    guard.observe("exec_command", '{"cmd": "curl -s https://x.test/api/notes/d"}', "new body")
+    assert guard.stall == 0
+    assert guard.max_stall == 2
+
+
+def test_stall_peak_matches_hint_when_the_threshold_is_reached():
+    """When the hint does fire, the peak must agree with it (no off-by-one)."""
+    guard = enum_guard.EnumerationGuard()
+
+    for _ in range(enum_guard._STALL_AFTER + 1):
+        guard.observe("exec_command", _NOTE.format(leaf="a"), _SAME_404)
+
+    assert guard.stall_hits == 1
+    assert guard.max_stall == enum_guard._STALL_AFTER
+    assert guard.max_stall == guard.stall
+
+
+def test_stall_peak_stays_zero_when_every_observation_is_new():
+    """Counter-example: a productive run must not look stalled in the summary."""
+    guard = enum_guard.EnumerationGuard()
+
+    for index, status in enumerate(("200", "403", "404", "500")):
+        guard.observe(
+            "exec_command",
+            _NOTE.format(leaf=index),
+            f"[HTTP {status}] page {index}",
+        )
+
+    assert guard.max_stall == 0
+
+
+def test_class_streak_peak_tracks_the_longest_single_mechanism_run():
+    """Three injection probes, each a *different* response shape: no stall."""
+    guard = enum_guard.EnumerationGuard()
+
+    for status in ("200", "403", "404"):
+        guard.observe(
+            "exec_command",
+            '{"cmd": "curl -s \'https://x.test/api/items?id=1 OR 1=1\'"}',
+            f"[HTTP {status}] rows",
+        )
+
+    assert guard.max_stall == 0, "every response had its own status"
+    assert guard.max_class_streak == 2
+
+
+# ---------------------------------------------------------------------------
+# Stall keys on *shape*; blocking still keys on exact text
+# ---------------------------------------------------------------------------
+def test_same_shape_with_different_text_counts_as_a_stall():
+    """The change under test, stated as one line.
+
+    Measured over 265 finished runs: solved runs produced a new response shape
+    on 73 % of calls, burnt ones on 55 % -- half of a failing run's calls
+    re-read the same kind of page.  Under the text-level rule only 7 % of
+    failures ever reached six repeats; under the shape-level rule 30 % do.
+    """
+    guard = enum_guard.EnumerationGuard()
+
+    for index in range(3):
+        guard.observe(
+            "exec_command",
+            _NOTE.format(leaf=index),
+            f"[HTTP 404] not found: nothing at /api/notes/n{index}",
+        )
+
+    assert guard.stall == 2, "three calls, one shape"
+    assert guard.max_stall == 2
+
+
+def test_a_different_status_is_a_different_shape():
+    """Counter-example: 403 then 404 is information, not a repeat."""
+    guard = enum_guard.EnumerationGuard()
+
+    guard.observe("exec_command", _NOTE.format(leaf="a"), "[HTTP 403] forbidden")
+    guard.observe("exec_command", _NOTE.format(leaf="b"), "[HTTP 404] not found")
+
+    assert guard.stall == 0
+
+
+def test_a_different_media_type_or_size_class_is_a_different_shape():
+    """A JSON API answer and an HTML error page are never the same observation."""
+    guard = enum_guard.EnumerationGuard()
+    body = "x" * 400
+
+    guard.observe("exec_command", _NOTE.format(leaf="a"), f"[HTTP 200] {body}")
+    guard.observe("exec_command", _NOTE.format(leaf="b"), '[HTTP 200]\n{"ok": true}')
+
+    assert guard.stall == 0
+
+
+def test_shape_repeats_never_reach_the_block_path(factory):
+    """The block must keep the exact signature: a repeated *shape* is not proof.
+
+    A paginated API or a blind extraction legitimately returns the same shape
+    with different values.  If the coarse signature reached ``counts``, the
+    guard would start refusing calls it has no evidence against.
+    """
+    tool = FakeTool("exec_command", "[HTTP 404] nothing here")
+    guard, (wrapped,) = _install(factory, [tool])
+
+    for index in range(enum_guard._HARD_REPEATS + 3):
+        _run(wrapped, BLOCK_PATHS[index % len(BLOCK_PATHS)])
+
+    assert guard.stall >= enum_guard._HARD_REPEATS, "the shape repeats were seen"
+    # Same paths, same body -> the exact signature did repeat, so the block is
+    # about the exact repeats only.  Distinct bodies on those paths must not
+    # extend it: that call is evidence of nothing.
+    assert tool.calls == enum_guard._HARD_REPEATS + 1
+
+
+def test_shell_output_without_a_status_falls_back_to_the_text_signature():
+    """No marker from the target: two same-length listings are not one page."""
+    guard = enum_guard.EnumerationGuard()
+
+    guard.observe("exec_command", '{"cmd": "ls -la /tmp"}', "a" * 300)
+    guard.observe("exec_command", '{"cmd": "ls /tmp"}', "b" * 300)
+
+    assert guard.stall == 0, "no HTTP marker -> no shape claim"
+
+    guard.observe("exec_command", '{"cmd": "ls /tmp"}', "b" * 300)
+    assert guard.stall == 1, "an exact text repeat still counts, as before"
+
+
+def test_the_switch_restores_the_text_level_rule(monkeypatch):
+    """``CTF_STRUCT_SIG=0`` is the ablation arm: same shape no longer counts."""
+    monkeypatch.setenv("CTF_STRUCT_SIG", "0")
+    guard = enum_guard.EnumerationGuard()
+
+    for index in range(3):
+        guard.observe(
+            "exec_command",
+            _NOTE.format(leaf=index),
+            f"[HTTP 404] not found: nothing at /api/notes/n{index}",
+        )
+
+    assert guard.stall == 0, "text differs, so the old rule sees three new observations"
+
+
+def test_the_hint_names_what_was_actually_observed():
+    """A shape stall must not claim "same bodies" -- the bodies differed."""
+    guard = enum_guard.EnumerationGuard()
+
+    for index in range(enum_guard._STALL_AFTER + 1):
+        guard.observe(
+            "exec_command",
+            _NOTE.format(leaf=index % 3),
+            f"[HTTP 404] not found: nothing at /api/notes/n{index}",
+        )
+
+    assert guard.stall_hits == 1
+    hint = guard._stall_hint()
+    # The cadence repeats every _STALL_REPEAT calls, so ask again until it fires
+    # with the peak value still in ``stall``.
+    while hint is None and guard.stall < enum_guard._STALL_AFTER + enum_guard._STALL_REPEAT:
+        guard.observe(
+            "exec_command",
+            _NOTE.format(leaf="a"),
+            "[HTTP 404] not found: nothing at /api/notes/nz",
+        )
+        hint = guard._stall_hint()
+
+    assert hint is not None
+    assert "same shape" in hint
+    assert "same bodies" not in hint
+
+
+def test_class_streak_peak_stays_zero_when_classes_change():
+    """Counter-example: alternating mechanisms is exactly what the guard wants."""
+    guard = enum_guard.EnumerationGuard()
+
+    guard.observe(
+        "exec_command",
+        '{"cmd": "curl -s \'https://x.test/api/items?id=1 OR 1=1\'"}',
+        "[HTTP 200] rows",
+    )
+    guard.observe("exec_command", '{"cmd": "curl -s https://x.test/admin/panel"}', "[HTTP 200]")
+    guard.observe("exec_command", '{"cmd": "curl -s https://x.test/api/notes/a"}', "x")
+
+    assert guard.max_class_streak == 0
+
+
+def test_stats_snapshot_carries_the_peaks():
+    """``stats()`` feeds the run diagnostics; the peaks must be in it."""
+    guard = enum_guard.EnumerationGuard()
+    for leaf in "abc":
+        guard.observe("exec_command", _NOTE.format(leaf=leaf), _SAME_404)
+
+    stats = guard.stats()
+
+    assert stats["max_stall"] == 2
+    # Three leaves in one family is itself an enumeration shape, so the
+    # information-collection class counts once (the second leaf classifies it).
+    assert stats["max_class_streak"] == 1
+    assert stats["stall_hits"] == 0
+    assert stats["class_hits"] == 0

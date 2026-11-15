@@ -198,7 +198,15 @@ def _guard_summary(guard: object, journey_state: object, finisher: object, reach
         f"created={journey_state.created} payloads={journey_state.payloads} "
         f"prompts={journey_state.prompts} "
         f"| finish: refused={finisher.refusals} allowed={finisher.allowed} "
-        f"| mechanisms: {mechanisms}"
+        f"| mechanisms: {mechanisms} "
+        # Stall diagnostics go last, after every existing anchor.  ``max=0``
+        # on a run that made many probes means the observation fingerprint saw
+        # every response as new -- the detector was looking at the wrong thing,
+        # not at a model that kept changing approach.
+        f"| stall: max={getattr(guard, 'max_stall', 0)} "
+        f"hits={getattr(guard, 'stall_hits', 0)} "
+        f"class_max={getattr(guard, 'max_class_streak', 0)} "
+        f"class_hits={getattr(guard, 'class_hits', 0)}"
     )
 
 

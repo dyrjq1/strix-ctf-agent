@@ -183,3 +183,29 @@ def test_payload_round_trips_through_the_fallback_parser(tmp_path: Path) -> None
     ):
         assert parsed[key] == from_line[key], key
     assert parsed["mount_broken"] is False
+
+
+def test_summary_line_reports_the_stall_peaks_without_breaking_parsers() -> None:
+    """The stall diagnostics are a suffix: old anchors and regexes must survive.
+
+    ``_GUARD_LINE_RE`` is shared by ``batch_eval`` and ``eval_sample`` and is not
+    end-anchored, so a trailing segment is safe -- but only if it is actually
+    appended after every existing field.  This pins both facts.
+    """
+    from ctf_strix.enum_guard import EnumerationGuard
+
+    guard = EnumerationGuard()
+    guard.max_stall = 4
+    guard.stall_hits = 0
+    guard.max_class_streak = 7
+    guard.class_hits = 1
+    journey = SimpleNamespace(
+        wall_hit=0, authed=False, created=False, payloads=0, prompts=0, observe_calls=0
+    )
+    finisher = SimpleNamespace(refusals=0, allowed=0)
+
+    line = run_strix_ctf._guard_summary(guard, journey, finisher, reached=20)
+
+    assert "| stall: max=4 hits=0 class_max=7 class_hits=1" in line
+    assert line.rindex("mechanisms:") < line.index("| stall:"), "suffix must go last"
+    assert batch_eval._GUARD_LINE_RE.search(line) is not None
