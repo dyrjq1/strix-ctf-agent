@@ -585,6 +585,11 @@ class AutoSubmitter:
             # 用"提交值"语义（claimed="3" 实证），映射到的值照交。
             or str(q.get("id") or "") in mapped
         ]
+        # 平台还没解锁的 question 不投：实例记录里 ``unlocked`` 显式 false
+        # 说明 requires 链上一步没答对，此刻交什么都被拒，白耗一次尝试。
+        # 只有**显式** false 才挡——老平台没有这个字段（None），不能顺手
+        # 把整张题表清空。答对后解锁的题由下面的第二轮补派。
+        pending = [q for q in pending if q.get("unlocked") is not False]
         multiple = len(questions) > 1
         if not pending:
             # 区分两种"没得投"：拿不到列表（错误）vs 只有 checker 题（正常）。
@@ -624,6 +629,13 @@ class AutoSubmitter:
                 # ``attempts_remaining`` 是平台按 question 记账的剩余次数。为 0
                 # 时继续打只会拿到拒绝，白白在日志里制造"我试过了"的假象。
                 left = q.get("attempts_remaining")
+                # 平台部分题只暴露 ``attempts_cap``（配置值），不暴露剩余
+                # 次数；实例刚起时它等于剩余次数，按它记账比按常量准。
+                declared_cap = q.get("attempts_cap")
+                if not isinstance(left, int) and not self.is_qa and isinstance(
+                    declared_cap, int
+                ) and declared_cap > 0:
+                    left = declared_cap
                 qa_budget = self.is_qa and not isinstance(left, int)
                 if qa_budget:
                     left = _QA_ATTEMPT_CAP
@@ -671,9 +683,13 @@ class AutoSubmitter:
                 )
                 first = mapped.get(str(qid))
                 probe_skip = first is not None and not whitelisted
-                q_cands = ([first] if first is not None else []) + (
-                    cands if whitelisted else []
-                )
+                # 去重保序：契约行答案通常也出现在 FLAG{...} 宽集里，
+                # 同一串交两遍既浪费一次尝试，也在台账里制造"试过两次"
+                # 的假象。dict.fromkeys 保序去重。
+                q_cands = list(dict.fromkeys(
+                    ([first] if first is not None else [])
+                    + (cands if whitelisted else [])
+                ))
                 # 选择题：不在 choices 里的候选直接丢弃。平台对越界值返回
                 # refused（不计次数但也不得分），发出去只会污染台账。
                 q_choices = [str(c) for c in (q.get("choices") or [])]
@@ -682,6 +698,17 @@ class AutoSubmitter:
                         a for a in q_cands
                         if fits_choices(a, str(q.get("mode") or ""), q_choices)
                     ]
+                # 候选数不超过本题剩余的作答额度：超额候选交出去只会被平台
+                # 拒绝，日志里还写成"我试过"。截断方向按上面的可信度排序，
+                # 被丢掉的一定是排在末尾的裸 hex。
+                if isinstance(left, int) and len(q_cands) > left:
+                    dropped = len(q_cands) - left
+                    q_cands = q_cands[:left]
+                    if dropped:
+                        skipped.append(
+                            f"{qid}: attempt budget {left}, "
+                            f"{dropped} candidates untried"
+                        )
                 for pos, ans in enumerate(q_cands):
                     # 先问不记账的判分器。它正确 → 只写一条提交记录；
                     # 它不可用（旧平台 / 网络抖动）→ 退回直接提交。
@@ -757,7 +784,98 @@ class AutoSubmitter:
                             else:
                                 skipped.append(f"{qid}: attempts_remaining exhausted")
                             break
+        # ---- 第二轮：答对之后才解锁的问题（最多一轮，§4.231 欠账） ----
+        #
+        # gated 问题的 mode / unlocked 只出现在**实例记录**里，challenge
+        # payload 从来不下发（SAMPLE-009 实证：payload 只有 flag，实例记录
+        # 里才有 root）。主循环按 ``unlocked is not False`` 过滤过一轮，所以
+        # 锁住的题不会被白打；答对之后重读一次实例记录，把状态翻成 unlocked
+        # 的问题补派一次：checker 题走 /check（答案就是靶机副作用），其余只
+        # 投模型在 ``ANSWER[<qid>]=`` 里逐字点名的值——绝不拿宽集候选去猜
+        # 新题，猜错一次就是一次额度。只做一轮，不递归。
+        extra_pending = 0
+        if correct and not self.is_qa and self.instance:
+            before = {
+                str(q.get("id") or ""): q.get("unlocked")
+                for q in questions
+                if q.get("id")
+            }
+            attempted = {str(t.get("qid") or "") for t in tried if t.get("qid")}
+            fresh2 = self._questions()
+            multiple2 = multiple or len(fresh2) > 1
+            for q in fresh2:
+                qid = str(q.get("id") or "")
+                if not qid or qid in attempted:
+                    continue
+                if q.get("unlocked") is False:
+                    continue
+                if before.get(qid) is True:
+                    # 主循环里它本来就是解锁的，已经给过一次机会；再打只是
+                    # 用同一份证据烧第二次额度。
+                    continue
+                mode2 = str(q.get("mode") or "")
+                ans2 = mapped.get(qid)
+                if mode2 != "checker" and ans2 is None:
+                    continue
+                extra_pending += 1
+                left2 = q.get("attempts_remaining")
+                if isinstance(left2, int) and left2 <= 0:
+                    skipped.append(
+                        f"{qid}: attempts_remaining=0 (unlocked round)"
+                    )
+                    continue
+                if mode2 == "checker":
+                    body = self._post(
+                        f"/api/v1/instances/{self.instance}/check",
+                        {"question_id": qid},
+                    )
+                    if "error" not in body and check_verdict(
+                        body, qid, multiple=multiple2
+                    ):
+                        correct.append(f"{qid}=<checker>")
+                        tried.append({"qid": qid, "answer": "<checker>",
+                                      "correct": True, "channel": "check"})
+                        flag = body.get("challenge_fully_solved")
+                        if flag is True:
+                            platform_flag = True
+                        elif flag is False:
+                            platform_flag = False
+                        if self.success is not None:
+                            self.success.mark(
+                                "checker", "passed via /check (unlocked)",
+                                answer="<checker>",
+                            )
+                    else:
+                        tried.append({"qid": qid, "answer": "<checker>",
+                                      "correct": False, "channel": "check"})
+                    continue
+                self.attempts += 1
+                res = self._post(
+                    "/api/v1/submissions",
+                    {
+                        "instance_id": self.instance,
+                        "question_id": qid,
+                        "answer": ans2,
+                    },
+                )
+                tried.append({"qid": qid, "answer": ans2, **{
+                    k: res.get(k)
+                    for k in ("correct", "solve_rank", "detail", "error")
+                }})
+                if question_correct(res, qid):
+                    correct.append(f"{qid}={ans2}")
+                    flag = res.get("challenge_fully_solved")
+                    if flag is True:
+                        platform_flag = True
+                    elif flag is False:
+                        platform_flag = False
+                    if self.success is not None:
+                        self.success.mark(
+                            "platform_submit", "correct=true (unlocked)",
+                            answer=ans2,
+                        )
         unlocked: list[str] = []
+        answered_ids = {x.split("=", 1)[0] for x in correct}
         if correct and not self.is_qa and self.challenge_id:
             # G1（协议 §2）：答对过才值得重读 challenge 端点——解锁由「答对」
             # 触发，别在每次 finish 都多打一串请求。
@@ -767,7 +885,10 @@ class AutoSubmitter:
                 unlocked = [
                     str(q.get("id") or "")
                     for q in fresh
-                    if q.get("id") and str(q.get("id") or "") not in known
+                    if q.get("id")
+                    and str(q.get("id") or "") not in known
+                    # 第二轮已经答掉的题不用再叫模型"继续解"。
+                    and str(q.get("id") or "") not in answered_ids
                 ]
         self.answers_tried.extend(tried)
         self.correct.extend(correct)
@@ -782,8 +903,14 @@ class AutoSubmitter:
         # 多题必须同一口径：平台明确 True，或至少有一个被接受的答案。
         if platform_flag is True:
             fully_solved = True
-        elif multiple:
-            fully_solved = platform_flag is not False and len(correct) == len(pending)
+        elif multiple or extra_pending:
+            # 第二轮补派的问题也算进分母：锁住的题 unlocked 之前不进
+            # pending，但它们同样是"本题没做完"的一部分。单问题挑战若在
+            # 第二轮多派了一道，也走这条口径，否则链题只答第一问就会被
+            # 判成"完全解出"（和当初的 16 条假阳性同一类错）。
+            fully_solved = platform_flag is not False and len(correct) == (
+                len(pending) + extra_pending
+            )
         else:
             fully_solved = bool(correct) or unnamed_correct
         if unlocked:

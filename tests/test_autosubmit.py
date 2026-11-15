@@ -184,6 +184,140 @@ def test_missing_attempts_remaining_is_capped_at_platform_limit() -> None:
     assert any("1 candidates untried" in s for s in verdict["skipped"]), verdict
 
 
+def test_mapped_answer_is_not_resubmitted_as_broad_candidate() -> None:
+    """契约行答案同时被宽集抽到时只能交一次。
+
+    模型几乎总会在 summary 里同时写 ``ANSWER[q]=FLAG{...}`` 和同一串
+    ``FLAG{...}``；旧码先投 mapped、再把宽集原样投一遍，同一答案浪费一次
+    平台额度，台账里还写成"试了两个候选"。
+    """
+    sub, sent = _mk([{"id": "q1", "mode": "dynamic"}])
+    sub._verify = lambda *a, **k: None  # type: ignore[method-assign]
+    verdict = sub.submit('{"executive_summary": "ANSWER[q1]=FLAG{abc}\\nfound FLAG{abc}"}')
+    assert [b["answer"] for b in sent] == ["FLAG{abc}"], sent
+    assert len(verdict["tried"]) == 1
+
+
+def test_attempts_cap_field_limits_candidates() -> None:
+    """平台只给 ``attempts_cap`` 时按它截断，而不是按自定的 5。
+
+    实例记录里 ``attempts_remaining`` 可以是 null，而 ``attempts_cap`` 有值
+    （SAMPLE-001 实测两个字段并存）。按配置值记账，候选数就不会超过平台
+    真正的额度。
+    """
+    sub, sent = _mk(
+        [{"id": "q1", "mode": "dynamic", "attempts_cap": 2}]
+    )
+    sub._verify = lambda *a, **k: None  # type: ignore[method-assign]
+    verdict = sub.submit(" ".join(f"FLAG{{aaa{i:02d}}}" for i in range(6)))
+    assert len(sent) == 2, sent
+    assert any("attempt budget 2" in s for s in verdict["skipped"]), verdict
+
+
+def test_locked_question_is_not_attempted() -> None:
+    """``unlocked=false`` 的题在主循环不投：requires 没答对，交什么都被拒。"""
+    sub, sent = _mk([
+        {"id": "slug", "mode": "dynamic"},
+        {"id": "flag", "mode": "dynamic", "unlocked": False,
+         "requires": ["slug"]},
+    ])
+    sub._verify = lambda *a, **k: None  # type: ignore[method-assign]
+    verdict = sub.submit("FLAG{abc}")
+    assert [b["question_id"] for b in sent] == ["slug"], sent
+    assert verdict["tried"]
+
+
+def test_second_round_checks_newly_unlocked_checker() -> None:
+    """答对 flag 后重读实例记录，补派刚解锁的 checker 题。
+
+    SAMPLE-009：payload 只有 ``flag``，``root`` 只存在于实例记录。主循环按
+    ``unlocked`` 把它挡在门外；答对以后它翻成 unlocked，第二轮走 ``/check``
+    把它一起解掉——这就是"两问链题两问都 true"的路径。
+    """
+    first = [{"id": "flag", "mode": "dynamic"}]
+    second = [
+        {"id": "flag", "mode": "dynamic", "unlocked": True},
+        {"id": "root", "mode": "checker", "unlocked": True,
+         "requires": ["flag"]},
+    ]
+    sub, sent = _mk(first)
+    seq = [first, second]
+    sub._questions = lambda: seq.pop(0) if seq else second  # type: ignore[method-assign]
+    sub.check_ok.add("root")  # type: ignore[attr-defined]
+    raw_post = sub._post
+
+    def post_with_flag(path: str, body: dict[str, Any]) -> dict[str, Any]:
+        res = raw_post(path, body)
+        # 多问题挑战的 /check 回执必须显式带上 challenge_fully_solved，
+        # 与平台真实契约一致（SAMPLE-009 回执实测有这两个字段）。
+        if path.endswith("/check") and res.get("passed") is True:
+            return {**res, "challenge_fully_solved": True}
+        return res
+
+    sub._post = post_with_flag  # type: ignore[method-assign]
+
+    verdict = sub.submit('{"executive_summary": "answer: right"}')
+
+    assert "root=<checker>" in verdict["correct"], verdict
+    assert verdict["challenge_fully_solved"] is True, verdict
+    assert {"question_id": "root"} in sent, sent
+
+
+def test_second_round_submits_named_answer_for_unlocked_question() -> None:
+    """第二轮对新解锁的 non-checker 题只投 ``ANSWER[qid]=`` 点名的值。"""
+    first = [{"id": "flag", "mode": "dynamic"}]
+    second = first + [{"id": "root", "mode": "dynamic", "unlocked": True}]
+    sub, sent = _mk(first)
+    seq = [first, second]
+    sub._questions = lambda: seq.pop(0) if seq else second  # type: ignore[method-assign]
+
+    verdict = sub.submit(
+        '{"executive_summary": "answer: right\\nANSWER[root]=right"}'
+    )
+
+    assert sorted(verdict["correct"]) == ["flag=right", "root=right"], verdict
+
+
+def test_second_round_does_not_retry_a_question_already_unlocked() -> None:
+    """本来就解锁的题在主循环已给过机会，第二轮不能再打一次。
+
+    锁的旧行为是把同一份证据往同一题上再烧一次额度，日志还看不出区别。
+    """
+    def fake_post(path: str, body: dict[str, Any]) -> dict[str, Any]:
+        sent.append(body)
+        if path.endswith("/check"):
+            return {"passed": False, "timed_out": False,
+                    "question_id": body.get("question_id")}
+        return {"correct": body["question_id"] == "flag",
+                "question_id": body["question_id"]}
+
+    questions = [
+        {"id": "flag", "mode": "dynamic", "unlocked": True},
+        {"id": "root", "mode": "dynamic", "unlocked": True},
+    ]
+    sub, sent = _mk(questions)
+    sub._post = fake_post  # type: ignore[method-assign]
+    sub._verify = lambda *a, **k: None  # type: ignore[method-assign]
+
+    verdict = sub.submit("answer: right")
+
+    root_tries = [t for t in verdict["tried"] if t.get("qid") == "root"]
+    assert len(root_tries) == 1, verdict
+
+
+def test_single_question_has_no_second_round_requests() -> None:
+    """单问题零回归：没有新解锁问题时，第二轮不发任何请求。"""
+    qs = [{"id": "flag", "mode": "dynamic"}]
+    sub, sent = _mk(qs)
+    sub._verify = lambda *a, **k: None  # type: ignore[method-assign]
+    sub._questions = lambda: qs  # type: ignore[method-assign]
+
+    verdict = sub.submit("answer: right")
+
+    assert [b["question_id"] for b in sent] == ["flag"], sent
+    assert verdict["challenge_fully_solved"] is True
+
+
 def test_platform_attempt_cap_does_not_apply_to_qa() -> None:
     """qa 通道的 3 次闸门不能被平台 5 次上限顶掉（两套通道两套上限）。"""
     sub, sent = _mk([{"id": "q1", "mode": "dynamic"}], run_mode="qa")
