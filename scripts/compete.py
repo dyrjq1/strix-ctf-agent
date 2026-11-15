@@ -41,7 +41,7 @@
            PYTHONPATH=$PWD/src:$PWD/vendor/src
     python scripts/compete.py --token "$PF_TOKEN" \
         --competition <cid> --state-dir ~/compete-state --lanes 3 \
-        --turns 25 --wallclock 900 --until "2026-11-15T20:00+08:00"
+        --turns 25 --wallclock 300 --until "2026-11-15T20:00+08:00"
 
     # 只看队列不动手：
     python scripts/compete.py ... --dry-run
@@ -132,6 +132,21 @@ _QA_BONUS = 30
 #: 难度对墙钟的放大倍数（与 batch_eval 的 tiers 同源）。派单前用真实
 #: 上限判会话窗口够不够，而不是拿基准 wallclock 猜。
 _WALL_TIER = {"easy": 1.0, "medium": 1.5, "hard": 2.3}
+
+#: 单次尝试的时间盒基准（easy 档；medium ×1.5、hard ×2.3 由 ``_WALL_TIER``
+#: 与 batch_eval 各自的 tiers 施加）。**这不是"调小预算换分数"，是把一次尝试
+#: 的长度对齐到实测的边际收益拐点**——依据是 389 条真值 run（207 解出）的离线
+#: 重放，见 docs/47 §2.3.2：
+#:
+#: - 解出的尝试里 **73.5%（86/117）在 300s 内就结束了**；
+#: - 按分档盒子（300/450/690）截断，丢掉 **21/207 = 10.1%** 的解出，腾出
+#:   **31.6%** 的车道时间 = **170 次额外尝试**；只要其中 **12.3%** 解出就不亏；
+#: - 同题失败一次后再试一次，实测解出率 **29.2%（42/144）**；未解出且 >300s
+#:   的那 125 次尝试里，**41.6%** 的题后来被同题另一次尝试解出。
+#:
+#: 12.3% 的盈亏平衡线 vs 29.2% 的实测重试率，是这个数字唯一的依据。**硬上限仍然
+#: 是上限**：这改的是一次尝试的长度，不是允许它无限跑。
+_ATTEMPT_BOX_S = 300
 
 
 def _value_bonus(chal: dict[str, Any]) -> int:
@@ -671,7 +686,8 @@ def _collect(
     return status
 
 
-def main() -> int:
+def build_parser() -> argparse.ArgumentParser:
+    """命令行契约。单独成函数，好让测试钉住默认值（尤其时间盒）。"""
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     p.add_argument("--token", required=True)
     p.add_argument("--competition", required=True, help="competition id")
@@ -683,7 +699,13 @@ def main() -> int:
         help="并发车道（默认 2：平台配额 3，留 1 个余量给停止中/重试实例）",
     )
     p.add_argument("--turns", type=int, default=25)
-    p.add_argument("--wallclock", type=int, default=900)
+    p.add_argument(
+        "--wallclock",
+        type=int,
+        default=_ATTEMPT_BOX_S,
+        help=f"单次尝试墙钟基准（秒，easy 档；默认 {_ATTEMPT_BOX_S}，依据见 "
+        "docs/47 §2.3.2）",
+    )
     p.add_argument("--until", default="", help="ISO 时间，到点收工（空=一直跑）")
     p.add_argument(
         "--ignore-platform-solves",
@@ -698,7 +720,11 @@ def main() -> int:
         action="store_true",
         help="放行封存/烧毁池的题（仅练习场自测；正式赛不要用）",
     )
-    args = p.parse_args()
+    return p
+
+
+def main() -> int:
+    args = build_parser().parse_args()
 
     state_dir = Path(args.state_dir).expanduser()
     state = load_state(state_dir)

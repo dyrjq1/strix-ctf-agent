@@ -382,3 +382,39 @@ def test_lane_relay_base_is_overridable(monkeypatch) -> None:
     monkeypatch.setenv("CTF_VPN_RELAY_BASE", "50000")
     assert compete._lane_env(1)["CTF_VPN_RELAY"].endswith(":50002")
     assert compete._lane_env(1)["CTF_VPN_RELAY_CONTROL"].endswith(":50003")
+
+
+def test_attempt_box_is_the_measured_break_even_point() -> None:
+    """时间盒基准钉在 300s：它是实测的边际收益拐点，不是随手调小。
+
+    依据（docs/47 §2.3.2，389 条真值 run 离线重放）：73.5% 的解出在 300s 内完成；
+    分档盒 300/450/690 丢 10.1% 解出、腾出 31.6% 车道时间（170 次额外尝试），
+    盈亏平衡只需 12.3% 的额外尝试解出，而实测同题失败后再试的解出率是 29.2%。
+    改这个数字必须重跑那组测量，所以这里把它钉住。
+    """
+    assert compete._ATTEMPT_BOX_S == 300
+
+
+def test_parser_default_wallclock_tracks_the_attempt_box() -> None:
+    """CLI 默认值必须与常量同源，否则文档与行为会悄悄分叉。"""
+    args = compete.build_parser().parse_args(["--token", "t", "--competition", "c"])
+    assert args.wallclock == compete._ATTEMPT_BOX_S
+
+
+def test_tiered_box_matches_the_documented_triple() -> None:
+    """难度放大后的实际盒子就是文档里那组 300/450/690。"""
+    base = compete._ATTEMPT_BOX_S
+    assert [round(base * compete._WALL_TIER[d]) for d in ("easy", "medium", "hard")] == [
+        300,
+        450,
+        690,
+    ]
+
+
+def test_attempt_box_leaves_a_hard_attempt_room_to_finish() -> None:
+    """反方向：盒子不能小到连一个正常搜索都放不下。
+
+    p10 的解出尝试要 60s、中位 114s；hard 档 690s 必须显著大于中位解出耗时，
+    否则「省时间」会变成「全都跑不完」。
+    """
+    assert compete._ATTEMPT_BOX_S * compete._WALL_TIER["hard"] >= 4 * 114
