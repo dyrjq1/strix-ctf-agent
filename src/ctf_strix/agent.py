@@ -3333,6 +3333,19 @@ def _run_agent(
     # the prompt describes cannot drift apart (docs/27 C3/C4).
     hint, groups = install_toolset(task, kind)
 
+    # shell 发出的 HTTP 记进流量台账（只记录、不改行为）。277 个 run 里
+    # exec_command 占 64% 的调用，这些交换原本全部逃出台账，导致
+    # traffic_list / viability_probe 事实上失效。装在修复层**内层**：
+    # 读的是模型原始 command，不受下游提示注入影响。见 shell_traffic.py。
+    try:
+        from ctf_strix.shell_traffic import install as install_shell_traffic
+
+        install_shell_traffic()
+        print("[ctfy] shell traffic ledger installed", flush=True)
+    except Exception as exc:  # noqa: BLE001 -- 观测层失效不能阻止跑题
+        print(f"[ctfy] shell traffic ledger failed: {type(exc).__name__}: {exc}", flush=True)
+        diag["shell_traffic"] = "failed"
+
     # 参数修复层必须**最后装**：后装的在最外层，下游守卫（finish/autosubmit/
     # 各类计数器）看到的才是修好的参数串。实测 145 次 finish_scan 里 127 次
     # 卡在「形状错误」而 SDK 只回一句 "Invalid JSON input"，模型无法自我纠正

@@ -464,6 +464,15 @@ def test_agent_entry() -> None:
         -1 < idx_hook < idx_guard,
         f"hook@{idx_hook} guard@{idx_guard}",
     )
+    # shell 的 HTTP 记录层：装了但装在内层（早于参数修复层）才算接线正确。
+    idx_shell = src.find("install_shell_traffic()")
+    idx_repair = src.find("install_arg_repair()")
+    check("入口装了 shell 台账记录", idx_shell > -1, f"@{idx_shell}")
+    check(
+        "记录层先于参数修复层",
+        -1 < idx_shell < idx_repair,
+        f"shell@{idx_shell} repair@{idx_repair}",
+    )
     f = entry._extract_flag(
         "=== ctf_recon.md ===\n# CTF Recon — https://other.run/\nFLAG{bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb}\n",
         "abc.ctfy.run",

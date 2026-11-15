@@ -311,7 +311,8 @@ def traffic_list(limit: int = 25, url_contains: str = "", only_errors: bool = Fa
     if not items:
         return (
             "[traffic] nothing recorded yet. This ledger fills itself from "
-            "http_probe; a `curl` in exec_command is invisible to it."
+            "http_probe, and from the URLs a curl/requests call in "
+            "exec_command names (method + URL only, no response)."
         )
     needle = (url_contains or "").strip().lower()
     rows = []

@@ -540,6 +540,12 @@ async def main() -> int:
     dropped = install_ctf_toolset(drop_bookkeeping=not args.keep_bookkeeping)
     print(f"[trim] dropped {len(dropped)} tools: {', '.join(dropped)}")
 
+    # shell 发出的 HTTP 记进流量台账（只记录、不改行为），装在修复层内层。
+    from ctf_strix.shell_traffic import install as install_shell_traffic
+
+    install_shell_traffic()
+    print("[guard] shell traffic ledger installed")
+
     # 参数修复层最外层：形状错误的工具调用在这里被拆包或换成可纠正的提示，
     # 而不是让 SDK 回一句 "Invalid JSON input" 让模型原地重试。
     from ctf_strix.tool_arg_repair import install as install_arg_repair
