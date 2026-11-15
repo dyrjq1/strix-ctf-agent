@@ -283,6 +283,15 @@ def _guard_state_payload(
         },
         "mechanisms": {name: int(count) for name, count in counts.items()},
         "mount_verified": bool(mount_verified),
+        # Stall diagnostics.  The summary line carries them too, but a run that
+        # dies on the wall clock never prints that line, and "the hint never
+        # fired" is exactly the question we ask of a dead run.
+        "stall": {
+            "max": int(getattr(guard, "max_stall", 0)),
+            "hits": int(getattr(guard, "stall_hits", 0)),
+            "class_max": int(getattr(guard, "max_class_streak", 0)),
+            "class_hits": int(getattr(guard, "class_hits", 0)),
+        },
         # v1.1: the frozen summary line stays byte-identical; new counters are
         # sidecar-only and read back by ``_parse_guard``.
         "endpoints": _endpoint_sources(),

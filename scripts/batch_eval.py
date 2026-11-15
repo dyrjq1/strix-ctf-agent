@@ -1461,6 +1461,13 @@ _GUARD_LINE_RE = re.compile(
     r"prompts=(\d+) \| finish: refused=(\d+)"
 )
 
+#: Stall diagnostics, appended after every existing field.  Optional on purpose:
+#: logs written before 2026-11-15 do not carry the suffix, and a parser that
+#: insists on it would make every archived run unreadable.
+_STALL_LINE_RE = re.compile(
+    r"\| stall: max=(\d+) hits=(\d+) class_max=(\d+) class_hits=(\d+)"
+)
+
 
 def _int_field(value: object) -> int:
     """把 JSON 里的计数安全转成 int（缺失/None/坏值都记 0）。"""
@@ -1468,6 +1475,18 @@ def _int_field(value: object) -> int:
         return int(value)  # type: ignore[arg-type]
     except (TypeError, ValueError):
         return 0
+
+
+def _stall_fields(block: object) -> dict[str, int]:
+    """Read the stall diagnostics from the sidecar, tolerating an old file."""
+    if not isinstance(block, dict):
+        return {"stall_max": 0, "stall_hits": 0, "class_max": 0, "class_hits": 0}
+    return {
+        "stall_max": _int_field(block.get("max")),
+        "stall_hits": _int_field(block.get("hits")),
+        "class_max": _int_field(block.get("class_max")),
+        "class_hits": _int_field(block.get("class_hits")),
+    }
 
 
 def _parse_guard(
@@ -1505,6 +1524,10 @@ def _parse_guard(
         "journey_hits": log.count("USER JOURNEY GUARD"),
         "finish_refused": 0,
         "finish_hits": log.count("REFUSED: this summary"),
+        "stall_max": 0,
+        "stall_hits": 0,
+        "class_max": 0,
+        "class_hits": 0,
         **v11_fields(None),
     }
     m = _GUARD_LINE_RE.search(log)
@@ -1519,6 +1542,14 @@ def _parse_guard(
             journey_prompts=int(m.group(7)),
             finish_refused=int(m.group(8)),
         )
+        stall = _STALL_LINE_RE.search(log)
+        if stall:
+            out.update(
+                stall_max=int(stall.group(1)),
+                stall_hits=int(stall.group(2)),
+                class_max=int(stall.group(3)),
+                class_hits=int(stall.group(4)),
+            )
         # reach=0 说明守卫一次都没被调用过——这一题的守卫数据全是废的，
         # 不能当成"行为良好"的证据。标出来，免得又被读成"今天没触发"。
         out["mount_broken"] = out["reach"] == 0
@@ -1548,6 +1579,7 @@ def _parse_guard(
         journey_payloads=_int_field(journey.get("payloads")),
         journey_prompts=_int_field(journey.get("prompts")),
         finish_refused=_int_field(finish.get("refused")),
+        **_stall_fields(state.get("stall")),
         **v11_fields(state),
     )
     # 文件存在时只看启动时 verify_mount 的结果：True→装好了；False→没装上。
