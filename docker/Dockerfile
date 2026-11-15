@@ -32,6 +32,7 @@ RUN set -eux; \
         netcat-openbsd iproute2 dnsutils \
         openssh-client sshpass \
         nmap smbclient \
+        ripgrep nodejs \
         vim-tiny less procps \
         libssl-dev libffi-dev \
         binwalk libimage-exiftool-perl p7zip-full xz-utils zbar-tools \
@@ -41,6 +42,12 @@ RUN set -eux; \
 
 # openssh-client + sshpass：CTFY-0001 v3 合规硬缺口（awd 模式 ssh 横向移动），
 # 1.3.1 起补装。仅客户端，不装 sshd，不给容器开监听面。
+#
+# ripgrep + nodejs（1.3.10）：389 条真值 run 的工具输出里，"NAME: command not
+# found" 命中 34/207 解出、36/182 未解出；高频缺失名是 rg（16 次）与 node。
+# rg 是 web 侦察的刚需——下载/落盘的 JS bundle、sourcemap、响应体全要 grep，
+# 没有它 agent 只能 `grep -r` 或写 python，多花轮次；node 用来跑客户端 JS
+# 反混淆产物。两者都是 Debian bookworm 官方包，构建期装、运行期离线。
 
 # ffuf：Debian bookworm 的 apt 只有 1.1.0；按派单取上游静态二进制并锁版本。
 # 构建期下载 + sha256 校验，运行期离线，不引入外网依赖。

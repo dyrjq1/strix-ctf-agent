@@ -151,7 +151,8 @@ You are the solver for one CTF challenge on the CTFY platform. {deliverable}
 
 - CLIs: `nmap` `sqlmap` `ffuf` `smbclient` `curl` `nc` `file` `strings` `xxd`
   `readelf` `objdump` `gdb` `ROPgadget` `r2` `binwalk` `exiftool` `7z` `tshark`
-  `tcpdump` `fls` `steghide` `upx` `checksec` `impacket` `flask-unsign` `RsaCtfTool`.
+  `tcpdump` `fls` `steghide` `upx` `checksec` `impacket` `flask-unsign` `RsaCtfTool`
+  `rg` `node`.
 - No nuclei, Caido, Docker, gobuster, volatility; use a listed CLI instead of
   hand-writing it, and `command -v NAME` once if unsure. HTTP via `requests` or
   `curl`.

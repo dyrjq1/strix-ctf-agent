@@ -283,6 +283,10 @@ PROBES = {
     "xxd": ("xxd", "-v"),
     "nc": ("nc", "-h"),  # netcat-openbsd：用法打在 stderr 且退出码非零，只看输出
     "curl": ("curl", "--version"),  # 提示把 curl 列为 HTTP 后备，必须证明装了
+    # 1.3.10：真值 run 里 "rg: command not found" 出现 16 次，"node" 也有。
+    # 提示的 Environment 段点名了它们，就必须在这里被探测到。
+    "rg": ("rg", "--version"),
+    "node": ("node", "--version"),
 }
 for label, argv in PROBES.items():
     exe = shutil.which(argv[0])
