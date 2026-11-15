@@ -11,6 +11,7 @@
 | `stall_from_logs.py` | 从各 run 的 `run.log` 回捞 `\| stall:` 后缀（JSONL 行里可能没有） | `python3 stall_from_logs.py 0` |
 | `replay_today.py` | **仪表自检**：把某批 run 的 `agents.db` item 流逐条喂给真守卫，与线上打印值对账 | `python3 replay_today.py` |
 | `replay_shape_sig2.py` | 离线形态判据扫描（历史总体，多阈值、多签名变体） | `python3 replay_shape_sig2.py` |
+| `source_leak_gap.py` | 第 0 步：源码泄漏三段落差（请求过 → 200/404/兜底 → 是否转化），按行归属状态码 | `python3 source_leak_gap.py`（写 `~/source_leak_gap2.json`） |
 | `untouched_audit.py` | 审计还剩多少题没跑过（pools.json 会过期） | `python3 untouched_audit.py` |
 | `s3_pick.py` | 按预注册哈希规则选 20 题 + 3 个 spares | `python3 s3_pick.py` |
 | `vm_pytest.sh` | VM 上跑 pytest（设好 TMP/TEMP/PYTHONPATH 与 basetemp） | `bash vm_pytest.sh s2v tests/test_enum_guard.py` |
