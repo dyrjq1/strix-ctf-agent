@@ -288,6 +288,215 @@ SUITES = {
 #: 进程级缓存，一次批测只问一次平台。
 _SUITE_CACHE: dict[str, str] = {}
 
+# ---------------------------------------------------------------------------
+# 平台 hint：只读那一半。
+#
+# `docs/47` §3 的 P1：hint 是弱模型上唯一有 2× 实证的杠杆（Cybench 405B
+# 7.5%→15%，arXiv 2408.08926），而本题 `hint_cost_mode=discount`——开提示只
+# 封顶本题收益，不扣总分。但**已释放且免费**的那几条根本不用付这个代价：
+# 作者放出来就是给人看的，读列表本身也不花钱。
+#
+# 所以这里只做不需要花任何代价的一半：低频探测 → 把**已有正文**的提示拼进
+# 题面。付费档（`status=available` 且无 body）一律不碰，`view_hint` 是团队内
+# 一次性的不可撤销扣费，要有实测数字之后单独决策，不能混在一次接线里悄悄花掉。
+#
+# 探测节奏按 §3.3：每题至多每 20 分钟问一次。判断"该不该问"优先用题目详情
+# 里本来就有的 `hints_released`（每次尝试都会重新取详情，等于顺带轮询了一遍）；
+# 该字段缺失时才按 20 分钟节奏直接问。
+_HINT_POLL_S = 1200
+
+#: 拼进题面的提示正文上限（字符）。单题预算 25 轮 × 每轮几千字符的上下文，
+#: 一条几千字的提示会把题面和失败事实挤到注意力边缘，得不偿失。
+_HINT_BRIEF_MAX = 1600
+
+
+def _hint_state_path(out_path: str | Path) -> Path:
+    """hint 轮询状态的落盘位置，与结果文件同目录同名。
+
+    必须落盘而不是留在进程内存里：``compete.py`` 是**一次尝试一个 batch_eval
+    进程**，20 分钟的探测节奏跨进程才成立。
+    """
+    return Path(out_path).with_suffix(".hints.json")
+
+
+def _hint_state_load(path: Path) -> dict:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {"challenges": {}}
+    if not isinstance(data, dict) or not isinstance(data.get("challenges"), dict):
+        return {"challenges": {}}
+    return data
+
+
+def _hint_state_save(path: Path, data: dict) -> None:
+    """原子写：临时文件 + ``os.replace``（Windows 上 replace 才是原子的）。"""
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with tmp.open("w", encoding="utf-8") as fh:
+            json.dump(data, fh, ensure_ascii=False, indent=1)
+            fh.write("\n")
+        os.replace(tmp, path)
+    except OSError:
+        # 状态文件写不了就退化成"每次都问一次"，不影响本次尝试。
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+
+
+def _hint_tiers_to_brief(payload: dict) -> str:
+    """把 hint 分层压成一段可直接进题面的文本；没有可用正文就返回空串。
+
+    只收 ``body`` 非空的那几层——那就是"已释放且不必再付费"的内容（免费的，
+    或本队此前已经开过的）。付费未开的层平台本来就不会给 body，这里自然跳过，
+    不去 `view_hint`。
+    """
+    tiers = payload.get("tiers") if isinstance(payload, dict) else None
+    if not isinstance(tiers, list):
+        return ""
+    default_mode = str(payload.get("cost_mode") or "")
+    blocks: list[str] = []
+    total = 0
+    for tier in tiers:
+        if not isinstance(tier, dict):
+            continue
+        body = str(tier.get("body") or "").strip()
+        if not body:
+            continue
+        head = f"### 提示 {len(blocks) + 1}"
+        mode = str(tier.get("cost_mode") or default_mode)
+        if mode == "discount":
+            head += "（本题已开启；平台按折扣封顶本题收益）"
+        block = f"{head}\n{body}"
+        if tier.get("link_url"):
+            block += f"\n链接：{tier['link_url']}"
+        if tier.get("attachment_name"):
+            block += f"\n附件：{tier['attachment_name']}"
+        if total + len(block) > _HINT_BRIEF_MAX:
+            break
+        blocks.append(block)
+        total += len(block)
+    if not blocks:
+        return ""
+    return (
+        "## 平台提示（本题作者在赛窗口内发布，调度器已替你取回）\n"
+        "提示只是方向，不等于答案：按它缩小范围，仍要自己验证。\n\n"
+        + "\n\n".join(blocks)
+    )
+
+
+def _hint_brief(
+    client: object,
+    challenge_id: str,
+    detail: dict,
+    state_path: Path,
+    now: float | None = None,
+) -> tuple[str, dict]:
+    """按 20 分钟节奏探测本题 hint，返回 (可拼进题面的文本, 记账字段)。
+
+    任何异常都吞掉并返回空串：hint 是锦上添花，不能因为它让一次尝试崩掉，
+    更不能让它烧掉调度器的连败预算。
+    """
+    now = time.time() if now is None else now
+    state = _hint_state_load(state_path)
+    entry = state["challenges"].setdefault(challenge_id, {})
+    cached = str(entry.get("brief") or "")
+    released = detail.get("hints_released") if isinstance(detail, dict) else None
+    known_empty = isinstance(released, int) and released == 0
+    last_poll = entry.get("last_poll")
+    try:
+        due = last_poll is None or now - float(last_poll) >= _HINT_POLL_S
+    except (TypeError, ValueError):
+        due = True  # 状态文件被写坏了就当没问过：多问一次比永不问要安全
+    polled = False
+    if not known_empty and due:
+        polled = True
+        try:
+            payload = client.hints(challenge_id)
+        except Exception:  # noqa: BLE001 - 平台侧任何异常都不该传染
+            payload = {}
+        if isinstance(payload, dict) and payload:
+            entry["last_poll"] = now
+            entry["tiers"] = len(payload.get("tiers") or [])
+            fresh = _hint_tiers_to_brief(payload)
+            if fresh:
+                entry["brief"] = fresh
+                cached = fresh
+            elif cached:
+                # 本队已经开过的层在列表里带 body；若这次没带，保留上次取到的。
+                pass
+            _hint_state_save(state_path, state)
+    rec = {"hint_polled": polled, "hint_chars": len(cached)}
+    if cached:
+        rec["hint_tiers"] = int(entry.get("tiers") or 0)
+    return cached, rec
+
+
+def _hint_payload(resp: object) -> dict:
+    """REST 响应 → ``{"tiers": [...]}`` 形状；认不出就返回 ``{}``。
+
+    REST 这一侧的返回体没有被协议文档写死（hint 只有 MCP 工具那侧的描述），
+    所以两种常见形状都收：带 ``tiers`` 的对象，或裸的层列表。
+    """
+    try:
+        data = resp.json()
+    except ValueError:
+        return {}
+    if isinstance(data, dict):
+        return data
+    if isinstance(data, list):
+        return {"tiers": data}
+    return {}
+
+
+def _mcp_result(text: str, content_type: str = "") -> dict:
+    """从 MCP 响应里取出 ``tools/call`` 的结果对象。
+
+    HTTP 传输可能是纯 JSON，也可能是 SSE（``event: message`` + ``data: {...}``，
+    CLAUDE.md §15 记的就是 SSE）。工具结果本身通常是
+    ``{"content": [{"type": "text", "text": "<json 字符串>"}]}``。
+    """
+    raw = None
+    stripped = text.lstrip()
+    if "text/event-stream" in (content_type or "") or stripped.startswith("event:"):
+        chunks = [
+            line[5:].strip()
+            for line in text.splitlines()
+            if line.startswith("data:")
+        ]
+        for chunk in reversed(chunks):
+            try:
+                raw = json.loads(chunk)
+                break
+            except ValueError:
+                continue
+    if raw is None:
+        try:
+            raw = json.loads(text)
+        except ValueError:
+            return {}
+    if not isinstance(raw, dict):
+        return {}
+    result = raw.get("result", raw)
+    if not isinstance(result, dict):
+        return {}
+    content = result.get("content")
+    if isinstance(content, list):
+        for item in content:
+            if isinstance(item, dict) and item.get("type") == "text":
+                try:
+                    obj = json.loads(item.get("text") or "")
+                except ValueError:
+                    continue
+                if isinstance(obj, dict):
+                    return obj
+    structured = result.get("structuredContent")
+    if isinstance(structured, dict):
+        return structured
+    return result if "tiers" in result else {}
+
 
 def _title_prefixes(title: str) -> list[str]:
     """把套件标题规范成题号前缀候选。
@@ -1297,6 +1506,51 @@ class Client:
                 return {}
             offset += len(items)
         return {}
+
+    def hints(self, challenge_id: str) -> dict:
+        """取本题的 hint 分层（只读）。任何失败都返回 ``{}``。
+
+        两条入口都试：协议文档说 MCP 工具是 REST 的投影（`docs/08` §mcp.json），
+        所以先打 REST；404/405 再退 MCP JSON-RPC。两条都不通就静默——hint 是
+        锦上添花，平台没开这个口子不能让整次尝试崩掉。
+        """
+        competition = self.competition_id
+        if competition:
+            url = (
+                f"{PLATFORM}/api/v1/competitions/{competition}"
+                f"/challenges/{challenge_id}/hints"
+            )
+            try:
+                r = self.s.get(url, timeout=20)
+                if r.status_code == 200:
+                    return _hint_payload(r)
+            except (requests.RequestException, ValueError):
+                pass
+        return self._mcp_tool(
+            "list_hints",
+            {"competition_id": competition, "challenge_id": challenge_id},
+        )
+
+    def _mcp_tool(self, name: str, arguments: dict, timeout: int = 25) -> dict:
+        """一次 MCP ``tools/call``，返回结果对象；失败返回 ``{}``。"""
+        body = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {"name": name, "arguments": arguments},
+        }
+        try:
+            r = self.s.post(
+                f"{PLATFORM}/api/v1/mcp/",
+                json=body,
+                timeout=timeout,
+                headers={"Accept": "application/json, text/event-stream"},
+            )
+        except requests.RequestException:
+            return {}
+        if r.status_code != 200:
+            return {}
+        return _mcp_result(r.text, r.headers.get("Content-Type", ""))
 
     def fetch_instance_attachments(
         self, iid: str, cap_bytes: int = 64 * 1024 * 1024
@@ -3373,6 +3627,11 @@ def main() -> int:
         help="重试注入：上一轮失败路径文件（由 compete 按题生成，只含同题事实）",
     )
     p.add_argument(
+        "--no-hints", action="store_true",
+        help="关掉平台 hint 的只读探测（默认开：只取已释放且免费的正文，"
+             "付费层一律不开启）",
+    )
+    p.add_argument(
         "--no-canary", action="store_true",
         help="关掉开跑前的整队闸门（平台凭据 + LLM 端点各探一次）；"
              "仅用于故障演练，默认开",
@@ -3397,6 +3656,8 @@ def main() -> int:
 
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
+    # hint 探测节奏要跨进程（每尝试一个进程），所以状态跟着结果文件走。
+    hint_state = _hint_state_path(out)
     archive = Path(args.archive_dir).expanduser()
     if not args.no_archive:
         archive.mkdir(parents=True, exist_ok=True)
@@ -3603,6 +3864,16 @@ def main() -> int:
             if retry_brief:
                 brief = f"{brief}\n\n{retry_brief}" if brief else retry_brief
                 rec["retry_notes_chars"] = len(retry_brief)
+            # P1：平台hint 的只读一半（docs/47 §3）。作者放出且免费的那几条
+            # 直接进题面；付费未开的一律不碰。探测按 20 分钟节奏、状态跨进程
+            # 落盘——compete 是一次尝试一个进程，节奏必须靠文件。
+            if not args.no_hints:
+                hint_note, hint_rec = _hint_brief(
+                    client, cid, challenge_detail, hint_state,
+                )
+                rec.update(hint_rec)
+                if hint_note:
+                    brief = f"{brief}\n\n{hint_note}" if brief else hint_note
             # 附件投递：平台把文件挂在挑战上，不会自动出现在我们自己的沙箱里。
             attachments = (
                 client.fetch_attachments(cid)

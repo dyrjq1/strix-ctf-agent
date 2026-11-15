@@ -465,6 +465,111 @@ def test_listed_detail_degrades_instead_of_raising_when_routing_fails(monkeypatc
     assert client._listed_detail("NOSUCHSUITE-001") == {}
 
 
+class _HintClient:
+    """只实现 ``hints()`` 的桩；记录被问了几次。"""
+
+    def __init__(self, payload=None, boom: bool = False) -> None:
+        self.payload = payload if payload is not None else {"tiers": []}
+        self.boom = boom
+        self.calls = 0
+
+    def hints(self, challenge_id: str) -> dict:
+        self.calls += 1
+        if self.boom:
+            raise RuntimeError("平台 503")
+        return self.payload
+
+
+def test_hint_tiers_to_brief_keeps_only_tiers_with_body():
+    """付费未开的层没有正文——这里绝不能替 agent 去开（团队内一次性扣费）。"""
+    brief = batch_eval._hint_tiers_to_brief(
+        {
+            "cost_mode": "discount",
+            "tiers": [
+                {"id": "h1", "body": "先看 /login 的 cookie 是不是自签的", "cost_mode": "free"},
+                {"id": "h2", "status": "available", "cost_mode": "discount", "cost_percent": 50},
+            ],
+        }
+    )
+    assert "cookie 是不是自签" in brief
+    assert "提示 2" not in brief
+
+
+def test_hint_tiers_to_brief_honours_the_char_cap():
+    payload = {"tiers": [{"id": f"h{i}", "body": "x" * 900} for i in range(5)]}
+    brief = batch_eval._hint_tiers_to_brief(payload)
+    assert brief
+    assert len(brief) <= batch_eval._HINT_BRIEF_MAX + 200
+
+
+def test_hint_brief_injects_released_hint_and_records_it(tmp_path):
+    out = tmp_path / "results.jsonl"
+    client = _HintClient({"tiers": [{"id": "h1", "body": "作者提示：留意 JWT 的 kid 参数"}]})
+    brief, rec = batch_eval._hint_brief(
+        client, "SAMPLE-001", {"hints_released": 1}, batch_eval._hint_state_path(out),
+    )
+    assert "JWT 的 kid" in brief
+    assert rec["hint_chars"] == len(brief)
+    assert client.calls == 1
+
+
+def test_hint_brief_does_not_poll_when_the_detail_says_none_released(tmp_path):
+    """详情里 `hints_released = 0` 时连一次请求都不发：详情本身就是免费的轮询。"""
+    client = _HintClient()
+    brief, rec = batch_eval._hint_brief(
+        client, "SAMPLE-001", {"hints_released": 0}, tmp_path / "results.jsonl",
+    )
+    assert brief == ""
+    assert client.calls == 0
+    assert rec["hint_polled"] is False
+
+
+def test_hint_brief_rate_limits_and_reuses_the_cached_text(tmp_path):
+    """20 分钟内不再问平台，但上一次取到的正文照样进题面。"""
+    path = tmp_path / "results.jsonl"
+    state = batch_eval._hint_state_path(path)
+    client = _HintClient({"tiers": [{"id": "h1", "body": "看源码里的注释"}]})
+    first, _ = batch_eval._hint_brief(client, "Q-1", {}, state, now=1000.0)
+    assert first and client.calls == 1
+
+    second, rec2 = batch_eval._hint_brief(client, "Q-1", {}, state, now=1000.0 + 60)
+    assert second == first
+    assert client.calls == 1
+    assert rec2["hint_polled"] is False
+
+    batch_eval._hint_brief(client, "Q-1", {}, state, now=1000.0 + batch_eval._HINT_POLL_S + 1)
+    assert client.calls == 2
+
+
+def test_hint_brief_swallows_a_platform_failure(tmp_path):
+    """平台挂了只是没有提示，不能让一次尝试崩掉、更不能烧掉连败预算。"""
+    client = _HintClient(boom=True)
+    brief, rec = batch_eval._hint_brief(
+        client, "Q-1", {}, tmp_path / "results.jsonl", now=5.0,
+    )
+    assert brief == ""
+    assert rec["hint_chars"] == 0
+
+
+def test_mcp_result_unwraps_an_sse_tools_call():
+    text = (
+        "event: message\n"
+        'data: {"jsonrpc":"2.0","id":1,"result":{"content":['
+        '{"type":"text","text":"{\\"tiers\\": [{\\"id\\": \\"h1\\", \\"body\\": \\"x\\"}]}"}]}}\n'
+    )
+    got = batch_eval._mcp_result(text, "text/event-stream")
+    assert got["tiers"][0]["body"] == "x"
+
+
+def test_mcp_result_reads_a_plain_json_body():
+    got = batch_eval._mcp_result('{"result": {"tiers": []}}', "application/json")
+    assert got == {"tiers": []}
+
+
+def test_hint_payload_accepts_a_bare_tier_list():
+    assert batch_eval._hint_payload(_StubResp([{"id": "h1", "body": "y"}]))["tiers"][0]["body"] == "y"
+
+
 def test_title_prefixes_normalises_title() -> None:
     from batch_eval import _title_prefixes
 
