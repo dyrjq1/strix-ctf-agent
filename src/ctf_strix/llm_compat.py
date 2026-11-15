@@ -20,8 +20,10 @@ stream、无任何其他字段）也报同样的错，所以它实际是「缺�
 * 设置为正整数 → 透明模型代理在 ``model_settings.max_tokens`` 为 None 时
   注入该值；调用方已显式设置的（如 compaction 摘要的 4096）**不被覆盖**。
 
-这是协议兼容接线，不是预算调节：值必须落在端点公布的范围内（比赛网关
-为 [1, 8192]），由部署配置声明，代码不做任何推断。
+这是协议兼容接线，不是预算调节：值由部署配置声明，代码只做一件事——
+**把超出网关公布上限（[1, 8192]）的值收敛到上限并告警**。缺参和配大是同一个
+400 的两种触发方式，后者会让整局每一次调用都失败，所以在注入处兜住（见
+``_MAX_TOKENS_CEILING``）。范围内的值原样发送，不做任何推断。
 
 回滚：删掉 agent.py 挂载点的 ``llm_compat.install()`` 调用即可（或
 ``LLM_MAX_TOKENS`` 不设）。无环境变量时本模块的代理就是纯转发。
@@ -39,9 +41,24 @@ logger = logging.getLogger(__name__)
 #: 不用 ``STRIX_*``：那是 agent 自身行为的旋钮，这里描述的是对端协议。
 _ENV_NAME: Final = "LLM_MAX_TOKENS"
 
+#: 网关公布的上限。同一个 400 的文案里写着这个数：
+#: ``Range of max_tokens should be [1, 8192]``。
+#:
+#: ⚠️ 缺参只是它的一种触发方式。2026-11-15 复盘又抓到另一种：一次已经跑了
+#: 854s / 40 轮的 run 死于 ``400 InternalError.Algo.InvalidParameter: Range of
+#: max_tokens should be [1, 8192]``——**配大了**，而且 ``llm_preflight`` 固定
+#: 发 ``max_tokens=1``，结构上永远探不到。配错的后果不是"这一题失败"，是
+#: **整场比赛的每一次调用都 400**。所以这个上限在注入处收敛，不靠人配对。
+_MAX_TOKENS_CEILING: Final = 8192
+
 
 def max_tokens_from_env() -> int | None:
-    """读 ``LLM_MAX_TOKENS``；非正整数告警并视为未设置。"""
+    """读 ``LLM_MAX_TOKENS``；非正整数告警并视为未设置，超上限则收敛到上限。
+
+    ``max_tokens`` 是**单次响应的上限**，不是目标长度：收敛只会让一次本来会被
+    网关拒绝的调用变成合法请求，不会让正常配置变短。配置本身不改（人写错要看得见），
+    只改实际发出去的值。
+    """
     raw = os.environ.get(_ENV_NAME, "").strip()
     if not raw:
         return None
@@ -53,6 +70,15 @@ def max_tokens_from_env() -> int | None:
     if value <= 0:
         logger.warning("ctf-llm: %s=%d 非正，忽略", _ENV_NAME, value)
         return None
+    if value > _MAX_TOKENS_CEILING:
+        logger.warning(
+            "ctf-llm: %s=%d 超过网关上限 %d，按 %d 发送（否则每次调用都会 400）",
+            _ENV_NAME,
+            value,
+            _MAX_TOKENS_CEILING,
+            _MAX_TOKENS_CEILING,
+        )
+        return _MAX_TOKENS_CEILING
     return value
 
 

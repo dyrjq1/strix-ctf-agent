@@ -125,6 +125,20 @@ def test_bad_env_values_are_ignored(monkeypatch, raw):
     assert llm_compat.max_tokens_from_env() is None
 
 
+@pytest.mark.parametrize("raw", ["8192", "2048", "1"])
+def test_in_range_values_are_sent_unchanged(monkeypatch, raw):
+    """上限之内的配置必须原样发出：收敛只救配错的，不动配对。"""
+    monkeypatch.setenv("LLM_MAX_TOKENS", raw)
+    assert llm_compat.max_tokens_from_env() == int(raw)
+
+
+@pytest.mark.parametrize("raw", ["8193", "16384", "200000"])
+def test_above_ceiling_clamps_instead_of_failing_every_call(monkeypatch, raw):
+    """配大了不能变成「每次调用都 400」——收敛到网关公布的上限。"""
+    monkeypatch.setenv("LLM_MAX_TOKENS", raw)
+    assert llm_compat.max_tokens_from_env() == llm_compat._MAX_TOKENS_CEILING
+
+
 def test_install_wraps_the_provider_model(monkeypatch):
     from strix.config.models import StrixProvider
 
