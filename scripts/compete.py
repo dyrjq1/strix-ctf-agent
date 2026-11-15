@@ -22,12 +22,12 @@
 选题策略（纯函数 ``rank_queue``，全部可单测）：
 
 - 已解出 / 已关闭 / qa-only 的题不进队列；
-- 动态积分下早解优先：easy > medium > hard 的基础分；
-- ``solves_count`` 是唯一难度代理（UI 不显示难度，API 返回）：
-  他队解出过 = 可解性证据加分，零解出题压后（分高但胜率未知，
-  留到证明可解或收尾再打）；
+- 优先级按平台动态积分的**剩余价值**：``solves_count`` 越少分越高
+  （0 解出拿满，≥``_DECAY_SOLVERS`` 队解出归零）。难度只做同档 tie-break，
+  不再单独决定先后——动态积分下"难度高但没人解出"正是最值钱的题；
 - web 是实测强项（解出率 83%），类别加权优先；
 - 连续失败 ``max_failures``（默认 2）次 → deferred（放弃）；
+  尾巴题（≤``_TAIL_MAX_SOLVES`` 队解出）例外，用 ``_TAIL_RETRY_BUDGET``；
 - deferred 题的 ``solves_count`` 较放弃时上涨 ``rerun_solves_jump``
   （默认 3）→ 判定为「其实可解」重新入队（后期重跑信号）；
 - 门控题（questions[].requires）：前置问题已解的优先（解一个解锁
@@ -95,15 +95,35 @@ ACTIVE, RUNNING, SOLVED, FAILED, DEFERRED = "active", "running", "solved", "fail
 #: 不计 fails、不 defer，稍后重派。与 skipped 的区别是连一行结果都没有。
 INFRA = "infra"
 
-#: 基础分：动态积分下早解优先，easy 先打（快分 + 名次优势）。
-_DIFFICULTY_WEIGHT = {"easy": 300, "medium": 200, "hard": 100}
+#: 平台动态积分的参数（competition 对象）：``dynamic_points`` / ``exponential``
+#: / ``decay_solvers=30`` / ``minimum_fraction=0.1``。分值随解题队数**单调下降**，
+#: 地板是满分的 10%。曲线公式平台没公开，所以这里不复刻它，只取它保证的那条
+#: 单调性：**他队解得越少，这道题还剩的分越多**。
+#:
+#: 旧表是 easy 300 / medium 200 / hard 100，且零解出再倒扣 100——那在"每题固定
+#: 分值"的赛制里成立，在动态积分下正好反了。入围赛实测：2 队解出的 crypto 题值
+#: 970 分，占榜首总分的 68.7%；200+ 队解出的 misc 题只剩地板价 100。按旧表排，
+#: 我们最先放弃的恰好是唯一值钱的那道。
+_DECAY_SOLVERS = 30
+_VALUE_WEIGHT = 300
+#: 同价值档位内的 tie-break：易题先打（更快出分，且早解在动态积分下有优势）。
+#: 只做 tie-break，不参与主排序——权重刻意比 _VALUE_WEIGHT 小一个数量级。
+_EASE_TIEBREAK = {"easy": 20, "medium": 10, "hard": 0}
 #: 类别偏好：web 是实测强项（48 测 40 解），其余平权起步。
 _CATEGORY_WEIGHT = {"web": 60}
-#: 可解性证据：他队解出过 → 加分；零解出 → 压后（不是不打，是排后面）。
-_SOLVABLE_BONUS = 150
-_UNSOLVED_PENALTY = -100
 #: 每次失败扣分；连续失败 max_failures 次 → deferred。
 _FAIL_PENALTY = 90
+#: 尾巴题（他队解出 ≤ 这个数）的独立重试预算。
+#:
+#: 依据：独立重试是弱模型上证据最强的杠杆——多一次**新上下文**尝试在 AutoPenBench
+#: 上把单题 27.3% 提到 45.5%（NDSS LASTx 2026, lastx2026-42），InterCode-CTF
+#: @1 89% → @5 95%（arXiv 2412.02776）；CTF 曲线在 k=5 后收益递减。取 5，不是无限。
+#:
+#: 旧策略下这类题连第二次都拿不到：``max_failures=2`` 直接 deferred，而复活要求
+#: ``solves_count`` 上涨 3——在 0–2 队解出的题上，整场比赛可能都等不到这个跳变。
+#: 结果是最值钱的题在第二次失败后就被永久放弃。
+_TAIL_MAX_SOLVES = 5
+_TAIL_RETRY_BUDGET = 5
 #: 门控题：前置问题全部被我们解过 → 优先（解一个解锁一串）。
 _GATING_BONUS = 40
 #: QA 题库题（is_qa_only）：不占实例配额、通常几分钟出结果，给一点优先。
@@ -112,6 +132,21 @@ _QA_BONUS = 30
 #: 难度对墙钟的放大倍数（与 batch_eval 的 tiers 同源）。派单前用真实
 #: 上限判会话窗口够不够，而不是拿基准 wallclock 猜。
 _WALL_TIER = {"easy": 1.0, "medium": 1.5, "hard": 2.3}
+
+
+def _value_bonus(chal: dict[str, Any]) -> int:
+    """按平台动态积分推"这道题还剩多少分"——单调、无参数可调。
+
+    只依赖 ``solves_count``：0 解出拿满 ``_VALUE_WEIGHT``，到 ``_DECAY_SOLVERS``
+    队解出时归零（此后是地板价，彼此无差别）。用线性代理而不是复刻指数曲线，
+    是因为公式未公开，而排序只需要单调性。
+    """
+    solves = int(chal.get("solves_count") or 0)
+    if solves <= 0:
+        return _VALUE_WEIGHT
+    if solves >= _DECAY_SOLVERS:
+        return 0
+    return round(_VALUE_WEIGHT * (_DECAY_SOLVERS - solves) / _DECAY_SOLVERS)
 
 
 def challenge_score(
@@ -130,10 +165,9 @@ def challenge_score(
     rec = state.get(cid) or {}
     if rec.get("status") == SOLVED or cid in my_solved:
         return None
-    score = _DIFFICULTY_WEIGHT.get(str(chal.get("difficulty") or ""), 150)
+    score = _value_bonus(chal)
+    score += _EASE_TIEBREAK.get(str(chal.get("difficulty") or ""), 10)
     score += _CATEGORY_WEIGHT.get(str(chal.get("category") or ""), 0)
-    solves = int(chal.get("solves_count") or 0)
-    score += _SOLVABLE_BONUS if solves > 0 else _UNSOLVED_PENALTY
     if chal.get("is_qa_only"):
         # 2026-11-13 实测：qa_only 题（SAMPLE-005/020）此前被直接判 None，
         # 从未派过单。它们不占实例配额，走 batch_eval 的 QA 分支。
@@ -196,10 +230,15 @@ def rank_queue(
         score = challenge_score(chal, state, my_solved)
         if score is None:
             continue
-        if int(rec.get("fails") or 0) >= max_failures:
+        fails_budget = (
+            _TAIL_RETRY_BUDGET
+            if int(chal.get("solves_count") or 0) <= _TAIL_MAX_SOLVES
+            else max_failures
+        )
+        if int(rec.get("fails") or 0) >= fails_budget:
             rec["status"] = DEFERRED
             rec["solves_count_seen"] = int(chal.get("solves_count") or 0)
-            notes.append(f"{cid}: 连败 {max_failures} 次→deferred")
+            notes.append(f"{cid}: 连败 {fails_budget} 次→deferred")
             continue
         if int(rec.get("skips") or 0) >= max_failures:
             # B-23：连续基础设施跳过同样 defer——重派不产生任何新信息，

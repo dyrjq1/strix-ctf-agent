@@ -1,8 +1,8 @@
 """compete.py 调度策略的纯函数单测（无网络）。
 
 钉的是比赛日会反复发生的四类决策：
-  1. 先做哪些题——难度/类别/可解性证据/门控的排序；
-  2. 什么时候放弃——连败次数进 deferred；
+  1. 先做哪些题——按动态积分剩余价值（``solves_count``）、类别/门控的排序；
+  2. 什么时候放弃——连败次数进 deferred（尾巴题有独立预算）；
   3. 后期是否重跑——deferred 题的 solves_count 跳变是「其实可解」信号；
   4. 跨题记忆的简略层——digest 一行一题，且不含任何答案细节
      （全局记忆与题内上下文必须隔开）。
@@ -55,17 +55,34 @@ def test_solved_closed_are_not_queued_but_qa_only_is() -> None:
 
 
 def test_easier_difficulty_ranks_first() -> None:
-    """动态积分：早解优先，easy 先打。"""
+    """同价值档位内 easy 先打（tie-break：更快出分、早解优先）。"""
     chals = [_chal("hard-1", difficulty="hard"), _chal("easy-1")]
     queue, _ = compete.rank_queue(chals, {}, set())
     assert [c["id"] for c in queue] == ["easy-1", "hard-1"]
 
 
-def test_proven_solvable_ranks_above_zero_solve() -> None:
-    """solves_count 是唯一难度代理：零解出题压后，等可解性证据。"""
-    chals = [_chal("solo", solves_count=0), _chal("known", solves_count=5)]
+def test_zero_solve_ranks_above_widely_solved_tail() -> None:
+    """动态积分：他队解得越少，剩余分值越高——先打尾巴题。
+
+    2026-11-15 改。旧策略（零解出压后 + 难度 hard 最低权重）在"每题固定分值"
+    下成立，在 ``dynamic_points`` 下正好反了：入围赛实测 2 队解出的 crypto 题
+    值 970 分、占榜首总分 68.7%，200+ 队解出的 misc 题只剩地板价；而名次
+    3–79 共 77 队分数完全相同（442），说明中位题对名次零贡献。
+    """
+    chals = [_chal("tail", solves_count=2), _chal("crowd", solves_count=200)]
     queue, _ = compete.rank_queue(chals, {}, set())
-    assert [c["id"] for c in queue] == ["known", "solo"]
+    assert [c["id"] for c in queue] == ["tail", "crowd"]
+
+
+def test_value_ordering_is_monotone_in_solver_count() -> None:
+    """价值代理只需单调：解出数越少排越前，跨难度标签成立。"""
+    chals = [
+        _chal("many", solves_count=25),
+        _chal("few", solves_count=1, difficulty="hard"),
+        _chal("none", solves_count=0, difficulty="hard"),
+    ]
+    queue, _ = compete.rank_queue(chals, {}, set())
+    assert [c["id"] for c in queue] == ["none", "few", "many"]
 
 
 def test_web_ranks_above_other_categories_at_same_tier() -> None:
@@ -81,6 +98,31 @@ def test_consecutive_failures_defer_the_question() -> None:
     assert queue == []
     assert state["A"]["status"] == compete.DEFERRED
     assert any("deferred" in n for n in notes)
+
+
+def test_tail_question_keeps_retrying_past_the_short_budget() -> None:
+    """尾巴题（他队解出 ≤5 队）有独立重试预算：连败 2 次不判死。
+
+    依据：独立重试是弱模型上证据最强的杠杆（多一次新上下文单题 27.3%→45.5%，
+    NDSS LASTx 2026；InterCode-CTF @1 89%→@5 95%）。而在 0–2 队解出的题上，
+    deferred 复活所需的 solves_count +3 整场比赛都可能等不到——旧策略等于
+    让最值钱的题在第二次失败后永久出局。
+    """
+    state = {"A": {"status": "active", "fails": 2, "runs": 2}}
+    queue, _ = compete.rank_queue(
+        [_chal("A", solves_count=1)], state, set(), max_failures=2
+    )
+    assert [c["id"] for c in queue] == ["A"]
+    assert state["A"]["status"] != compete.DEFERRED
+
+
+def test_tail_question_still_defers_at_its_own_budget() -> None:
+    """预算不是无限：到 _TAIL_RETRY_BUDGET 仍要判死，否则会锁死车道。"""
+    state = {"A": {"status": "active", "fails": compete._TAIL_RETRY_BUDGET, "runs": 5}}
+    queue, notes = compete.rank_queue([_chal("A", solves_count=0)], state, set())
+    assert queue == []
+    assert state["A"]["status"] == compete.DEFERRED
+    assert any("连败" in n for n in notes)
 
 
 def test_deferred_requeues_when_solves_count_jumps() -> None:
