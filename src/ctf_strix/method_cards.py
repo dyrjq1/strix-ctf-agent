@@ -143,6 +143,12 @@ CARDS: tuple[Card, ...] = (
         "JWT：`exec_command` 解 header 看 alg；alg=none 与弱密钥各试一次；分清“验签失败”与“解析失败”。",
     ),
     _card(
+        "predictable_code,authentication_failures,otp,mfa,two_factor,account_merge,"
+        "2fa_bypass,account_recovery,password_reset",
+        "认证流程：`route_map` 列全登录/OTP/找回/绑定端点并画状态机；先测顺序再测值——同码重放、"
+        "跳步、乱序提交、A 的对象带进 B 的会话；每步记状态码与长度差，合并/绑定类看哪侧属性被覆盖。",
+    ),
+    _card(
         "idor,broken_access_control,mass_assignment,2fa_bypass,account_merge",
         "越权：两个账号互换同名资源 id，看是否 200 且内容不同；`traffic_list` 回看已发请求里的 id/role 字段。两个账号放两个具名会话（session 参数分别写 alice 与 bob），否则后登录的会把前一个的 cookie 覆盖掉。",
     ),

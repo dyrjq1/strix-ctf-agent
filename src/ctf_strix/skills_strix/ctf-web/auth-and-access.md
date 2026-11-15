@@ -1,5 +1,29 @@
 # CTF Web - Auth & Access Control Attacks
 
+## Procedure: multi-step auth flows (read first)
+
+Failures in these challenges are almost never a wrong value; they are the wrong *step*. A
+register -> login -> OTP -> recover -> bind/merge flow is a state machine, and the check is often
+placed on the value while the order goes unchecked.
+
+1. **Draw the state machine.** `route_map` for the endpoint list, then `http_probe` each one with
+   the flow's own token; write down every node and the field that node consumes. Missing nodes are
+   usually the bug: a "step 2" reachable without "step 1", or a bind endpoint that never verifies.
+2. **One observable per step.** Status code, body length, which fields appear, timing. Two steps
+   answering identically run the same check — do not spend a second payload there.
+3. **Test the flow, not the value.** Replay one code twice, skip a step, submit steps out of order,
+   fire the same request twice concurrently, and carry account A's object reference into B's
+   session. Any acceptance here is the intended class of bug; write it down as the finding before
+   trying to cash it in.
+4. **Merge/bind flows: prepare two controlled accounts** (named sessions `alice` and `bob`), merge,
+   then read which side's attributes survived. The overwritten side is the privilege you inherited.
+5. **Exit:** a higher-privilege session or the flag. If every ordering probe is rejected the state
+   machine is sound — switch to the value side (code derivation: time seed, short numeric space,
+   predictable PRNG, code reuse across users) instead of trying more orderings.
+
+Discriminating test: the same code or token accepted in a different step order, or a later step
+reachable on its own.
+
 ## Table of Contents
 - [Password/Secret Inference from Public Data](#passwordsecret-inference-from-public-data)
 - [Login Form Brute-Force](#login-form-brute-force)

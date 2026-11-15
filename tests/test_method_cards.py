@@ -216,6 +216,31 @@ def test_cve_adaptation_section_exists_in_the_pack() -> None:
     assert "controlled observation" in text
 
 
+def test_auth_flow_card_fires_on_flow_tags() -> None:
+    for tags in (
+        ["predictable_code"],
+        ["authentication_failures", "2fa_bypass"],
+        ["account_merge"],
+    ):
+        cards = method_cards.select(tags, "web")
+        assert any("认证流程" in card.text for card in cards), tags
+
+
+def test_auth_flow_card_outranks_the_object_swap_card() -> None:
+    """Both fire on an account-merge tag; the flow check must come first."""
+    got = [card.text for card in method_cards.select(["account_merge"], "web")]
+    assert len(got) >= 2
+    assert "认证流程" in got[0]
+
+
+def test_auth_flow_procedure_exists_in_the_pack() -> None:
+    from ctf_strix.skillpack import PACK_DIR
+
+    text = (PACK_DIR / "ctf-web" / "auth-and-access.md").read_text(encoding="utf-8")
+    assert "Procedure: multi-step auth flows" in text
+    assert "state machine" in text
+
+
 def test_select_keeps_every_card_when_all_its_tools_are_installed() -> None:
     """The filter is a subset test: a complete registry changes nothing."""
     every = [key for card in method_cards.CARDS for key in card.keys]
