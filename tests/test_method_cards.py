@@ -241,6 +241,23 @@ def test_auth_flow_procedure_exists_in_the_pack() -> None:
     assert "state machine" in text
 
 
+def test_supply_chain_card_fires_on_install_tags() -> None:
+    for tags in (
+        ["software_supply_chain", "malicious_install"],
+        ["dependency_confusion"],
+        ["typosquatting"],
+    ):
+        cards = method_cards.select(tags, "web")
+        assert any("供应链" in card.text for card in cards), tags
+
+
+def test_supply_chain_card_points_at_a_real_section() -> None:
+    from ctf_strix.skillpack import PACK_DIR
+
+    text = (PACK_DIR / "ctf-supply-chain" / "ctf-supply-chain.md").read_text(encoding="utf-8")
+    assert "First three probes" in text
+
+
 def test_select_keeps_every_card_when_all_its_tools_are_installed() -> None:
     """The filter is a subset test: a complete registry changes nothing."""
     every = [key for card in method_cards.CARDS for key in card.keys]
