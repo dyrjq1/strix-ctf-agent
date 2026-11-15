@@ -118,6 +118,22 @@ def test_multi_question_teaching_still_present() -> None:
     assert "ANSWER[<问题id>]=" in brief
 
 
+# ---------------------------------------------------------------- 门控问题
+def test_brief_carries_finish_the_chain_discipline() -> None:
+    """门控问题不会出现在 payload 里，靠这条与题面字符串无关的纪律兜住。
+
+    平台实测（2026-11-16）：capture 掉第一问后 ``questions`` 仍只有那一问，
+    两个问题都解完的题也一样。所以"全部都要交"的发条对这类题不响，而题面
+    description 里写着第二步——agent 拿到第一个 flag 就收工，后半段白丢。
+    """
+    detail = {"description": "step 1: read the token; step 2: promote bob",
+              "questions": [{"id": "flag"}]}
+    brief = batch_eval._challenge_brief(detail)
+    assert "多步" in brief and "做完再收工" in brief
+    # 只在单问题题上多这一行；flag 单问题题的 ANSWER 教学仍保持原样。
+    assert "ANSWER[" not in brief
+
+
 
 # ---------------------------------------------------------------- B-4 契约行
 def test_per_question_answers_maps_lines_to_qids() -> None:

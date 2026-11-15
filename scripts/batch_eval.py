@@ -2697,6 +2697,16 @@ def _challenge_brief(detail: dict) -> str:
             "并保持这个值不再改动——评测脚本只按这个格式取答案，"
             "写在摘要段落里等于没交。\n"
         )
+    # 门控问题在 payload 里根本不存在（2026-11-16 实测：capture 掉第一问之后，
+    # questions 仍然只有那一问；两个问题都解完的题也一样），所以上面"全部都要
+    # 交"和"含 checker"两条规则对这类题一声不响。题面 description 则把整条链
+    # 写全了（先取什么、再打哪个接口），人类照做即得分；agent 拿到第一个 flag
+    # 就收工，后半段白丢。这里补一条与题面字符串无关的收工纪律。
+    lines.append(
+        "完成度：题面若把解法写成多步（第一步 / 第二步 / Step 1 / 然后……），"
+        "每一步都要真正做完再收工；由平台侧（judge / checker）自动判定的步骤"
+        "不需要你提交字符串，做完即自动记账。\n"
+    )
     moves = _tag_moves(tags)
     if moves:
         lines.append(moves)

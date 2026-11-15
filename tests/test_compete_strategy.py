@@ -418,3 +418,66 @@ def test_attempt_box_leaves_a_hard_attempt_room_to_finish() -> None:
     否则「省时间」会变成「全都跑不完」。
     """
     assert compete._ATTEMPT_BOX_S * compete._WALL_TIER["hard"] >= 4 * 114
+
+
+# ---------------------------------------------------------------- 题表分页
+class _Resp:
+    """只够 fetch_challenges 用的最小响应对象。"""
+
+    def __init__(self, body: dict) -> None:
+        self._body = body
+
+    def raise_for_status(self) -> None:
+        return None
+
+    def json(self) -> dict:
+        return self._body
+
+
+def _fake_pages(monkeypatch, total_ids: list[str], *, total=None, ignore_offset=False):
+    """装一个按 offset/limit 切页的假平台，返回调用记录。"""
+    calls: list[tuple[int, int]] = []
+
+    def fake_get(url, headers=None, params=None, timeout=None):
+        params = params or {}
+        off = 0 if ignore_offset else int(params.get("offset") or 0)
+        lim = int(params.get("limit") or 50)
+        calls.append((off, lim))
+        page = [{"id": cid} for cid in total_ids[off:off + lim]]
+        body = {"items": page, "limit": lim, "offset": off}
+        if total is not None:
+            body["total"] = total
+        return _Resp(body)
+
+    monkeypatch.setattr(compete.requests, "get", fake_get)
+    return calls
+
+
+def test_challenge_table_pages_until_total(monkeypatch) -> None:
+    """真平台契约 ``{items, limit, offset, total}`` 且默认 limit=50。
+
+    只取一页时，超过一页的比赛会静默少一半题：不入账、不派单、digest 里也不
+    出现，看上去像"平台就这么多题"——是漏题而不是调度取舍。150 题必须三页到齐。
+    """
+    ids = [f"T-{i:03d}" for i in range(150)]
+    calls = _fake_pages(monkeypatch, ids, total=len(ids))
+    got = compete.fetch_challenges("t", "c")
+    assert [c["id"] for c in got] == ids
+    assert calls == [(0, compete._PAGE_LIMIT), (100, compete._PAGE_LIMIT)]
+
+
+def test_challenge_table_without_total_stays_single_page(monkeypatch) -> None:
+    """没有 ``total``（老后端 / 精简 payload）时退回一页就停，行为不变。"""
+    calls = _fake_pages(monkeypatch, ["A", "B"], total=None)
+    got = compete.fetch_challenges("t", "c")
+    assert [c["id"] for c in got] == ["A", "B"]
+    assert len(calls) == 1
+
+
+def test_challenge_table_stops_when_a_page_repeats(monkeypatch) -> None:
+    """服务端忽略 offset（永远回第一页）时不能死循环，也不能重复入账。"""
+    ids = [f"T-{i:03d}" for i in range(150)]
+    calls = _fake_pages(monkeypatch, ids, total=150, ignore_offset=True)
+    got = compete.fetch_challenges("t", "c")
+    assert [c["id"] for c in got] == ids[: compete._PAGE_LIMIT]
+    assert len(calls) == 2  # 第二页没有新 id → 停

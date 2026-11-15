@@ -296,17 +296,43 @@ def build_digest(state: dict[str, Any], challenges: list[dict[str, Any]]) -> str
 # ---------------------------------------------------------------- 平台 I/O
 
 
+#: 题表分页实测契约（2026-11-16，真平台）：``{items, limit, offset, total}``，
+#: **默认 ``limit=50``**。只取首页 = 超过 50 题的比赛静默少一半题：不入账、不派单、
+#: digest 里也不出现，看上去像"平台就这么多题"。
+_PAGE_LIMIT = 100
+#: total 撒谎（服务端永远说还剩）时的刹车。4000 题远超任何真实比赛。
+_MAX_PAGES = 40
+
+
 def fetch_challenges(token: str, cid: str, timeout: int = 30) -> list[dict[str, Any]]:
-    """拉全量题表（分页 dict → items 列表）。失败抛异常，由主循环兜。"""
-    r = requests.get(
-        f"{PLATFORM}/api/v1/competitions/{cid}/challenges",
-        headers={"Authorization": f"Bearer {token}"},
-        timeout=timeout,
-    )
-    r.raise_for_status()
-    data = r.json()
-    items = data.get("items") if isinstance(data, dict) else data
-    return [c for c in (items or []) if isinstance(c, dict)]
+    """拉全量题表（分页 dict → items 列表）。失败抛异常，由主循环兜。
+
+    按 ``total`` 翻页到齐为止。``total`` 缺失时退回"只取一页"的老行为；某页
+    没带来任何新 id 也停——服务端忽略 offset 时不会变成死循环。
+    """
+    out: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    offset = 0
+    for _ in range(_MAX_PAGES):
+        r = requests.get(
+            f"{PLATFORM}/api/v1/competitions/{cid}/challenges",
+            headers={"Authorization": f"Bearer {token}"},
+            params={"limit": _PAGE_LIMIT, "offset": offset},
+            timeout=timeout,
+        )
+        r.raise_for_status()
+        data = r.json()
+        items = data.get("items") if isinstance(data, dict) else data
+        page = [c for c in (items or []) if isinstance(c, dict)]
+        fresh = [c for c in page if str(c.get("id")) not in seen]
+        for c in fresh:
+            seen.add(str(c.get("id")))
+        out.extend(fresh)
+        total = data.get("total") if isinstance(data, dict) else None
+        if not page or not fresh or not isinstance(total, int) or len(out) >= total:
+            break
+        offset += len(page)
+    return out
 
 
 def fetch_scoreboard(token: str, cid: str, timeout: int = 30) -> dict[str, Any]:
