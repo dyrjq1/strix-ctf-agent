@@ -1468,6 +1468,11 @@ _STALL_LINE_RE = re.compile(
     r"\| stall: max=(\d+) hits=(\d+) class_max=(\d+) class_hits=(\d+)"
 )
 
+#: Mechanism-class counts, printed between the finish fields and the stall
+#: suffix. Optional on purpose: archived lines predate the field, and the
+#: sidecar is the fallback for a run killed before its summary line.
+_MECH_LINE_RE = re.compile(r"\| mechanisms: ([^|\n]+)")
+
 
 def _int_field(value: object) -> int:
     """把 JSON 里的计数安全转成 int（缺失/None/坏值都记 0）。"""
@@ -1487,6 +1492,49 @@ def _stall_fields(block: object) -> dict[str, int]:
         "class_max": _int_field(block.get("class_max")),
         "class_hits": _int_field(block.get("class_hits")),
     }
+
+
+def _mechanism_fields(state: object) -> dict[str, object]:
+    """从 sidecar 里抬出机制类别计数与台账写入次数。
+
+    ``mechanisms`` 说的是这一场到底碰了哪些 CAPEC 类别；不抬进结果行，
+    就只能靠离线重放 transcript 才能恢复，"整场待在一个类别里"和"守卫
+    根本没装"在表上长得一样。旧 sidecar 没有这两个键，读成"没观测到"，
+    不是错误。
+    """
+    out: dict[str, object] = {"mechanisms": {}, "ledger_injections": 0}
+    if not isinstance(state, dict):
+        return out
+    body = state.get("mechanisms")
+    if isinstance(body, dict):
+        counts = {
+            str(name): _int_field(count)
+            for name, count in body.items()
+            if str(name).strip()
+        }
+        if counts:
+            out["mechanisms"] = counts
+    finish = state.get("finish")
+    if isinstance(finish, dict):
+        out["ledger_injections"] = _int_field(finish.get("ledger_injections"))
+    return out
+
+
+def _parse_mechanism_line(log: str) -> dict[str, int]:
+    """解析冻结汇总行里的 ``| mechanisms: name=count,...`` 段。"""
+    m = _MECH_LINE_RE.search(log)
+    if not m:
+        return {}
+    body = m.group(1).strip()
+    if not body or body in {"(none)", "none"}:
+        return {}
+    counts: dict[str, int] = {}
+    for part in body.split(","):
+        name, sep, value = part.partition("=")
+        name = name.strip()
+        if sep and name:
+            counts[name] = _int_field(value)
+    return counts
 
 
 def _parse_guard(
@@ -1528,6 +1576,8 @@ def _parse_guard(
         "stall_hits": 0,
         "class_max": 0,
         "class_hits": 0,
+        "mechanisms": {},
+        "ledger_injections": 0,
         **v11_fields(None),
     }
     m = _GUARD_LINE_RE.search(log)
@@ -1554,7 +1604,17 @@ def _parse_guard(
         # 不能当成"行为良好"的证据。标出来，免得又被读成"今天没触发"。
         out["mount_broken"] = out["reach"] == 0
         # v1.1 counters are only in the sidecar; the line format is frozen.
-        out.update(v11_fields(read_state(guard_state)))
+        state = read_state(guard_state)
+        out.update(v11_fields(state))
+        # The mechanism breakdown is on the line but was never lifted into the
+        # result row; the sidecar carries it too and wins when they disagree.
+        line_mechanisms = _parse_mechanism_line(log)
+        if line_mechanisms:
+            out["mechanisms"] = line_mechanisms
+        sidecar_mechanisms = _mechanism_fields(state)
+        if sidecar_mechanisms["mechanisms"]:
+            out["mechanisms"] = sidecar_mechanisms["mechanisms"]
+        out["ledger_injections"] = sidecar_mechanisms["ledger_injections"]
         return out
 
     state = read_state(guard_state)
@@ -1580,6 +1640,7 @@ def _parse_guard(
         journey_prompts=_int_field(journey.get("prompts")),
         finish_refused=_int_field(finish.get("refused")),
         **_stall_fields(state.get("stall")),
+        **_mechanism_fields(state),
         **v11_fields(state),
     )
     # 文件存在时只看启动时 verify_mount 的结果：True→装好了；False→没装上。

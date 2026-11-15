@@ -255,3 +255,54 @@ def test_an_old_log_without_the_suffix_still_parses() -> None:
 
     assert parsed["reach"] == 7
     assert parsed["stall_max"] == 0 and parsed["class_hits"] == 0
+
+
+def test_mechanism_counts_and_ledger_reach_the_result_row(tmp_path: Path) -> None:
+    """The mechanism breakdown and provenance counters must be in the row.
+
+    They used to live only in the sidecar, so "the run stayed inside one
+    CAPEC class" and "the guard never ran" produced the same result row.
+    """
+    state = _write(
+        tmp_path,
+        _state(
+            mechanisms={"injection": 4, "traversal": 2},
+            finish={"refused": 2, "allowed": 5, "ledger_injections": 3},
+        ),
+    )
+
+    from_sidecar = batch_eval._parse_guard("", state)
+    assert from_sidecar["mechanisms"] == {"injection": 4, "traversal": 2}
+    assert from_sidecar["ledger_injections"] == 3
+
+
+def test_mechanism_counts_parse_from_the_summary_line() -> None:
+    """A printed line is authoritative and carries the breakdown even with no sidecar."""
+    guard = SimpleNamespace(
+        counts={"k": 2},
+        mechanism_counts=lambda: {"injection": 2, "traversal": 1},
+        observe_calls=9,
+    )
+    journey = SimpleNamespace(
+        wall_hit=0, authed=False, created=False, payloads=0, prompts=0, observe_calls=0
+    )
+    finisher = SimpleNamespace(refusals=0, allowed=0)
+    line = run_strix_ctf._guard_summary(guard, journey, finisher, reached=9)
+
+    parsed = batch_eval._parse_guard(line)
+
+    assert parsed["mechanisms"] == {"injection": 2, "traversal": 1}
+    # The ledger counter has no slot on the frozen line: absent means zero.
+    assert parsed["ledger_injections"] == 0
+
+
+def test_old_sidecar_without_mechanisms_yields_empty_mapping(tmp_path: Path) -> None:
+    """An older sidecar reads as "none observed", never as an error."""
+    body = _state()
+    body.pop("mechanisms")
+    state = _write(tmp_path, body)
+
+    parsed = batch_eval._parse_guard("", state)
+
+    assert parsed["mechanisms"] == {}
+    assert parsed["ledger_injections"] == 0

@@ -280,6 +280,10 @@ def _guard_state_payload(
         "finish": {
             "refused": finisher.refusals,
             "allowed": finisher.allowed,
+            # Only in the sidecar: the frozen summary line has no slot for it,
+            # and "the ledger actually wrote something" is exactly the
+            # instrument check an A/B needs (docs/32 §11.5).
+            "ledger_injections": int(getattr(finisher, "ledger_injections", 0)),
         },
         "mechanisms": {name: int(count) for name, count in counts.items()},
         "mount_verified": bool(mount_verified),
