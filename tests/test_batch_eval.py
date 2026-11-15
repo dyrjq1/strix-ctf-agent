@@ -188,6 +188,8 @@ def test_main_records_guard_without_name_error(workdir: Path, monkeypatch) -> No
             "--token",
             "t",
             "--no-archive",
+            # 这组测的是跑批记录，不是派单闸门；闸门有自己的单测。
+            "--no-canary",
         ],
     )
 
@@ -530,7 +532,8 @@ def _run_single(workdir: Path, monkeypatch, client_cls, log: str = ANSWER_LOG) -
     monkeypatch.setattr(
         sys,
         "argv",
-        ["batch_eval.py", "--plan", str(plan), "--out", str(out), "--token", "t", "--no-archive"],
+        ["batch_eval.py", "--plan", str(plan), "--out", str(out), "--token", "t",
+         "--no-archive", "--no-canary"],
     )
     assert batch_eval.main() == 0
     return json.loads(out.read_text(encoding="utf-8").splitlines()[-1])

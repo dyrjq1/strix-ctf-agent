@@ -680,6 +680,34 @@ class Client:
             return iid
         return None
 
+    def canary(self) -> tuple[bool, str]:
+        """只读探针：确认 token 至少能读一次实例列表。
+
+        403 有两种完全不同的含义，必须分开：
+        - 响应体含 ``competition_required`` ⇒ 只是缺 competition 作用域，
+          凭据是好的（CLAUDE.md 记过这条误判）；
+        - 其余 401/403 ⇒ 凭据失效/被回收，**这一批一题都不该跑**。
+
+        网络抖动与 5xx 不在这里判死：那是 ``launch`` 的退避重试该处理的事，
+        把一次超时升级成「整批停跑」比漏判更糟。
+
+        Returns:
+            ``(ok, detail)``；``ok=False`` 只代表凭据/权限问题。
+        """
+        params = {"competition_id": self.competition_id} if self.competition_id else {}
+        try:
+            r = self.s.get(f"{PLATFORM}/api/v1/instances", params=params, timeout=30)
+        except requests.RequestException as exc:
+            return True, f"skip:network:{type(exc).__name__}"
+        if r.status_code == 200:
+            return True, "ok"
+        if r.status_code in (401, 403):
+            body = (r.text or "")[:400]
+            if "competition_required" in body:
+                return True, "ok:competition_required"
+            return False, f"auth:{r.status_code}"
+        return True, f"skip:http:{r.status_code}"
+
     def launch(self, challenge_id: str, attempts: int = 5) -> str:
         """起一个实例。先兜底清理残留，再启动，平台故障时退避重试。
 
@@ -3134,6 +3162,126 @@ def _kill_group(proc: subprocess.Popen) -> None:
             os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
 
 
+#: 派单闸门的开关。``CTF_CANARY=0`` / ``--no-canary`` 可整体关掉。
+_CANARY_OFF = ("0", "false", "off", "no")
+
+
+def _probe_endpoint(client: Client, target, target_kind: str) -> tuple[bool, str]:
+    """按目标类型探一次可达性。四种口径不能混：
+    TCP 要原始套接字、UDP 没有 connect 探测、附件题没有网络目标、web 走 HTTP。
+    """
+    if target_kind == "tcp":
+        return _probe_tcp(target)
+    if target_kind == "udp":
+        # UDP 无连接，"connect 探测"不成立。中继已经起来，可达性由构建保证；
+        # 真发数据报需要题目协议，探测会误判并换掉好实例。
+        return True, "udp relay open"
+    if target_kind == "file":
+        return True, "file-only"
+    return client.probe_reachable(target)
+
+
+#: 同实例重探的等待序列（秒）。2026-11-15 docs/40 §5：7 道题在单次抖动后
+#: 永久失联，而「node4 不可达 / ready 后端口未起」都是瞬断——换实例常常换来
+#: 同一个坏节点，还多付一次起停与配额。先在同一实例上等 30+60 秒再换。
+_PROBE_REUSE_WAITS = (30, 60)
+
+
+def _probe_reuse_waits(env=None) -> tuple[int, ...]:
+    """``CTF_PROBE_REUSE=0`` 时返回空序列（回到「立刻换实例」的旧行为）。"""
+    env = os.environ if env is None else env
+    if str(env.get("CTF_PROBE_REUSE", "")).strip().lower() in _CANARY_OFF:
+        return ()
+    return _PROBE_REUSE_WAITS
+
+
+def _reprobe(probe, waits=(30, 60), sleep=time.sleep):
+    """在同一实例上重探，直到出现可达。
+
+    Returns:
+        ``(ok, detail, waited_s)``；``waits`` 为空时等价于不重探。
+    """
+    waited = 0.0
+    detail = ""
+    for pause in waits:
+        sleep(pause)
+        waited += float(pause)
+        ok, detail = probe()
+        if ok:
+            return True, detail, waited
+    return False, detail, waited
+
+
+#: ``wait_ready`` 超时后，沿用同一实例再等一轮的秒数（docs/40 §8-B）。
+#: 实测 017/018 启动要 4–6 分钟；被旧 180s 上限判死的题，再等一轮就能起。
+_READY_REUSE_TIMEOUT = 180
+
+
+def _ready_reuse_timeout(env=None) -> int:
+    """``CTF_READY_REUSE=0`` 关掉复用；给数字则用该秒数（默认 180）。"""
+    env = os.environ if env is None else env
+    raw = str(env.get("CTF_READY_REUSE", "")).strip()
+    if raw.lower() in _CANARY_OFF:
+        return 0
+    if raw.isdigit():
+        return int(raw)
+    return _READY_REUSE_TIMEOUT
+
+
+def _canary_enabled(env=None) -> bool:
+    env = os.environ if env is None else env
+    return str(env.get("CTF_CANARY", "")).strip().lower() not in _CANARY_OFF
+
+
+def _canary_exit_code() -> int:
+    """闸门拒绝时的退出码：沿用 ``llm_preflight.EXIT_CODE``（3）。
+
+    与「一题跑完但没解出」区分开——后者才写结果行。
+    """
+    try:
+        from ctf_strix import llm_preflight
+
+        return int(llm_preflight.EXIT_CODE)
+    except Exception:  # noqa: BLE001 — 模块缺席时仍要有一个稳定值
+        return 3
+
+
+def _canary_llm(env=None) -> tuple[bool, str]:
+    """一次 1-token 探针。只有「端点明确拒绝」才返回 False。
+
+    探针缺席、被显式关闭、provider 不在探测白名单、超时 —— 一律放行，
+    宁可漏判也不能因为探针本身的问题停掉整批。
+    """
+    try:
+        from ctf_strix import llm_preflight
+    except Exception as exc:  # noqa: BLE001
+        return True, f"skip:import:{type(exc).__name__}"
+    env = os.environ if env is None else env
+    if not llm_preflight.enabled(env):
+        return True, "skip:disabled"
+    res = llm_preflight.probe(env=env)
+    if res.ok:
+        return True, res.reason or "ok"
+    return False, f"{res.kind}:{res.reason}"
+
+
+def _dispatch_canary(client: Client, env=None) -> tuple[bool, str]:
+    """开跑前的整队闸门：平台凭据 + LLM 端点各探一次。
+
+    2026-11-13 实测：一个失效的 LLM key 连续烧掉 10 道题的派单，
+    ``compete`` 还把每题记成 failed（两连败后整题 deferred）。
+    这里把「环境不可用」和「题目失败」彻底分开：闸门不过 ⇒ 整批停跑、
+    一题都不派、一行结果都不写。
+    """
+    ok, detail = client.canary()
+    print(f"[canary] platform ok={ok} {detail}", flush=True)
+    if not ok:
+        return False, f"platform:{detail}"
+    ok_llm, detail_llm = _canary_llm(env)
+    print(f"[canary] llm ok={ok_llm} {detail_llm}", flush=True)
+    return ok_llm, f"llm:{detail_llm}"
+
+
 def main() -> int:
     p = argparse.ArgumentParser()
     p.add_argument("--plan", required=True, help="JSON 文件：题目计划")
@@ -3171,6 +3319,11 @@ def main() -> int:
         "--retry-notes", default="",
         help="重试注入：上一轮失败路径文件（由 compete 按题生成，只含同题事实）",
     )
+    p.add_argument(
+        "--no-canary", action="store_true",
+        help="关掉开跑前的整队闸门（平台凭据 + LLM 端点各探一次）；"
+             "仅用于故障演练，默认开",
+    )
     args = p.parse_args()
 
     plan = json.loads(Path(args.plan).read_text(encoding="utf-8"))
@@ -3199,6 +3352,20 @@ def main() -> int:
     if args.competition_id:
         # CLI 覆盖优先于环境变量：显式参数比进程环境更贴近本次调用意图。
         client.competition_id = args.competition_id.strip()
+
+    # 派单闸门：环境不可用 ⇒ 一题都不跑、一行结果都不写。
+    # 放在「按难度分层预算」之前：预算还没用上就该停了。
+    if args.no_canary or not _canary_enabled():
+        print("[canary] 已关闭（--no-canary / CTF_CANARY=0）", flush=True)
+    else:
+        ok, detail = _dispatch_canary(client)
+        if not ok:
+            print(
+                f"[canary] ok=False {detail} —— 停队：本批不派任何题，也不写结果行"
+                "（环境问题不是题目失败）",
+                flush=True,
+            )
+            return _canary_exit_code()
 
     # 按难度分层预算，但**上限要贴着实测值**，不能拍脑袋放大。
     #
@@ -3264,7 +3431,17 @@ def main() -> int:
         try:
             t0 = time.time()
             iid = client.launch(cid)
-            target = client.wait_ready(iid)
+            try:
+                target = client.wait_ready(iid)
+            except TimeoutError as exc:
+                # B-31（docs/40 §8-B）：超时先别销毁重起。实例往往只是慢，
+                # 同实例再等一轮比重新排队便宜；换实例还可能落到同一个坏节点。
+                extra = _ready_reuse_timeout()
+                if not extra:
+                    raise
+                print(f"  ! {exc}；实例还在，沿用同一实例再等 {extra}s", flush=True)
+                target = client.wait_ready(iid, timeout=extra)
+                rec["ready_reuse_s"] = extra
             rec["launch_s"] = round(time.time() - t0, 1)
 
             # TCP / VPN 题必须建桥。不建的话 `_public_url()` 会把它拼成
@@ -3304,20 +3481,27 @@ def main() -> int:
             # 「ready」是平台对实例状态的说法，不是从这台机器能连上的证明。
             # 实测踩过：实例正常、沙箱 curl 全程 000，agent 把整道题的预算
             # 都花在重试上。坏实例要当场发现，不能让它先烧掉十几分钟。
-            if target_kind == "tcp":
-                reachable, detail = _probe_tcp(target)
-            elif target_kind == "udp":
-                # UDP 无连接，"connect 探测"不成立。中继已经起来，可达性由
-                # 构建保证；真发数据报需要题目协议，探测会误判并换掉好实例。
-                reachable, detail = True, "udp relay open"
-            elif target_kind == "file":
-                # 纯附件题没有网络目标，可达性由「文件已下载」保证。
-                reachable, detail = True, "file-only"
-            else:
-                reachable, detail = client.probe_reachable(target)
+            reachable, detail = _probe_endpoint(client, target, target_kind)
             rec["reachable"] = reachable
             if not reachable:
-                print(f"  ! 不可达（{detail}），换一个实例重试", flush=True)
+                # 先在同一实例上重探（docs/40 §5 / B-31）：单次抖动就让 7 道题
+                # 永久失联，而「node4 不可达」「ready 后端口未起」都是瞬断。
+                # 换实例要重新排队、占配额，节点级故障时还换到同一个坏节点。
+                waits = _probe_reuse_waits()
+                if waits:
+                    print(f"  ! 不可达（{detail}），先在同一实例上重探 {waits}", flush=True)
+                    ok, detail2, waited = _reprobe(
+                        lambda: _probe_endpoint(client, target, target_kind), waits
+                    )
+                    if ok:
+                        reachable, detail = True, detail2
+                        rec["reachable"] = True
+                        rec["reprobe_s"] = waited
+                        print(f"  重探可达（{waited:.0f}s，{detail2}）", flush=True)
+                    else:
+                        detail = detail2
+                if not reachable:
+                    print(f"  ! 仍不可达（{detail}），换一个实例重试", flush=True)
                 if bridge is not None:
                     bridge.stop()
                     bridge = None
@@ -3334,12 +3518,7 @@ def main() -> int:
                     rec["service"] = {"host": real_host, "access": access, "bridge": target}
                     rec["vpn"] = {"iface": tunnel.iface} if tunnel else None
                 rec["target"] = target
-                if target_kind == "tcp":
-                    reachable, detail = _probe_tcp(target)
-                elif target_kind == "udp":
-                    reachable, detail = True, "udp relay open"
-                else:
-                    reachable, detail = client.probe_reachable(target)
+                reachable, detail = _probe_endpoint(client, target, target_kind)
                 rec["reachable"] = reachable
                 if not reachable:
                     msg = f"两个实例都不可达: {detail}"

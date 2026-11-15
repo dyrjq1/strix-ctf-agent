@@ -283,8 +283,9 @@ def _run_plan(workdir: Path, monkeypatch, fake_run_agent, argv_extra=()) -> dict
     monkeypatch.setattr(
         sys,
         "argv",
+        # 这组测的是采样重开策略，不是派单闸门；闸门有自己的单测。
         ["batch_eval.py", "--plan", str(plan), "--out", str(out), "--token", "t",
-         "--no-archive", *argv_extra],
+         "--no-archive", "--no-canary", *argv_extra],
     )
     assert batch_eval.main() == 0
     return json.loads(out.read_text(encoding="utf-8").splitlines()[-1])

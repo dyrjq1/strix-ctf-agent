@@ -91,6 +91,9 @@ PLATFORM = batch_eval.PLATFORM if hasattr(batch_eval, "PLATFORM") else "https://
 #: 状态机：active（可跑）/ running / solved / failed / deferred（放弃，
 #: 等 solves_count 跳变或收尾 sweep）。
 ACTIVE, RUNNING, SOLVED, FAILED, DEFERRED = "active", "running", "solved", "failed", "deferred"
+#: 子进程在写结果行之前就退了（派单闸门拒绝 / 环境不备）。**不是题目失败**：
+#: 不计 fails、不 defer，稍后重派。与 skipped 的区别是连一行结果都没有。
+INFRA = "infra"
 
 #: 基础分：动态积分下早解优先，easy 先打（快分 + 名次优势）。
 _DIFFICULTY_WEIGHT = {"easy": 300, "medium": 200, "hard": 100}
@@ -414,6 +417,17 @@ def save_state(state_dir: Path, state: dict[str, Any]) -> None:
     os.replace(tmp, state_dir / "state.json")
 
 
+def _row_count(state_dir: Path, cid: str) -> int:
+    """这题的结果文件里现在有几条记录（判「本轮有没有写新行」）。"""
+    p = state_dir / "runs" / f"{cid}.jsonl"
+    if not p.exists():
+        return 0
+    try:
+        return sum(1 for line in p.read_text(encoding="utf-8").splitlines() if line.strip())
+    except OSError:
+        return 0
+
+
 def read_last_result(state_dir: Path, cid: str) -> dict[str, Any] | None:
     """读 batch_eval 给这题追加的最后一条 jsonl 记录（判成败的唯一依据）。"""
     p = state_dir / "runs" / f"{cid}.jsonl"
@@ -572,11 +586,20 @@ def _failure_lines(rec: dict[str, Any]) -> list[str]:
 
 
 def _collect(
-    cid: str, state: dict[str, Any], state_dir: Path
+    cid: str, state: dict[str, Any], state_dir: Path, exit_code: int | None = None
 ) -> str:
     """子进程退出后收账：以 jsonl 最后一条记录为准（不信退出码，冒烟 #8）。"""
     rec = read_last_result(state_dir, cid) or {}
     state_rec = state.setdefault(cid, {})
+    # 派单闸门/环境不备：子进程在写第一行结果之前就退了。原实现会把
+    # **上一轮**的最后一条记录当本轮结果——既可能重复记一次旧失败，也会把
+    # 「整批停跑」记成题目失败（11-13 一个坏 key 连烧 10 道题就是这么来的）。
+    rows_before = state_rec.get("rows_before")
+    if rows_before is not None and _row_count(state_dir, cid) <= int(rows_before):
+        state_rec["status"] = ACTIVE
+        state_rec["one_line"] = f"infra: no result row (exit {exit_code})"
+        state_rec["infra_stops"] = int(state_rec.get("infra_stops") or 0) + 1
+        return INFRA
     if state_rec.get("status") == SOLVED:
         # B-28：平台已解回灌的题，本地一次判负不得把它降级成 failed。
         return SOLVED
@@ -661,6 +684,9 @@ def main() -> int:
     lane_of: dict[str, int] = {}
     stop = False
     last_solve_sync = 0.0
+    #: 连续「一行结果都没写」的车道数——用来把环境停跑的退避拉长到 5 分钟，
+    #: 而不是每 poll 秒重派一次。任何一次正常收车就清零。
+    infra_streak = 0
 
     def _sigint(_sig, _frm):
         nonlocal stop
@@ -784,6 +810,8 @@ def main() -> int:
                 break
             session_warned = False
             rec = state.setdefault(cid, {})
+            # 收车时用来判「本轮有没有写结果行」；必须在启动子进程之前取。
+            rec["rows_before"] = _row_count(state_dir, cid)
             rec["status"] = RUNNING
             used = set(lane_of.values())
             lane = next(i for i in range(args.lanes) if i not in used)
@@ -820,9 +848,21 @@ def main() -> int:
                     continue
                 del running[cid]
                 lane_of.pop(cid, None)
-                status = _collect(cid, state, state_dir)
+                status = _collect(cid, state, state_dir, exit_code=proc.returncode)
                 if status == SOLVED:
                     my_solved.add(cid)
+                if status == INFRA:
+                    infra_streak += 1
+                    wait = min(300.0, 15.0 * (2 ** min(infra_streak - 1, 4)))
+                    print(
+                        f"[compete] {cid} 未派成（环境问题，不计失败），"
+                        f"{wait:.0f}s 后再试",
+                        flush=True,
+                    )
+                    save_state(state_dir, state)
+                    time.sleep(wait)
+                    continue
+                infra_streak = 0
                 save_state(state_dir, state)
                 print(f"[compete] {cid} 收车：{status}", flush=True)
                 break
