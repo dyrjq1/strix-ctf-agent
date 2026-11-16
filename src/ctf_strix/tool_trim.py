@@ -13,6 +13,7 @@ UPLOADLABS-001 上消耗了 27.6% 的调用预算且对拿 flag 零贡献。
 
 from __future__ import annotations
 
+import os
 from typing import Final
 
 #: 记账类工具：产出渗透测试交付物，CTF 下不计分。
@@ -290,8 +291,27 @@ def install_ctf_toolset(
             from ctf_strix import parallel
 
             parallel.install()
-        except Exception:  # noqa: BLE001 - the tool surface must still install
-            pass
+            # ``race_spawn`` belongs on this seam, not only on the official
+            # entrypoint: whoever keeps the agent-graph tools needs the
+            # one-call spawn too, or the A/B arm measures a surface the
+            # delivered image does not have.  Ledger §4.249.
+            if parallel.register_race_tool():
+                print("[trim] race_spawn registered", flush=True)
+        except Exception as exc:  # noqa: BLE001 - the tool surface must still install
+            print(f"[trim] race_spawn skipped: {type(exc).__name__}", flush=True)
+
+    # 失败→下一步提示默认关，A/B 之后再决定默认值（台账 §4.250）。
+    if os.environ.get("CTF_RECOVERY_NOTICE", "").strip() in ("1", "true", "on"):
+        try:
+            from ctf_strix import recovery_notice
+
+            recovery_notice.install()
+            print("[trim] recovery notice installed", flush=True)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[trim] recovery notice skipped: {type(exc).__name__}", flush=True)
+    class_block = os.environ.get("CTF_CLASS_BLOCK", "").strip().lower()
+    if class_block not in ("", "0", "off", "false", "no"):
+        print("[trim] class block installed", flush=True)
     return dropped
 
 
