@@ -250,22 +250,29 @@ _TURNS: dict[str, str] = {
 #: two mutually exclusive directions remain and both can be checked from the
 #: evidence already collected.  Everything else is faster single-threaded.
 _RACE = """\
-## Parallel hypothesis race (opt-in)
+## Parallel hypothesis race
 
-The agent-graph tools are present for this run. They are not a general
-invitation to delegate: the default is still to solve the challenge yourself.
+The agent-graph tools are present for this run and they are part of the expected
+topology. After the first recon pass tells you what the challenge is, the next
+move is usually not one more probe -- it is to split the search.
 
-- **Spawn only after recon, and only with two directions.** Before spawning,
-  list the candidate directions in `think`. Spawn only when that list contains
-  at least two directions that (a) are mutually exclusive -- confirming one
-  rules the other out -- and (b) can each be checked with the evidence you
-  already have. Then spawn **one** child per direction, at most **two**
-  children for the whole run.
-- **Do not spawn** when a direction is already ahead on evidence, when the
-  challenge is small enough to finish in a few calls, when the candidates are
-  variations of one mechanism, or when you cannot name what would falsify a
-  direction. In those cases keep working yourself; `finish_scan` is closer
-  than `create_agent`.
+- **Split in `think` before you split in `create_agent`.** Name the directions,
+  what each would prove, and the single check that would falsify it. A direction
+  is real only if the tools you already have can decide it.
+- **Spawn whenever more than one direction is live.** Alternative mechanisms,
+  alternative entry points, alternative sources of credentials, alternative
+  encodings, a version-specific path versus a logic path: these are separate
+  probes and belong to separate agents. Spawn **one** child per direction, and
+  at most **two** children for the whole run.
+- **Work first, spawn second, never wait.** The spawn call returns immediately;
+  keep your own line of investigation running while the child works. Sitting
+  idle after spawning wastes the budget you were trying to save.
+- **Do not spawn** for a single mechanical step, for a direction already ahead
+  on evidence, or when you cannot name what would falsify it. Those you do
+  yourself.
+- **A run that only ever tried one line of investigation did not use the
+  topology it was given.** If the answer never appears and the trace shows one
+  line of attack from start to finish, the search was too narrow.
 - **One child, one direction.** Every `create_agent` brief must contain:
   1. the single hypothesis and the exact check that would falsify it;
   2. the facts already established (paths, credentials/session state, files,
