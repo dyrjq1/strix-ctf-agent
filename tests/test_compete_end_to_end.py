@@ -147,6 +147,7 @@ def _run(monkeypatch, base: str, state_dir: Path, spawned: list, *,
             "plan": plan,
             "attempt": attempt,
             "direction": direction[0] if direction else None,
+            "failure_path": list(failure_path or []),
         })
         rec = {"challenge": str(chal["id"]), "correct": correct}
         if not correct:
@@ -238,6 +239,25 @@ def test_a_failed_challenge_spends_its_tail_budget_then_defers(
     assert len(set(later)) == len(later), "同一次 --once 里重派用了同一个方向"
     assert rec["direction"] == later[-1]
     assert len(rec["directions"]) == min(5, len(later))
+
+
+def test_directions_switch_off_is_the_control_arm(platform, monkeypatch, tmp_path):
+    """``CTF_REDISPATCH=0``：重派仍带失败路径，但不再换入口方向。
+
+    关掉换向不能顺手把失败路径也关掉——那是两个独立变量，一起关掉 A/B 就
+    测不出换向本身的贡献。对照臂还要求 state 里不留方向痕迹。
+    """
+    monkeypatch.setenv(compete.DIRECTIONS_ENV, "0")
+    base, p = platform([_chal("CHAL-1")])
+    spawned: list = []
+    _run(monkeypatch, base, tmp_path, spawned, correct=False)
+    assert len(spawned) > 1, "尾巴题预算没跑起来，测不到重派"
+    assert all(s["direction"] is None for s in spawned), spawned
+    assert spawned[0]["failure_path"] == [], "首跑不该有失败路径"
+    assert spawned[1]["failure_path"], "对照臂丢了失败路径，与实验臂不等价"
+    state = json.loads((tmp_path / "state.json").read_text(encoding="utf-8"))
+    assert state["CHAL-1"].get("direction") is None
+    assert not state["CHAL-1"].get("directions")
 
 
 def test_a_deadline_in_the_past_exits_without_touching_the_platform(

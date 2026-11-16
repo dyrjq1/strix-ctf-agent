@@ -15,6 +15,8 @@ import re
 import sys
 from pathlib import Path
 
+import pytest
+
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "scripts"))
 sys.path.insert(0, str(ROOT / "vendor" / "src"))
@@ -592,6 +594,22 @@ def test_each_attempt_moves_to_a_different_direction() -> None:
     """连续重派必须换向：第 2、3 次尝试不能给出同一个类别。"""
     seen = [compete.entry_direction(n)[0] for n in (2, 3, 4)]
     assert len(set(seen)) == len(seen)
+
+
+@pytest.mark.parametrize("value", ["0", "false", "no", "off", " OFF ", "False"])
+def test_directions_can_be_switched_off(monkeypatch, value: str) -> None:
+    """关掉开关 = A/B 的对照臂：与 ``CTF_BROWSER`` 同形，只认否定的那四个词。"""
+    monkeypatch.setenv(compete.DIRECTIONS_ENV, value)
+    assert compete.directions_enabled() is False
+
+
+@pytest.mark.parametrize("value", ["", "1", "true", "yes", "on", "anything"])
+def test_directions_default_on_and_accept_no_positive_override(
+    monkeypatch, value: str
+) -> None:
+    """没有正向覆盖：除那四个否定词外一律生效，拼错的开关不会静默改行为。"""
+    monkeypatch.setenv(compete.DIRECTIONS_ENV, value)
+    assert compete.directions_enabled() is True
 
 
 def test_plan_item_is_untouched_by_the_direction() -> None:

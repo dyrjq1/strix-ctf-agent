@@ -190,6 +190,18 @@ _ENTRY_DIRECTIONS: tuple[tuple[str, str], ...] = (
 )
 
 
+#: 消融开关，形状与 ``CTF_BROWSER`` / ``CTF_CARDS_OFF`` 一致：只有
+#: ``0/false/no/off`` 关掉，没有正向覆盖。关掉时 ``entry_direction`` 的结果被
+#: 丢弃，重派退回改动前的行为（只带失败路径），用于 A/B 的另一臂。
+DIRECTIONS_ENV = "CTF_REDISPATCH"
+
+
+def directions_enabled() -> bool:
+    """换向是否生效（A/B 的一臂靠它关掉）。"""
+    raw = os.environ.get(DIRECTIONS_ENV, "").strip().lower()
+    return raw not in {"0", "false", "no", "off"}
+
+
 def entry_direction(attempt: int) -> tuple[str, str] | None:
     """第 ``attempt`` 次尝试（1 起）该走的入口方向；首跑不注入。
 
@@ -1050,8 +1062,9 @@ def main() -> int:
             rec["rows_before"] = _row_count(state_dir, cid)
             rec["status"] = RUNNING
             # 第几次尝试决定入口方向：失败过的题换一个机制类别起步，首跑不注入。
+            # ``CTF_REDISPATCH=0`` 时退回改动前的行为，A/B 的对照臂靠它。
             attempt = int(rec.get("runs") or 0) + 1
-            direction = entry_direction(attempt)
+            direction = entry_direction(attempt) if directions_enabled() else None
             if direction is not None:
                 rec["direction"] = direction[0]
                 rec["directions"] = (
