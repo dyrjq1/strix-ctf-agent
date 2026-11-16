@@ -48,6 +48,15 @@ def test_run_agent_puts_tags_on_the_child_command() -> None:
     assert "cmd += _tags_arg(tags)" in BE_SRC
 
 
+def test_cards_off_switch_reaches_the_child_and_the_row() -> None:
+    """The card A/B arms share one working tree, so arm A only exists if the
+    switch is forwarded to the child env -- and only checkable if each row
+    records which arm it belongs to (the 11-14 P0-4 ablation ran both arms
+    identical precisely because the switch was not forwarded)."""
+    assert '"CTF_CARDS_OFF": os.environ.get("CTF_CARDS_OFF", "")' in BE_SRC
+    assert 'rec["cards_off"] = os.environ.get("CTF_CARDS_OFF", "")' in BE_SRC
+
+
 def test_both_run_agent_call_sites_pass_tags() -> None:
     """Instance path and QA path: a challenge answered without a target still
     carries the tags its challenge was published with."""

@@ -188,6 +188,46 @@ def test_cve_tag_shape_selects_the_adaptation_card() -> None:
         assert cards and "已知 CVE" in cards[0].text, tags
 
 
+def test_cards_off_env_drops_exactly_the_named_card(monkeypatch) -> None:
+    """A card's A/B arms must differ by that card and nothing else.
+
+    The CVE target tags also select the Java stack card; suppressing the
+    adaptation card must leave that one in place, otherwise arm A is measuring
+    two ablations at once.
+    """
+    tags = ["cve_2017_9805", "apache_struts2"]
+    baseline = method_cards.render(tags, "web")
+    assert "已知 CVE" in baseline
+
+    monkeypatch.setenv("CTF_CARDS_OFF", "historical_cve")
+    without = method_cards.render(tags, "web")
+    assert "已知 CVE" not in without
+    assert "[Web playbook]" in without
+    assert "Java 栈" in without
+    assert len(without) < len(baseline)
+
+
+def test_cards_off_env_is_a_no_op_when_blank_or_unknown(monkeypatch) -> None:
+    tags = ["cve_2017_9805"]
+    baseline = method_cards.render(tags, "web")
+    for value in ("", "  ", "no_such_card"):
+        monkeypatch.setenv("CTF_CARDS_OFF", value)
+        assert method_cards.render(tags, "web") == baseline, value
+
+
+def test_cards_off_env_is_case_insensitive_and_listed(monkeypatch) -> None:
+    tags = ["historical_cve"]
+    monkeypatch.setenv("CTF_CARDS_OFF", " Historical_CVE , sqli ")
+    assert "已知 CVE" not in method_cards.render(tags, "web")
+
+
+def test_cards_off_keeps_select_pure(monkeypatch) -> None:
+    """The table-level API must not read the ablation switch."""
+    tags = ["historical_cve"]
+    monkeypatch.setenv("CTF_CARDS_OFF", "historical_cve")
+    assert any("已知 CVE" in card.text for card in method_cards.select(tags, "web"))
+
+
 def test_cve_shape_does_not_match_unrelated_tags() -> None:
     for tags in (["cve"], ["cve_2021"], ["xcve_2021_3129"], ["cve_2021_312"]):
         assert all("已知 CVE" not in card.text for card in method_cards.select(tags, "web")), tags

@@ -27,6 +27,7 @@ catches a typo in a card nobody happens to hit).
 
 from __future__ import annotations
 
+import os
 import re
 from collections.abc import Collection
 from dataclasses import dataclass
@@ -299,6 +300,19 @@ def select(
     return out
 
 
+def _disabled_keys() -> frozenset[str]:
+    """Card keys the ``CTF_CARDS_OFF`` env switch suppresses.
+
+    Ablation-only: a card's A/B arms must differ by exactly that card, and the
+    batch harness runs both arms from one working tree (ledger §4.235).  Unset,
+    blank or unknown keys return an empty set, so the default is byte-identical
+    to the pre-switch behaviour.  Keys are compared case-insensitively, the same
+    way :func:`select` treats incoming tags.
+    """
+    raw = os.environ.get("CTF_CARDS_OFF", "")
+    return frozenset(k.strip().lower() for k in raw.split(",") if k.strip())
+
+
 def render(
     tags: Iterable[str] | None,
     kind: str | None = None,
@@ -309,8 +323,15 @@ def render(
     Cards are appended in priority order and the loop stops before the block
     would exceed :data:`MAX_CHARS`, so the lowest-priority cards are the ones
     dropped.  A run with no matching card injects nothing at all.
+
+    Cards whose key set intersects ``CTF_CARDS_OFF`` are dropped before the
+    budget loop, exactly as if they were not in the table.  ``select`` stays
+    pure so the table-level tests can keep calling it without env noise.
     """
     cards = select(tags, kind, available=available)
+    disabled = _disabled_keys()
+    if disabled:
+        cards = [card for card in cards if not (card.keys & disabled)]
     if not cards:
         return ""
     lines = [PLAYBOOK]

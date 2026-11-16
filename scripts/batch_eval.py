@@ -282,6 +282,11 @@ SUITES = {
     # 解析不到；真值取自 ctfwork/run_pg_1113.py 的运行时覆写
     # (PLAYGROUND = "bc60dc1764f34413964a547102f17261")。
     "SAMPLE": "bc60dc1764f34413964a547102f17261",
+    # 2026-11-16: CVE 套件（1474 题）此前只靠 /api/v1/suites 兜底解析；Go 后端
+    # 上线后该端点 404（§4.211 之后的迁移），CVE-2018-18778 这类题会以
+    # RoutingError 整题秒退。cap=1，与 CTFARENA 同级。id 取自 list_competitions
+    # 的 suite 行（title=CVE）。
+    "CVE": "52f4b0d57e644549934e343813a9ad8e",
 }
 
 #: `GET /api/v1/suites` 的解析结果缓存：前缀 → suite id。
@@ -3388,6 +3393,9 @@ def run_agent(
         # 能力消融开关同理：批跑验证「关掉探针」的对照臂必须能传进去，否则
         # 两条臂实际是同一条（2026-11-14 P0-4 消融臂事故）。
         "CTF_VIABILITY": os.environ.get("CTF_VIABILITY", ""),
+        # 方法卡 A/B（台账 §4.235）：A 臂必须是「这张卡不在」，只能靠环境开关
+        # 让同一份工作树渲染出两臂；不转发就等于两臂同一份提示词。
+        "CTF_CARDS_OFF": os.environ.get("CTF_CARDS_OFF", ""),
         "STRIX_TELEMETRY": "false",
         # 每次 LLM 调用后原子落盘。进程被墙钟 SIGKILL 时，run_strix_ctf 末尾那行
         # `[usage]` 永远不会打印——两条 A/B 臂就这么丢了 token 数（只能记 n/a）。
@@ -3948,6 +3956,10 @@ def main() -> int:
                 )
                 brief = f"{brief}\n\n{note}" if brief else note
             rec["brief_chars"] = len(brief)
+            # 方法卡消融臂在结果行里可查。臂别靠命令行复述：一次跑批可能几十
+            # 行，「哪一行属于哪条臂」必须落盘（§4.209 的教训是同型事故的
+            # 另一种：两臂提示词完全一样而结果表看不出来）。
+            rec["cards_off"] = os.environ.get("CTF_CARDS_OFF", "")
             # 每题默认一次机会；--max-samples>1 时，只有「有证据的早停」才
             # 换策略重开（见 _resample_allowed）。判据与重开决定都在 harness
             # 这一侧：agent 只负责把「停在哪」落盘（host/family/mechanism/

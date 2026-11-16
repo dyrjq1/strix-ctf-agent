@@ -358,6 +358,26 @@ def test_suite_for_uses_static_table_without_network(monkeypatch):
     assert called["n"] == 0
 
 
+def test_suite_for_routes_cve_without_the_dead_suites_endpoint(monkeypatch):
+    """CVE-* must resolve from the static table.
+
+    ``/api/v1/suites`` answered 404 from 2026-11-15 (Go backend), so the
+    fallback cannot resolve anything new; a CVE challenge would exit the item
+    with RoutingError before any instance is started.
+    """
+    import batch_eval
+
+    def boom(*a, **k):  # noqa: ANN002, ANN003
+        raise AssertionError("CVE must not need the network")
+
+    monkeypatch.setattr(batch_eval, "_fetch_suite_map", boom)
+    batch_eval._SUITE_CACHE.clear()
+
+    assert batch_eval.suite_for("CVE-2018-18778") == "52f4b0d57e644549934e343813a9ad8e"
+    # CTFARENA must still win for its own ids (prefix collisions stay ordered).
+    assert batch_eval.suite_for("CTFARENA-058") == "4394a10aa5d24f97a1ec3301ca718a45"
+
+
 def test_suite_for_falls_back_to_platform_suites(monkeypatch):
     """XBOW 这种静态表里没有的套件，必须靠 /api/v1/suites 兜底，而不是整题崩掉。
 
