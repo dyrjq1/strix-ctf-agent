@@ -309,6 +309,9 @@ def install_ctf_toolset(
             print("[trim] recovery notice installed", flush=True)
         except Exception as exc:  # noqa: BLE001
             print(f"[trim] recovery notice skipped: {type(exc).__name__}", flush=True)
+    class_block = os.environ.get("CTF_CLASS_BLOCK", "").strip().lower()
+    if class_block not in ("", "0", "off", "false", "no"):
+        print("[trim] class block installed", flush=True)
     return dropped
 
 

@@ -110,6 +110,17 @@ _STALL_REPEAT = 4
 _CLASS_STREAK_AFTER = _STALL_AFTER
 _CLASS_STREAK_REPEAT = _STALL_REPEAT
 
+#: How many consecutive probes of the *same* mechanism class with no new
+#: observation before that class is hard-refused.  Why 8 and not 6 or 10:
+#: ``_STALL_AFTER`` is 6 across *all* classes, where any novelty anywhere
+#: clears it; a single class is a narrower question and legitimately needs a
+#: few payload variations (a blind extraction stays inside one class), so the
+#: per-class budget sits one step above the cross-class one.  It is not 10
+#: because the class hint already fires at 6 with no observed change of
+#: direction, so the extra two calls buy nothing.  The two thresholds stay
+#: separate constants so tuning one cannot silently move the other.
+_CLASS_BLOCK_AFTER: Final[int] = 8
+
 #: How many *consecutive never-before-requested paths* make a run of requests a
 #: shape rather than navigation.  Physical basis: one unseen path is how every
 #: request to a new route looks; two in a row, neither carrying any mechanism
@@ -741,6 +752,54 @@ def _structure_enabled() -> bool:
     }
 
 
+def _class_block_enabled() -> bool:
+    """Opt-in switch for the mechanism-class hard block (default **off**).
+
+    Off by default because the per-class budget is an experiment: the family
+    block and the class *hint* already ship, and turning a hint into a refusal
+    changes which calls reach the target.  The A/B decides the default; this
+    switch keeps both arms one env var apart.
+    """
+    return os.environ.get("CTF_CLASS_BLOCK", "0").strip().lower() not in {
+        "0",
+        "off",
+        "false",
+        "no",
+    }
+
+
+#: Transport failures that mean the call never reached the target.  They are
+#: not observations: no page was returned, so counting one as "same response
+#: again" charges the model for the network, and a jittery target would block
+#: an otherwise healthy family.  Each pattern is the literal text the client
+#: (curl, urllib, the shell capability) emits, matched case-insensitively.
+_UNREACHABLE_PATTERNS: Final[tuple[tuple[str, re.Pattern[str]], ...]] = (
+    ("refused", re.compile(r"connection refused", re.I)),
+    ("reset", re.compile(r"connectionreseterror", re.I)),
+    ("timeout", re.compile(r"\btimed out\b", re.I)),
+    ("dns", re.compile(r"temporary failure in name resolution", re.I)),
+    ("tls", re.compile(r"\bsslerror\b", re.I)),
+    ("closed", re.compile(r"\[tcp\] connection closed", re.I)),
+)
+
+
+def _unreachable(result: Any) -> str | None:
+    """Return the transport-failure kind when the call never reached the host.
+
+    Args:
+        result: the tool result.
+
+    Returns:
+        A short kind (``refused`` / ``reset`` / ``timeout`` / ``dns`` /
+        ``tls`` / ``closed``), or ``None`` for a real response.
+    """
+    text = result if isinstance(result, str) else str(result)
+    for kind, pattern in _UNREACHABLE_PATTERNS:
+        if pattern.search(text):
+            return kind
+    return None
+
+
 class EnumExhausted(BaseException):
     """The model kept retrying a hard-blocked family instead of rerouting.
 
@@ -758,6 +817,21 @@ class EnumExhausted(BaseException):
         super().__init__(message)
         self.family = family
         self.refusals = refusals
+
+
+class _ProbeToken(tuple):
+    """``(key, args)`` with the predicted mechanism class attached.
+
+    The class refusal has to run before the tool, so :meth:`begin` classifies
+    the call there; :meth:`finish` still re-derives the class because the
+    leaf/breadth fallbacks need a response.  Keeping the token a plain
+    2-tuple keeps every existing caller (tests, ``observe``) unchanged.
+    """
+
+    def __new__(cls, key: str | None, args: str, mechanism: str | None) -> "_ProbeToken":
+        token = super().__new__(cls, (key, args))
+        token.mechanism = mechanism
+        return token
 
 
 class EnumerationGuard:
@@ -851,6 +925,23 @@ class EnumerationGuard:
         self._run_paths: set[str] = set()
         #: Consecutive calls that asked for a path this run had never requested.
         self.new_path_streak: int = 0
+        #: Mechanism classes the class block has refused from now on.  Only
+        #: populated while ``CTF_CLASS_BLOCK`` is on; empty otherwise.
+        self.blocked_classes: set[str] = set()
+        #: Calls refused because their mechanism class was blocked.
+        self.class_blocked_calls: int = 0
+        #: The class of the immediately preceding classified probe and how many
+        #: probes that class has gone without a new observation (inclusive of
+        #: the first one).  Strictly consecutive: another class resets the run.
+        self._class_run: str | None = None
+        self._class_misses: int = 0
+        #: Observations already seen *within one class*, ignoring path family.
+        #: The family counters treat a new name as new information; the class
+        #: question is "was this answer new to this hypothesis", so a different
+        #: URL returning the same page is still zero information here.
+        self._class_seen: dict[str, set[str]] = {}
+        #: Unreachable-notice kinds already shown this run (one notice each).
+        self._unreachable_noticed: set[str] = set()
 
     def mechanism_counts(self) -> dict[str, int]:
         """Return a read-only snapshot of the per-CAPEC-class probe counts.
@@ -894,6 +985,8 @@ class EnumerationGuard:
             "max_class_streak": self.max_class_streak,
             "stall_hits": self.stall_hits,
             "class_hits": self.class_hits,
+            "blocked_classes": sorted(self.blocked_classes),
+            "class_blocked_calls": self.class_blocked_calls,
         }
 
     def note_answer(self) -> None:
@@ -916,6 +1009,11 @@ class EnumerationGuard:
         self.exhausted_family = None
         self.stall = 0
         self.class_streak = 0
+        self.blocked_classes.clear()
+        self._class_run = None
+        self._class_misses = 0
+        self._class_seen.clear()
+        self._unreachable_noticed.clear()
 
     def soft_reset(self) -> None:
         """Drop the per-attempt escalation state, keep the hard blocks.
@@ -934,6 +1032,11 @@ class EnumerationGuard:
         """
         self.refusal_counts.clear()
         self.exhausted_family = None
+        # The class *blocks* are hard blocks and stay, like ``blocked``; only
+        # the per-attempt escalation counter is dropped, so the first call of a
+        # new attempt cannot inherit "one probe away from a refusal".
+        self._class_run = None
+        self._class_misses = 0
 
     def begin(self, tool_name: str, args: str) -> tuple[str | None, str]:
         """调用前登记。
@@ -943,10 +1046,17 @@ class EnumerationGuard:
             args: 原始参数串。
 
         Returns:
-            ``(族指纹, 参数串)``，交给 :meth:`finish` 结算。
+            ``(族指纹, 参数串)``，交给 :meth:`finish` 结算。它是
+            :class:`_ProbeToken`，额外带一个 ``mechanism`` 属性。
+
+        The third field is :func:`_mechanism_of` of the same argument blob
+        ``finish`` will classify, computed here because the hard class
+        refusal must happen *before* the tool runs.  It is only a prediction:
+        ``finish`` still applies the leaf/breadth fallbacks that need a
+        response.
         """
         self.observe_calls += 1
-        return _fingerprint(tool_name, args), args
+        return _ProbeToken(_fingerprint(tool_name, args), args, _mechanism_of(args))
 
     def refusal(self, token: tuple[str | None, str]) -> str | None:
         """Return the hard error when this call's family is already blocked.
@@ -960,20 +1070,28 @@ class EnumerationGuard:
         Returns:
             The short error text for a blocked family, otherwise ``None``.
         """
-        key, _args = token
-        if key is None or key not in self.blocked:
-            return None
-        self.blocked_calls += 1
-        self.refusal_counts[key] += 1
-        # Escalate to a run-level stop once the model has had
-        # ``_ENUM_REFUSAL_LIMIT`` chances to reroute.  The sink reads this and
-        # raises EnumExhausted; until then the cheap refusal is just a hint.
-        if (
-            self.exhausted_family is None
-            and self.refusal_counts[key] >= _ENUM_REFUSAL_LIMIT
-        ):
-            self.exhausted_family = key
-        return self._blocked_error(key)
+        key, args = token[:2]
+        mechanism = getattr(token, "mechanism", None) or _mechanism_of(args)
+        if key is not None and key in self.blocked:
+            self.blocked_calls += 1
+            self.refusal_counts[key] += 1
+            # Escalate to a run-level stop once the model has had
+            # ``_ENUM_REFUSAL_LIMIT`` chances to reroute.  The sink reads this
+            # and raises EnumExhausted; until then the cheap refusal is just a
+            # hint.
+            if (
+                self.exhausted_family is None
+                and self.refusal_counts[key] >= _ENUM_REFUSAL_LIMIT
+            ):
+                self.exhausted_family = key
+            return self._blocked_error(key)
+        # The class branch only fires for a call that classifies into a class
+        # that was already exhausted.  ``mechanism is None`` (a plain ``GET /``,
+        # an ``ls``) must never be refused: no class means no class evidence.
+        if mechanism is not None and mechanism in self.blocked_classes:
+            self.class_blocked_calls += 1
+            return self._class_blocked_error(mechanism)
+        return None
 
     def finish(self, token: tuple[str | None, str], result: Any) -> str | None:
         """调用后结算，返回要追加到结果末尾的提示（或 None）。
@@ -985,13 +1103,32 @@ class EnumerationGuard:
         Returns:
             提示文本；无需提示时返回 None。
         """
-        key, args = token
+        key, args = token[:2]
         if key is not None and key in self.blocked:
             # Not dead code even though the wrapper checks ``refusal`` first:
             # a concurrent tool call can block the family between ``begin``
             # and this call, and the public ``observe()`` path never runs
             # ``refusal`` at all.
             return self._blocked_error(key)
+        # A transport failure is not an observation.  Checked before every
+        # counter so a refused connection cannot advance ``stall``, register a
+        # ``_global`` signature, bump ``counts[key]``, or feed the class run --
+        # the "dead target blocks a healthy family" failure.  Gated by the same
+        # switch as the class block: with the switch off this branch is dead
+        # and the guard behaves exactly as before (the A/B arm must be the old
+        # code, not a partially fixed one).  The notice is per kind, once per
+        # run: the first one tells the model what happened, the rest would be
+        # noise inside an already-burning budget.
+        if _class_block_enabled():
+            unreachable = _unreachable(result)
+            if unreachable is not None:
+                if unreachable in self._unreachable_noticed:
+                    return None
+                self._unreachable_noticed.add(unreachable)
+                return (
+                    "\n\n[ENUMERATION GUARD] 目标不可达，这次不算一次尝试；"
+                    "先确认目标仍在线再继续"
+                )
         if _is_bundle_read(args):
             self.bundle_hits += 1
             if self.bundle_hits in (2, 4):
@@ -1086,6 +1223,25 @@ class EnumerationGuard:
                 self.max_class_streak = self.class_streak
             self.mechanisms[mechanism] += 1
             class_hint = self._class_hint(mechanism)
+            # Per-class "no new observation" run.  Only while the switch is
+            # on: with it off, the guard must not even keep this state, so the
+            # disabled path is the old code plus one dead branch.
+            if _class_block_enabled():
+                if mechanism != self._class_run:
+                    self._class_run = mechanism
+                    self._class_misses = 0
+                class_seen = self._class_seen.setdefault(mechanism, set())
+                if stall_sig in class_seen:
+                    self._class_misses += 1
+                else:
+                    class_seen.add(stall_sig)
+                    # Count the first probe too: ``_CLASS_BLOCK_AFTER`` probes
+                    # of one class with no new answer mean the *next* call is
+                    # refused.  Starting at zero would make it the tenth.
+                    self._class_misses = 1
+                if self._class_misses >= _CLASS_BLOCK_AFTER:
+                    self.blocked_classes.add(mechanism)
+                    return self._class_blocked_error(mechanism)
 
         n = self.counts[key]
         family = key.split("|")[-1]
@@ -1124,6 +1280,35 @@ class EnumerationGuard:
             "response too many times; this family is blocked. Change mechanism "
             "now: auth bypass, injection, SSRF pivot, file read, or use existing "
             "access. Do not resend this family. Switch method or get a session."
+        )
+
+    def _class_blocked_error(self, mechanism: str) -> str:
+        """Deterministic refusal naming three classes still worth trying.
+
+        The alternative list is derived from :data:`MECHANISM_NAMES` order and
+        the live state (untried first, then tried-but-unblocked), never from a
+        path, an id or a challenge-specific word: the same guard state always
+        yields the same sentence.
+        """
+        untried = [
+            name
+            for name in MECHANISM_NAMES
+            if name not in self.mechanisms and name not in self.blocked_classes
+        ]
+        other = [
+            name
+            for name in MECHANISM_NAMES
+            if name != mechanism
+            and name not in self.blocked_classes
+            and name not in untried
+        ]
+        choices = (untried + other)[:3]
+        alt_text = "/".join(choices) if choices else "(none left)"
+        return (
+            f"ERROR: [MECHANISM GUARD] '{mechanism}' is exhausted: the last "
+            f"{_CLASS_BLOCK_AFTER} probes of that class added no new "
+            f"observation. Do not send another '{mechanism}' probe. Switch "
+            f"mechanism to {alt_text} -- the one your existing evidence points at."
         )
 
     def _class_hint(self, mechanism: str) -> str | None:
