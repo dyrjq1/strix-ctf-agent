@@ -3396,6 +3396,10 @@ def run_agent(
         # 方法卡 A/B（台账 §4.235）：A 臂必须是「这张卡不在」，只能靠环境开关
         # 让同一份工作树渲染出两臂；不转发就等于两臂同一份提示词。
         "CTF_CARDS_OFF": os.environ.get("CTF_CARDS_OFF", ""),
+        # 并行竞速子 agent（台账 §4.65，默认关）。同样必须转发：白名单漏掉它，
+        # ON 臂就是 OFF 臂，跑完只会得到"开了也没变化"的假象——11-14 消融臂
+        # 事故是同一类错。
+        "CTF_ALLOW_SUBAGENTS": os.environ.get("CTF_ALLOW_SUBAGENTS", ""),
         "STRIX_TELEMETRY": "false",
         # 每次 LLM 调用后原子落盘。进程被墙钟 SIGKILL 时，run_strix_ctf 末尾那行
         # `[usage]` 永远不会打印——两条 A/B 臂就这么丢了 token 数（只能记 n/a）。
