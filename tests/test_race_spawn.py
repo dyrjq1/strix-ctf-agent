@@ -41,10 +41,24 @@ class _Spawner:
 
 @pytest.fixture(autouse=True)
 def _clean(monkeypatch):
+    """Start from a surface that does not already carry ``race_spawn``.
+
+    ``register_race_tool`` short-circuits when the process-wide
+    ``factory._EXTRA_TOOLS`` already holds the tool (it is not per-test state),
+    so an earlier test that went through ``install_ctf_toolset`` with the switch
+    on would otherwise make ``captured`` empty here.
+    """
+    from strix.agents import factory
+
+    before_extra = tuple(factory._EXTRA_TOOLS)  # noqa: SLF001
+    factory._EXTRA_TOOLS[:] = [  # noqa: SLF001
+        t for t in before_extra if getattr(t, "name", "") != "race_spawn"
+    ]
     monkeypatch.delenv("CTF_ALLOW_SUBAGENTS", raising=False)
     parallel.reset_run()
     parallel._RACE_TOOL_INSTALLED = False
     yield
+    factory._EXTRA_TOOLS[:] = before_extra  # noqa: SLF001
     parallel.reset_run()
     parallel._RACE_TOOL_INSTALLED = False
 
