@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import ast
 import json
 import shutil
 import sys
@@ -1397,3 +1398,91 @@ def test_teardown_keeps_the_ledger_entry_when_the_delete_never_lands(
 
     data = json.loads(ledger.read_text(encoding="utf-8"))
     assert "iid-z" in (data.get("instances") or {})
+
+# --- 实例复用重探：成功之后不许再重建（2026-11-16 卡 A A/B 首题事故） --------
+# 事故形状：首探超时 -> 同实例重探 30s 后可达 -> 代码却照样拆实例、重新排队，
+# 新实例没等到就绪，整条臂记成 SKIPPED。缩进错了一层，单元测试当时没盖住，
+# 因为那段逻辑长在 main 的巨型循环里、没有可注入的边界。
+# 这里改从语法树上断言结构：拆实例的动作必须和「仍不可达」那条打印同属一个
+# `if not reachable:` 分支——重探成功就落不到它。
+
+
+def _if_nodes(test_operand: str):
+    tree = ast.parse((ROOT / "scripts" / "batch_eval.py").read_text(encoding="utf-8"))
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.If):
+            continue
+        test = node.test
+        if not (isinstance(test, ast.UnaryOp) and isinstance(test.op, ast.Not)):
+            continue
+        operand = test.operand
+        if isinstance(operand, ast.Name) and operand.id == test_operand:
+            yield node
+
+
+def _calls(node, attr: str):
+    for sub in ast.walk(node):
+        if isinstance(sub, ast.Call) and isinstance(sub.func, ast.Attribute):
+            if sub.func.attr == attr:
+                yield sub
+
+
+def _literal_text(node) -> str:
+    """把 print 的第一个实参折成字面文本（f-string 只取常量段）。"""
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value
+    if isinstance(node, ast.JoinedStr):
+        return "".join(
+            part.value
+            for part in node.values
+            if isinstance(part, ast.Constant) and isinstance(part.value, str)
+        )
+    return ""
+
+
+def _prints_marking(node, marker: str):
+    for sub in ast.walk(node):
+        if not (isinstance(sub, ast.Call) and isinstance(sub.func, ast.Name)):
+            continue
+        if sub.func.id != "print" or not sub.args:
+            continue
+        if marker in _literal_text(sub.args[0]):
+            yield sub
+
+
+def _if_with_direct_print(marker: str):
+    """外层 if 也「包含」那条打印，所以只认把打印放在自己 body 里的那一层。"""
+    for node in _if_nodes("reachable"):
+        for stmt in node.body:
+            if not (isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Call)):
+                continue
+            call = stmt.value
+            if not (isinstance(call.func, ast.Name) and call.func.id == "print"):
+                continue
+            if call.args and marker in _literal_text(call.args[0]):
+                yield node
+                break
+
+
+def test_rebuild_only_runs_after_the_reprobe_also_failed() -> None:
+    """重探可达之后不许 teardown/launch——否则一次抖动赔掉一整条臂。"""
+    guards = list(_if_with_direct_print("仍不可达"))
+    assert len(guards) == 1, "换实例的守卫找不到或不唯一"
+    guard = guards[0]
+    assert any(True for _ in _calls(guard, "teardown")), (
+        "teardown 不在「仍不可达」分支里：重探成功也会重建实例"
+    )
+    assert any(True for _ in _calls(guard, "launch")), (
+        "launch 不在「仍不可达」分支里：重探成功也会重新排队"
+    )
+
+
+def test_cards_off_is_recorded_before_the_instance_exists() -> None:
+    """实例没起来就 SKIP 的行也要能归属到某条臂（§4.236 的另一个教训）。"""
+    src = (ROOT / "scripts" / "batch_eval.py").read_text(encoding="utf-8")
+    init_at = src.index('rec = {"idx": idx, "challenge": cid')
+    arm_at = src.index('rec["cards_off"]')
+    launch_at = src.index("iid = client.launch(cid)")
+    assert init_at < arm_at < launch_at, (
+        "臂别要在 rec 初始化时就落盘，晚于起实例就会让 INFRA 行丢失臂别"
+    )

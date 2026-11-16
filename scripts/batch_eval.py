@@ -3775,6 +3775,9 @@ def main() -> int:
 
         rec = {"idx": idx, "challenge": cid, "difficulty": diff, "started": time.time()}
         rec["model"] = model or os.environ.get("STRIX_LLM", "")
+        # 消融臂别在这里就要落盘：实例没起来就 SKIP 的行也得能归属到某条臂，
+        # 否则一次 INFRA 就把「哪一臂丢了」从结果表上抹掉（§4.236 的教训）。
+        rec["cards_off"] = os.environ.get("CTF_CARDS_OFF", "")
         # 每次运行一个唯一名字。它同时是沙箱目录名和 agent name，所以
         # 唯一性直接等于"不会续跑"。随机后缀是防同一秒内的重复调用。
         run_id = _new_run_id(cid)
@@ -3874,29 +3877,33 @@ def main() -> int:
                     else:
                         detail = detail2
                 if not reachable:
+                    # 重探成功就继续用这个实例：重建要重新排队、再占一次配额，
+                    # 而「重探可达」已经证明服务是活的。这段曾经缩进错一层，
+                    # 于是重探成功也照样拆实例重来——第一次抖动就把一臂的
+                    # 数据赔进去（2026-11-16 卡 A A/B 首题，SKIPPED）。
                     print(f"  ! 仍不可达（{detail}），换一个实例重试", flush=True)
-                if bridge is not None:
-                    bridge.stop()
-                    bridge = None
-                if tunnel is not None:
-                    tunnel.down()
-                    tunnel = None
-                client.teardown(iid)
-                iid = client.launch(cid)
-                target = client.wait_ready(iid)
-                if isinstance(target, dict):
-                    bridge, tunnel, target, target_kind, real_host, access = _attach(
-                        iid, target, client
-                    )
-                    rec["service"] = {"host": real_host, "access": access, "bridge": target}
-                    rec["vpn"] = {"iface": tunnel.iface} if tunnel else None
-                rec["target"] = target
-                reachable, detail = _probe_endpoint(client, target, target_kind)
-                rec["reachable"] = reachable
-                if not reachable:
-                    msg = f"两个实例都不可达: {detail}"
-                    raise TimeoutError(msg)
-                print(f"  重建后可达 -> {target}", flush=True)
+                    if bridge is not None:
+                        bridge.stop()
+                        bridge = None
+                    if tunnel is not None:
+                        tunnel.down()
+                        tunnel = None
+                    client.teardown(iid)
+                    iid = client.launch(cid)
+                    target = client.wait_ready(iid)
+                    if isinstance(target, dict):
+                        bridge, tunnel, target, target_kind, real_host, access = _attach(
+                            iid, target, client
+                        )
+                        rec["service"] = {"host": real_host, "access": access, "bridge": target}
+                        rec["vpn"] = {"iface": tunnel.iface} if tunnel else None
+                    rec["target"] = target
+                    reachable, detail = _probe_endpoint(client, target, target_kind)
+                    rec["reachable"] = reachable
+                    if not reachable:
+                        msg = f"两个实例都不可达: {detail}"
+                        raise TimeoutError(msg)
+                    print(f"  重建后可达 -> {target}", flush=True)
             else:
                 print(f"  可达 ({detail})", flush=True)
 
@@ -3956,10 +3963,6 @@ def main() -> int:
                 )
                 brief = f"{brief}\n\n{note}" if brief else note
             rec["brief_chars"] = len(brief)
-            # 方法卡消融臂在结果行里可查。臂别靠命令行复述：一次跑批可能几十
-            # 行，「哪一行属于哪条臂」必须落盘（§4.209 的教训是同型事故的
-            # 另一种：两臂提示词完全一样而结果表看不出来）。
-            rec["cards_off"] = os.environ.get("CTF_CARDS_OFF", "")
             # 每题默认一次机会；--max-samples>1 时，只有「有证据的早停」才
             # 换策略重开（见 _resample_allowed）。判据与重开决定都在 harness
             # 这一侧：agent 只负责把「停在哪」落盘（host/family/mechanism/
