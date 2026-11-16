@@ -326,6 +326,42 @@ def active() -> tuple[str, tuple[str, ...] | None]:
     return _ACTIVE_KIND, _ACTIVE_GROUPS
 
 
+def _target_values(ctx: dict[str, Any] | None) -> list[str]:
+    """Target values from strix's per-run context, in either shape it uses.
+
+    ``authorized_targets`` arrives as ``[{"type": "url", "value": "..."}]`` or
+    as plain strings depending on the entrypoint; both are read here so the
+    scope registry and the rendered target block cannot disagree.
+    """
+    out: list[str] = []
+    for target in (ctx or {}).get("authorized_targets") or []:
+        if isinstance(target, dict):
+            value = target.get("value") or target.get("url") or ""
+        elif isinstance(target, str):
+            value = target
+        else:
+            value = ""
+        value = str(value).strip()
+        if value:
+            out.append(value)
+    return out
+
+
+def _seed_scope(ctx: dict[str, Any] | None) -> None:
+    """Hand the run's authorised hosts to the traffic ledger's scope audit.
+
+    Called before every early return in :func:`build`: the ledger must describe
+    the same run whether or not this prompt was the one rendered.  Failure is
+    swallowed -- accounting must never be able to break a run's prompt.
+    """
+    try:
+        from ctf_strix import traffic
+
+        traffic.set_authorized_targets(_target_values(ctx))
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def _targets_block(ctx: dict[str, Any] | None) -> str:
     """把本次 run 的授权目标渲染进提示（原 scope.jinja 的核心信息）。"""
     if not ctx:
@@ -525,6 +561,8 @@ def build(
     Returns:
         提示全文。
     """
+    _seed_scope(system_prompt_context)
+
     if os.environ.get("CTF_PROMPT_OFF", "").strip().lower() in ("1", "true", "yes"):
         # 回滚 / A/B 对照：退回 strix 原始的 103,541 字符通用提示。
         # 模式照传：退回原样应连 scan_mode 的语义一起退，而不是钉死 deep。

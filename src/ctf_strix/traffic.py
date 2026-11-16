@@ -44,6 +44,7 @@ import os
 import re
 import threading
 import time
+from collections.abc import Iterable
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Final
@@ -66,6 +67,65 @@ _ID_PATTERNS: Final = (
 )
 _PATH_RE: Final = re.compile(r'"(/api/[A-Za-z0-9_\-./{}$:]{2,120})"')
 
+#: Anything that looks like a host in a response.  Deliberately loose: a bare
+#: IP in a JSON body counts, because that is how a config dump names the next
+#: service, and missing it is how "in scope" gets misreported.
+_HOSTLIKE: Final = re.compile(
+    r"(?<![\w.-])((?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,62})\.)+[A-Za-z]{2,24})(?![\w-])"
+)
+_IPV4: Final = re.compile(r"(?<![\d.])(\d{1,3}(?:\.\d{1,3}){3})(?![\d.])")
+_URL_HOST: Final = re.compile(r"^[A-Za-z][A-Za-z0-9+.\-]*://([^/?#]+)")
+
+#: Hosts the task itself authorised.  Seeded from the run's system prompt
+#: context; empty means "use whatever the first exchange touched".
+_AUTHORIZED: set[str] = set()
+
+
+def _host(url: str) -> str:
+    """Host part of a URL, lowercased; empty when there is none."""
+    match = _URL_HOST.match((url or "").strip())
+    if not match:
+        return ""
+    return match.group(1).split("@")[-1].split(":")[0].strip().lower()
+
+
+def _hosts_in(text: str) -> set[str]:
+    """Host-like tokens in a response: DNS names and bare IPv4 addresses.
+
+    Bare IPs matter: a config dump names the next service as ``10.4.2.7`` with
+    no scheme, and a URL-only matcher would then call a *disclosed* host
+    "out of scope".
+    """
+    found = {m.group(1).lower() for m in _HOSTLIKE.finditer(text or "")}
+    found |= {m.group(1) for m in _IPV4.finditer(text or "")}
+    return found
+
+
+def set_authorized_targets(values: Iterable[str]) -> set[str]:
+    """Record the hosts this task was handed, for out-of-scope accounting.
+
+    Args:
+        values: URLs (or bare hosts) taken from the run's target list.
+
+    Returns:
+        The host set now in effect.
+    """
+    for value in values or ():
+        host = _host(value) or (value or "").strip().lower()
+        if host:
+            _AUTHORIZED.add(host)
+    return set(_AUTHORIZED)
+
+
+def authorized_hosts() -> set[str]:
+    """Hosts registered as in-scope for this process; empty means "unseeded"."""
+    return set(_AUTHORIZED)
+
+
+def reset_authorized_targets() -> None:
+    """Clear the registry.  Tests call it; a run never does."""
+    _AUTHORIZED.clear()
+
 
 @dataclass
 class Exchange:
@@ -84,6 +144,11 @@ class Exchange:
     elapsed: float = 0.0
     phase: str = ""
     note: str = ""
+    #: ``target`` / ``app_named`` / ``out_of_scope`` / ``""`` (no host at all).
+    #: Filled in by :meth:`TrafficLedger.add` at record time, when "what the app
+    #: had already named" is still knowable; recomputing it later from the file
+    #: cannot tell a host the app disclosed from one the model guessed.
+    scope: str = ""
 
     def brief(self) -> dict[str, Any]:
         """One-line view for ``list_requests``: no bodies."""
@@ -107,6 +172,28 @@ class TrafficLedger:
         self._items: list[Exchange] = []
         self._seq = 0
         self._write_failed = False
+        #: Hosts this run discovered by *reading the target* (a response body,
+        #: a header, a redirect target).  Following one of these is using the
+        #: app's own surface; a host in neither this set nor the authorised set
+        #: is the model's own guess.
+        self._named: set[str] = set()
+        #: Fallback target set, used only when nothing was authorised up front:
+        #: the first host contacted is taken as the task's own.
+        self._seeded: set[str] = set()
+
+    def _scope_for(self, url: str) -> str:
+        """Classify one destination against what was authorised or disclosed."""
+        host = _host(url)
+        if not host:
+            return ""
+        known = set(_AUTHORIZED) or set(self._seeded)
+        if host in known:
+            return "target"
+        if host in self._named:
+            return "app_named"
+        if not known:
+            return "target"  # first contact seeds the target set
+        return "out_of_scope"
 
     def next_id(self) -> str:
         """Reserve a short, stable id (``r12``) before the request is sent.
@@ -122,9 +209,19 @@ class TrafficLedger:
     def add(self, exchange: Exchange) -> None:
         """Append one exchange and persist it when a path is configured."""
         with self._lock:
+            exchange.scope = self._scope_for(exchange.url)
+            if exchange.scope == "target" and not _AUTHORIZED:
+                host = _host(exchange.url)
+                if host:
+                    self._seeded.add(host)
             self._items.append(exchange)
             if len(self._items) > _MAX_RECORDS:
                 del self._items[: len(self._items) - _MAX_RECORDS]
+            # Learn what this response disclosed *after* classifying the
+            # request: a host named in its own response does not retroactively
+            # make that request in-scope.
+            self._named |= _hosts_in(exchange.resp_body)
+            self._named |= _hosts_in(" ".join(exchange.resp_headers.values()))
             line = json.dumps(asdict(exchange), ensure_ascii=False)
         if self.path is None or self._write_failed:
             return
@@ -153,6 +250,8 @@ class TrafficLedger:
         """Drop everything.  Tests use this; a run never calls it."""
         with self._lock:
             self._items.clear()
+            self._named.clear()
+            self._seeded.clear()
             self._seq = 0
             self._write_failed = False
         if self.path is not None:
@@ -327,6 +426,17 @@ def traffic_list(limit: int = 25, url_contains: str = "", only_errors: bool = Fa
     shown = rows[-wanted:]
 
     lines = [f"[traffic] {total} of {len(items)} recorded exchange(s) match"]
+    out_of_scope = [item for item in rows if item.scope == "out_of_scope"]
+    if out_of_scope:
+        hosts = sorted({_host(item.url) for item in out_of_scope if _host(item.url)})
+        names = ", ".join(hosts[:6]) + (" ..." if len(hosts) > 6 else "")
+        # A record, not a block: the ledger says what left the authorised set
+        # and leaves the decision where it belongs.  Blocking here would repeat
+        # the failure of a prompt that told the model a door was shut.
+        lines.append(
+            f"out of scope ({len(out_of_scope)}): {names} "
+            "-- neither the task URL nor a host any response named"
+        )
     # The *count* is the signal that matters -- "52 ids, 0 fetched" is the 043
     # failure -- so it is computed uncapped and only the display is clipped.
     pending_all = pending_targets(limit=0)
@@ -343,8 +453,12 @@ def traffic_list(limit: int = 25, url_contains: str = "", only_errors: bool = Fa
         )
     for item in shown:
         status = item.status if item.status is not None else item.phase or "ERR"
+        # ``!`` marks a destination the task never authorised and no response
+        # ever named.  It is one character, so a row that stayed in scope keeps
+        # the historical shape and existing readers of this text do not move.
+        mark = "!" if item.scope == "out_of_scope" else " "
         lines.append(
-            f"  {item.id:<5} {item.method:<6} {str(status):<14} "
+            f" {mark}{item.id:<5} {item.method:<6} {str(status):<14} "
             f"{item.size:>7}B {int(item.elapsed * 1000):>6}ms  {item.url[:120]}"
         )
     if total > len(shown):
