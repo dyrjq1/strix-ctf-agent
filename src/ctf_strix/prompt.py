@@ -208,9 +208,10 @@ _TURNS_FILE = """\
 
 1. `file_triage` the attachment once. Do not run `file` and `strings` by hand
    first: the triage answer already contains both, plus the family guess.
-2. Run its `next:` table in order (1 then 2 then 3). The table is per family and
-   every command is installed in this image; a deep-read skill line is a last
-   resort, not the first step. Do not substitute a command from another family.
+2. Run its `next:` table in order (1 then 2 then 3). The table is drawn from
+   what this image ships; if one of its commands is absent, `command -v NAME`
+   settles it in one call -- a deep-read skill line is a last resort, not the
+   first step. Do not substitute a command from another family.
 3. When the trail is a string rather than a file, `decode_blob` before writing
    your own decoder — it reports which layer was which. An archive goes through
    `unpack_archive`; a binary stays static in `elfpeek` until you have a reason
@@ -344,8 +345,11 @@ def _targets_block(ctx: dict[str, Any] | None) -> str:
     if len(lines) == 1:
         return ""
     lines.append(
-        "- There is no second host, no internal DNS you can reach, and no other "
-        "port worth scanning. Host-header tricks and subdomain guessing return nothing."
+        "- Those are the targets you were handed. Anything else is out of scope "
+        "unless a response from one of them names it -- then it is part of the "
+        "app's own surface and following it is in scope. If the app's routing "
+        "needs a particular Host or Origin to answer as itself, set it: that is "
+        "using the URL you were given, not hunting for a new one."
     )
     return "\n".join(lines)
 

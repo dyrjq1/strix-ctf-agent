@@ -68,7 +68,7 @@ CATALOGUE: Final[tuple[ToolInfo, ...]] = (
     ToolInfo(
         "exec_command",
         "shell. Use it for Python scripts, payload loops and every file read "
-        "after you get execution; there is no second host",
+        "after you get execution",
         ALL_KINDS,
         "base",
     ),
