@@ -126,7 +126,8 @@ def _run(monkeypatch, base: str, state_dir: Path, spawned: list, *,
     """跑一次 main()，把子进程换成"写一条结果行就退出"的假货。"""
     monkeypatch.setattr(compete, "PLATFORM", base)
 
-    def fake_spawn(chal, args, sdir, failure_path=None, lane=0):
+    def fake_spawn(chal, args, sdir, failure_path=None, lane=0,
+                   direction=None, attempt=1):
         runs = Path(sdir) / "runs"
         runs.mkdir(parents=True, exist_ok=True)
         # 真 _spawn 会先把派单 plan 落盘再起子进程；这里照做，好让"派单项里
@@ -140,7 +141,13 @@ def _run(monkeypatch, base: str, state_dir: Path, spawned: list, *,
         (runs / f"plan-{chal['id']}.json").write_text(
             json.dumps(plan), encoding="utf-8"
         )
-        spawned.append({"id": str(chal["id"]), "lane": lane, "plan": plan})
+        spawned.append({
+            "id": str(chal["id"]),
+            "lane": lane,
+            "plan": plan,
+            "attempt": attempt,
+            "direction": direction[0] if direction else None,
+        })
         rec = {"challenge": str(chal["id"]), "correct": correct}
         if not correct:
             rec["stop_reason"] = "turns_exhausted"
@@ -224,6 +231,13 @@ def test_a_failed_challenge_spends_its_tail_budget_then_defers(
     assert len(spawned) == compete._TAIL_RETRY_BUDGET
     assert rec["status"] == compete.DEFERRED
     assert rec["failure_path"] and "turns_exhausted" in rec["failure_path"][-1]
+    # 重派换入口方向：首跑不注入，之后每次换一个类别（不重复）。
+    assert spawned[0]["attempt"] == 1 and spawned[0]["direction"] is None
+    later = [s["direction"] for s in spawned[1:]]
+    assert all(d is not None for d in later), later
+    assert len(set(later)) == len(later), "同一次 --once 里重派用了同一个方向"
+    assert rec["direction"] == later[-1]
+    assert len(rec["directions"]) == min(5, len(later))
 
 
 def test_a_deadline_in_the_past_exits_without_touching_the_platform(

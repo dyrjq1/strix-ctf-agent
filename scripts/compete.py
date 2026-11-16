@@ -148,6 +148,62 @@ _WALL_TIER = {"easy": 1.0, "medium": 1.5, "hard": 2.3}
 #: 是上限**：这改的是一次尝试的长度，不是允许它无限跑。
 _ATTEMPT_BOX_S = 300
 
+#: 重派时的入口方向表。**换的是入口，不是预算**：第二次尝试的开销与第一次
+#: 完全一样，改的只有「从哪个机制类别开始」。依据是重试的实测收益集中在
+#: 均值回归之外的独立初始化——同题失败后再试一次解出率 29.2%（42/144），而
+#: 同一初始化的重放失败高度相关（同模型、同提示、同轨迹）。按顺序轮转而不是
+#: 让模型自选，是因为「自选方向」在零证据时就是它上一次的选择。
+#:
+#: 每条只描述机制类别，不出现题号、路径、参数名或任何一种题的具体事实
+#: （命名测试）；新增条目同样受这条约束。
+_ENTRY_DIRECTIONS: tuple[tuple[str, str], ...] = (
+    (
+        "surface",
+        "先把攻击面摊平：目录/路由/参数/方法逐个枚举，列全可达端点再挑点",
+    ),
+    (
+        "auth",
+        "先走认证与授权：注册/登录/会话/cookie/令牌/角色边界，按状态机顺序测",
+    ),
+    (
+        "client",
+        "先从客户端看：页面里的 JS 与 sourcemap、前端校验、隐藏字段，"
+        "以及浏览器渲染后的 DOM（browser_render）",
+    ),
+    (
+        "input",
+        "先从输入处理看：参数类型、边界、编码与解析差异、模板与注入点，"
+        "一次只改一个变量",
+    ),
+    (
+        "flow",
+        "先看多步与异步流程：上传、导入、回调/webhook、任务队列、轮询接口",
+    ),
+    (
+        "infra",
+        "先看配置与基础设施：默认凭据、备份/调试/管理端点、缓存、代理与头处理",
+    ),
+    (
+        "files",
+        "先看文件与路径：读取、包含、穿越、软链、归档解包与临时目录",
+    ),
+)
+
+
+def entry_direction(attempt: int) -> tuple[str, str] | None:
+    """第 ``attempt`` 次尝试（1 起）该走的入口方向；首跑不注入。
+
+    Args:
+        attempt: 派单序号，1 = 首次尝试。
+
+    Returns:
+        ``(label, text)``；``attempt <= 1`` 时返回 ``None``——首跑加任何
+        方向提示都等于给所有题统一加了偏置，那是一次没有对照的改动。
+    """
+    if attempt <= 1:
+        return None
+    return _ENTRY_DIRECTIONS[(attempt - 2) % len(_ENTRY_DIRECTIONS)]
+
 
 def _value_bonus(chal: dict[str, Any]) -> int:
     """按平台动态积分推"这道题还剩多少分"——单调、无参数可调。
@@ -621,18 +677,56 @@ def _lane_env(lane: int) -> dict[str, str]:
     }
 
 
+def build_retry_notes(
+    failure_path: list[str] | None,
+    direction: tuple[str, str] | None,
+    attempt: int,
+) -> str:
+    """拼 ``--retry-notes`` 文件正文；两段都没有时返回空串（不写文件）。
+
+    两段的顺序有讲究：先说「哪些路已经走过」，再说「这次从哪儿开始」。反过来
+    模型会先被方向牵着走，把上一轮的结构化事实当脚注。
+
+    Args:
+        failure_path: 同一道题前几轮的结构化失败路径（至多取 3 条）。
+        direction: :func:`entry_direction` 的结果。
+        attempt: 派单序号，写进标题让模型知道这是第几次。
+
+    Returns:
+        文件正文；空串表示这一单不需要重试提示。
+    """
+    blocks: list[str] = []
+    if failure_path:
+        blocks.append(
+            "## 上一轮失败路径（本队自己的调试记录，不是平台提示）\n"
+            + "\n".join(f"- {line}" for line in failure_path[-3:])
+            + "\n\n上面这些路径已证明走不通或没有产生新观测；换机制类别，"
+            "不要复读同一组探测。"
+        )
+    if direction is not None:
+        label, text = direction
+        blocks.append(
+            f"## 本次换入口方向（第 {attempt} 次尝试，{label}）\n"
+            f"{text}。从这个类别开始，做出观测后再决定下一步；"
+            "上一轮的方向只作对照，不作为起始点。"
+        )
+    return "\n\n".join(blocks) + ("\n" if blocks else "")
+
+
 def _spawn(
     chal: dict[str, Any],
     args: argparse.Namespace,
     state_dir: Path,
     failure_path: list[str] | None = None,
     lane: int = 0,
+    direction: tuple[str, str] | None = None,
+    attempt: int = 1,
 ) -> subprocess.Popen:
     """派一个 batch_eval 子进程跑单题（agent 上下文从零开始）。
 
-    ``failure_path`` 只来自同一道题**本进程自己**的失败记录（state.json
-    里按 cid 存放），经显式 ``--retry-notes`` 文件交界面注入，绝不从
-    digest/别的题读——题间隔离不变量保持不变。
+    ``failure_path`` 与 ``direction`` 只来自同一道题**本进程自己**的失败
+    记录（state.json 里按 cid 存放），经显式 ``--retry-notes`` 文件交界面
+    注入，绝不从 digest/别的题读——题间隔离不变量保持不变。
     """
     cid = str(chal["id"])
     runs = state_dir / "runs"
@@ -656,15 +750,10 @@ def _spawn(
     ]
     if args.competition:
         cmd += ["--competition-id", args.competition]
-    if failure_path:
+    notes_text = build_retry_notes(failure_path, direction, attempt)
+    if notes_text:
         notes = runs / f"retry-notes-{cid}.txt"
-        notes.write_text(
-            "## 上一轮失败路径（本队自己的调试记录，不是平台提示）\n"
-            + "\n".join(f"- {line}" for line in failure_path[-3:])
-            + "\n\n上面这些路径已证明走不通或没有产生新观测；换机制类别，"
-            "不要复读同一组探测。\n",
-            encoding="utf-8",
-        )
+        notes.write_text(notes_text, encoding="utf-8")
         cmd += ["--retry-notes", str(notes)]
     log = open(runs / f"{cid}.stdout.log", "a", encoding="utf-8")
     env = {**os.environ, **_lane_env(lane)}
@@ -960,15 +1049,31 @@ def main() -> int:
             # 收车时用来判「本轮有没有写结果行」；必须在启动子进程之前取。
             rec["rows_before"] = _row_count(state_dir, cid)
             rec["status"] = RUNNING
+            # 第几次尝试决定入口方向：失败过的题换一个机制类别起步，首跑不注入。
+            attempt = int(rec.get("runs") or 0) + 1
+            direction = entry_direction(attempt)
+            if direction is not None:
+                rec["direction"] = direction[0]
+                rec["directions"] = (
+                    list(rec.get("directions") or []) + [direction[0]]
+                )[-5:]
             used = set(lane_of.values())
             lane = next(i for i in range(args.lanes) if i not in used)
             running[cid] = _spawn(
-                chal, args, state_dir, failure_path=rec.get("failure_path"), lane=lane
+                chal,
+                args,
+                state_dir,
+                failure_path=rec.get("failure_path"),
+                lane=lane,
+                direction=direction,
+                attempt=attempt,
             )
             lane_of[cid] = lane
             print(
                 f"[compete] 派单 {cid}（{len(running)}/{args.lanes} 车道，"
-                f"lane={lane} 中转 {_lane_env(lane)['CTF_VPN_RELAY']}）",
+                f"lane={lane} 中转 {_lane_env(lane)['CTF_VPN_RELAY']}"
+                + (f"，换向={direction[0]}" if direction else "")
+                + "）",
                 flush=True,
             )
         save_state(state_dir, state)

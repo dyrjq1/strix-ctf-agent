@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import json
+import re
 import sys
 from pathlib import Path
 
@@ -530,3 +531,120 @@ def test_challenge_table_stops_when_a_page_repeats(monkeypatch) -> None:
     got = compete.fetch_challenges("t", "c")
     assert [c["id"] for c in got] == ids[: compete._PAGE_LIMIT]
     assert len(calls) == 2  # 第二页没有新 id → 停
+
+
+# ---------------------------------------------------------------- 失败重派：换入口方向
+#
+# 同题失败后重派不是原样重放：第二次起换一个机制类别起步。预算不动（同一次
+# 尝试的开销与第一次一样），协议也不动（只走 --retry-notes 这一个显式文件）。
+
+
+def test_first_attempt_never_gets_a_direction() -> None:
+    """首跑注入方向 = 给所有题统一加偏置，那是没有对照的改动。"""
+    assert compete.entry_direction(0) is None
+    assert compete.entry_direction(1) is None
+
+
+def test_retry_directions_rotate_through_every_class() -> None:
+    total = len(compete._ENTRY_DIRECTIONS)
+    picks = [compete.entry_direction(n) for n in range(2, 2 + total)]
+    labels = [p[0] for p in picks]
+    assert len(set(labels)) == total, "两个尝试序号给了同一个方向"
+    wrap = compete.entry_direction(2 + total)
+    assert wrap is not None and wrap[0] == picks[0][0], "用完之后要回到起点"
+
+
+def test_retry_directions_stay_generic() -> None:
+    """命名测试：方向表不得含题号、IP、路径或 flag 片段。"""
+    joined = " ".join(text for _, text in compete._ENTRY_DIRECTIONS)
+    assert not re.search(r"[A-Z]{3,}-\d+", joined), "题号进了方向表"
+    assert "flag{" not in joined.lower()
+    assert "http://" not in joined.lower() and "https://" not in joined.lower()
+    assert not re.search(r"\b(?:\d{1,3}\.){3}\d{1,3}\b", joined), "IP 进了方向表"
+    for label, text in compete._ENTRY_DIRECTIONS:
+        assert label.islower() and label.isascii()
+        assert len(text) <= 80, f"{label} 说明过长，会挤占尝试的上下文"
+
+
+def test_first_run_writes_no_retry_notes() -> None:
+    assert compete.build_retry_notes(None, None, 1) == ""
+
+
+def test_retry_notes_put_evidence_before_the_new_direction() -> None:
+    text = compete.build_retry_notes(
+        ["收场：no_progress"], compete.entry_direction(2), 2
+    )
+    assert "上一轮失败路径" in text and "收场：no_progress" in text
+    assert "本次换入口方向" in text
+    assert text.index("上一轮失败路径") < text.index("本次换入口方向")
+    assert "第 2 次尝试" in text
+    assert text.endswith("\n")
+
+
+def test_direction_alone_still_produces_notes() -> None:
+    """上一轮没有结构化失败事实（例如 infra skip）时，方向仍然要说。"""
+    text = compete.build_retry_notes(None, compete.entry_direction(3), 3)
+    assert "本次换入口方向" in text
+    assert "上一轮失败路径" not in text
+
+
+def test_each_attempt_moves_to_a_different_direction() -> None:
+    """连续重派必须换向：第 2、3 次尝试不能给出同一个类别。"""
+    seen = [compete.entry_direction(n)[0] for n in (2, 3, 4)]
+    assert len(set(seen)) == len(seen)
+
+
+def test_plan_item_is_untouched_by_the_direction() -> None:
+    """换向只走 notes 文件；派单项仍然只有 id/difficulty。"""
+    item = compete.build_plan_item("A", _chal("A"))
+    assert set(item) == {"id", "difficulty"}
+
+
+def _fake_popen(monkeypatch) -> dict:
+    """拦下子进程启动，只留命令行：测的是「写了什么文件、带了什么参数」。"""
+    captured: dict = {}
+
+    def fake(cmd, **kwargs):
+        captured["cmd"] = list(cmd)
+        stream = kwargs.get("stdout")
+        if hasattr(stream, "close"):
+            stream.close()  # 真的 Popen 会接管这个句柄；假的不接管就得自己关
+        return object()
+
+    monkeypatch.setattr(compete.subprocess, "Popen", fake)
+    return captured
+
+
+def _args(**kw):
+    argv = ["--token", "t", "--competition", "c", *sum(([f"--{k}", str(v)] for k, v in kw.items()), [])]
+    return compete.build_parser().parse_args(argv)
+
+
+def test_spawn_writes_the_retry_notes_file_for_a_retry(tmp_path, monkeypatch) -> None:
+    captured = _fake_popen(monkeypatch)
+    args = _args()
+    direction = compete.entry_direction(2)
+    assert direction is not None
+    compete._spawn(
+        _chal("A"),
+        args,
+        tmp_path,
+        failure_path=["收场：no_progress"],
+        direction=direction,
+        attempt=2,
+    )
+    cmd = captured["cmd"]
+    assert "--retry-notes" in cmd
+    notes = Path(cmd[cmd.index("--retry-notes") + 1])
+    text = notes.read_text(encoding="utf-8")
+    assert "上一轮失败路径" in text and "本次换入口方向" in text
+    # 派单项仍然干净（隔离不变量在真 _spawn 路径上也成立）。
+    plan = json.loads((tmp_path / "runs" / "plan-A.json").read_text(encoding="utf-8"))
+    assert plan == [{"id": "A", "difficulty": "easy"}]
+
+
+def test_spawn_on_the_first_attempt_writes_no_notes(tmp_path, monkeypatch) -> None:
+    captured = _fake_popen(monkeypatch)
+    compete._spawn(_chal("A"), _args(), tmp_path, failure_path=None, direction=None, attempt=1)
+    assert "--retry-notes" not in captured["cmd"]
+    assert not (tmp_path / "runs" / "retry-notes-A.txt").exists()
