@@ -34,6 +34,7 @@ tail -c 7000 NXz3x3fk.js
 from __future__ import annotations
 
 import json
+import os
 import re
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -169,6 +170,283 @@ def _derived_candidates(counts: dict[str, int], blob: str, limit: int = 8) -> li
                 return out
     return out
 
+
+#: 结构派生候选的硬上限。三类加起来不超过这个数——20 条已经比一次
+#: method_sweep 能舒服打完的量还多，再多只是把预算摊薄到更差的方向上。
+_MAX_STRUCTURAL: Final = 20
+
+#: "这一段是个具体 id"的三种形状，都在靶机上见过：纯数字（/api/notes/42）、
+#: 带前缀的十六进制（note_d6e7380c）、长十六进制（16-40 位）。
+_ID_SEG_RE: Final = re.compile(
+    r"^(?:\d{1,12}|[0-9a-fA-F]{16,40}|[A-Za-z][A-Za-z0-9]{1,20}_[0-9a-fA-F]{6,40})$"
+)
+
+#: 只说明"这里是 id、但没有具体值"的占位段。它们证明端点属于实例族，
+#: 本身却不是可请求的路径，所以只用来截前缀。
+_ID_PLACEHOLDER_SEG: Final = frozenset(
+    {"id", "{id}", ":id", "$id", "<id>", "${id}", "uid", "{uid}", "slug", ":slug", "{slug}"}
+)
+
+#: 页面/JS 里出现过的 id 值。纯数字只从 HTML 属性与 URL 形状取（正文里的
+#: 数字全是噪声），带前缀/长十六进制才从全文取。
+_ID_TOKEN_RE: Final = re.compile(
+    r"\b([A-Za-z][A-Za-z0-9]{1,20}_[0-9a-fA-F]{6,40})\b|\b([0-9a-fA-F]{16,40})\b"
+)
+_ATTR_ID_RE: Final = re.compile(
+    r"""\b(?:data-[\w-]*id|id|value)\s*=\s*["'](\d{1,9})["']""", re.IGNORECASE
+)
+#: 写在 HTML 链接或 JS 字符串里的实例路径，如 ``/api/notes/43``。
+_URL_ID_RE: Final = re.compile(r"/[A-Za-z][A-Za-z0-9_\-]*/(\d{1,9})(?=[\"'/<>\s?#])")
+
+#: HTML form 控件名——参数面最可靠的来源，因为它是应用自己声明的字段。
+_FORM_NAME_RE: Final = re.compile(
+    r"""<(?:input|select|textarea|button)\b[^>]*\bname\s*=\s*"""
+    r"""["']([A-Za-z_][A-Za-z0-9_\-]{0,30})["']""",
+    re.IGNORECASE,
+)
+#: 查询串里出现过的参数名：``fetch("/api/x?limit=10")``、``/search?q=``。
+_QUERY_PARAM_RE: Final = re.compile(r"[?&]([A-Za-z_][A-Za-z0-9_\-]{0,30})=")
+#: JS 对象字面量的键。``{limit: 10}`` 是参数，``{method: "POST"}`` 是 fetch 选项。
+_OBJ_KEY_RE: Final = re.compile(r"""([{,]\s*)([A-Za-z_][A-Za-z0-9_]{1,30})\s*:""")
+_QUOTED_KEY_RE: Final = re.compile(r"""["']([A-Za-z_][A-Za-z0-9_\-]{1,30})["']\s*:""")
+
+#: fetch/请求选项的键，出现在每个 bundle 里，不是应用字段。
+_JS_KEY_NOISE: Final = frozenset(
+    {
+        "method", "headers", "body", "mode", "credentials", "cache", "redirect",
+        "referrer", "referrerpolicy", "signal", "keepalive", "integrity", "window",
+        "document", "location", "function", "return", "const", "let", "var",
+    }
+)
+
+#: 页面词汇里永远不是资源名的词：HTML 标签、框架关键字、HTTP 方法、虚词。
+#: 这不是"路径字典"——它只做减法，从不产出候选。
+_NOUN_STOPWORDS: Final = frozenset(
+    """
+    about above across after again against all also and any are because been before
+    being below between both but can could did does doing done down during each
+    few for from further had has have having here how into its itself just more
+    most must not now off once only other our out over own same should some such
+    than that the their them then there these they this those through too under
+    until very was were what when where which while who will with would you your
+    div span class style script src href html head body meta link rel http https
+    json charset utf viewport initial scale noscript svg path xmlns aria title
+    type name value placeholder button form input select option textarea
+    table thead tbody footer header section main nav article strong code img
+    true false null none undefined import export default async await fetch
+    get post put patch delete options head
+    """.split()
+)
+
+#: 页面"文字"的两处来源：HTML 文本节点、带空格的 JS 字符串（URL 不带空格）。
+_HTML_TEXT_RE: Final = re.compile(r">([^<>]{2,400})<")
+_JS_TEXT_RE: Final = re.compile(r"""["'`]([^"'`\n<>]*\s[^"'`\n<>]{2,300})["'`]""")
+#: 标签外的成串英文（按钮文案常直接写在模板里）。
+_PROSE_RUN_RE: Final = re.compile(
+    r"[A-Za-z][A-Za-z0-9_\-]*(?:[ \t,.!?]+[A-Za-z][A-Za-z0-9_\-]*){2,}"
+)
+#: 出现这些字符的"文字"其实是代码/URL，不是文案。
+_PROSE_BAD_CHARS: Final = frozenset("{}[]:=()/<>;@#*+|\\\"`")
+
+
+def _norm_request(url: str) -> str:
+    """URL 或路径 → ``path?query``，用于和流量台账比较"请求过没有"。
+
+    和 ``traffic._normalise_path`` 的区别只有一个，但很关键：那边故意丢掉
+    query（它只回答"这个资源问过没有"），这里必须保留——[参数] 候选的全部
+    信息就在 query 里，丢掉就等于把它自己判成"已请求"。
+    """
+    text = (url or "").strip()
+    if "://" in text:
+        text = text.split("://", 1)[1]
+        slash = text.find("/")
+        text = text[slash:] if slash >= 0 else "/"
+    text = text.split("#", 1)[0]
+    if not text.startswith("/"):
+        text = "/" + text
+    path, sep, query = text.partition("?")
+    path = path.rstrip("/") or "/"
+    return path + (("?" + query) if sep else "")
+
+
+def _observed_ids(counts: dict[str, int], blob: str) -> list[str]:
+    """已观测到的具体 id 值，确定性排序（数字在前、按值；其余按字典序）。"""
+    found: list[str] = []
+
+    def add(value: str) -> None:
+        if value and value not in found:
+            found.append(value)
+
+    for path in sorted(counts):
+        for seg in path.split("/"):
+            if seg and _ID_SEG_RE.match(seg):
+                add(seg)
+    for match in _ID_TOKEN_RE.finditer(blob):
+        add(match.group(1) or match.group(2))
+    for match in _ATTR_ID_RE.finditer(blob):
+        add(match.group(1))
+    for match in _URL_ID_RE.finditer(blob):
+        add(match.group(1))
+    return sorted(found, key=lambda v: (0, int(v)) if v.isdigit() else (1, v))
+
+
+def _instance_parents(counts: dict[str, int]) -> list[str]:
+    """已发现路径里"实例族"的父路径，如 /api/notes/42 与 /api/notes/${id}。"""
+    parents: list[str] = []
+    for path in sorted(counts):
+        segs = [seg for seg in path.split("/") if seg]
+        if len(segs) < 2:
+            continue
+        last = segs[-1]
+        if not (_ID_SEG_RE.match(last) or last.lower() in _ID_PLACEHOLDER_SEG):
+            continue
+        parent = "/" + "/".join(segs[:-1])
+        if parent not in parents:
+            parents.append(parent)
+    return parents
+
+
+def _page_nouns(blob: str, limit: int, exclude: frozenset[str] = frozenset()) -> list[str]:
+    """页面/JS 文字里的名词候选，按出现次数降序、同频按字典序。
+
+    只读"文字"（HTML 文本节点、带空格的 JS 字符串），不读 URL、属性名和
+    对象键——那些地方的名词（limit、offset、method）是参数，不是子资源。
+    ``exclude`` 用来把已识别的参数名再挡一遍。
+    """
+    freq: dict[str, int] = {}
+    texts = [match.group(1) for match in _HTML_TEXT_RE.finditer(blob)]
+    texts += [match.group(1) for match in _JS_TEXT_RE.finditer(blob)]
+    texts += [match.group(0) for match in _PROSE_RUN_RE.finditer(blob)]
+    for text in texts:
+        if any(ch in _PROSE_BAD_CHARS for ch in text):
+            continue
+        for word in _WORD_RE.findall(text):
+            low = word.lower()
+            if (
+                len(low) < 4 or low.isdigit() or _ID_SEG_RE.match(low)
+                or low in _NOUN_STOPWORDS or low in exclude
+            ):
+                continue
+            freq[low] = freq.get(low, 0) + 1
+    ranked = sorted(freq.items(), key=lambda kv: (-kv[1], kv[0]))
+    return [word for word, _ in ranked[:limit]]
+
+
+def _page_params(blob: str) -> list[str]:
+    """页面/JS/form 里出现过的参数名，按首次出现顺序（form 优先）。
+
+    只认**原文里出现过**的名字；没有静态参数表，页面没写的名字不会冒出来。
+    """
+    names: list[str] = []
+
+    def add(value: str) -> None:
+        low = value.lower()
+        if low in _JS_KEY_NOISE or low in _NOUN_STOPWORDS:
+            return
+        if value not in names:
+            names.append(value)
+
+    for match in _FORM_NAME_RE.finditer(blob):
+        add(match.group(1))
+    for match in _QUERY_PARAM_RE.finditer(blob):
+        add(match.group(1))
+    for match in _QUOTED_KEY_RE.finditer(blob):
+        add(match.group(1))
+    for match in _OBJ_KEY_RE.finditer(blob):
+        add(match.group(2))
+    return names
+
+
+def _structural_candidates(
+    counts: dict[str, int],
+    blob: str,
+    requested: set[str] | frozenset[str] = frozenset(),
+    limit: int = _MAX_STRUCTURAL,
+) -> list[tuple[str, str]]:
+    """从已发现端点确定性地派生三类结构候选（不爆破、不随机）。
+
+    阶梯思想取自 ipa-lab/hackingBuddyGPT 的 ``utils/web_api/exploration_steps.py``：
+    先沿着已确认存在的资源往下走一步，再横向拼同族的子资源，最后才碰查询参数。
+    但这里**不抄** ``random.choice``，也不查字典——每个候选的可变部分都必须
+    能在页面原文或已发现路径里找到出处。
+
+    Args:
+        counts: 已发现的路径 → 出现次数。
+        blob: 首页与 chunk 原文，既是 id 来源，也是词汇/参数名的唯一出处。
+        requested: 台账里已经请求过的 URL（或路径）。命中的候选一律不输出。
+        limit: 三类合计上限，默认 20。
+
+    Returns:
+        ``[(类别, 路径)]``，类别为 ``实例`` / ``子资源`` / ``参数``，
+        顺序固定（实例 → 子资源 → 参数），同输入必得同输出。
+    """
+    seen = {_norm_request(path) for path in counts}
+    seen |= {_norm_request(url) for url in requested}
+
+    def fresh(path: str) -> bool:
+        key = _norm_request(path)
+        if key in seen:
+            return False
+        seen.add(key)
+        return True
+
+    params = _page_params(blob)
+
+    # (a) 实例路径：父路径来自已发现路径里的 id 段/占位段，id 取观测到的具体值。
+    instance: list[tuple[str, str]] = []
+    ids = _observed_ids(counts, blob)
+    if ids:
+        parents = sorted(_instance_parents(counts), key=lambda p: (-_weight(p), p))
+        for parent in parents:
+            for ident in ids:
+                path = f"{parent}/{ident}"
+                if fresh(path):
+                    instance.append(("实例", path))
+                    if len(instance) >= 6:
+                        break
+            if len(instance) >= 6:
+                break
+
+    # (b) 子资源：已发现的 /api 前缀 × 页面文字里的名词。
+    subresource: list[tuple[str, str]] = []
+    prefix_set: set[str] = set()
+    for path in counts:
+        match = re.match(r"^(/api(?:/[a-z0-9_\-]{2,20})?)", path)
+        if match:
+            prefix_set.add(match.group(1))
+    prefixes = sorted(prefix_set, key=lambda p: (-_weight(p), -counts.get(p, 0), p))
+    nouns = _page_nouns(blob, 14, frozenset(p.lower() for p in params))
+    # 名词在外、前缀在内轮转：否则排第一的前缀会独吞全部名额。
+    for noun in nouns:
+        for prefix in prefixes:
+            if noun == prefix.rsplit("/", 1)[-1]:
+                continue
+            path = f"{prefix}/{noun}"
+            if fresh(path):
+                subresource.append(("子资源", path))
+                if len(subresource) >= 7:
+                    break
+        if len(subresource) >= 7:
+            break
+
+    # (c) 查询参数面：已发现端点 × 页面/form/JS 里出现过的参数名。
+    # 模板路径（/api/notes/${id}）不能直接请求，先排除。
+    query: list[tuple[str, str]] = []
+    endpoints = [
+        path for path in sorted(counts, key=lambda p: (-_weight(p), -counts[p], p))
+        if not any(ch in path for ch in "{}<>$:")
+    ][:10]
+    for param in params[:10]:
+        for endpoint in endpoints:
+            path = f"{endpoint}?{param}=1"
+            if fresh(path):
+                query.append(("参数", path))
+                if len(query) >= 7:
+                    break
+        if len(query) >= 7:
+            break
+
+    return (instance[:6] + subresource[:7] + query[:7])[: max(0, limit)]
 
 async def route_map(base_url: str, max_chunks: int = _MAX_CHUNKS) -> str:
     """从首页和它引用的 JS 里提取后端路径候选（只读 GET，一次调用完成）。
@@ -315,6 +593,29 @@ async def route_map(base_url: str, max_chunks: int = _MAX_CHUNKS) -> str:
         "是最容易撞出未文档化入口的动作。不要再去读 bundle 原文："
         f"要看原文用 traffic_view(\"{home_id}\") 或 traffic_list(url_contains=…) 取台账。"
     )
+    structural = (
+        _structural_candidates(
+            counts,
+            html + "\n" + "\n".join(blobs),
+            {item.url for item in traffic.ledger().items() if item.url},
+        )
+        if os.environ.get("CTF_STRUCTURAL", "").strip() in ("1", "true", "on")
+        else []
+    )
+    if structural:
+        # 新节放在末尾：上面那段路径表保持原样（<= 30 条），这里只追加
+        # "从已发现结构确定派生、且台账里从未请求过"的候选。
+        lines.append("")
+        lines.append(
+            f"── 结构派生候选（{len(structural)} 条，均从未请求；"
+            "由已发现端点/页面词汇确定性派生，未验证）──"
+        )
+        lines.extend(f"  [{kind}] {path}" for kind, path in structural)
+        lines.append(
+            "next: 先挑一条 [实例] 用 http_probe 打——同族端点已存在时，"
+            "实例路径通常直接返回那条数据；[参数] 则在同一路径上换方法/"
+            "补字段名继续。这些都是台账里没发过的 URL，试完自然去重。"
+        )
     return "\n".join(lines)
 
 
