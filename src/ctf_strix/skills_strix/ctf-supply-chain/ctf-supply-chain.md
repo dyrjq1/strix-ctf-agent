@@ -110,6 +110,24 @@ Collecting bistro-rate-limiter
    publish did not land or the version constraint is too tight - check the pin before
    trying anything else.
 
+### A 200 from an upload endpoint is not proof
+
+Upload endpoints on the challenge's own registry routinely answer `200` with an **empty
+body** and store nothing - a wrong action parameter, a rejected filename, or a write
+side that only accepts one content type. The status code is not evidence.
+
+Verify by **reading the index back**: `GET /simple/<name>/` (or the registry's listing
+page) and match your exact filename or version. If it is not in the listing, the upload
+did not land, whatever came back. Do this **before** triggering the install, so the next
+step has a known-good input.
+
+Then **trigger the install yourself**. A rebuild described as scheduled, automatic or
+"on deploy" may never run inside your time budget; waiting for it is indistinguishable
+from a broken exploit. Run the install action and read its `Downloading` line. If it
+still resolves the old version, there are exactly two causes - the artifact is not
+listed, or the version constraint is tighter than your version - and one probe tells
+you which.
+
 ### If the rebuild always resolves the same version
 
 Then the pin is not mutable and confusion is not the bug. Stop publishing attempts and
