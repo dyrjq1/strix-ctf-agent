@@ -31,6 +31,11 @@ from typing import Any
 
 from ctf_strix.flag_extract import CANDIDATE_RE, is_placeholder
 
+try:  # the SDK type has to be importable where the annotation is evaluated
+    from agents import RunContextWrapper
+except Exception:  # noqa: BLE001 - no runtime, no tools to annotate
+    RunContextWrapper = Any  # type: ignore[assignment,misc]
+
 logger = logging.getLogger(__name__)
 
 #: Hard ceiling from the run constraints: container memory is the limiting
@@ -332,6 +337,143 @@ async def _stop_for_race(
         )
     except Exception:  # noqa: BLE001 - a race stop must never crash the run
         logger.exception("parallel race: stopping agents failed")
+
+
+def register_race_tool(register_fn: Any = None) -> list[str]:
+    """Register ``race_spawn`` — a one-call spawn with a blank-context child.
+
+    Vendored ``create_agent`` costs the model two extra decisions before it can
+    act: a ``view_agent_graph`` pre-call and a skill selection, and its default
+    ``inherit_context=True`` hands the child the parent's whole history.  Both
+    make delegating *more expensive* than continuing alone, which is the
+    measured reason the protocol never fired (ledger §4.246).
+
+    This tool removes both: it takes the same two halves a brief needs (a name
+    and a task), spawns through the runner's own ``spawn_child_agent`` seam and
+    passes ``parent_history=[]`` so the child starts from the brief alone.  The
+    child is a normal agent — same tools, same model, same run budget.
+    """
+    global _RACE_TOOL_INSTALLED
+    if not enabled():
+        return []
+    if _RACE_TOOL_INSTALLED:
+        return ["race_spawn"]
+    try:
+        from agents import RunContextWrapper, function_tool
+        from strix.agents import factory
+    except Exception:  # noqa: BLE001 - no runtime, no tool
+        return []
+
+    register = register_fn or factory.register_agent_tools
+    try:
+        existing = {getattr(t, "name", "") for t in factory.registered_agent_tools()}
+    except Exception:  # noqa: BLE001
+        existing = set()
+    if "race_spawn" in existing:
+        _RACE_TOOL_INSTALLED = True
+        return ["race_spawn"]
+
+    async def race_spawn(
+        ctx: RunContextWrapper, name: str, task: str  # noqa: ANN001 - SDK type
+    ) -> str:
+        """Start a second line of investigation in parallel, right now.
+
+        Use it as soon as recon has produced more than one live direction:
+        alternative mechanisms, alternative entry points, alternative sources
+        of credentials, a version-specific path versus a logic path.  One call
+        per direction, at most two for the whole run.
+
+        The child starts fresh: it sees only the ``task`` you write, not your
+        conversation.  So put the established facts in the task (paths,
+        credentials, files, commands that already failed) and state the one
+        check that would falsify the direction.  The call returns immediately;
+        keep working on your own line, and the child's report arrives in your
+        inbox when it finishes.
+
+        Args:
+            name: short label for the direction, e.g. "auth-bypass".
+            task: the single hypothesis, the exact check that would falsify
+                it, the facts already established, and what is out of bounds.
+        """
+        inner = ctx.context if isinstance(getattr(ctx, "context", None), dict) else {}
+        return await spawn_direction(inner, name, task)
+
+    tool = function_tool(timeout=120)(race_spawn)
+    register(tool)
+    _RACE_TOOL_INSTALLED = True
+    return [getattr(tool, "name", "race_spawn")]
+
+
+async def spawn_direction(inner: dict, name: str, task: str) -> str:
+    """Spawn one blank-context child through the runner's own seam.
+
+    ``inner`` is the run context dict the vendored agent graph threads through
+    every tool (``agent_id``, ``parent_id``, ``spawn_child_agent``,
+    ``coordinator``).  Kept separate from the SDK tool wrapper so the protocol
+    is testable without a live ``ToolContext``.
+    """
+    if inner.get("parent_id") is not None:
+        return _json(
+            {
+                "success": False,
+                "error": (
+                    "REFUSED: nested sub-agents are disabled in CTF mode. "
+                    "Do your assigned direction yourself and report back."
+                ),
+            }
+        )
+    spawner = inner.get("spawn_child_agent")
+    if not callable(spawner):
+        return _json(
+            {"success": False, "error": "runner did not provide a child spawner"}
+        )
+    label = _clean_name(name)
+    if not str(task or "").strip():
+        return _json({"success": False, "error": "task must not be empty"})
+    global _SPAWNED
+    with _LOCK:
+        if _SPAWNED >= MAX_SUBAGENTS:
+            return _json(
+                {
+                    "success": False,
+                    "error": (
+                        f"REFUSED: this run allows at most {MAX_SUBAGENTS} "
+                        "sub-agents. Work with the agents already running, or "
+                        "stop one and continue yourself."
+                    ),
+                    "subagent_limit": MAX_SUBAGENTS,
+                    "spawned": _SPAWNED,
+                }
+            )
+        _SPAWNED += 1
+    if inner.get("coordinator") is not None:
+        _bind_coordinator(inner["coordinator"])
+    try:
+        result = await spawner(
+            parent_ctx=inner,
+            name=label,
+            task=str(task),
+            skills=[],
+            # Blank context is the point: the brief is the whole input, so a
+            # child costs one small prompt instead of a copy of the run.
+            parent_history=[],
+        )
+    except BaseException as exc:  # noqa: BLE001 - roll the counter back
+        _rollback_spawn()
+        return _json({"success": False, "error": f"spawn failed: {exc}"})
+    if isinstance(result, dict) and result.get("success") is False:
+        _rollback_spawn()
+    logger.info("race_spawn: %s (%s)", label, _SPAWNED)
+    return _json(result if isinstance(result, dict) else {"success": True})
+
+
+def _clean_name(name: str) -> str:
+    """Keep a child label to something the graph view can print."""
+    text = "".join(ch for ch in str(name or "") if ch.isalnum() or ch in "-_ ").strip()
+    return (text or "direction")[:40]
+
+
+_RACE_TOOL_INSTALLED = False
 
 
 def install() -> bool:

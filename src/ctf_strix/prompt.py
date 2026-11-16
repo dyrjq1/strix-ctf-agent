@@ -256,15 +256,16 @@ The agent-graph tools are present for this run and they are part of the expected
 topology. After the first recon pass tells you what the challenge is, the next
 move is usually not one more probe -- it is to split the search.
 
-- **Split in `think` before you split in `create_agent`.** Name the directions,
+- **Split in `think` before you split with `race_spawn`.** Name the directions,
   what each would prove, and the single check that would falsify it. A direction
   is real only if the tools you already have can decide it.
 - **Spawn whenever more than one direction is live.** Alternative mechanisms,
   alternative entry points, alternative sources of credentials, alternative
   encodings, a version-specific path versus a logic path: these are separate
-  probes and belong to separate agents. Spawn **one** child per direction, and
-  at most **two** children for the whole run.
-- **Work first, spawn second, never wait.** The spawn call returns immediately;
+  probes and belong to separate agents. `race_spawn(name, task)` starts one
+  child per direction, and at most **two** children for the whole run. It is a
+  single call: no graph view, no skill selection, no context to hand over.
+- **Work first, spawn second, never wait.** `race_spawn` returns immediately;
   keep your own line of investigation running while the child works. Sitting
   idle after spawning wastes the budget you were trying to save.
 - **Do not spawn** for a single mechanical step, for a direction already ahead
@@ -273,7 +274,8 @@ move is usually not one more probe -- it is to split the search.
 - **A run that only ever tried one line of investigation did not use the
   topology it was given.** If the answer never appears and the trace shows one
   line of attack from start to finish, the search was too narrow.
-- **One child, one direction.** Every `create_agent` brief must contain:
+- **One child, one direction.** The child starts fresh -- it sees only the
+  `task` you pass, not this conversation. So the `task` must contain:
   1. the single hypothesis and the exact check that would falsify it;
   2. the facts already established (paths, credentials/session state, files,
      commands that already failed);

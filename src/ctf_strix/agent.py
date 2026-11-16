@@ -3110,6 +3110,12 @@ def _run_agent(
         from ctf_strix import parallel
 
         parallel_on = parallel.enabled() and parallel.install()
+        if parallel_on:
+            # 一调用派出空上下文子 agent：vendor 的 create_agent 要让模型先
+            # view_agent_graph 再选 skill，还把父的全量历史继承给子，实测
+            # 结果是模型一次都不派（§4.246）。这个工具把前置条件去掉了。
+            race_tools = parallel.register_race_tool()
+            diag["race_tools"] = race_tools
     except Exception as exc:  # noqa: BLE001 -- parallelism must not gate the run
         print(f"[ctfy] parallel guard failed: {type(exc).__name__}: {exc}", flush=True)
 
