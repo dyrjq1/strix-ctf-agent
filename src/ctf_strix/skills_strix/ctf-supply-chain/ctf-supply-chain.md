@@ -11,29 +11,26 @@ metadata:
 
 ## The one thing that matters
 
-In these challenges the entry point is almost never an HTTP route you have to guess.
-It is **an install / build / deploy action the application performs on your behalf**.
-If the app has a button or endpoint that says install, add, publish, build, sync,
-update, upgrade, import, restore or deploy, that is the attack surface. Reading its
-dependency configuration is worth more than enumerating 200 paths.
+The entry point is almost never an HTTP route you have to guess. It is **an install /
+build / deploy action the application performs on your behalf**. Any button or endpoint
+that says install, add, publish, build, sync, update, import, restore or deploy is the
+attack surface, and reading its dependency configuration beats enumerating 200 paths.
 
 ## First three probes (in this order)
 
 1. **Find the install action and read what it installs.**
    `GET /` and every list endpoint; look for a package name, a version, a source URL.
    Then read the config that decides *where* that name is fetched from.
-2. **Read the dependency configuration files** (whichever the app exposes):
-   `package.json`, `package-lock.json`, `.npmrc`, `requirements.txt`,
-   `pyproject.toml`, `pip.conf`, `Pipfile`, `Gemfile`, `Gemfile.lock`,
-   `.gemrc`, `go.mod`, `.github/workflows/*.yml`, `Dockerfile`, `Makefile`.
-   If they are not directly readable, look for an endpoint that echoes them
-   (debug page, admin panel, build log, error page).
+2. **Read the dependency configuration** (whichever the app exposes): `package.json`,
+   `package-lock.json`, `.npmrc`, `requirements.txt`, `pyproject.toml`, `pip.conf`,
+   `Gemfile.lock`, `go.mod`, `.github/workflows/*.yml`, `Dockerfile`, `Makefile`.
+   If none is readable, look for an endpoint that echoes one (debug page, build log).
 3. **Compare the two lists.** The vulnerability is the *difference* between
    "what the app says it depends on" and "what the resolver will actually pick".
 
 ## The mechanism table
 
-Each row is a distinct bug. Pick the row that matches what you already saw.
+Each row is a distinct bug. Pick the one matching what you already saw.
 
 | Symptom you already have | Bug | Answer is usually |
 |---|---|---|
@@ -49,13 +46,12 @@ Each row is a distinct bug. Pick the row that matches what you already saw.
 
 ## Reading a registry (offline)
 
-The challenge target usually *is* the registry, or proxies one. Endpoints worth one
-call each, in this order:
+The target usually *is* the registry, or proxies one. One call each, in this order:
 
 - PyPI-style: `/simple/`, `/simple/<name>/`, `/pypi/<name>/json`, `/#/<name>`
 - npm-style: `/<name>`, `/@<scope>%2f<name>`, `/-/<name>-<version>.tgz`
 - RubyGems-style: `/api/v1/gems/<name>.json`, `/gems/<name>-<version>.gem`,
-  `/versions`, `/specs.4.8.gz`
+  `/specs.4.8.gz`
 - Generic artifact: `/api/v1/search?q=`, `/api/packages`, `/artifacts`, `/repository/`
 
 A 200 with a JSON body is the metadata. Read `description`, `homepage`, `author`,
@@ -64,107 +60,68 @@ far more often than in an exploit chain.
 
 ## The install is a shell command: read it, then look for the second index
 
-A redeploy / install endpoint usually returns the raw command it ran. That output is the
-single most valuable artefact in the whole challenge, because it tells you three things
-at once:
-
-- **which package name** is installed,
-- **which indexes** are consulted, and **in what order**,
-- whether `--extra-index-url` (not `--index-url`) is in play.
-
-`pip` resolves `--extra-index-url` across **both** indexes and picks the highest version,
-regardless of which index it came from. That is the dependency-confusion bug. Two indexes
-listed with the internal one first does not save it: version wins, not order.
-
-### Reading the pip output line by line
+A redeploy / install endpoint usually returns the raw command it ran - the single most
+valuable artefact in the challenge, because it names **which package** is installed,
+**which indexes** are consulted and **in what order**, and whether `--extra-index-url`
+(not `--index-url`) is in play. `pip` resolves `--extra-index-url` across **both** indexes
+and picks the highest version regardless of origin: listing the internal one first does not
+save it, because version wins, not order.
 
 ```
 Looking in indexes: http://internal-pypi:8080/simple/, http://public-pypi:8080/simple/
-Collecting bistro-rate-limiter
-  Downloading http://internal-pypi:8080/packages/bistro_rate_limiter-1.0.0.tar.gz (1.4 kB)
+Collecting orders-lib
+  Downloading http://internal-pypi:8080/packages/orders_lib-1.0.0.tar.gz (1.4 kB)
 ```
 
-- `Looking in indexes:` - the resolution order, and the list of registries you must probe.
-- `Downloading <url>` - **the index that actually won**, plus the exact artifact path.
-  That URL is a live endpoint. Fetch it: an sdist carries `setup.py` / `pyproject.toml`,
-  and CTF authors put metadata, next-hop URLs, or the flag path there.
-- `Installing build dependencies` - the install runs a build backend **as the installer**.
-  A malicious `setup.py` therefore executes as the service user. That is the payload
-  delivery mechanism for this whole family.
+- `Looking in indexes:` - the resolution order, and every registry you must probe.
+- `Downloading <url>` - **the index that actually won**, plus a live artifact URL. An
+  sdist carries `setup.py` / `pyproject.toml`, and authors hide metadata, next-hop URLs
+  or the flag path there.
+- `Installing build dependencies` - the build backend runs **as the installer**, so a
+  malicious `setup.py` executes as the service user. That is the payload mechanism.
 
 ### The four moves after you see the command
 
-1. **List each index named in the output.** `GET /simple/` on every one of them, then
-   `GET /simple/<the installed package>/` on each. You are looking for which index has
-   the name and which versions it offers.
-2. **Compare versions across the two indexes.** If the internal index pins `1.0.0` and
-   the other index can serve something higher, publishing a higher version to the second
-   index is the exploit. If the public index has no such name at all, the challenge is
-   namespace confusion instead - one of the two indexes already holds the attacker copy
-   and you need to find which.
+1. **List each index in the output.** `GET /simple/`, then `GET /simple/<installed name>/`
+   on every one. Which index has the name, and which versions does it offer?
+2. **Compare versions across indexes.** If the internal one pins `1.0.0` and the other can
+   serve higher, publishing a higher version there is the exploit. If the second has no
+   such name at all, it is namespace confusion - one index already holds the attacker copy.
 3. **Find the write side.** `/api/upload`, `/upload`, `/pypi/<name>/upload`,
    `/-/package/publish`, `/api/publish`, or a docs page naming a twine endpoint. A mirror
-   that only reads is a dead end; a mirror you can write to **is** the challenge.
-4. **Re-trigger the install and read the resolved version.** The `Downloading` line in the
-   new output is your proof. If it still says `1.0.0` from the internal index, your
-   publish did not land or the version constraint is too tight - check the pin before
-   trying anything else.
+   that only reads is a dead end; one you can write to **is** the challenge.
+4. **Re-trigger and read the resolved version.** The `Downloading` line is the proof; the
+   upload section below covers what to do when it does not move.
 
-### A 200 from an upload endpoint is not proof
+### A 200 from an upload is not proof
 
-On a `pypiserver`-style registry the **success** response is `200` with a **completely
-empty body** - so neither the status code nor the body length tells you anything. The
-failure modes look identical: a wrong `:action` value, a filename that does not parse
-into `name-version`, or a write side that only accepts one content type can all come
-back looking like a success.
+On a `pypiserver`-style registry **success is `200` with an empty body**, so neither the
+status nor the body length carries information: a wrong `:action`, a filename that does not
+parse as `<name>-<version>.tar.gz`, and a multipart body field sent as a query parameter all
+look the same. `409` means that filename already exists - publish a higher version.
 
-Two field-level details are worth knowing before you debug blind:
+Verify by **reading the index back** (`GET /simple/<name>/` lists your exact filename)
+*before* triggering, then **trigger the install yourself**: a rebuild described as
+"automatic" or "on deploy" may never run inside your budget, and waiting for it is
+indistinguishable from a broken exploit. Read the version it actually resolved. If it is
+still the old one, either the artifact is not listed or the constraint is tighter than your
+version, and one probe separates the two.
 
-- `:action=file_upload` must be a **multipart body field**, not a query-string
-  parameter; some servers answer `400` when it is only in the URL.
-- The uploaded filename must parse as `<name>-<version>.tar.gz`. A bare `<name>.tar.gz`
-  is rejected. A `409` (or `400` when the client identifies as twine) means the file
-  name already exists - pick a higher version rather than re-uploading the same one.
-
-Verify by **reading the index back**: `GET /simple/<name>/` (or the registry's listing
-page) and match your exact filename or version. If it is not in the listing, the upload
-did not land, whatever came back. Do this **before** triggering the install, so the next
-step has a known-good input.
-
-Then **trigger the install yourself**. A rebuild described as scheduled, automatic or
-"on deploy" may never run inside your time budget; waiting for it is indistinguishable
-from a broken exploit. Run the install action and read its `Downloading` line. If it
-still resolves the old version, there are exactly two causes - the artifact is not
-listed, or the version constraint is tighter than your version - and one probe tells
-you which.
-
-### If the version changed but nothing executed
-
-Pip builds an sdist in an isolated environment and installs the declared build
-requirements from the configured index first (PEP 517). If that index has no
-`setuptools`, the build fails and the install aborts **before** your `setup.py` is ever
-imported - the artifact was "picked up", the payload never ran. A prebuilt wheel, or a
-`pyproject.toml` with an in-tree backend and no requirements, avoids the dependency on
-whatever the target index happens to host.
-
-### If the rebuild always resolves the same version
-
-Then the pin is not mutable and confusion is not the bug. Stop publishing attempts and
-go read the artefact itself: fetch the `Downloading` URL, unpack the sdist, and read
-`setup.py`, `pyproject.toml`, and any `README` / `PKG-INFO`. The flag or the next host is
-frequently inside package metadata rather than behind an exploit.
+If the version changed but nothing executed, the cause is usually PEP 517: pip builds the
+sdist in isolation and installs the declared build requirements from the configured index
+first. With no `setuptools` there the build fails before your `setup.py` is imported, so a
+prebuilt wheel - or an in-tree backend with no requirements - is the way in.
 
 ## When the answer is "the install already happened"
 
-If the app shows an install log, or a resolved dependency tree, that log is evidence:
-it names the source URL, the version, and the maintainer. Read it before writing any
-payload. Half of these challenges are solved by reading one log line.
+An install log or a resolved dependency tree is evidence: it names the source URL, the
+version and the maintainer. Read it before writing any payload - half of these challenges
+are solved by reading one log line.
 
 ## What not to do
 
 - Do not brute-force package names. The name is in the config you have not read yet.
-- Do not treat this as a web challenge. `route_map` will show 3 routes and that is
-  the whole app; the surface is the dependency graph behind it.
+- Do not treat this as a web challenge. The surface is the dependency graph behind it.
 - Do not try to reach the public internet. The mirror is the target.
 
 ## References
