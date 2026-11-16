@@ -98,6 +98,11 @@ curl "https://target.com/page?name={{config}}"
 
 # Request inspection
 curl -v -X POST https://target.com/api -H "Content-Type: application/json" -d '{}'
+
+# JS-rendered shell (curl shows an empty div + one bundle): read the real DOM
+# browser_render(url="https://target.com/", wait_ms=5000)
+chromium --headless=new --no-sandbox --disable-gpu --dump-dom \
+  --virtual-time-budget=5000 https://target.com/ | head -c 4000
 ```
 
 ## Login Brute-Force — Hard Rules

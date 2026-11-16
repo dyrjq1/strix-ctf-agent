@@ -38,7 +38,16 @@ RUN set -eux; \
         binwalk libimage-exiftool-perl p7zip-full xz-utils zbar-tools \
         sox libsox-fmt-all pngcheck steghide poppler-utils \
         tcpdump tshark sleuthkit \
+        chromium fonts-dejavu-core \
     && rm -rf /var/lib/apt/lists/*
+
+# chromium（2026-11-16）：页面由脚本拼出来的题只看字节等于看不见——curl 拿到的是
+# 空壳，真正的 DOM 在浏览器里。此前镜像只有 playwright 的 Python 包、没有任何
+# 浏览器二进制（docs/30 缺口表），agent 只能手工读 bundle 猜。
+# 用发行版二进制而不是 `playwright install chromium`：没有驱动与浏览器版本配对
+# 这一层会静默漂移的东西，`docker/check_toolchain.sh` 每次构建真开一次页面。
+# 运行期以非 root 的 agent 用户跑，namespace sandbox 在容器内起不来，
+# browser_render 默认带 --no-sandbox（容器本身就是边界）。
 
 # openssh-client + sshpass：CTFY-0001 v3 合规硬缺口（awd 模式 ssh 横向移动），
 # 1.3.1 起补装。仅客户端，不装 sshd，不给容器开监听面。

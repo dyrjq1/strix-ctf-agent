@@ -158,6 +158,7 @@ def install_web_capabilities(
     traffic_register: RegisterFn | None = None,
     web_cve_register: RegisterFn | None = None,
     viability_register: RegisterFn | None = None,
+    browser_register: RegisterFn | None = None,
 ) -> tuple[dict[str, list[str]], list[str]]:
     """Install the structured HTTP and route-discovery primitives.
 
@@ -170,6 +171,7 @@ def install_web_capabilities(
             ``ctf_strix.aisec.tools.register_web_cve``.
         viability_register: Test seam; defaults to
             ``ctf_strix.viability.register``.
+        browser_register: Test seam; defaults to ``ctf_strix.browser.register``.
 
     Returns:
         ``(installed, errors)``.  ``installed`` maps capability name to the
@@ -188,6 +190,8 @@ def install_web_capabilities(
         from ctf_strix.aisec.tools import register_web_cve as web_cve_register
     if viability_register is None:
         from ctf_strix.viability import register as viability_register
+    if browser_register is None:
+        from ctf_strix.browser import register as browser_register
 
     installed: dict[str, list[str]] = {}
     errors: list[str] = []
@@ -207,6 +211,11 @@ def install_web_capabilities(
     viability_on, _reason = wants_viability()
     if viability_on:
         _install("viability", viability_register, installed, errors)
+    # 浏览器原语：页面是脚本拼出来的，只剩字节就等于看不见。CTF_BROWSER=0
+    # 是消融/回滚开关，与 viability 同形（只认 0/false/no，无正向覆盖）。
+    browser_on, _reason = wants_browser()
+    if browser_on:
+        _install("browser", browser_register, installed, errors)
     return installed, errors
 
 
@@ -225,6 +234,21 @@ def wants_viability() -> tuple[bool, str]:
     if forced in ("0", "false", "no"):
         return False, "CTF_VIABILITY=0"
     return True, "default on"
+
+
+def wants_browser() -> tuple[bool, str]:
+    """Decide whether the ``browser_render`` tool is installed.
+
+    Same contract as :func:`wants_viability`: on by default, ``CTF_BROWSER=0``
+    is the ablation and rollback path, and there is no positive override.  The
+    parsing lives in :mod:`ctf_strix.browser` so the env name has one owner.
+
+    Returns:
+        ``(enabled, reason)`` for the run log.
+    """
+    from ctf_strix.browser import wants_browser as _wants
+
+    return _wants()
 
 
 def install_soft_deadline(soft_seconds: float, turns: int):

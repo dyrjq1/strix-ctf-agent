@@ -111,7 +111,11 @@ def test_prompt_stays_small(block):
     # 5,186 before hypothesis discipline; 6,216 after (+1,030 exactly).
     # Headroom from the old threshold is preserved, so a one-line edit fits but
     # an unmeasured section does not.
-    assert size < 7030, f"system prompt grew to {size} chars"
+    # 2026-11-16 browser primitive: one catalogue line plus ``chromium`` in the
+    # Environment CLI list, measured 7,391.  Threshold 7,430 -- same ~40-char
+    # headroom the previous band kept, so the next addition still has to be
+    # argued for here rather than slipping in.
+    assert size < 7430, f"system prompt grew to {size} chars"
 
 
 _KINDS = ("web", "file", "tcp")

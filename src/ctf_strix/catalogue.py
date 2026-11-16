@@ -122,6 +122,13 @@ CATALOGUE: Final[tuple[ToolInfo, ...]] = (
         "web",
     ),
     ToolInfo(
+        "browser_render",
+        "render one page in headless chromium and return the DOM after its "
+        "scripts ran (or save a PNG), for shells that only build in the browser",
+        WEB_KINDS,
+        "web",
+    ),
+    ToolInfo(
         "traffic_list",
         "list this run exchanges plus ids the target returned that nobody "
         "fetched yet; read-only, no network",

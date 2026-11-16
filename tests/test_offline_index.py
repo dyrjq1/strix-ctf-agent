@@ -90,6 +90,9 @@ IMAGE_TOOLS = frozenset(
         # there.  Added after the 389-run corpus showed 16 "rg: command not
         # found" outputs (ledger §4.224).
         "rg", "node",
+        # 浏览器：页面是脚本拼出来的，只有字节等于看不见（docs/30 的缺口）。
+        # 镜像装发行版 chromium，browser_render 与 ctf-web 的 CLI 示例都指向它。
+        "chromium",
     }
 )
 

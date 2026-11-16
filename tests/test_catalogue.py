@@ -156,7 +156,10 @@ def test_prompt_stays_inside_the_web_budget():
     # 2026-11-13 B-14（台账 §4.165）：收工序言教 ANSWER[<qid>]=<value>
     # 契约行（非 flag 题的唯一交付通道），prose 实测 4,984 -> 5151。阈值
     # 与实测的距离保持 ~100（一次单行改动的余量），工具段仍插不进来。
-    assert prose < 5251, f"web prompt prose grew to {prose} chars (index {index})"
+    # 2026-11-16 浏览器原语：catalogue 多一行 browser_render（~150 字符）
+    # + Environment 的 CLI 名单加 chromium（11 字符），实测 5,251 -> 5,415。
+    # 阈值同步抬到 5,515，仍是一次单行改动的余量，不是敞口。
+    assert prose < 5515, f"web prompt prose grew to {prose} chars (index {index})"
     assert index < 2050, f"skill index grew to {index} chars (prose {prose})"
 
 

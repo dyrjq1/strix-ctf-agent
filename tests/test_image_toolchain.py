@@ -238,6 +238,35 @@ def test_docker_check_script_checks_metadata_and_imports() -> None:
         assert stmt in script, f"check_toolchain.sh lost its real import: {stmt}"
 
 
+def test_image_ships_a_browser_binary_and_boots_it() -> None:
+    """The gap docs/30 named: a playwright package and no browser to drive.
+
+    Two assertions, because either half alone is how the gap survived: the
+    Dockerfile must install ``chromium``, and the build-time script must not
+    settle for ``--version`` -- it renders a data: page and checks that a
+    script inside it actually ran.
+    """
+    lines = (ROOT / "docker" / "Dockerfile").read_text(encoding="utf-8").splitlines()
+    start = next(i for i, line in enumerate(lines) if "apt-get install" in line)
+    # The package list is a continued RUN, so the block is what to inspect.
+    block = " ".join(lines[start : start + 25])
+    assert "chromium" in block, "the image installs no browser"
+
+    script = (ROOT / "docker" / "check_toolchain.sh").read_text(encoding="utf-8")
+    assert '"chromium": ("chromium", "--version")' in script
+    assert "--dump-dom" in script, "version output cannot prove the browser boots"
+    assert "RENDER-OK" in script, "the probe does not check that page scripts ran"
+    assert "--screenshot=" in script, "shot mode is shipped but never exercised"
+
+
+def test_browser_primitive_has_no_python_driver_dependency() -> None:
+    """The primitive shells out on purpose; a driver import would be a silent pair."""
+    text = (ROOT / "src" / "ctf_strix" / "browser.py").read_text(encoding="utf-8")
+    for banned in ("import playwright", "from playwright", "import selenium"):
+        assert banned not in text
+    assert "subprocess" in text
+
+
 def test_closure_manifest_matches_the_lock() -> None:
     """构建期核对用的闭包清单必须与 lock 完全一致，否则检查会失效或误报。"""
     pins = _pins()

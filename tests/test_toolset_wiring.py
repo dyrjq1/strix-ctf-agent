@@ -132,6 +132,29 @@ def test_viability_probe_disappears_when_ablated(registry, monkeypatch):
     assert "`http_probe`" in text
 
 
+def test_web_challenge_registers_browser_render(registry):
+    """The browser must be in the real web registry, not just importable."""
+    names, groups, text = registry("web", {"challenge": {"description": "a login page"}})
+    assert "browser_render" in names
+    assert "`browser_render`" in text
+
+
+def test_browser_render_disappears_when_ablated(registry, monkeypatch):
+    """``CTF_BROWSER=0`` removes both the tool and its prompt line."""
+    monkeypatch.setenv("CTF_BROWSER", "0")
+    names, groups, text = registry("web", {"challenge": {"description": "a login page"}})
+    assert "browser_render" not in names
+    assert "`browser_render`" not in text
+    assert "http_probe" in names
+
+
+def test_file_challenge_never_pays_for_the_browser(registry):
+    """An attachment challenge has no page to render."""
+    names, groups, text = registry("file", {"challenge": {"attachment": "x.zip"}})
+    assert "browser_render" not in names
+    assert "`browser_render`" not in text
+
+
 def test_tcp_challenge_registers_socket_tools(registry):
     names, groups, text = registry("tcp")
     assert {"tcp", "tcp_batch"} <= names

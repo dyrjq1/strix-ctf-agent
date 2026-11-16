@@ -287,6 +287,8 @@ PROBES = {
     # 提示的 Environment 段点名了它们，就必须在这里被探测到。
     "rg": ("rg", "--version"),
     "node": ("node", "--version"),
+    # browser_render 的唯一依赖：版本能打印还不够，下面会真开一次页面。
+    "chromium": ("chromium", "--version"),
 }
 for label, argv in PROBES.items():
     exe = shutil.which(argv[0])
@@ -297,6 +299,41 @@ for label, argv in PROBES.items():
     if not out:
         sys.exit(f"{label} produced no version output")
     print(f"[toolchain] {label}: {out.splitlines()[0][:90]}")
+PY
+
+echo "[toolchain] booting the headless browser"
+python3 - <<'PY'
+import os
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+# 打印版本不能证明浏览器能起来：缺库、sandbox 起不来、profile 不可写都会让
+# 它在比赛里的第一次调用才炸。这里用 data: 页面（无网络依赖）真渲染一次，
+# 断言脚本执行后的 DOM 里出现注入的标记。docs/30 的缺口就是「有包没二进制」。
+profile = tempfile.mkdtemp(prefix="tc-chromium-")
+shot = Path(profile) / "shot.png"
+base = ["chromium", "--headless=new", "--no-sandbox", "--disable-gpu",
+        "--disable-dev-shm-usage", "--no-first-run",
+        f"--user-data-dir={profile}", "--window-size=800,600"]
+
+def run(extra, timeout=90):
+    return subprocess.run(base + extra, capture_output=True, text=True, timeout=timeout)
+
+page = ("data:text/html,<title>tc</title><div id=r></div>"
+        "<script>document.getElementById('r').textContent='RENDER-OK'</script>")
+dom = run(["--virtual-time-budget=3000", "--dump-dom", page])
+out = (dom.stdout or "") + (dom.stderr or "")
+if "RENDER-OK" not in out:
+    sys.exit("chromium did not execute page scripts (dump-dom): " + out[-400:])
+
+png = run([f"--screenshot={shot}", "--virtual-time-budget=3000", page])
+if png.returncode != 0 or not shot.exists():
+    sys.exit("chromium did not write a screenshot: " + ((png.stdout or "") + (png.stderr or ""))[-400:])
+if shot.read_bytes()[:8] != b"\x89PNG\r\n\x1a\n":
+    sys.exit("chromium screenshot is not a PNG")
+print("[toolchain] chromium: scripts ran (RENDER-OK), screenshot %d bytes" % shot.stat().st_size)
 PY
 
 echo "[toolchain] OK"

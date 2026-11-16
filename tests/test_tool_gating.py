@@ -133,6 +133,8 @@ def test_catalogue_does_not_promise_tools_nobody_registers():
     registered |= {"http_probe", "route_map", "method_sweep", "path_variants"}
     # Viability ladder: registered by ``capabilities`` with the web surface.
     registered |= {"viability_probe"}
+    # Browser primitive: registered by ``capabilities`` with the web surface.
+    registered |= {"browser_render"}
     # Traffic memory: two read-only primitives that replay the ledger.
     registered |= {"traffic_list", "traffic_view"}
     # The base four are vendor tools; they are asserted separately below.
