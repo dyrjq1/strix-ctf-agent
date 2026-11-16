@@ -3413,6 +3413,11 @@ def run_agent(
         # ON 臂就是 OFF 臂，跑完只会得到"开了也没变化"的假象——11-14 消融臂
         # 事故是同一类错。
         "CTF_ALLOW_SUBAGENTS": os.environ.get("CTF_ALLOW_SUBAGENTS", ""),
+        # 机制移植的 A/B 开关（台账 §4.250 起）。白名单不转发 = 两臂同一份代码，
+        # 2026-11-17 Q2 首跑就是这么废掉的：CTF_RECOVERY_NOTICE 已 export，
+        # 子进程里 `[trim]` 只有 race_spawn 一行，notice 从未安装。
+        "CTF_RECOVERY_NOTICE": os.environ.get("CTF_RECOVERY_NOTICE", ""),
+        "CTF_STRUCTURAL": os.environ.get("CTF_STRUCTURAL", ""),
         "STRIX_TELEMETRY": "false",
         # 每次 LLM 调用后原子落盘。进程被墙钟 SIGKILL 时，run_strix_ctf 末尾那行
         # `[usage]` 永远不会打印——两条 A/B 臂就这么丢了 token 数（只能记 n/a）。
