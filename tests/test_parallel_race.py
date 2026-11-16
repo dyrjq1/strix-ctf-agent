@@ -123,6 +123,61 @@ def test_agent_graph_tools_are_registered_when_enabled(
         assert name in names, f"{name} must be reachable when the switch is on"
 
 
+def test_race_spawn_is_registered_through_the_trim_seam(
+    monkeypatch, base_tools_restored
+) -> None:
+    """The eval harness only calls ``install_ctf_toolset``.
+
+    ``agent.py`` registers ``race_spawn`` on the official entrypoint.  An A/B
+    arm that runs through the harness and a delivered image that runs through
+    ``agent.py`` must expose the same tool surface; this pins the shared seam
+    so the two entries cannot drift apart again (ledger §4.249).
+    """
+    from ctf_strix.tool_trim import install_ctf_toolset
+
+    factory = base_tools_restored
+    before_extra = tuple(factory._EXTRA_TOOLS)  # noqa: SLF001
+    before_flag = parallel._RACE_TOOL_INSTALLED
+    try:
+        parallel._RACE_TOOL_INSTALLED = False
+        monkeypatch.setenv("CTF_ALLOW_SUBAGENTS", "1")
+
+        install_ctf_toolset()
+
+        names = {tool.name for tool in factory.registered_agent_tools()}
+        assert "race_spawn" in names
+    finally:
+        factory._EXTRA_TOOLS[:] = before_extra  # noqa: SLF001
+        parallel._RACE_TOOL_INSTALLED = before_flag
+
+
+def test_race_spawn_is_absent_from_the_trim_seam_by_default(
+    monkeypatch, base_tools_restored
+) -> None:
+    """With the switch off the harness must not gain the spawn tool."""
+    from ctf_strix.tool_trim import install_ctf_toolset
+
+    factory = base_tools_restored
+    before_extra = tuple(factory._EXTRA_TOOLS)  # noqa: SLF001
+    before_flag = parallel._RACE_TOOL_INSTALLED
+    try:
+        parallel._RACE_TOOL_INSTALLED = False
+        # Earlier tests in this process may have registered the tool; start from
+        # a surface that does not already carry it.
+        factory._EXTRA_TOOLS[:] = [  # noqa: SLF001
+            t for t in before_extra if getattr(t, "name", "") != "race_spawn"
+        ]
+        monkeypatch.delenv("CTF_ALLOW_SUBAGENTS", raising=False)
+
+        install_ctf_toolset()
+
+        names = {tool.name for tool in factory.registered_agent_tools()}
+        assert "race_spawn" not in names
+    finally:
+        factory._EXTRA_TOOLS[:] = before_extra  # noqa: SLF001
+        parallel._RACE_TOOL_INSTALLED = before_flag
+
+
 def test_enabling_restores_the_graph_after_a_default_trim(
     monkeypatch, base_tools_restored
 ) -> None:
@@ -153,23 +208,33 @@ def test_keeping_the_graph_tools_also_installs_the_limit_guard(
 
     from ctf_strix.tool_trim import install_ctf_toolset
 
-    monkeypatch.setenv("CTF_ALLOW_SUBAGENTS", "1")
-    install_ctf_toolset()
+    # The seam now also registers ``race_spawn`` into the process-wide
+    # ``_EXTRA_TOOLS``.  Left behind, that registration makes every later test
+    # see the tool as already installed (``test_race_spawn.py`` then gets an
+    # empty capture list).  Restore the surface this test inherited.
+    before_extra = tuple(factory._EXTRA_TOOLS)  # noqa: SLF001
+    before_flag = parallel._RACE_TOOL_INSTALLED
+    try:
+        monkeypatch.setenv("CTF_ALLOW_SUBAGENTS", "1")
+        install_ctf_toolset()
 
-    async def inner(_ctx, _raw):
-        return json.dumps({"success": True})
+        async def inner(_ctx, _raw):
+            return json.dumps({"success": True})
 
-    guarded = factory._with_bounded_result(_tool("create_agent", inner))
-    root = _Context(agent_id="root", parent_id=None, coordinator=_Coordinator())
+        guarded = factory._with_bounded_result(_tool("create_agent", inner))
+        root = _Context(agent_id="root", parent_id=None, coordinator=_Coordinator())
 
-    async def run():
-        return [
-            json.loads(await guarded.on_invoke_tool(root, "{}"))
-            for _ in range(parallel.MAX_SUBAGENTS + 1)
-        ]
+        async def run():
+            return [
+                json.loads(await guarded.on_invoke_tool(root, "{}"))
+                for _ in range(parallel.MAX_SUBAGENTS + 1)
+            ]
 
-    results = asyncio.run(run())
-    assert [r["success"] for r in results] == [True, True, False], results
+        results = asyncio.run(run())
+        assert [r["success"] for r in results] == [True, True, False], results
+    finally:
+        factory._EXTRA_TOOLS[:] = before_extra  # noqa: SLF001
+        parallel._RACE_TOOL_INSTALLED = before_flag
 
 
 def test_prompt_carries_the_race_protocol_only_when_enabled(monkeypatch) -> None:
@@ -178,7 +243,7 @@ def test_prompt_carries_the_race_protocol_only_when_enabled(monkeypatch) -> None
     monkeypatch.setenv("CTF_ALLOW_SUBAGENTS", "1")
     enabled_text = prompt.build({})
     assert "Parallel hypothesis race" in enabled_text
-    assert "list the candidate directions in `think`" in enabled_text
+    assert "Split in `think` before you split with `race_spawn`" in enabled_text
     assert "at most **two**" in enabled_text
     assert "platform verdict" in enabled_text
 
