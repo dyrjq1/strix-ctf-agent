@@ -111,6 +111,14 @@ def _strip_dead_proxy(manifest: Manifest) -> list[str]:
     ``environment.value`` 是可变 dict，且 ``unix_local.py:434`` 会把它
     ``update`` 进每次 exec 的环境，所以在这里改就生效。
 
+    ⚠️ 白名单不能只删不并：Caido 那份 ``NO_PROXY=localhost,127.0.0.1``
+    （``session_manager.py:315``）会**覆盖**调用方设的白名单。调用方
+    （``batch_eval._proxy_blackhole``）把代理指到黑洞端口，靠 NO_PROXY 放行
+    靶机与 LLM 网关；被覆盖成「只剩回环」之后，agent 的 curl/pip 打靶机
+    全走黑洞，拿到的是一次 ECONNREFUSED 而不是靶机响应。064 实测：第二
+    个服务与主靶机同一个 IP，仍被自家代理吞掉，pip 5 次重试共 30s，agent
+    再花一轮诊断 ``env | grep -i proxy``，最后靠 ``--noproxy '*'`` 才打通。
+
     Args:
         manifest: strix 构造的沙箱清单。
 
@@ -123,6 +131,21 @@ def _strip_dead_proxy(manifest: Manifest) -> list[str]:
     removed = [k for k in _CAIDO_PROXY_KEYS if k in env]
     for key in removed:
         env.pop(key, None)
+    # 并集而不是覆盖：保留 Caido 的回环项，同时把调用方（runner 进程环境里）
+    # 的靶机/网关项拿回来。两边大小写各一份，统一写同一份合并结果。
+    for key in ("NO_PROXY", "no_proxy"):
+        merged: list[str] = []
+        for src in (
+            env.get(key),
+            os.environ.get("NO_PROXY"),
+            os.environ.get("no_proxy"),
+        ):
+            for host in str(src or "").split(","):
+                host = host.strip()
+                if host and host not in merged:
+                    merged.append(host)
+        if merged:
+            env[key] = ",".join(merged)
     return removed
 
 

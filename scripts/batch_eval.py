@@ -1956,15 +1956,23 @@ def _parse_guard(
     return out
 
 
-def _proxy_blackhole(target: str) -> dict[str, str]:
+def _proxy_blackhole(
+    target: str, extra_hosts: list[str] | tuple[str, ...] = ()
+) -> dict[str, str]:
     """把"外网不可达"从"卡 60 秒"变成"立刻拒绝"。
 
     只做一件事：把 HTTP(S)_PROXY 指到一个关闭的本地端口，并用 NO_PROXY
     放行本题靶机与 LLM 网关。这样 agent 再想 `curl github.com/...` 会拿到
     瞬时 connection refused，而不是挂满超时——两者对模型的信息量完全不同。
 
+    ⚠️ 多服务题必须把**每个** service 主机都放行，不只是接成主目标的那一个。
+    064 实测：第二个服务（包索引）与主靶机同一个 IP，因为不在白名单里，被
+    自家黑洞代理吞成瞬时拒绝，pip 重试 5 次共 30s；agent 又花一轮诊断代理，
+    才用 ``--noproxy '*'`` 打通。
+
     Args:
         target: 本题靶机地址（URL 或 host:port）。
+        extra_hosts: 同一实例的其余 service 主机名（``Client.endpoints``）。
 
     Returns:
         可直接并入子进程环境变量的字典。
@@ -1975,6 +1983,10 @@ def _proxy_blackhole(target: str) -> dict[str, str]:
     host = urlsplit(target if "://" in target else f"//{target}").hostname
     if host:
         allowed.append(host)
+    for extra in extra_hosts:
+        extra = str(extra or "").strip()
+        if extra:
+            allowed.append(extra)
     llm_host = urlsplit(os.environ.get("LLM_API_BASE", "")).hostname
     if llm_host:
         allowed.append(llm_host)
@@ -3335,6 +3347,7 @@ def run_agent(
     challenge_id: str = "",
     files: dict[str, bytes] | None = None,
     tags: list[str] | None = None,
+    extra_hosts: list[str] | None = None,
 ) -> tuple[str, float]:
     """跑一次 strix，返回 (完整日志, 墙钟耗时)。
 
@@ -3379,7 +3392,7 @@ def run_agent(
         # 指到一个必然拒绝的本地端口，失败就从"慢"变成"瞬时"，模型立刻换路。
         # ⚠️ NO_PROXY 必须放行两类：本题靶机（否则打不到目标）和 LLM 网关
         # （否则 strix 自己连不上模型，整题直接挂）。
-        **_proxy_blackhole(target),
+        **_proxy_blackhole(target, extra_hosts=extra_hosts or ()),
         "STRIX_RUNTIME_BACKEND": "local",
         "PYTHONUNBUFFERED": "1",
         # 凭据只来自环境。仓库里写死 key 的代价不是"泄漏"，而是几个月后
@@ -3999,6 +4012,13 @@ def main() -> int:
                     files=attachments,
                     tags=[
                         t for t in (challenge_detail.get("tags") or []) if isinstance(t, str)
+                    ],
+                    # 白名单要覆盖本实例**所有** service 主机：只放行主目标时，
+                    # 第二个服务（包索引/管理面）会被自家黑洞代理吞掉。
+                    extra_hosts=[
+                        str(svc.get("host") or "").strip()
+                        for svc in (getattr(client, "endpoints", []) or [])
+                        if svc.get("host")
                     ],
                 )
                 logs.append(sample_log)
