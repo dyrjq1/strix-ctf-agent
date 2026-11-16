@@ -61,11 +61,18 @@ to ``stop_reason="enum_exhausted"``.
 
 from __future__ import annotations
 
+from ctf_strix.tool_notes import append_note
+
 import hashlib
+import json
+import os
 import re
 from collections import Counter
 from typing import TYPE_CHECKING, Any, Final
 
+from ctf_strix.command_tokens import command_text as _command_text
+from ctf_strix.command_tokens import segments as _command_segments
+from ctf_strix.journey_guard import _args_session_signal
 from ctf_strix.probe_surface import PROBE_TOOLS
 
 if TYPE_CHECKING:
@@ -102,6 +109,28 @@ _STALL_REPEAT = 4
 #: budget.  Only the *class* is new here, not the threshold.
 _CLASS_STREAK_AFTER = _STALL_AFTER
 _CLASS_STREAK_REPEAT = _STALL_REPEAT
+
+#: How many consecutive probes of the *same* mechanism class with no new
+#: observation before that class is hard-refused.  Why 8 and not 6 or 10:
+#: ``_STALL_AFTER`` is 6 across *all* classes, where any novelty anywhere
+#: clears it; a single class is a narrower question and legitimately needs a
+#: few payload variations (a blind extraction stays inside one class), so the
+#: per-class budget sits one step above the cross-class one.  It is not 10
+#: because the class hint already fires at 6 with no observed change of
+#: direction, so the extra two calls buy nothing.  The two thresholds stay
+#: separate constants so tuning one cannot silently move the other.
+_CLASS_BLOCK_AFTER: Final[int] = 8
+
+#: How many *consecutive never-before-requested paths* make a run of requests a
+#: shape rather than navigation.  Physical basis: one unseen path is how every
+#: request to a new route looks; two in a row, neither carrying any mechanism
+#: syntax, is the model naming things instead of attacking them -- the wording
+#: of a single hypothesis in many names.  This is not a budget: it decides when
+#: a shape becomes *classifiable*, and the actionable hint still waits for
+#: ``_CLASS_STREAK_AFTER`` saws.  Retries of an already-requested path never
+#: reach it, which is what keeps blind extraction (one endpoint, many payloads)
+#: out of the enumeration counter.
+_BREADTH_CLASSIFY_AT: Final[int] = 2
 
 #: 从命令里提取"被探测的路径族"。抽不出来就不计——宁可漏抓，不可误伤。
 _PATH_RE = re.compile(r"[A-Za-z0-9_\-./]*(?:api|admin|flag|config|debug|static|assets)[A-Za-z0-9_\-./]*")
@@ -317,11 +346,163 @@ def _host_of(args: str) -> str | None:
     return m.group(1).rstrip(".;:") if m else None
 
 
+# ---- 指纹的另外两维：HTTP 方法与认证态 ----------------------------------
+#
+# 为什么要这两维（报告 WEB-3③ / WEB-6）：``blocked`` 的键一旦只有
+# ``工具|host|族``，同一路径族的**所有方法、无论带不带会话**都在工具执行前被硬拒。
+# 拿到账号之后再打同一个接口、或者把 GET 换成 POST 试写入口，都会被一句
+# "this family is blocked" 挡回去——守卫把"这条路没有新信息"说成了"这条路
+# 永远不许走"。换方法就是换请求，带上会话就是换身份，两者都是**真实的状态
+# 变化**，旧计数不该继承过来。
+
+#: 方法词表。只认这八个，避免把 ``-X PRIVATE`` 之类的目录名当方法。
+_METHOD_WORDS: Final[frozenset[str]] = frozenset(
+    {"GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "TRACE"}
+)
+#: 显式方法选项。``-X`` 只归 curl：wget 的 ``-X`` 是 ``--exclude-directories``，
+#: 把目录名当成方法会把 GET 认成 ``PUBLIC``（见 ``command_tokens._WGET_VALUE_OPTIONS``）。
+_CURL_METHOD_OPTIONS: Final[frozenset[str]] = frozenset({"-X", "--request"})
+_WGET_METHOD_OPTIONS: Final[frozenset[str]] = frozenset({"--method"})
+#: 带请求体的选项：不写 ``-X`` 时 curl / wget 也会改发 POST。
+#: ``-d`` / ``-F`` 只归 curl —— wget 的 ``-d`` 是 ``--debug``。
+_CURL_BODY_FLAGS: Final[frozenset[str]] = frozenset(
+    {"-d", "--data", "--data-raw", "--data-binary", "--data-urlencode", "--json", "-F", "--form"}
+)
+_WGET_BODY_FLAGS: Final[frozenset[str]] = frozenset(
+    {"--post-data", "--post-file", "--body-data", "--body-file"}
+)
+_CURL_HEAD_FLAGS: Final[frozenset[str]] = frozenset({"-I", "--head"})
+_CURL_GET_FLAGS: Final[frozenset[str]] = frozenset({"-G", "--get"})
+#: 会话请求头。``Cookie`` / ``Authorization`` 是"这次请求带着身份"的机制级证据；
+#: 其余自定义头（含 ``X-Forwarded-For``）不改变身份，不算。
+_SESSION_HEADER_NAMES: Final[frozenset[str]] = frozenset({"cookie", "authorization"})
+#: ``Cookie: v`` / ``Cookie=v`` / ``"Cookie": "v"`` —— 最后一种是
+#: ``http_probe`` 的 ``headers_json`` 传 JSON 文本时的形态（引号在分隔符前）。
+_SESSION_HEADER_RE = re.compile(
+    r"(?:^|[\s\"',{;])(?:cookie|authorization)\s*[\"']?\s*[:=]\s*\S", re.I
+)
+
+
+def _json_object(args: str) -> dict[str, Any] | None:
+    """参数里的 JSON 对象；解析不出来（shell 原文形态）就返回 None。"""
+    try:
+        data = json.loads(args)
+    except (TypeError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _client_of(token: str) -> str | None:
+    """``curl`` / ``wget``（允许带目录与 ``.exe``），其余返回 None。"""
+    base = token.rsplit("/", 1)[-1].lower()
+    if base.endswith(".exe"):
+        base = base[:-4]
+    return base if base in ("curl", "wget") else None
+
+
+def _segment_method(tokens: list[str], client: str) -> str | None:
+    """一个 curl / wget 命令段的方法：显式选项优先，否则由旗标隐含。"""
+    explicit = _CURL_METHOD_OPTIONS if client == "curl" else _WGET_METHOD_OPTIONS
+    body = _CURL_BODY_FLAGS if client == "curl" else _WGET_BODY_FLAGS
+    implied: str | None = None
+    index = 1
+    while index < len(tokens):
+        token = tokens[index]
+        option, separator, attached = token.partition("=")
+        # curl 也吃 ``-XPOST`` 这种粘写形态。
+        short = token[:2] if len(token) > 2 and not token.startswith("--") else ""
+        if option in explicit or short in explicit:
+            if separator:
+                candidate = attached
+            elif short in explicit:
+                candidate = token[2:]
+            else:
+                index += 1
+                candidate = tokens[index] if index < len(tokens) else ""
+            word = candidate.strip().upper()
+            if word in _METHOD_WORDS:
+                return word
+        elif token in body or (
+            len(token) > 2 and not token.startswith("--") and token[:2] in body
+        ):
+            implied = implied or "POST"
+        elif client == "curl" and token in _CURL_HEAD_FLAGS:
+            implied = implied or "HEAD"
+        elif client == "curl" and token in _CURL_GET_FLAGS:
+            implied = implied or "GET"
+        index += 1
+    return implied
+
+
+def _method_of(args: str) -> str:
+    """这次调用用的是哪个 HTTP 方法；判断不出来按 GET 计。
+
+    两处来源：探测工具的 ``method`` / ``methods`` 参数（``method_sweep`` 与
+    ``path_variants`` 收的是逗号分隔串，排序后拼成一个稳定键），以及 shell 里
+    curl / wget 段的方法选项。
+    """
+    data = _json_object(args)
+    if data is not None:
+        raw = data.get("method")
+        if isinstance(raw, str):
+            word = raw.strip().upper()
+            if word in _METHOD_WORDS:
+                return word
+        many = data.get("methods")
+        if isinstance(many, str):
+            words = sorted(
+                {w for w in re.split(r"[\s,]+", many.upper()) if w in _METHOD_WORDS}
+            )
+            if words:
+                return "+".join(words)
+    for tokens in _command_segments(_command_text(args)):
+        client = _client_of(tokens[0]) if tokens else None
+        if client is None:
+            continue
+        method = _segment_method(tokens, client)
+        if method is not None:
+            return method
+    return "GET"
+
+
+def _auth_of(args: str) -> str:
+    """这次调用是否带着会话；键里只留 ``auth`` / ``anon`` 两值。
+
+    先读 JSON 参数里的 ``headers`` / ``headers_json`` / ``cookies`` —— 覆盖
+    ``http_probe`` 这类以 JSON 传参的探测工具（``command_text`` 只解码
+    ``command``/``cmd``/``script``/``chars``，对这些工具返回原文，shell 门控
+    看不到任何东西）。再退回 shell 门控 ``journey_guard._args_session_signal``，
+    它负责 ``curl -b`` / ``--cookie-jar`` / ``-H 'Cookie: ...'`` 的引号与
+    heredoc 处理，不重复实现。
+    """
+    data = _json_object(args)
+    if data is not None:
+        for field in ("headers", "header", "headers_json"):
+            headers = data.get(field)
+            if isinstance(headers, dict):
+                for name, value in headers.items():
+                    if value and str(name).strip().lower() in _SESSION_HEADER_NAMES:
+                        return "auth"
+            elif isinstance(headers, str) and _SESSION_HEADER_RE.search(headers):
+                return "auth"
+        for field in ("cookies", "cookie"):
+            cookies = data.get(field)
+            if isinstance(cookies, dict) and cookies:
+                return "auth"
+            if isinstance(cookies, str) and cookies.strip():
+                return "auth"
+    return "auth" if _args_session_signal(args) else "anon"
+
+
 def _fingerprint(tool_name: str, args: str) -> str | None:
     """把一次探测归一化成指纹，用于判断"是不是同一族"。
 
-    只保留：工具名 + 目标 host + 命中的业务路径词。丢掉具体的 URL 参数、
-    文件名、随机串——那些正是模型用来"换个参数重试"的空间。
+    只保留：工具名 + 目标 host + HTTP 方法 + 认证态 + 命中的业务路径词。丢掉
+    具体的 URL 参数、文件名、随机串——那些正是模型用来"换个参数重试"的空间。
+
+    **族名必须是最后一段**：``finish()``、``_blocked_error()``、
+    ``exhausted_detail()`` 都按末段取族名，测试也按 ``.endswith("|api/login")``
+    断言。新增维度只能往中间插。
 
     Args:
         tool_name: 工具名。
@@ -371,7 +552,7 @@ def _fingerprint(tool_name: str, args: str) -> str | None:
     if not families:
         return None
 
-    return f"{tool_name}|{host}|{sorted(families)[0]}"
+    return f"{tool_name}|{host}|{_method_of(args)}|{_auth_of(args)}|{sorted(families)[0]}"
 
 
 #: "又在读前端 bundle" 的特征：curl/wget 一个 .js、cat 一个 .js、或 read_file 到 .js。
@@ -396,6 +577,15 @@ _WRITE_REDIRECT_RE = re.compile(r"\b(?:cat|tee)\b[^\n]*?(?:>>?|<<)")
 _HEAD_DURATION_RE = re.compile(r"\b\d+(?:\.\d+)?\s*(?:ms|s|seconds?|sec)\b", re.I)
 _HEAD_SIZE_RE = re.compile(r"\b\d+(?:\.\d+)?\s*(?:B|KB|MB|bytes?)\b", re.I)
 
+#: ``http_probe`` 的状态行末尾挂着本轮的交换 id（``traffic.next_id()`` →
+#: ``id=r7``），它对每个响应都不同，但**不代表任何状态变化**。留着它，
+#: 同一路径同一响应的两次探测就是两个指纹 —— 重复计数恒 0、stall 恒不涨，
+#: ENUMERATION GUARD 在最该响的地方永远不响（报告 WEB-2）。
+#:
+#: 只洗 ``id=rNN`` 这一种形态：``[HTTP 403]`` 里的状态码、``phase=CONNECT``
+#: 里的归因都必须是语义的一部分。
+_HEAD_REQ_ID_RE = re.compile(r"\bid=r\d+\b")
+
 
 def _norm_head(head: str) -> str:
     """归一化状态行里逐次变化的部分，保留状态码等语义数字。
@@ -408,6 +598,7 @@ def _norm_head(head: str) -> str:
     """
     out = _HEAD_DURATION_RE.sub("<t>", head)
     out = _HEAD_SIZE_RE.sub("<n>", out)
+    out = _HEAD_REQ_ID_RE.sub("id=<id>", out)
     return re.sub(r"\s+", " ", out).strip()
 
 
@@ -485,6 +676,130 @@ def _obs_signature(result: Any, args: str) -> str:
     return hashlib.sha1(payload.encode("utf-8", "replace")).hexdigest()[:12]
 
 
+#: Markers that say "this result came from the target", not from the local
+#: shell.  Without one of these the result is not a response and is left out of
+#: the shape counter entirely.
+_RESPONSE_MARKER_RE = re.compile(
+    r"\[HTTP\s+(\d{3})\]|HTTP/1\.[01]\s+(\d{3})|phase=([A-Z][A-Z_]+)"
+)
+_TAG_RE = re.compile(r"<([a-zA-Z][a-zA-Z0-9]*)")
+#: Body bytes per size bucket.  200 is the page-cache-block scale: below it two
+#: pages of the same kind land in one bucket, above it they do not.
+_SIZE_BUCKET = 200
+
+
+def _structure_signature(result: Any) -> str | None:
+    """The *shape* of a response: status, media type, size bucket, tag vocabulary.
+
+    Why a second, coarser signature exists:
+
+    ``_obs_signature`` hashes the first 1500 normalised characters, which is the
+    right thing for the hard block (it must not refuse a call the model has a
+    real reason to repeat) and the wrong thing for "did that teach me anything".
+    Measured over 265 finished runs in ``/var/tmp/ctfbox`` (replayed from
+    ``.state/agents.db``, no tokens spent): solved runs produced a *new response
+    shape* on 73 % of their calls, burnt runs on 55 % -- roughly half of a
+    failing run's calls re-read the same kind of page with different words in
+    it.  The text-level detector saw 7 % of failures reach six repeats; the
+    shape-level one sees 30 %, at the cost of touching 7 % of solved runs with
+    one extra hint line.
+
+    Only markers from the target count (HTTP status, transport phase).  A shell
+    listing has no shape at all: two ``ls`` outputs of the same length are not
+    "the same page", so they fall back to the text signature.
+
+    Args:
+        result: 工具返回值。
+
+    Returns:
+        形态串；结果没有目标侧标记时返回 None。
+    """
+    text = result if isinstance(result, str) else str(result)
+    match = _RESPONSE_MARKER_RE.search(text[:400])
+    if match is None:
+        return None
+    status = next(group for group in match.groups() if group)
+    _, _, body = text.partition("\n")
+    low = body[:400].lower()
+    if "<html" in low or "<!doctype html" in low:
+        ctype = "html"
+    elif body.lstrip()[:1] in ("{", "["):
+        # ``in "{["`` would be true for the empty string -- an empty body is
+        # not JSON, and calling it JSON made a bodyless result look like an
+        # API answer.
+        ctype = "json"
+    else:
+        ctype = "text"
+    tags = len({tag.lower() for tag in _TAG_RE.findall(body[:4000])})
+    return f"{status}|{ctype}|{len(body) // _SIZE_BUCKET}|tags={tags}"
+
+
+def _structure_enabled() -> bool:
+    """Opt-in switch for the shape-level stall criterion (default **off**).
+
+    Off is not caution for its own sake: the live A/B on 2026-11-15 ran 40
+    question-runs with both settings and the hint fired zero times either way
+    (deepest stall 0-2, threshold 6), so the shape rule changed no behaviour
+    and its +1 solve was noise.  Shipping the untested side of an inert switch
+    buys nothing; the code stays so a later experiment can retest it at a
+    different threshold, one env var away.
+    """
+    return os.environ.get("CTF_STRUCT_SIG", "0").strip().lower() not in {
+        "0",
+        "off",
+        "false",
+        "no",
+    }
+
+
+def _class_block_enabled() -> bool:
+    """Opt-in switch for the mechanism-class hard block (default **off**).
+
+    Off by default because the per-class budget is an experiment: the family
+    block and the class *hint* already ship, and turning a hint into a refusal
+    changes which calls reach the target.  The A/B decides the default; this
+    switch keeps both arms one env var apart.
+    """
+    return os.environ.get("CTF_CLASS_BLOCK", "0").strip().lower() not in {
+        "0",
+        "off",
+        "false",
+        "no",
+    }
+
+
+#: Transport failures that mean the call never reached the target.  They are
+#: not observations: no page was returned, so counting one as "same response
+#: again" charges the model for the network, and a jittery target would block
+#: an otherwise healthy family.  Each pattern is the literal text the client
+#: (curl, urllib, the shell capability) emits, matched case-insensitively.
+_UNREACHABLE_PATTERNS: Final[tuple[tuple[str, re.Pattern[str]], ...]] = (
+    ("refused", re.compile(r"connection refused", re.I)),
+    ("reset", re.compile(r"connectionreseterror", re.I)),
+    ("timeout", re.compile(r"\btimed out\b", re.I)),
+    ("dns", re.compile(r"temporary failure in name resolution", re.I)),
+    ("tls", re.compile(r"\bsslerror\b", re.I)),
+    ("closed", re.compile(r"\[tcp\] connection closed", re.I)),
+)
+
+
+def _unreachable(result: Any) -> str | None:
+    """Return the transport-failure kind when the call never reached the host.
+
+    Args:
+        result: the tool result.
+
+    Returns:
+        A short kind (``refused`` / ``reset`` / ``timeout`` / ``dns`` /
+        ``tls`` / ``closed``), or ``None`` for a real response.
+    """
+    text = result if isinstance(result, str) else str(result)
+    for kind, pattern in _UNREACHABLE_PATTERNS:
+        if pattern.search(text):
+            return kind
+    return None
+
+
 class EnumExhausted(BaseException):
     """The model kept retrying a hard-blocked family instead of rerouting.
 
@@ -502,6 +817,21 @@ class EnumExhausted(BaseException):
         super().__init__(message)
         self.family = family
         self.refusals = refusals
+
+
+class _ProbeToken(tuple):
+    """``(key, args)`` with the predicted mechanism class attached.
+
+    The class refusal has to run before the tool, so :meth:`begin` classifies
+    the call there; :meth:`finish` still re-derives the class because the
+    leaf/breadth fallbacks need a response.  Keeping the token a plain
+    2-tuple keeps every existing caller (tests, ``observe``) unchanged.
+    """
+
+    def __new__(cls, key: str | None, args: str, mechanism: str | None) -> "_ProbeToken":
+        token = super().__new__(cls, (key, args))
+        token.mechanism = mechanism
+        return token
 
 
 class EnumerationGuard:
@@ -525,9 +855,23 @@ class EnumerationGuard:
     另外维护**全局停滞**计数：连续 N 次调用（跨所有族）都没产生新指纹，
     说明模型在原地打转，不管它换没换路径。
 
+    ## 第三套计数：机制类别（以及广度为什么躲在它后面）
+
+    上面两套都按"响应"或"族"计数，于是"换名字不换假设"两处都躲得过：换名字
+    就是新指纹、新族。第三套按 CAPEC-1000 顶层的机制类别计（见
+    ``_MECHANISM_RULES``），同一个类别里换六个名字仍然是一个假设。
+
+    但只按"族内叶子 ≥ 2"归类仍有一个洞：``_path_family`` 按**目录**切族，
+    一次跨目录扫描（``/admin/x``、``/backup/y``、``/uploads/z``）每个名字各成
+    一族、各只有一片叶子，永远凑不满叶数门槛——这正是"广度扫描天然规避全部
+    停止判据"。所以这里另留运行级路径集合：连续 ``_BREADTH_CLASSIFY_AT`` 条
+    **从没请求过**的路径、且都不带机制语法，同样归入信息收集。已知路径的重试
+    会清零该连击，盲注那种"一个端点、几百个 payload"因此不受影响。
+
     Attributes:
         counts: 族 → 连续同响应次数。
         stall: 连续零新信息的调用数（跨族）。
+        new_path_streak: 连续请求"本 run 没请求过"的路径的次数。
     """
 
     def __init__(self) -> None:
@@ -539,6 +883,19 @@ class EnumerationGuard:
         self._global: set[tuple[str | None, str]] = set()
         self.stall: int = 0
         self.stall_hits: int = 0
+        #: Deepest stall / longest same-class streak this run ever reached.
+        #: The hints only fire at ``_STALL_AFTER`` / ``_CLASS_STREAK_AFTER``, so
+        #: "hint never appeared" cannot distinguish "the model kept changing
+        #: mechanism" from "the guard never saw the repetition".  The peaks
+        #: answer which distance to the threshold a lost run actually got to,
+        #: and therefore whether the fix belongs in the threshold or in the
+        #: observation fingerprint (``_obs_signature``).
+        self.max_stall: int = 0
+        self.max_class_streak: int = 0
+        #: Whether the last counted stall was a *shape* repeat (response from the
+        #: target) or an exact text repeat (everything else).  The hint names what
+        #: was actually observed instead of claiming "same body" for both.
+        self._stall_from_shape: bool = False
         #: Probes per CAPEC mechanism class, for the "same hypothesis" hint.
         self.mechanisms: Counter[str] = Counter()
         #: Probes sent since the last *new* class was discovered.
@@ -559,6 +916,32 @@ class EnumerationGuard:
         self.exhausted_family: str | None = None
         #: Distinct request paths seen per family (path-diversity gate).
         self._family_paths: dict[str, set[str]] = {}
+        #: Every ``host|path`` this run has asked for.  ``_family_paths`` is
+        #: keyed by fingerprint, and ``_path_family`` splits on the *directory*,
+        #: so a scan that walks one directory per name (``/admin/x``,
+        #: ``/backup/y``, ``/uploads/z``) lands in a different family every time,
+        #: each with a single leaf.  The family rule therefore never sees it;
+        #: only a run-wide path set does.
+        self._run_paths: set[str] = set()
+        #: Consecutive calls that asked for a path this run had never requested.
+        self.new_path_streak: int = 0
+        #: Mechanism classes the class block has refused from now on.  Only
+        #: populated while ``CTF_CLASS_BLOCK`` is on; empty otherwise.
+        self.blocked_classes: set[str] = set()
+        #: Calls refused because their mechanism class was blocked.
+        self.class_blocked_calls: int = 0
+        #: The class of the immediately preceding classified probe and how many
+        #: probes that class has gone without a new observation (inclusive of
+        #: the first one).  Strictly consecutive: another class resets the run.
+        self._class_run: str | None = None
+        self._class_misses: int = 0
+        #: Observations already seen *within one class*, ignoring path family.
+        #: The family counters treat a new name as new information; the class
+        #: question is "was this answer new to this hypothesis", so a different
+        #: URL returning the same page is still zero information here.
+        self._class_seen: dict[str, set[str]] = {}
+        #: Unreachable-notice kinds already shown this run (one notice each).
+        self._unreachable_noticed: set[str] = set()
 
     def mechanism_counts(self) -> dict[str, int]:
         """Return a read-only snapshot of the per-CAPEC-class probe counts.
@@ -582,7 +965,8 @@ class EnumerationGuard:
 
     def exhausted_detail(self) -> str:
         """One-line reason for the ``EnumExhausted`` exception."""
-        family = (self.exhausted_family or "target").split("|", 2)[-1]
+        # 族名永远是键的末段（键形如 ``工具|host|方法|认证态|族``）。
+        family = (self.exhausted_family or "target").rsplit("|", 1)[-1]
         return (
             f"enumeration exhausted: '{family}' stayed blocked after "
             f"{self.refusal_count(self.exhausted_family or '')} refused calls; "
@@ -597,6 +981,12 @@ class EnumerationGuard:
             "exhausted": self.exhausted,
             "exhausted_family": self.exhausted_family,
             "observe_calls": self.observe_calls,
+            "max_stall": self.max_stall,
+            "max_class_streak": self.max_class_streak,
+            "stall_hits": self.stall_hits,
+            "class_hits": self.class_hits,
+            "blocked_classes": sorted(self.blocked_classes),
+            "class_blocked_calls": self.class_blocked_calls,
         }
 
     def note_answer(self) -> None:
@@ -613,10 +1003,17 @@ class EnumerationGuard:
         self._global.clear()
         self.leaves.clear()
         self._family_paths.clear()
+        self._run_paths.clear()
+        self.new_path_streak = 0
         self.refusal_counts.clear()
         self.exhausted_family = None
         self.stall = 0
         self.class_streak = 0
+        self.blocked_classes.clear()
+        self._class_run = None
+        self._class_misses = 0
+        self._class_seen.clear()
+        self._unreachable_noticed.clear()
 
     def soft_reset(self) -> None:
         """Drop the per-attempt escalation state, keep the hard blocks.
@@ -626,11 +1023,20 @@ class EnumerationGuard:
         must not end the retry attempt on its very first call -- the model gets
         one honest chance under the new instruction.  The blocks themselves
         stay: that family produced no new information, so probing it again is
-        still wasted work.  ``blocked_calls`` is a run-wide statistic and is
-        left alone, like in :meth:`note_answer`.
+        still wasted work.  "That family" is one *cell* of the request cube --
+        same tool, host, HTTP method and authentication state (see
+        :func:`_fingerprint`); a retry that changes method or brings a session
+        is a different cell and starts from zero, so the block does not hold
+        the model to an identity it no longer has.  ``blocked_calls`` is a
+        run-wide statistic and is left alone, like in :meth:`note_answer`.
         """
         self.refusal_counts.clear()
         self.exhausted_family = None
+        # The class *blocks* are hard blocks and stay, like ``blocked``; only
+        # the per-attempt escalation counter is dropped, so the first call of a
+        # new attempt cannot inherit "one probe away from a refusal".
+        self._class_run = None
+        self._class_misses = 0
 
     def begin(self, tool_name: str, args: str) -> tuple[str | None, str]:
         """调用前登记。
@@ -640,10 +1046,17 @@ class EnumerationGuard:
             args: 原始参数串。
 
         Returns:
-            ``(族指纹, 参数串)``，交给 :meth:`finish` 结算。
+            ``(族指纹, 参数串)``，交给 :meth:`finish` 结算。它是
+            :class:`_ProbeToken`，额外带一个 ``mechanism`` 属性。
+
+        The third field is :func:`_mechanism_of` of the same argument blob
+        ``finish`` will classify, computed here because the hard class
+        refusal must happen *before* the tool runs.  It is only a prediction:
+        ``finish`` still applies the leaf/breadth fallbacks that need a
+        response.
         """
         self.observe_calls += 1
-        return _fingerprint(tool_name, args), args
+        return _ProbeToken(_fingerprint(tool_name, args), args, _mechanism_of(args))
 
     def refusal(self, token: tuple[str | None, str]) -> str | None:
         """Return the hard error when this call's family is already blocked.
@@ -657,20 +1070,28 @@ class EnumerationGuard:
         Returns:
             The short error text for a blocked family, otherwise ``None``.
         """
-        key, _args = token
-        if key is None or key not in self.blocked:
-            return None
-        self.blocked_calls += 1
-        self.refusal_counts[key] += 1
-        # Escalate to a run-level stop once the model has had
-        # ``_ENUM_REFUSAL_LIMIT`` chances to reroute.  The sink reads this and
-        # raises EnumExhausted; until then the cheap refusal is just a hint.
-        if (
-            self.exhausted_family is None
-            and self.refusal_counts[key] >= _ENUM_REFUSAL_LIMIT
-        ):
-            self.exhausted_family = key
-        return self._blocked_error(key)
+        key, args = token[:2]
+        mechanism = getattr(token, "mechanism", None) or _mechanism_of(args)
+        if key is not None and key in self.blocked:
+            self.blocked_calls += 1
+            self.refusal_counts[key] += 1
+            # Escalate to a run-level stop once the model has had
+            # ``_ENUM_REFUSAL_LIMIT`` chances to reroute.  The sink reads this
+            # and raises EnumExhausted; until then the cheap refusal is just a
+            # hint.
+            if (
+                self.exhausted_family is None
+                and self.refusal_counts[key] >= _ENUM_REFUSAL_LIMIT
+            ):
+                self.exhausted_family = key
+            return self._blocked_error(key)
+        # The class branch only fires for a call that classifies into a class
+        # that was already exhausted.  ``mechanism is None`` (a plain ``GET /``,
+        # an ``ls``) must never be refused: no class means no class evidence.
+        if mechanism is not None and mechanism in self.blocked_classes:
+            self.class_blocked_calls += 1
+            return self._class_blocked_error(mechanism)
+        return None
 
     def finish(self, token: tuple[str | None, str], result: Any) -> str | None:
         """调用后结算，返回要追加到结果末尾的提示（或 None）。
@@ -682,13 +1103,32 @@ class EnumerationGuard:
         Returns:
             提示文本；无需提示时返回 None。
         """
-        key, args = token
+        key, args = token[:2]
         if key is not None and key in self.blocked:
             # Not dead code even though the wrapper checks ``refusal`` first:
             # a concurrent tool call can block the family between ``begin``
             # and this call, and the public ``observe()`` path never runs
             # ``refusal`` at all.
             return self._blocked_error(key)
+        # A transport failure is not an observation.  Checked before every
+        # counter so a refused connection cannot advance ``stall``, register a
+        # ``_global`` signature, bump ``counts[key]``, or feed the class run --
+        # the "dead target blocks a healthy family" failure.  Gated by the same
+        # switch as the class block: with the switch off this branch is dead
+        # and the guard behaves exactly as before (the A/B arm must be the old
+        # code, not a partially fixed one).  The notice is per kind, once per
+        # run: the first one tells the model what happened, the rest would be
+        # noise inside an already-burning budget.
+        if _class_block_enabled():
+            unreachable = _unreachable(result)
+            if unreachable is not None:
+                if unreachable in self._unreachable_noticed:
+                    return None
+                self._unreachable_noticed.add(unreachable)
+                return (
+                    "\n\n[ENUMERATION GUARD] 目标不可达，这次不算一次尝试；"
+                    "先确认目标仍在线再继续"
+                )
         if _is_bundle_read(args):
             self.bundle_hits += 1
             if self.bundle_hits in (2, 4):
@@ -698,14 +1138,33 @@ class EnumerationGuard:
                     "Stop downloading/cat-ing .js: feed those paths to method_sweep, "
                     "then POST to the most plausible one."
                 )
+        fresh_path = False
         if key is not None:
             path = _request_path(args)
             if path is not None:
                 self._family_paths.setdefault(key, set()).add(path)
+                run_path = f"{_host_of(args) or ''}|{path}"
+                fresh_path = run_path not in self._run_paths
+                if fresh_path:
+                    self._run_paths.add(run_path)
+                    self.new_path_streak += 1
+                else:
+                    self.new_path_streak = 0
         sig = _obs_signature(result, args)
-        fresh = (key, sig) not in self._global
-        self._global.add((key, sig))
+        # The stall counter asks "did that teach me anything", so it keys on the
+        # *shape* of the response; the warn/block counters below keep the exact
+        # signature, because refusing a call needs far stronger evidence than
+        # hinting about one (a paginated API legitimately repeats a shape).
+        # ``shape is None`` means the result never reached the target, so the
+        # text signature -- today's behaviour -- is used instead of guessing.
+        shape = _structure_signature(result) if _structure_enabled() else None
+        self._stall_from_shape = shape is not None
+        stall_sig = sig if shape is None else f"shape:{shape}"
+        fresh = (key, stall_sig) not in self._global
+        self._global.add((key, stall_sig))
         self.stall = 0 if fresh else self.stall + 1
+        if self.stall > self.max_stall:
+            self.max_stall = self.stall
 
         if key is None:
             return self._stall_hint()
@@ -728,21 +1187,61 @@ class EnumerationGuard:
             # same path family asked for a second distinct leaf is the 043
             # behaviour -- many new names, one hypothesis.  One leaf alone is
             # ordinary navigation and is left unclassified.
+            #
+            # The leaf comes from ``_request_path`` (query-free), not from the
+            # raw argument tail.  ``/api/search?q=1`` … ``?q=40`` is *one*
+            # leaf: a payload sweep against a single endpoint is blind
+            # extraction, a legitimate deepening, and the report marks it as
+            # must-not-mis-classify.  Reading the argument tail made every
+            # ``?q=N`` a fresh leaf and fired this hint on exactly that shape.
             family = _path_family(args)
-            if family is not None:
-                leaf = args.rsplit("/", 1)[-1]
+            path = _request_path(args)
+            if family is not None and path is not None:
+                leaf = path.rsplit("/", 1)[-1]
                 leaves = self.leaves.setdefault(family, set())
                 leaves.add(leaf)
                 if len(leaves) >= 2:
                     mechanism = "information-collection"
+        if mechanism is None and fresh_path and self.new_path_streak >= _BREADTH_CLASSIFY_AT:
+            # Cross-directory scan: naming one directory per guess makes every
+            # guess its own family with one leaf, so the rule above can never
+            # fire -- breadth walked that way dodged every stop criterion the
+            # guard had.  Consecutive *never-requested* paths, none carrying any
+            # mechanism syntax, are the same hypothesis ("where else might
+            # something be?") written as many names, so they join the same
+            # class counter.  A retry of an already-requested path resets the
+            # streak above, which is what keeps blind extraction (one endpoint,
+            # hundreds of payloads) out of here.
+            mechanism = "information-collection"
         class_hint = None
         if mechanism is not None:
             if mechanism not in self.mechanisms:
                 self.class_streak = 0
             else:
                 self.class_streak += 1
+            if self.class_streak > self.max_class_streak:
+                self.max_class_streak = self.class_streak
             self.mechanisms[mechanism] += 1
             class_hint = self._class_hint(mechanism)
+            # Per-class "no new observation" run.  Only while the switch is
+            # on: with it off, the guard must not even keep this state, so the
+            # disabled path is the old code plus one dead branch.
+            if _class_block_enabled():
+                if mechanism != self._class_run:
+                    self._class_run = mechanism
+                    self._class_misses = 0
+                class_seen = self._class_seen.setdefault(mechanism, set())
+                if stall_sig in class_seen:
+                    self._class_misses += 1
+                else:
+                    class_seen.add(stall_sig)
+                    # Count the first probe too: ``_CLASS_BLOCK_AFTER`` probes
+                    # of one class with no new answer mean the *next* call is
+                    # refused.  Starting at zero would make it the tenth.
+                    self._class_misses = 1
+                if self._class_misses >= _CLASS_BLOCK_AFTER:
+                    self.blocked_classes.add(mechanism)
+                    return self._class_blocked_error(mechanism)
 
         n = self.counts[key]
         family = key.split("|")[-1]
@@ -774,12 +1273,42 @@ class EnumerationGuard:
         The family segment is truncated so the message stays well under 400
         characters even when a path segment is pathological.
         """
-        family = key.split("|", 2)[-1][:80]
+        # 族名是键的末段（``工具|host|方法|认证态|族``），按最后一段切。
+        family = key.rsplit("|", 1)[-1][:80]
         return (
             f"ERROR: [ENUMERATION GUARD] '{family}' returned the IDENTICAL "
             "response too many times; this family is blocked. Change mechanism "
             "now: auth bypass, injection, SSRF pivot, file read, or use existing "
-            "access. Do not resend this family."
+            "access. Do not resend this family. Switch method or get a session."
+        )
+
+    def _class_blocked_error(self, mechanism: str) -> str:
+        """Deterministic refusal naming three classes still worth trying.
+
+        The alternative list is derived from :data:`MECHANISM_NAMES` order and
+        the live state (untried first, then tried-but-unblocked), never from a
+        path, an id or a challenge-specific word: the same guard state always
+        yields the same sentence.
+        """
+        untried = [
+            name
+            for name in MECHANISM_NAMES
+            if name not in self.mechanisms and name not in self.blocked_classes
+        ]
+        other = [
+            name
+            for name in MECHANISM_NAMES
+            if name != mechanism
+            and name not in self.blocked_classes
+            and name not in untried
+        ]
+        choices = (untried + other)[:3]
+        alt_text = "/".join(choices) if choices else "(none left)"
+        return (
+            f"ERROR: [MECHANISM GUARD] '{mechanism}' is exhausted: the last "
+            f"{_CLASS_BLOCK_AFTER} probes of that class added no new "
+            f"observation. Do not send another '{mechanism}' probe. Switch "
+            f"mechanism to {alt_text} -- the one your existing evidence points at."
         )
 
     def _class_hint(self, mechanism: str) -> str | None:
@@ -809,10 +1338,12 @@ class EnumerationGuard:
         untried = [name for name in MECHANISM_NAMES if name not in self.mechanisms]
         untried_text = ", ".join(untried) if untried else "(none left)"
         return (
-            f"\n\n[MECHANISM GUARD] {streak} probes in a row stayed inside "
-            f"'{mechanism}' and no new attack class was found. "
-            "If you cannot name the exact value this run is extracting, the "
-            "mechanism is wrong: parameter count is not a hypothesis. "
+            f"\n\n[MECHANISM GUARD] {streak} probes in a row added no attack "
+            f"class this run had not already tried (last: '{mechanism}'). "
+            "A new name is not a new hypothesis: a fresh path, a fresh id or a "
+            "fresh parameter is still the same guess when the class does not "
+            "change. If you cannot name the exact value this run is "
+            "extracting, the mechanism is wrong. "
             f"Untried classes: {untried_text}. "
             "Pick the one the evidence you already have points at."
         )
@@ -823,9 +1354,19 @@ class EnumerationGuard:
         if (self.stall - _STALL_AFTER) % _STALL_REPEAT:
             return None
         self.stall_hits += 1
+        if self._stall_from_shape:
+            what = (
+                f"The last {self.stall} responses had the same shape: same status, "
+                "same media type, same size class, same page vocabulary. Their text "
+                "differed, the information did not."
+            )
+        else:
+            what = (
+                f"The last {self.stall} calls produced no new observation "
+                "(same bodies, same errors)."
+            )
         return (
-            f"\n\n[ENUMERATION GUARD] {self.stall} consecutive calls produced no new "
-            "observation (same bodies, same errors). Budget is burning without learning.\n"
+            f"\n\n[ENUMERATION GUARD] {what} Budget is burning without learning.\n"
             "Before the next request: (1) write down the single most promising fact you "
             "already have; (2) pick the mechanism that fact points at instead of probing "
             "more names."
@@ -887,7 +1428,7 @@ def install() -> EnumerationGuard:
                     # A hard block replaces the tool output entirely.
                     return hint
                 # 结果体量不确定（可能不是 str），统一转成字符串追加。
-                return f"{result}{hint}"
+                return append_note(result, hint)
             return result
 
         tool.on_invoke_tool = invoke
