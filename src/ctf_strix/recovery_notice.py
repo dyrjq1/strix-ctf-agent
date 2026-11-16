@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 from typing import Any, Final
 
@@ -85,6 +86,15 @@ _SEEN: set[str] = set()
 _INSTALLED = False
 
 
+def _debug() -> bool:
+    """诊断开关：每轮打印一行「哪个工具、识别成哪类」。默认关。"""
+    return os.environ.get("CTF_RECOVERY_DEBUG", "").strip().lower() in (
+        "1",
+        "true",
+        "on",
+    )
+
+
 def reset_run() -> None:
     """清空「已提示」集合。每个 run 开始时调用。"""
     _SEEN.clear()
@@ -139,11 +149,19 @@ def _attach(tool: Any) -> Any:
     if original is None or getattr(tool, "_ctf_recovery", False):
         return tool
     name = getattr(tool, "name", "")
+    if _debug():
+        print(f"[recovery] attach {name}", flush=True)
 
     async def on_invoke(ctx: Any, raw: Any) -> Any:
         result = await original(ctx, raw)
         try:
             if isinstance(result, str):
+                if _debug():
+                    hit = classify(result)
+                    print(
+                        f"[recovery] tool={name} len={len(result)} class={hit[0] if hit else '-'}",
+                        flush=True,
+                    )
                 extra = notice(name, result)
                 if extra:
                     return result + extra
