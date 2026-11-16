@@ -3417,6 +3417,7 @@ def run_agent(
         # 2026-11-17 Q2 首跑就是这么废掉的：CTF_RECOVERY_NOTICE 已 export，
         # 子进程里 `[trim]` 只有 race_spawn 一行，notice 从未安装。
         "CTF_RECOVERY_NOTICE": os.environ.get("CTF_RECOVERY_NOTICE", ""),
+        "CTF_RECOVERY_DEBUG": os.environ.get("CTF_RECOVERY_DEBUG", ""),
         "CTF_STRUCTURAL": os.environ.get("CTF_STRUCTURAL", ""),
         "STRIX_TELEMETRY": "false",
         # 每次 LLM 调用后原子落盘。进程被墙钟 SIGKILL 时，run_strix_ctf 末尾那行
