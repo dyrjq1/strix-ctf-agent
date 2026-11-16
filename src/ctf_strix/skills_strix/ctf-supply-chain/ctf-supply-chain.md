@@ -62,7 +62,7 @@ A 200 with a JSON body is the metadata. Read `description`, `homepage`, `author`
 `maintainers`, and any custom field - CTF authors put the flag or the next hop there
 far more often than in an exploit chain.
 
-﻿## The install is a shell command: read it, then look for the second index
+## The install is a shell command: read it, then look for the second index
 
 A redeploy / install endpoint usually returns the raw command it ran. That output is the
 single most valuable artefact in the whole challenge, because it tells you three things
