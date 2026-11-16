@@ -378,6 +378,55 @@ def test_each_lane_gets_its_own_vpn_relay_ports(monkeypatch) -> None:
     assert relays[2].endswith(":47448")
 
 
+def test_pool_blocked_ids_reads_burned_and_sealed(tmp_path: Path) -> None:
+    """池闸门名单必须同时收 sealed_excluded 与 burned。
+
+    漏一边的后果不对称：漏 burned 的题会被派出去、被 batch_eval 拒跑，
+    然后在车道里退避重派（2026-11-16 冒烟实测空转 8 分钟）。
+    """
+    exp = tmp_path / "experiments"
+    exp.mkdir()
+    (exp / "pools.json").write_text(
+        json.dumps(
+            {
+                "sealed_excluded": ["CTFARENA-047"],
+                "burned": ["CTFARENA-064", "SAMPLE-009"],
+                "dev": ["CTFARENA-001"],
+            }
+        ),
+        encoding="utf-8",
+    )
+    assert compete.pool_blocked_ids(tmp_path) == {
+        "CTFARENA-047",
+        "CTFARENA-064",
+        "SAMPLE-009",
+    }
+
+
+def test_pool_blocked_ids_tolerates_missing_and_broken_file(tmp_path: Path) -> None:
+    """没有池文件 = 没切池子，不拦；坏文件同样按空集处理（与 batch_eval 同口径）。"""
+    assert compete.pool_blocked_ids(tmp_path) == set()
+    exp = tmp_path / "experiments"
+    exp.mkdir()
+    (exp / "pools.json").write_text("{not json", encoding="utf-8")
+    assert compete.pool_blocked_ids(tmp_path) == set()
+
+
+def test_drop_pool_blocked_keeps_order_and_other_ids() -> None:
+    """剔除只按题号命中，未列入的题保持原顺序——排序结果不能被抖乱。"""
+    chals = [_chal("A"), _chal("B"), _chal("C"), _chal("D")]
+    assert [c["id"] for c in compete.drop_pool_blocked(chals, {"B", "D"})] == [
+        "A",
+        "C",
+    ]
+    assert [c["id"] for c in compete.drop_pool_blocked(chals, set())] == [
+        "A",
+        "B",
+        "C",
+        "D",
+    ]
+
+
 def test_lane_relay_base_is_overridable(monkeypatch) -> None:
     monkeypatch.setenv("CTF_VPN_RELAY_BASE", "50000")
     assert compete._lane_env(1)["CTF_VPN_RELAY"].endswith(":50002")

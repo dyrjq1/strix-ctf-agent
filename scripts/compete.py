@@ -556,6 +556,47 @@ def build_plan_item(
     return item
 
 
+def pool_blocked_ids(root: Path | None = None) -> set[str]:
+    """``experiments/pools.json`` 里封存/烧毁的题号（派单前剔除用）。
+
+    为什么要在调度器里先剔：``batch_eval`` 开跑前的池闸门
+    （``check_plan_pools``）会直接拒跑，而拒跑在车道看来是"环境问题"——
+    不计失败、退避重派，于是同一条被拒的题把车道占满整个窗口。
+    2026-11-16 冒烟实测：CTFARENA-047 被拒 5 次（15→240s 退避），
+    15 分钟窗口里空转约 8 分钟。
+
+    Args:
+        root: 仓库根，默认按本文件位置推断。
+
+    Returns:
+        题号集合；``pools.json`` 缺失或读不出来时返回空集（与 batch_eval
+        同口径：没切池子就不拦）。
+    """
+    root = root or Path(__file__).resolve().parent.parent
+    path = root / "experiments" / "pools.json"
+    try:
+        pools = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return set()
+    if not isinstance(pools, dict):
+        return set()
+    out: set[str] = set()
+    for key in ("sealed_excluded", "burned"):
+        values = pools.get(key) or []
+        if isinstance(values, list):
+            out.update(str(v) for v in values if str(v).strip())
+    return out
+
+
+def drop_pool_blocked(
+    challenges: list[dict[str, Any]], blocked: set[str]
+) -> list[dict[str, Any]]:
+    """剔除池闸门会拒跑的题；其余原样保序。"""
+    if not blocked:
+        return list(challenges)
+    return [c for c in challenges if str(c.get("id") or "") not in blocked]
+
+
 def _lane_env(lane: int) -> dict[str, str]:
     """给第 ``lane`` 条车道的子进程分配**独立**的 VPN 中转端口。
 
@@ -813,6 +854,11 @@ def main() -> int:
 
     _refresh_session(force=True)
 
+    #: 池闸门：封存/烧毁题派出去只会被 batch_eval 拒跑，然后在车道里退避
+    #: 重派（冒烟实测空转 8 分钟）。开跑前剔除一次；--allow-pools 显式放行。
+    blocked_pools = set() if args.allow_pools else pool_blocked_ids()
+    pool_note_printed = False
+
     while not stop:
         if deadline_reached(deadline):
             print("[compete] 到 --until，收工", flush=True)
@@ -824,6 +870,16 @@ def main() -> int:
             print(f"[compete] 题表拉取失败：{exc}，{args.poll}s 后重试", flush=True)
             time.sleep(args.poll)
             continue
+        kept = drop_pool_blocked(challenges, blocked_pools)
+        if len(kept) != len(challenges):
+            if not pool_note_printed:
+                pool_note_printed = True
+                print(
+                    f"[compete] 池闸门：剔除 {len(challenges) - len(kept)} 道"
+                    "封存/烧毁题（--allow-pools 放行）",
+                    flush=True,
+                )
+            challenges = kept
         # 刷新：新题自动入账；已解出（别处补交成功等）从 run 态摘除。
         for chal in challenges:
             cid = str(chal.get("id") or "")
