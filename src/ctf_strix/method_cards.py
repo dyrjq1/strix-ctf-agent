@@ -135,11 +135,6 @@ CARDS: tuple[Card, ...] = (
         "反序列化：先认格式（PHP O:/Java AC ED/pickle）；`web_cve_lookup` 查组件版本链，版本对得上再搓 gadget。",
     ),
     _card(
-        "historical_cve",
-        "已知 CVE：`web_cve_lookup` 出编号后先列三个可变点（入口路径、编码与分阶段、观测 oracle），"
-        "用 `http_probe` 先证能观测到我们控制的串，再上完整利用；失败只改一个点。细节见 ctf-web 的 CVE 适配节。",
-    ),
-    _card(
         "jwt,jwt_none,jwks,signature_bypass",
         "JWT：`exec_command` 解 header 看 alg；alg=none 与弱密钥各试一次；分清“验签失败”与“解析失败”。",
     ),
@@ -221,26 +216,6 @@ def _keys(tags: Iterable[str] | None) -> set[str]:
     return {t.strip().lower() for t in (tags or ()) if isinstance(t, str) and t.strip()}
 
 
-#: Platform CVE tags look like ``cve_2021_3129``.  They are class identifiers, so
-#: they are matched by shape rather than listed one by one -- a hardcoded list
-#: would miss every CVE challenge tagged after this table was written, and the
-#: card would silently never fire (the ``viability_probe`` failure mode).
-_CVE_TAG = re.compile(r"cve_\d{4}_\d{4,}")
-
-
-def _exact_cve_card(wanted: set[str]) -> bool:
-    """True when a card in the table already names one of these CVE tags.
-
-    A card written for one named CVE (Log4Shell) carries the exact variant; the
-    generic adaptation card would only spend budget repeating "find the entry
-    point" for a bug whose entry point is already known.
-    """
-    return any(
-        card.keys & wanted and any(_CVE_TAG.fullmatch(key) for key in card.keys)
-        for card in CARDS
-    )
-
-
 #: A tool name is a lowercase identifier inside backticks.  The table-wide scan
 #: in ``tests/test_method_cards.py`` guarantees every such span is a catalogue
 #: entry, so this cannot pick up prose or a shell flag (``--flag`` starts with
@@ -283,8 +258,6 @@ def select(
     if kind not in WEB_KINDS:
         return []
     wanted = _keys(tags)
-    if any(_CVE_TAG.fullmatch(tag) for tag in wanted) and not _exact_cve_card(wanted):
-        wanted.add("historical_cve")
     if not wanted:
         return []
     known = None if available is None else frozenset(available)

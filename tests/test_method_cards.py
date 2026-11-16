@@ -180,35 +180,27 @@ def test_select_with_available_none_keeps_the_whole_table() -> None:
     assert len(baseline) == method_cards.MAX_CARDS
 
 
-def test_cve_tag_shape_selects_the_adaptation_card() -> None:
-    """Platform tags arrive as ``cve_2021_3129``; matching by shape, not by list,
-    is what keeps the card alive for CVE challenges tagged later."""
-    for tags in (["historical_cve"], ["cve_2099_12345"], ["cve_2017_9805"]):
-        cards = method_cards.select(tags, "web")
-        assert cards and "已知 CVE" in cards[0].text, tags
-
-
 def test_cards_off_env_drops_exactly_the_named_card(monkeypatch) -> None:
     """A card's A/B arms must differ by that card and nothing else.
 
-    The CVE target tags also select the Java stack card; suppressing the
-    adaptation card must leave that one in place, otherwise arm A is measuring
-    two ablations at once.
+    An injection tag also selects the Java stack card; suppressing the injection
+    card must leave that one in place, otherwise arm A is measuring two
+    ablations at once.
     """
-    tags = ["cve_2017_9805", "apache_struts2"]
+    tags = ["sqli", "java"]
     baseline = method_cards.render(tags, "web")
-    assert "已知 CVE" in baseline
+    assert "注入：" in baseline
 
-    monkeypatch.setenv("CTF_CARDS_OFF", "historical_cve")
+    monkeypatch.setenv("CTF_CARDS_OFF", "sqli")
     without = method_cards.render(tags, "web")
-    assert "已知 CVE" not in without
+    assert "注入：" not in without
     assert "[Web playbook]" in without
     assert "Java 栈" in without
     assert len(without) < len(baseline)
 
 
 def test_cards_off_env_is_a_no_op_when_blank_or_unknown(monkeypatch) -> None:
-    tags = ["cve_2017_9805"]
+    tags = ["sqli"]
     baseline = method_cards.render(tags, "web")
     for value in ("", "  ", "no_such_card"):
         monkeypatch.setenv("CTF_CARDS_OFF", value)
@@ -216,44 +208,16 @@ def test_cards_off_env_is_a_no_op_when_blank_or_unknown(monkeypatch) -> None:
 
 
 def test_cards_off_env_is_case_insensitive_and_listed(monkeypatch) -> None:
-    tags = ["historical_cve"]
-    monkeypatch.setenv("CTF_CARDS_OFF", " Historical_CVE , sqli ")
-    assert "已知 CVE" not in method_cards.render(tags, "web")
+    tags = ["sqli"]
+    monkeypatch.setenv("CTF_CARDS_OFF", " SQLI , jwt ")
+    assert "注入：" not in method_cards.render(tags, "web")
 
 
 def test_cards_off_keeps_select_pure(monkeypatch) -> None:
     """The table-level API must not read the ablation switch."""
-    tags = ["historical_cve"]
-    monkeypatch.setenv("CTF_CARDS_OFF", "historical_cve")
-    assert any("已知 CVE" in card.text for card in method_cards.select(tags, "web"))
-
-
-def test_cve_shape_does_not_match_unrelated_tags() -> None:
-    for tags in (["cve"], ["cve_2021"], ["xcve_2021_3129"], ["cve_2021_312"]):
-        assert all("已知 CVE" not in card.text for card in method_cards.select(tags, "web")), tags
-
-
-def test_cve_card_outranks_stack_cards() -> None:
-    """The block truncates from the tail: a CVE run must keep the CVE card."""
-    got = [card.text for card in method_cards.select(["cve_2018_18778", "php", "laravel"], "web")]
-    assert got and "已知 CVE" in got[0]
-
-
-def test_named_cve_card_suppresses_the_generic_one() -> None:
-    """A card for that exact CVE already carries the variant; the generic card
-    would only spend budget re-asking where the entry point is."""
-    got = [card.text for card in method_cards.select(["cve_2021_44228", "log4j"], "web")]
-    assert got and "Log4Shell" in got[0]
-    assert all("已知 CVE" not in text for text in got)
-
-
-def test_cve_adaptation_section_exists_in_the_pack() -> None:
-    """The card points at "ctf-web 的 CVE 适配节"; a missing section is a dead end."""
-    from ctf_strix.skillpack import PACK_DIR
-
-    text = (PACK_DIR / "ctf-web" / "cves.md").read_text(encoding="utf-8")
-    assert "Adaptation procedure" in text
-    assert "controlled observation" in text
+    tags = ["sqli"]
+    monkeypatch.setenv("CTF_CARDS_OFF", "sqli")
+    assert any("注入：" in card.text for card in method_cards.select(tags, "web"))
 
 
 def test_auth_flow_card_fires_on_flow_tags() -> None:
