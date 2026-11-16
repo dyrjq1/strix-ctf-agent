@@ -112,9 +112,19 @@ Collecting bistro-rate-limiter
 
 ### A 200 from an upload endpoint is not proof
 
-Upload endpoints on the challenge's own registry routinely answer `200` with an **empty
-body** and store nothing - a wrong action parameter, a rejected filename, or a write
-side that only accepts one content type. The status code is not evidence.
+On a `pypiserver`-style registry the **success** response is `200` with a **completely
+empty body** - so neither the status code nor the body length tells you anything. The
+failure modes look identical: a wrong `:action` value, a filename that does not parse
+into `name-version`, or a write side that only accepts one content type can all come
+back looking like a success.
+
+Two field-level details are worth knowing before you debug blind:
+
+- `:action=file_upload` must be a **multipart body field**, not a query-string
+  parameter; some servers answer `400` when it is only in the URL.
+- The uploaded filename must parse as `<name>-<version>.tar.gz`. A bare `<name>.tar.gz`
+  is rejected. A `409` (or `400` when the client identifies as twine) means the file
+  name already exists - pick a higher version rather than re-uploading the same one.
 
 Verify by **reading the index back**: `GET /simple/<name>/` (or the registry's listing
 page) and match your exact filename or version. If it is not in the listing, the upload
@@ -127,6 +137,15 @@ from a broken exploit. Run the install action and read its `Downloading` line. I
 still resolves the old version, there are exactly two causes - the artifact is not
 listed, or the version constraint is tighter than your version - and one probe tells
 you which.
+
+### If the version changed but nothing executed
+
+Pip builds an sdist in an isolated environment and installs the declared build
+requirements from the configured index first (PEP 517). If that index has no
+`setuptools`, the build fails and the install aborts **before** your `setup.py` is ever
+imported - the artifact was "picked up", the payload never ran. A prebuilt wheel, or a
+`pyproject.toml` with an in-tree backend and no requirements, avoids the dependency on
+whatever the target index happens to host.
 
 ### If the rebuild always resolves the same version
 
