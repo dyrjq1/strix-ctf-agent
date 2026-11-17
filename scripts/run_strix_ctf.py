@@ -526,6 +526,22 @@ async def main() -> int:
     tb_guard.reset(args.turns)
     print(f"[guard] turn budget installed (budget={args.turns})")
 
+    # 多车道竞速（§4.254 修复）：官方入口的接线在 agent._run_agent，本
+    # harness 入口此前**漏装**——批次子进程恰恰从这里起跑，漏的就是真正
+    # 跑题的那条路（2026-11-17 真跑冒烟实测：标记 60s 落盘，agent 跑满
+    # 267s 不停，stop_reason=unknown）。两入口分裂与 llm_compat 是同一类
+    # 事故。configure 从 env 读 CTF_RACE_DIR/CTF_RACE_CHALLENGE/
+    # CTF_RACE_LANE（batch_eval 的白名单已转发），未设时返回 None、纯
+    # no-op——单进程跑批不需要知道竞速存在。
+    from ctf_strix import race_stop
+
+    _race_watcher = race_stop.configure()
+    if _race_watcher is not None:
+        print(
+            f"[guard] race watcher armed (challenge={_race_watcher.challenge_id} "
+            f"lane={_race_watcher.lane})"
+        )
+
     # 所有守卫装完之后立刻验证接线。不做这一步，接线失败会表现为
     # "计数器恒为 0"，和"今天没触发"完全无法区分——CTFARENA-012 就是这样
     # 白烧了 1170 秒。宁可启动时打一行 WARNING。
@@ -771,6 +787,10 @@ async def main() -> int:
         # 同款接线）。
         if hard_watchdog:
             agent_mod._check_soft_timeout()
+        # 竞速败方自停（§4.254 修复）：与软墙钟同一检查点、同一挂法。
+        # 未配置（race_stop.configure() 返回 None）时是纯 no-op，与
+        # soft_timeout 不同——它不依赖 hard_watchdog 是否安装。
+        agent_mod._check_race_lost()
         item = getattr(event, "item", None)
         kind = getattr(item, "type", None)
         if kind == "tool_call_item":
@@ -894,6 +914,13 @@ async def main() -> int:
         result = None
         print(f"\n[stopped] {type(exc).__name__}: {exc}")
         print("[stop] reason=wallclock")
+    except agent_mod.RaceLost as exc:
+        # 竞速败方自停（§4.254 修复）：兄弟车道已用平台验证的提交解出本题。
+        # 不算失败也不重开——reason=race_lost 不在 _RESAMPLE_REASONS，
+        # 重开等于把兄弟刚解掉的题再烧一遍。照常走 [usage]/守卫汇总。
+        result = None
+        print(f"\n[stopped] {type(exc).__name__}: {exc}")
+        print("[stop] reason=race_lost")
     except (NoProgress, EnumExhausted, TargetAbsent) as exc:
         # 这三种不是崩溃，是「有证据的收场」：整窗零新观测（NoProgress）、
         # 同一族被硬拒后还在重试（EnumExhausted）、靶面全是同一份非应答

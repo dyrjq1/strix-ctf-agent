@@ -202,3 +202,44 @@ class TestBatchPlumbing:
         assert env.get("CTF_RACE_LANE") == "plumbing-probe"
         # 题号由 run_agent 显式递，优先于外层环境：子进程不依赖 task 形状。
         assert env.get("CTF_RACE_CHALLENGE") == "RACE-001"
+
+
+class TestHarnessWiring:
+    """run_strix_ctf（batch/评测入口）的接线钉——§4.254 修复的直接动因。
+
+    官方入口（agent.py）接了、harness 入口漏接：单测全绿，真跑冒烟里标记
+    60s 落盘、agent 跑满 267s 不停（stop_reason=unknown）。批次子进程走的
+    恰恰是漏接的那条路——两入口分裂与 llm_compat 是同一类事故，所以这里
+    用 source-shape 钉死三处：启动 configure、sink 检查点、收场翻译。
+    """
+
+    RUN_SRC = (ROOT / "scripts" / "run_strix_ctf.py").read_text(encoding="utf-8")
+
+    def test_harness_sink_calls_race_checkpoint(self):
+        """事件回调必须在 run_strix_scan 之前调用竞速检查点。"""
+        src = self.RUN_SRC
+        sink_pos = src.index("    def sink(agent_id: str, event: object) -> None:")
+        check_pos = src.index("agent_mod._check_race_lost()")
+        assert sink_pos < check_pos < src.index("scan_id = args.name")
+
+    def test_harness_configures_watcher_at_startup(self):
+        """启动路径必须 configure（env 缺省时 no-op），armed 行作执行证据。"""
+        src = self.RUN_SRC
+        assert "race_stop.configure()" in src
+        assert "race watcher armed" in src
+        # 装在守卫安装段之后、run_strix_scan 之前。
+        assert src.index("tb_guard.reset(args.turns)") < src.index("race_stop.configure()")
+
+    def test_harness_translates_racelost_to_machine_readable_reason(self):
+        """RaceLost 要翻成 reason=race_lost 行，且接在通用 except 之前。"""
+        src = self.RUN_SRC
+        wc_pos = src.index("    except agent_mod.WallclockExceeded as exc:")
+        race_pos = src.index("    except agent_mod.RaceLost as exc:")
+        guard_pos = src.index("    except (NoProgress, EnumExhausted, TargetAbsent)")
+        assert wc_pos < race_pos < guard_pos
+        tail = src[race_pos : src.index("    except (NoProgress", race_pos)]
+        assert "[stop] reason=race_lost" in tail
+
+    def test_race_lost_is_not_resampled(self):
+        """被兄弟车道解掉的题不换策略重开：重开=把刚解掉的题再烧一遍。"""
+        assert "race_lost" not in batch_eval._RESAMPLE_REASONS
