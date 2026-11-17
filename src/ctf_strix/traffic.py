@@ -22,8 +22,9 @@ back.  Our image has no ``caido-cli``, so ``tool_trim`` drops all six proxy
 tools.  What was lost with them is not the proxy UI -- it is the memory.
 
 This module rebuilds the part that matters, without touching vendor:
-``http_probe`` appends every exchange to a ledger, and two read-only
-primitives read it back.  Nothing here sends a request, so none of it is a
+``http_probe`` appends every exchange to a ledger, and read-only
+primitives (``traffic_list`` / ``traffic_view`` / ``traffic_diff``) read it
+back.  Nothing here sends a request, so none of it is a
 probe tool and none of the guards should count it.
 
 ## What is stored, and what is not
@@ -528,7 +529,96 @@ def traffic_view(request_id: str = "", part: str = "both", offset: int = 0,
     return "\n".join(lines)
 
 
-TOOLS: Final = (traffic_list, traffic_view)
+#: diff 输出上限（字符）。差异文本是给模型看的行级线索，不是转储。
+_DIFF_MAX_CHARS: Final = 4000
+#: diff 输入截断：difflib 对超长正文是 O(n²)，预截防一步卡死
+#: （复用自 ctfy_project 的 traffic.diff，已获该队同意 2026-11-17）。
+_DIFF_INPUT_CAP: Final = 256 * 1024
+
+
+def traffic_diff(request_a: str = "", request_b: str = "") -> str:
+    """Line-diff the stored bodies of two exchanges, without re-sending either.
+
+    The ledger already holds every response body.  Comparing two of them -- an
+    authenticated call against an anonymous one, before/after a bypass header,
+    two blind-injection oracle answers -- is how a "these differ" observation
+    becomes "these are the lines that differ", which is what actually locates
+    the controlled field.  Logic reused (with consent, 2026-11-17) from the
+    ctfy_project traffic ledger's ``diff`` op.
+
+    Args:
+        request_a: first exchange id from traffic_list, e.g. ``r7``.
+        request_b: second exchange id, e.g. ``r9``.
+
+    Returns:
+        Unified-diff lines with added/removed counts, or a hint naming the ids
+        that exist when either id is unknown.
+    """
+    a = _LEDGER.get(request_a)
+    b = _LEDGER.get(request_b)
+    if a is None or b is None:
+        known = ", ".join(entry.id for entry in _LEDGER.items()[-12:]) or "(none)"
+        missing = request_a if a is None else request_b
+        return (
+            f"[traffic] no record {missing!r}. Known recent ids: {known}. "
+            "Call traffic_list to see what this run actually sent."
+        )
+    if a is b:
+        return "[traffic] both ids resolve to the same exchange; pick two different rows."
+
+    body_a, body_b = a.resp_body or "", b.resp_body or ""
+    if not body_a and not body_b:
+        return ("[traffic] both stored bodies are empty -- nothing to diff. "
+                "Use traffic_view on each id to confirm what was kept.")
+    input_truncated = len(body_a) > _DIFF_INPUT_CAP or len(body_b) > _DIFF_INPUT_CAP
+    body_a = body_a[:_DIFF_INPUT_CAP]
+    body_b = body_b[:_DIFF_INPUT_CAP]
+
+    import difflib
+
+    added = removed = 0
+    shown: list[str] = []
+    used = 0
+    truncated = False
+    for index, line in enumerate(difflib.unified_diff(
+        body_a.splitlines(), body_b.splitlines(),
+        fromfile=f"{a.id} {a.method} {a.url.split('://', 1)[-1].split('/', 1)[-1] or a.url}",
+        tofile=f"{b.id} {b.method} {b.url.split('://', 1)[-1].split('/', 1)[-1] or b.url}",
+        lineterm="", n=1,
+    )):
+        if index < 2:
+            continue
+        if line.startswith("+"):
+            added += 1
+        elif line.startswith("-"):
+            removed += 1
+        size = len(line) + 1
+        if used + size <= _DIFF_MAX_CHARS:
+            shown.append(line)
+            used += size
+        else:
+            truncated = True
+
+    def _status(item: Exchange) -> str:
+        return str(item.status) if item.status is not None else (item.phase or "ERR")
+
+    lines = [
+        f"[traffic] diff {a.id}({_status(a)}) vs {b.id}({_status(b)}): "
+        f"+{added} -{removed} lines"
+    ]
+    if input_truncated:
+        lines.append("note: an input body exceeded the 256KB diff cap; only the "
+                     "prefix was compared.")
+    lines.extend(shown)
+    if truncated:
+        lines.append(f"... output capped at {_DIFF_MAX_CHARS} chars; narrow with "
+                     "traffic_view(offset=...) on each id for the full region.")
+    if not shown and not truncated:
+        lines.append("note: the two bodies are line-identical (no differences).")
+    return "\n".join(lines)
+
+
+TOOLS: Final = (traffic_list, traffic_view, traffic_diff)
 
 
 def _as_async(func):
@@ -552,7 +642,7 @@ def _as_async(func):
 
 
 def register(register_fn=None) -> list[str]:
-    """Register the two read-only traffic primitives.
+    """Register the three read-only traffic primitives.
 
     Args:
         register_fn: injection point; defaults to

@@ -135,8 +135,11 @@ def test_catalogue_does_not_promise_tools_nobody_registers():
     registered |= {"viability_probe"}
     # Browser primitive: registered by ``capabilities`` with the web surface.
     registered |= {"browser_render"}
-    # Traffic memory: two read-only primitives that replay the ledger.
-    registered |= {"traffic_list", "traffic_view"}
+    # Traffic memory: read-only primitives that replay / compare the ledger.
+    registered |= {"traffic_list", "traffic_view", "traffic_diff"}
+    # websec: authdiff / jsrecon (logic reused from ctfy_project, 2026-11-17).
+    from ctf_strix import websec
+    registered |= {fn.__name__ for fn in websec.TOOLS}
     # The base four are vendor tools; they are asserted separately below.
     base = {"exec_command", "load_skill", "think"}
 

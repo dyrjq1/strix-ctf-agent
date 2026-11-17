@@ -159,7 +159,11 @@ def test_prompt_stays_inside_the_web_budget():
     # 2026-11-16 浏览器原语：catalogue 多一行 browser_render（~150 字符）
     # + Environment 的 CLI 名单加 chromium（11 字符），实测 5,251 -> 5,415。
     # 阈值同步抬到 5,515，仍是一次单行改动的余量，不是敞口。
-    assert prose < 5515, f"web prompt prose grew to {prose} chars (index {index})"
+    # 2026-11-17 websec 批（台账 §4.259）：catalogue 新增 authdiff / jsrecon /
+    # traffic_diff 三行工具描述，实测 5,415 -> 5,807（+392 = 三行
+    # name+summary）。仍是"每行都有已注册工具"的增长，不是散文膨胀；
+    # 阈值按惯例抬到实测 +~100。
+    assert prose < 5907, f"web prompt prose grew to {prose} chars (index {index})"
     assert index < 2050, f"skill index grew to {index} chars (prose {prose})"
 
 

@@ -156,6 +156,7 @@ def install_web_capabilities(
     discovery_register: RegisterFn | None = None,
     variants_register: RegisterFn | None = None,
     traffic_register: RegisterFn | None = None,
+    websec_register: RegisterFn | None = None,
     web_cve_register: RegisterFn | None = None,
     viability_register: RegisterFn | None = None,
     browser_register: RegisterFn | None = None,
@@ -167,6 +168,7 @@ def install_web_capabilities(
         discovery_register: Test seam; defaults to ``ctf_strix.discovery.register``.
         variants_register: Test seam; defaults to ``ctf_strix.variants.register``.
         traffic_register: Test seam; defaults to ``ctf_strix.traffic.register``.
+        websec_register: Test seam; defaults to ``ctf_strix.websec.register``.
         web_cve_register: Test seam; defaults to
             ``ctf_strix.aisec.tools.register_web_cve``.
         viability_register: Test seam; defaults to
@@ -186,6 +188,8 @@ def install_web_capabilities(
         from ctf_strix.variants import register as variants_register
     if traffic_register is None:
         from ctf_strix.traffic import register as traffic_register
+    if websec_register is None:
+        from ctf_strix.websec import register as websec_register
     if web_cve_register is None:
         from ctf_strix.aisec.tools import register_web_cve as web_cve_register
     if viability_register is None:
@@ -198,6 +202,9 @@ def install_web_capabilities(
     _install("http_probe", http_register, installed, errors)
     _install("discovery", discovery_register, installed, errors)
     _install("variants", variants_register, installed, errors)
+    # websec: authdiff / jsrecon -- logic reused (with consent, 2026-11-17)
+    # from the ctfy_project reference agent's web part; transport rewritten.
+    _install("websec", websec_register, installed, errors)
     # Traffic memory is read-only and depends on http_probe having recorded
     # something, but it is registered separately: a failure to install the
     # ledger must not take the probe down with it.

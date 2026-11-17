@@ -53,6 +53,8 @@ PROBE_TOOLS: Final[frozenset[str]] = frozenset(
         "route_map",
         "method_sweep",
         "path_variants",
+        "authdiff",
+        "jsrecon",
     }
 )
 

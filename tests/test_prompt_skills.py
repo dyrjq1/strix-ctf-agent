@@ -115,7 +115,11 @@ def test_prompt_stays_small(block):
     # Environment CLI list, measured 7,391.  Threshold 7,430 -- same ~40-char
     # headroom the previous band kept, so the next addition still has to be
     # argued for here rather than slipping in.
-    assert size < 7430, f"system prompt grew to {size} chars"
+    # 2026-11-17 websec batch (ledger 4.259): three catalogue tool lines
+    # (authdiff / jsrecon / traffic_diff), measured 7,783.  Threshold 7,823 --
+    # same ~40-char headroom, same rule: every added line must have a
+    # registered tool behind it.
+    assert size < 7823, f"system prompt grew to {size} chars"
 
 
 _KINDS = ("web", "file", "tcp")

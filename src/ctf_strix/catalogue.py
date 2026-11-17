@@ -143,6 +143,27 @@ CATALOGUE: Final[tuple[ToolInfo, ...]] = (
         "web",
     ),
     ToolInfo(
+        "traffic_diff",
+        "line-diff the stored bodies of two exchanges by id, without re-sending "
+        "either; where the controlled field actually is",
+        WEB_KINDS,
+        "web",
+    ),
+    ToolInfo(
+        "authdiff",
+        "authorization contrast: one request as authenticated, anonymous, with "
+        "bypass headers and under path rewrites, plus a verdict per variant",
+        WEB_KINDS,
+        "web",
+    ),
+    ToolInfo(
+        "jsrecon",
+        "pull the page's scripts and bundles, extract API paths, parameter "
+        "names, routes, key-like strings and source maps",
+        WEB_KINDS,
+        "web",
+    ),
+    ToolInfo(
         "web_cve_lookup",
         "offline CVE index for web products; KEV entries first",
         WEB_KINDS,
