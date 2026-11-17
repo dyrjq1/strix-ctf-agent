@@ -89,6 +89,19 @@ class _AuthHandler(BaseHTTPRequestHandler):
                 self._send(200, '{"data":"secret"}')
             else:
                 self._send(403, '{"error":"login required"}')
+        elif self.path == "/token":
+            # Token-gated endpoint: a Bearer header works, a cookie does not.
+            if self.headers.get("Authorization"):
+                self._send(200, '{"via":"token"}')
+            else:
+                self._send(403, '{"error":"token required"}')
+        elif self.path == "/glitch":
+            # A bypass header that *changes* the answer but to an error page:
+            # "changed but non-2xx" must not be sold as a bypass hit.
+            if self.headers.get("X-Admin") == "true":
+                self._send(500, '{"error":"boom"}')
+            else:
+                self._send(200, '{"ok":true}')
         elif self.path == "/open":
             self._send(200, '{"public":"info"}')
         else:
@@ -141,13 +154,92 @@ def test_authdiff_flags_an_unauthenticated_endpoint(auth_base):
     assert data["rows"][0]["label"] == "authed"
 
 
-def test_authdiff_without_a_session_says_so(auth_base):
-    """No cookie in the jar -> the anon verdict must not claim a leak."""
+def test_authdiff_baseline_refused_is_not_anonymous_readable(auth_base):
+    """S2：基线 403 时 anon 与基线相同只说明两者都被拒——不得报「匿名可读
+    /不需要登录」这种反向结论，必须先修基线。"""
     out = _call(authdiff, url=f"{auth_base}/data", variants="anon",
                 session="off")
     data = json.loads(out)
     joined = "；".join(data["verdicts"])
+    assert "基线不可读" in joined, data["verdicts"]
+    assert "不需要登录" not in joined, data["verdicts"]
+    assert "匿名可读" not in joined, data["verdicts"]
+
+
+def test_authdiff_baseline_404_is_not_anonymous_readable(auth_base):
+    """基线 404（路径不存在）同样没有对照意义（variants.py 的 404 先例）。"""
+    _login(auth_base)
+    out = _call(authdiff, url=f"{auth_base}/nope", variants="anon")
+    data = json.loads(out)
+    assert "基线不可读" in "；".join(data["verdicts"]), data["verdicts"]
+
+
+def test_authdiff_public_endpoint_without_login_says_so(auth_base):
+    """基线 2xx 且 jar 无 cookie：anon 相同才允许「不需要登录」的结论。"""
+    out = _call(authdiff, url=f"{auth_base}/open", variants="anon",
+                session="off")
+    data = json.loads(out)
+    joined = "；".join(data["verdicts"])
     assert "不需要登录" in joined, data["verdicts"]
+
+
+def test_authdiff_anon_strips_model_supplied_credentials(auth_base):
+    """S1：headers_json 里带 Authorization 时，anon 变体必须剥掉它——
+    否则"匿名"请求其实带凭据，会得出「匿名可读」的反向结论。"""
+    out = _call(authdiff, url=f"{auth_base}/token", variants="anon",
+                session="off",
+                headers_json='{"Authorization": "Bearer tok-123"}')
+    data = json.loads(out)
+    by_label = {row["label"]: row for row in data["rows"]}
+    assert by_label["authed"]["status"] == 200, by_label
+    assert by_label["anon"]["status"] == 403, by_label
+    joined = "；".join(data["verdicts"])
+    assert "鉴权生效" in joined, data["verdicts"]
+    assert "匿名可读" not in joined, data["verdicts"]
+
+
+def test_authdiff_changed_but_non_2xx_is_not_a_bypass_hit(auth_base):
+    """bypass 头把 200 打成 500：是「改变但非 2xx」，不是疑似绕过——
+    不能引导模型拿一个错误页去复验。"""
+    out = _call(authdiff, url=f"{auth_base}/glitch", variants="bypass",
+                session="off")
+    data = json.loads(out)
+    joined = "；".join(data["verdicts"])
+    assert "非 2xx" in joined, data["verdicts"]
+    assert "疑似生效" not in joined, data["verdicts"]
+
+
+def test_authdiff_rejects_destructive_methods(auth_base):
+    """写方法不参与对照（重放放大 6~13 次的破坏性请求）。"""
+    assert "method 非法" in _call(authdiff, url=f"{auth_base}/data",
+                                  method="DELETE")
+
+
+def test_authdiff_output_stays_valid_json_when_capped(auth_base, monkeypatch):
+    """输出超限时按行裁列表而不是硬切字符串——模型拿到一段坏 JSON 比少几行
+    行更糟（authdiff 原先没有 jsrecon 那套裁剪兜底）。"""
+    from ctf_strix import websec as _websec
+
+    _login(auth_base)
+    monkeypatch.setattr(_websec, "TOOL_TEXT_MAX", 900)
+    out = _call(authdiff, url=f"{auth_base}/data", variants="anon,bypass,path")
+    assert len(out) <= 960, len(out)
+    data = json.loads(out)
+    assert data["rows"] and data["verdicts"], data
+
+
+def test_authdiff_rows_carry_the_ledger_id(auth_base):
+    """S3：每行回传台账 id，traffic_diff 才能对着具体两条记录比（rows
+    的 url 全相同时，traffic_list 分不清哪条是哪个变体）。"""
+    _login(auth_base)
+    out = _call(authdiff, url=f"{auth_base}/data", variants="anon")
+    data = json.loads(out)
+    ids = [row["id"] for row in data["rows"] if "error" not in row]
+    assert ids and all(isinstance(i, str) and i for i in ids)
+    assert data["baseline"]["id"] == ids[0]
+    # The ids are real ledger rows: diffing two of them works end to end.
+    assert "diff" in traffic.traffic_diff(ids[0], ids[1]) or "identical" in \
+        traffic.traffic_diff(ids[0], ids[1])
 
 
 def test_authdiff_path_variants_generate_rewrites():
@@ -257,6 +349,122 @@ def test_jsrecon_records_page_and_bundle_fetches(js_base, fresh_ledger):
 
 def test_jsrecon_rejects_missing_url():
     assert "需要 url" in _call(jsrecon, url="")
+
+
+_CROSS_PAGE = (
+    b"<html><head>"
+    b"<script src='http://169.254.169.254/latest/meta.js'></script>"
+    b"<script src='/app.js'></script>"
+    b"<script src='/app.js'></script>"
+    b"</head></html>"
+)
+
+
+class _JsCrossHandler(BaseHTTPRequestHandler):
+    """Page content naming a third-party absolute URL and a duplicate local
+    script: page content is untrusted input, neither should be fetched twice
+    nor fetched at all."""
+
+    def log_message(self, *args):
+        pass
+
+    def do_GET(self):
+        if self.path == "/":
+            raw = _CROSS_PAGE
+        elif self.path == "/app.js":
+            raw = b"fetch('/api/local/thing');"
+        else:
+            self.send_response(404)
+            self.end_headers()
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html" if self.path == "/" else
+                         "application/javascript")
+        self.send_header("Content-Length", str(len(raw)))
+        self.end_headers()
+        self.wfile.write(raw)
+
+
+@pytest.fixture(scope="module")
+def js_cross_base():
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), _JsCrossHandler)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        yield f"http://127.0.0.1:{srv.server_address[1]}"
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_jsrecon_skips_cross_origin_and_duplicate_scripts(js_cross_base,
+                                                          fresh_ledger):
+    out = _call(jsrecon, url=f"{js_cross_base}/")
+    data = json.loads(out)
+    assert data["skipped_cross_origin"] == 1, data
+    urls = [b["url"] for b in data["bundles"]]
+    assert urls == [f"{js_cross_base}/app.js"], urls
+    # The metadata endpoint was never even attempted.
+    assert all("169.254" not in r.url for r in fresh_ledger.items()), \
+        [r.url for r in fresh_ledger.items()]
+
+
+class _JsRedirectHandler(BaseHTTPRequestHandler):
+    """/old 302 -> /app/ ; /app/ references app.js, which must resolve against
+    the *final* page URL (/app/app.js), not the original target."""
+
+    def log_message(self, *args):
+        pass
+
+    def do_GET(self):
+        if self.path == "/old":
+            self.send_response(302)
+            self.send_header("Location", "/app/")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        if self.path == "/app/":
+            raw = b"<html><script src='app.js'></script></html>"
+            ctype = "text/html"
+        elif self.path == "/app/app.js":
+            raw = b"fetch('/api/after/redirect');"
+            ctype = "application/javascript"
+        else:
+            self.send_response(404)
+            self.end_headers()
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(raw)))
+        self.end_headers()
+        self.wfile.write(raw)
+
+
+@pytest.fixture(scope="module")
+def js_redirect_base():
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), _JsRedirectHandler)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        yield f"http://127.0.0.1:{srv.server_address[1]}"
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_jsrecon_resolves_relative_src_after_redirect(js_redirect_base):
+    """302 之后相对 src 按最终页面 URL 解析：/old 页的 app.js 是
+    /app/app.js，不是根下的 /app.js。"""
+    out = _call(jsrecon, url=f"{js_redirect_base}/old")
+    data = json.loads(out)
+    urls = [b["url"] for b in data["bundles"]]
+    assert urls == [f"{js_redirect_base}/app/app.js"], urls
+    assert "/api/after/redirect" in data["api"], data["api"]
+
+
+def test_jsrecon_unreachable_page_returns_a_readable_error():
+    """首屏连接失败给 [jsrecon] 可读报错，不是裸异常甩给 SDK。"""
+    out = _call(jsrecon, url="http://127.0.0.1:9/")
+    assert out.startswith("[jsrecon]"), out
+    assert "不可达" in out, out
 
 
 # ------------------------------------------------------------ traffic_diff

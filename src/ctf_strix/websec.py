@@ -12,8 +12,9 @@
 
 - ``authdiff``：实测瓶颈在「flag 发现 / access-control 面」。手工判定
   「这个端点是否忘鉴权」至少要发 2~4 次请求再肉眼比对，做成一次调用。
-  基线（带会话）/ 匿名（去 Cookie）/ 代理绕过头 / 路径变形四组变体，
-  比对状态码、长度、内容哈希，直接给「匿名可读=疑似未鉴权」结论。
+  基线（带会话）/ 匿名（去 Cookie 且剥凭据头）/ 代理绕过头 / 路径变形
+  四组变体，比对状态码、长度、内容哈希，直接给「匿名可读=疑似未鉴权」
+  结论——该结论以基线 2xx 为前提（基线 403/404 时对照无区分度）。
 - ``jsrecon``：SPA 题把 bundle 落盘再 grep 要烧 3~4 步；``route_map``
   只抓静态链接/表单，抓不到 JS 里的 API 面。一次调用抽 API 路径、
   参数名、前端路由、硬编码密钥线索、sourceMap 与可疑注释。
@@ -67,12 +68,24 @@ AUTHDIFF_BYPASS_HEADERS: Final = (
     ("X-Admin", "true"),
 )
 AUTHDIFF_VARIANTS: Final = ("anon", "bypass", "path")
-_METHODS: Final = ("GET", "POST", "PUT", "PATCH", "DELETE")
+#: 只允许幂等/低破坏方法：对照一次会重放 6~13 个变体，PUT/PATCH/DELETE
+#: 的重放放大（连删 6 次、触发锁定）比它的对照价值贵得多——写端点的
+#: 越权判定用 http_probe 单发一次就够。
+_METHODS: Final = ("GET", "POST", "HEAD")
+#: anon 变体除 Cookie 外还必须剥掉的凭据头（大小写不敏感）：模型给的
+#: ``headers_json`` 里带 Authorization 时，"匿名"请求其实是带凭据的，
+#: 对照会得出反向结论（S1，codex 审查 2026-11-17）。
+_ANON_STRIP_HEADERS: Final = (
+    "authorization", "cookie", "x-api-key", "x-auth-token", "x-session-id",
+    "x-token", "proxy-authorization", "x-csrf-token",
+)
 
 # ---------- jsrecon ----------
 JSRECON_MAX_BUNDLES: Final = 6
 #: 单个 bundle 只留前 512KB。
 JSRECON_MAX_BUNDLE_CHARS: Final = 512 * 1024
+#: 流式读取的硬字节上限（解压后）：gzip 炸弹/超大 bundle 不整段进内存。
+JSRECON_MAX_BUNDLE_BYTES: Final = 2 * 1024 * 1024
 #: 所有 JS 合计上限（防内存爆）。
 JSRECON_MAX_JSON_CHARS: Final = 6 * 1024 * 1024
 JSRECON_MAX_PER_KIND: Final = 12
@@ -132,13 +145,21 @@ def _fetch(
     session: str | None = "auto",
     follow_redirects: bool = False,
     timeout: float = AUTHDIFF_TIMEOUT,
-) -> tuple[int, str, str]:
-    """发一个请求，返回 (status, content-type, body)。
+    max_bytes: int | None = None,
+) -> tuple[str, str, int, str, str]:
+    """发一个请求，返回 (台账 id, 最终 URL, status, content-type, body)。
 
     本仓约定的传输层：``requests`` 直发 + 按宿主只读 cookie 快照
     （``http_probe`` 的登录态沿用；``Set-Cookie`` 永不回写）+ 台账
     先占 id 再发（失败也落盘，同 ``variants`` 的纪律）。
     ``session=None`` 表示匿名（不带任何 cookie）。
+
+    - 台账 id 回传给调用方：变体行里带上 id，模型才能用
+      ``traffic_diff`` 对着具体两条记录做字段级比对（S3）。
+    - 最终 URL（跟随重定向之后）：jsrecon 的相对 ``src`` 必须按它解析，
+      按原始 target 解析会把 ``/login`` 页面的 ``static/app.js`` 抓错。
+    - ``max_bytes``：流式读取的硬字节上限（gzip 炸弹/超大 bundle 不该
+      在解压后整段进内存）。
     """
     snap = session_cookies(session, url) if session else {}
     headers = {"Connection": "close", "User-Agent": _UA}
@@ -154,6 +175,7 @@ def _fetch(
             method, url, timeout=timeout, verify=False,
             allow_redirects=follow_redirects, headers=headers,
             cookies=snap or None, data=body.encode("utf-8") if body else None,
+            stream=max_bytes is not None,
         )
     except Exception as exc:  # noqa: BLE001 — 失败也入台账，死路不该被重试
         traffic.record(
@@ -162,14 +184,35 @@ def _fetch(
             note=f"{type(exc).__name__}: {exc}"[:300],
         )
         raise
-    text = resp.text or ""
+    size = 0
+    if max_bytes is None:
+        text = resp.text or ""
+        size = len(resp.content or b"")
+    else:
+        chunks: list[bytes] = []
+        for chunk in resp.iter_content(64 * 1024):
+            if not chunk:
+                continue
+            chunks.append(chunk)
+            size += len(chunk)
+            if size >= max_bytes:
+                break
+        resp.close()
+        raw = b"".join(chunks)
+        text = raw.decode(resp.encoding or "utf-8", "replace")
     traffic.record(
         request_id=request_id, method=method, url=url, req_headers=sent_headers,
         status=resp.status_code, resp_headers=dict(resp.headers), resp_body=text,
-        size=len(resp.content or b""), elapsed=time.time() - started,
+        size=size, elapsed=time.time() - started,
         body_keep=64 * 1024,
     )
-    return resp.status_code, (resp.headers.get("content-type") or ""), text
+    return (
+        request_id,
+        str(resp.url or url),
+        resp.status_code,
+        (resp.headers.get("content-type") or ""),
+        text,
+    )
 
 
 def _parse_variants(variants: str) -> list[str]:
@@ -209,12 +252,20 @@ def _path_variants(url: str) -> list[tuple[str, str]]:
     return out
 
 
+def _strip_credentials(headers: dict | None) -> dict | None:
+    """anon 变体的头：剥掉凭据类头（S1）——否则"匿名"请求其实带凭据。"""
+    if not headers:
+        return None
+    return {k: v for k, v in headers.items()
+            if str(k).lower() not in _ANON_STRIP_HEADERS}
+
+
 def _probe(url: str, *, label: str, method: str, body: str,
            extra_headers: dict | None, session: str | None) -> dict:
     """发一个变体，返回可比较的三元组；失败不抛出，标记 error 继续。"""
     row: dict = {"label": label, "url": url}
     try:
-        status, ctype, text = _fetch(
+        rid, _final, status, ctype, text = _fetch(
             url, method=method, body=body,
             extra_headers=extra_headers, session=session,
         )
@@ -222,6 +273,7 @@ def _probe(url: str, *, label: str, method: str, body: str,
         row["error"] = f"{type(exc).__name__}: {exc}"
         return row
     row.update({
+        "id": rid,
         "status": status,
         "len": len(text or ""),
         "h": _h8(text or ""),
@@ -257,7 +309,9 @@ def _run_authdiff(*, url: str = "", method: str = "GET", body: str = "",
         ("authed", target, hdrs or None, session)
     ]
     if "anon" in picked:
-        plan.append(("anon", target, hdrs or None, None))
+        # S1：匿名变体必须连模型给的凭据头一起剥掉，只留 Cookie 快照的去除
+        # （session=None）不够——Authorization/X-API-Key 照发的话对照是假的。
+        plan.append(("anon", target, _strip_credentials(hdrs), None))
     if "bypass" in picked:
         for name, value in AUTHDIFF_BYPASS_HEADERS:
             merged = dict(hdrs)
@@ -285,8 +339,19 @@ def _run_authdiff(*, url: str = "", method: str = "GET", body: str = "",
     if "error" in baseline:
         verdicts.append("基线请求失败，先确认目标可达与会话有效")
     else:
+        # S2：匿名可读/鉴权生效的结论都以「基线本身是 2xx」为前提。基线
+        # 403/404/302 时 anon 与基线相同只说明两者都被拒/都不存在，把它判成
+        # 「匿名可读=疑似未鉴权」是反向结论。
+        base_status = baseline.get("status")
+        base_ok = isinstance(base_status, int) and 200 <= base_status < 300
         anon = by_label.get("anon")
-        if anon:
+        if not base_ok:
+            verdicts.append(
+                f"基线不可读（HTTP {base_status}）：404=路径不存在、"
+                "401/403=会话/凭证无效、302=被重定向——先修基线，对照结论"
+                "此刻没有意义"
+            )
+        elif anon:
             if "error" in anon:
                 verdicts.append("匿名请求失败")
             elif anon.get("same"):
@@ -298,23 +363,29 @@ def _run_authdiff(*, url: str = "", method: str = "GET", body: str = "",
                                     "Cookie，anon 与基线必然相同，此结论只说明"
                                     "「不需要登录」，先登录拿到会话再跑一次才有"
                                     "越权判定意义）")
-            elif anon.get("status") == baseline.get("status"):
+            elif anon.get("status") == base_status:
                 verdicts.append("匿名可达但内容不同 → 可能只有部分字段受控，"
                                 "值得按字段 diff")
             else:
                 verdicts.append("鉴权生效：匿名请求被拒（状态码不同）")
-        changed = [r["label"] for r in rows
-                   if r["label"].startswith("bypass:") and not r.get("same")
-                   and "error" not in r]
-        if changed:
-            verdicts.append(f"绕过头生效：{', '.join(changed)} 改变了结果 → "
-                            "服务端信任客户端代理头")
-        path_changed = [r["label"] for r in rows
-                        if r["label"].startswith("path:") and not r.get("same")
-                        and "error" not in r]
-        if path_changed:
-            verdicts.append(f"路径变形生效：{', '.join(path_changed)} → "
-                            "归一化/解析差异可绕过路由规则")
+        # bypass / path 的"生效"分两档：命中 2xx 才叫疑似绕过；只改成了
+        # 500/404 之类，最多说明错误页不同，不能引模型去复验（动态页的
+        # CSRF/nonce 抖动也会让哈希必然不同）。
+        for prefix, what in (("bypass:", "绕过头"), ("path:", "路径变形")):
+            changed = [r for r in rows
+                       if r["label"].startswith(prefix) and not r.get("same")
+                       and "error" not in r]
+            if not changed:
+                continue
+            hits = [r["label"] for r in changed
+                    if isinstance(r.get("status"), int) and 200 <= r["status"] < 300]
+            misses = [r["label"] for r in changed if r["label"] not in hits]
+            if hits:
+                verdicts.append(f"{what}疑似生效：{', '.join(hits)} 返回 2xx → "
+                                "服务端信任客户端代理头/归一化差异可绕过路由")
+            if misses:
+                verdicts.append(f"{what}仅改变结果（非 2xx）：{', '.join(misses)} "
+                                "——可能是错误页差异或动态内容抖动，需先复验")
         if not verdicts:
             verdicts.append("各变体无差异：该端点表现一致，换下一个输入点")
 
@@ -326,19 +397,29 @@ def _run_authdiff(*, url: str = "", method: str = "GET", body: str = "",
         "target": target,
         "method": method,
         "baseline": {k: baseline.get(k) for k in
-                     ("status", "len", "h", "type", "error") if k in baseline},
+                     ("id", "status", "len", "h", "type", "error") if k in baseline},
         "rows": rows,
         "verdicts": verdicts,
         "next": ("命中的绕过头/路径变形可直接用于 http_probe 复验；字段级差异"
-                 "用 traffic_diff 比两条台账记录。"
-                 if any("生效" in v or "匿名可读" in v for v in verdicts)
-                 else "换个端点或换 method（POST/PUT）再对照一次。"),
+                 "用 traffic_diff 按行内 id 比两条台账记录。"
+                 if any("疑似生效" in v or "匿名可读" in v for v in verdicts)
+                 else "换个端点或换 method（POST）再对照一次。"),
     }
     if stopped_early:
         payload["stopped_early"] = True
         payload["notes"] = [f"超过 {AUTHDIFF_BUDGET:.0f}s 预算，"
                             f"{len(rows)}/{len(plan)} 个变体已完成，结论基于已完成部分"]
-    return _clip(json.dumps(payload, ensure_ascii=False))
+    # 超限：按信息量从低到高裁（行从尾部裁，verdicts 是结论不裁），保持
+    # 返回合法 JSON；_clip 只是最后兜底（硬切会破坏 JSON，模型拿到一段
+    # 坏文本比少几行行更糟）。
+    text = json.dumps(payload, ensure_ascii=False)
+    while len(text) > TOOL_TEXT_MAX and len(payload["rows"]) > 1:
+        payload["rows"] = payload["rows"][:-1]
+        text = json.dumps(payload, ensure_ascii=False)
+    if len(text) > TOOL_TEXT_MAX and len(payload.get("verdicts", [])) > 1:
+        payload["verdicts"] = payload["verdicts"][:-1]
+        text = json.dumps(payload, ensure_ascii=False)
+    return _clip(text)
 
 
 async def authdiff(
@@ -357,7 +438,9 @@ async def authdiff(
 
     Args:
         url: 要对照的完整 URL（必填）。
-        method: 请求方法，GET / POST / PUT / PATCH / DELETE，默认 GET。
+        method: 请求方法，GET / POST / HEAD，默认 GET。写方法（PUT/PATCH/
+            DELETE）不做对照——一次对照会重放 6~13 个变体，破坏性重放的
+            放大风险大于对照价值；写端点的越权用 http_probe 单发判定。
         body: POST 等方法的请求体。
         headers_json: 额外请求头（JSON 字符串，≤6 个），如
             ``{"X-Custom": "v"}``。
@@ -432,10 +515,13 @@ def _run_jsrecon(*, url: str = "", session: str = "auto") -> str:
         raise _fail("jsrecon 需要 url")
     started = time.perf_counter()
 
-    status, ctype, html = _fetch(
-        target, method="GET", session=session,
-        follow_redirects=True, timeout=JSRECON_TIMEOUT,
-    )
+    try:
+        _rid, page_url, status, ctype, html = _fetch(
+            target, method="GET", session=session,
+            follow_redirects=True, timeout=JSRECON_TIMEOUT,
+        )
+    except Exception as exc:  # noqa: BLE001 — 首屏不可达给可读报错，不是裸异常
+        raise _fail(f"页面不可达：{type(exc).__name__}: {exc}") from exc
     scripts = _SCRIPT_SRC_RE.findall(html or "")
     inline = _INLINE_SCRIPT_RE.findall(html or "")
 
@@ -443,29 +529,46 @@ def _run_jsrecon(*, url: str = "", session: str = "auto") -> str:
     js_chunks: list[str] = []
     budget = JSRECON_MAX_JSON_CHARS
     stopped_early = False
-    for src in scripts[:JSRECON_MAX_BUNDLES]:
+    # 同源纪律（与 discovery 一致）：页面内容是**不可信输入**，页面里写的
+    # 第三方绝对 URL 不抓（防 SSRF 式元数据端点/内网探测由页面内容驱动）；
+    # 相对 src 按重定向后的最终页面 URL 解析（302 到 /login 后，
+    # static/app.js 该挂在 /login/static/ 下）。
+    origin_host = urlparse(page_url).netloc
+    seen_src: set[str] = set()
+    skipped_cross = 0
+    picked_src: list[str] = []
+    for src in scripts:
+        abs_url = urljoin(page_url, src)
+        if urlparse(abs_url).netloc != origin_host:
+            skipped_cross += 1
+            continue
+        if abs_url in seen_src:
+            continue
+        seen_src.add(abs_url)
+        picked_src.append(abs_url)
+        if len(picked_src) >= JSRECON_MAX_BUNDLES:
+            break
+    for abs_url in picked_src:
         if time.perf_counter() - started > JSRECON_BUDGET:
             stopped_early = True
             break
-        # 相对 src 必须相对页面 URL 解析（urljoin）；协议相对与绝对 URL
-        # 同样由 urljoin 处理。
-        abs_url = urljoin(target, src)
         try:
-            bstatus, bctype, text = _fetch(
+            rid, final_url, bstatus, bctype, text = _fetch(
                 abs_url, method="GET", session=session,
                 follow_redirects=True, timeout=JSRECON_TIMEOUT,
+                max_bytes=JSRECON_MAX_BUNDLE_BYTES,
             )
         except Exception as exc:  # noqa: BLE001 — 单个 bundle 失败不该作废整次
             bundles.append({"url": abs_url, "error": f"{type(exc).__name__}: {exc}"})
             continue
         text = text or ""
-        truncated = len(text) > JSRECON_MAX_BUNDLE_CHARS
+        truncated = len(text) >= JSRECON_MAX_BUNDLE_CHARS
         kept = text[:JSRECON_MAX_BUNDLE_CHARS]
         if budget > 0:
             kept = kept[:budget]
             budget -= len(kept)
             js_chunks.append(kept)
-        bundles.append({"url": abs_url, "status": bstatus,
+        bundles.append({"url": abs_url, "id": rid, "status": bstatus,
                         "len": len(text), "truncated": truncated})
 
     for chunk in inline:
@@ -492,6 +595,7 @@ def _run_jsrecon(*, url: str = "", session: str = "auto") -> str:
         "page": {"status": status, "bytes": len(html or ""),
                  "type": (ctype or "").split(";")[0].strip()[:40],
                  "scripts": len(scripts), "inline": len(inline)},
+        "skipped_cross_origin": skipped_cross,
         "bundles": bundles,
         "api": _rank(api_paths)[:JSRECON_MAX_PER_KIND],
         "api_total": len(set(api_paths)),

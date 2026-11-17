@@ -97,9 +97,14 @@ def test_web_challenge_registers_http_and_not_attachment_tools(registry):
     assert "web_cve_lookup" in names
     assert "`web_cve_lookup`" in text
     # Traffic memory travels with the HTTP surface: it is the only way to read
-    # back an exchange after its body scrolled out of the context.
-    assert {"traffic_list", "traffic_view"} <= names
+    # back an exchange after its body scrolled out of the context.  The authdiff
+    # / jsrecon / traffic_diff trio is the same surface (websec absorption,
+    # 2026-11-17): the registry test must pin them by name, not let
+    # test_tool_gating self-certify via websec.TOOLS.
+    assert {"traffic_list", "traffic_view", "traffic_diff"} <= names
+    assert {"authdiff", "jsrecon"} <= names
     assert "`traffic_list`" in text
+    assert "`authdiff`" in text
     for file_tool in ("file_triage", "decode_blob", "unpack_archive"):
         assert file_tool not in names
         assert f"`{file_tool}`" not in text

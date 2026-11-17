@@ -37,7 +37,8 @@ from typing import Final
 #: distinction is not visible from the name:
 #:
 #: * **always present** -- ``exec_command`` / ``write_stdin`` (Shell
-#:   capability) and the four primitives registered by ``capabilities``;
+#:   capability) and the six web primitives registered by ``capabilities``
+#:   (http/route/method/path + authdiff/jsrecon);
 #: * **conditionally present** -- ``repeat_request`` is a Caido tool, and
 #:   ``tool_trim`` drops the six Caido tools by default because the image has
 #:   no ``caido-cli``.  Keeping it here is still correct: if an image ever

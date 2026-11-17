@@ -531,7 +531,8 @@ def traffic_view(request_id: str = "", part: str = "both", offset: int = 0,
 
 #: diff 输出上限（字符）。差异文本是给模型看的行级线索，不是转储。
 _DIFF_MAX_CHARS: Final = 4000
-#: diff 输入截断：difflib 对超长正文是 O(n²)，预截防一步卡死
+#: diff 输入截断：difflib 对超长正文是 O(n²)，预截防一步卡死。台账正文
+#: 单条本来只存 64KB（body_keep），256KB 上限是纵深冗余而非真实约束
 #: （复用自 ctfy_project 的 traffic.diff，已获该队同意 2026-11-17）。
 _DIFF_INPUT_CAP: Final = 256 * 1024
 
