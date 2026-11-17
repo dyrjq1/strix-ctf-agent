@@ -17,7 +17,11 @@
    任何「停止中/重试中」实例都会挤掉别人的槽位（SAMPLE-001 连撞 5 次
    429），墙钟求和几乎等于经过时间（并发度≈1）。⚠️ 需要 VPN/隧道的
    TCP 题并行车道会共享子网路由互踩（vpn.py 单 wg 接口）；遇到路由型
-   失败先降 ``--lanes 1``。
+   失败先降 ``--lanes 1``。每条车道可用 ``--lane-config`` 绑定**不同厂商**
+   的模型与凭据（一家端点挂掉不连坐）。
+5. **体量档位**：题池规模赛前未知——每轮刷题表后按未关闭题数自动判
+   small/medium/large，只改调度参数（每题重试预算、deferred 复活敏感度），
+   不动单次尝试的时间盒。分批放题时档位自动换。
 
 选题策略（纯函数 ``rank_queue``，全部可单测）：
 
@@ -42,6 +46,12 @@
     python scripts/compete.py --token "$PF_TOKEN" \
         --competition <cid> --state-dir ~/compete-state --lanes 3 \
         --turns 25 --wallclock 300 --until "2026-11-15T20:00+08:00"
+
+    # 多厂商车道（可选）：--lane-config 一行一车道「名字|LLM_API_BASE|
+    # LLM_API_KEY|模型名」（chmod 600，# 注释/空行跳过）。不配则所有车道
+    # 共用当前进程的 LLM_* 环境（行为与改动前完全一致）。凭据只进子进程
+    # env，不进 argv、不落 state、不打印：
+    python scripts/compete.py ... --lanes 3 --lane-config ~/lanes.conf
 
     # 只看队列不动手：
     python scripts/compete.py ... --dry-run
@@ -217,6 +227,65 @@ def entry_direction(attempt: int) -> tuple[str, str] | None:
     return _ENTRY_DIRECTIONS[(attempt - 2) % len(_ENTRY_DIRECTIONS)]
 
 
+# ---------------------------------------------------------------- 题池体量档位
+
+#: 题池体量分档边界（按**未关闭题数** N 判定，每轮刷题表后重判——分批放题
+#: 时档位会自己跟上）。战术选择由代码在开赛时自动完成：人工赛中选档 =
+#: 人工注入指令（官方 Q&A Q6/Q69「赛前部署好、中途不能调试修改」）。
+#:
+#: 物理依据只有一条：总车道时间 ≈ 比赛时长 × lanes（10h×3 ≈ 108000
+#: 车道秒）。按平均尝试 ~450s、每题 2–3 次尝试算，N 要到 ~100 才真正
+#: 绑死，所以 large 的门槛放在 61：早于这个数收紧重试就是白丢 29.2% 的
+#: 同题重试解出率。分档只改**调度参数**（每题给几次机会、deferred 多
+#: 敏感），**不动单次尝试的时间盒**（_ATTEMPT_BOX_S 是 docs/47 §2.3.2
+#: 实测拐点，动它属于"单独调预算"）。尾巴题（≤_TAIL_MAX_SOLVES 队解出）
+#: 不受 max_failures 影响，由 _TAIL_RETRY_BUDGET 独立兜底，三档共用
+#: ——large 档砍的是**已被广泛解出的地板价题**的深度，零解题（满值）
+#: 的预算一根手指都不动。
+_REGIME_BOUNDS = {"small": 12, "medium": 60}
+
+#: 三档预设。medium = 实测默认（max_failures 2 / jump 3，docs/47 §2.3.2
+#: 拐点 + 29.2% 同题重试率）；small 放大覆盖（每题分值份额大，多一次全新
+#: 上下文重试的实测收益 29.2% 高于让出的车道时间）；large 收紧吞吐
+#: （早 defer 早换题，把车道时间让给还没碰过的题）。
+_REGIME_PRESETS: dict[str, dict[str, int]] = {
+    "small": {"max_failures": 4, "rerun_solves_jump": 2},
+    "medium": {"max_failures": 2, "rerun_solves_jump": 3},
+    "large": {"max_failures": 1, "rerun_solves_jump": 4},
+}
+
+#: 消融开关，形状与 CTF_REDISPATCH 一致：只有 0/false/no/off 关掉。关掉时
+#: 任何 N 都用 medium 默认（= 改动前行为），A/B 的对照臂靠它。
+REGIME_ENV = "CTF_REGIME"
+
+
+def regime_enabled() -> bool:
+    """体量分档是否生效（A/B 的对照臂靠它关掉）。"""
+    raw = os.environ.get(REGIME_ENV, "").strip().lower()
+    return raw not in {"0", "false", "no", "off"}
+
+
+def regime_of(n_open: int) -> str:
+    """按未关闭题数判体量档位。"""
+    if n_open <= _REGIME_BOUNDS["small"]:
+        return "small"
+    if n_open <= _REGIME_BOUNDS["medium"]:
+        return "medium"
+    return "large"
+
+
+def regime_preset(n_open: int) -> tuple[str, dict[str, int]]:
+    """体量档位与其调度参数。返回 ``(档名, preset)``。
+
+    关掉分档（CTF_REGIME=off）时固定返回 medium 默认——与改动前的行为
+    逐位一致。
+    """
+    if not regime_enabled():
+        return "medium", _REGIME_PRESETS["medium"]
+    name = regime_of(n_open)
+    return name, _REGIME_PRESETS[name]
+
+
 def _value_bonus(chal: dict[str, Any]) -> int:
     """按平台动态积分推"这道题还剩多少分"——单调、无参数可调。
 
@@ -323,12 +392,15 @@ def rank_queue(
             rec["solves_count_seen"] = int(chal.get("solves_count") or 0)
             notes.append(f"{cid}: 连败 {fails_budget} 次→deferred")
             continue
-        if int(rec.get("skips") or 0) >= max_failures:
+        if int(rec.get("skips") or 0) >= max(2, max_failures):
             # B-23：连续基础设施跳过同样 defer——重派不产生任何新信息，
             # 只烧实例启动开销。他队解出数跳变仍可唤醒（与连败 defer 同门）。
+            # 阈值取 ``max(2, max_failures)``：环境故障不是题目不可解的
+            # 证据，它的 defer 门槛不随体量档收紧——一次平台瞬时故障就
+            # 把题搁置到复活门槛之后，等于让基础设施抖动替我们选题。
             rec["status"] = DEFERRED
             rec["solves_count_seen"] = int(chal.get("solves_count") or 0)
-            notes.append(f"{cid}: infra-skip 连续 {max_failures} 次→deferred")
+            notes.append(f"{cid}: infra-skip 连续 {max(2, max_failures)} 次→deferred")
             continue
         scored.append((score, chal))
     scored.sort(key=lambda pair: (-pair[0], str(pair[1].get("id") or "")))
@@ -665,7 +737,9 @@ def drop_pool_blocked(
     return [c for c in challenges if str(c.get("id") or "") not in blocked]
 
 
-def _lane_env(lane: int) -> dict[str, str]:
+def _lane_env(
+    lane: int, lane_models: list[dict[str, str]] | None = None
+) -> dict[str, str]:
     """给第 ``lane`` 条车道的子进程分配**独立**的 VPN 中转端口。
 
     宿主机的中转是「一个端口 = 一条车道 = 一套 target」。共用一套端口时，
@@ -675,18 +749,73 @@ def _lane_env(lane: int) -> dict[str, str]:
 
     ``CTF_VPN_RELAY_BASE`` 默认 47444，车道 i 用 ``BASE+2i``（控制口 +1）。
 
+    ``lane_models``（:func:`load_lane_config` 的产物）存在时，车道 i 额外
+    覆盖 ``LLM_API_BASE`` / ``LLM_API_KEY`` / ``STRIX_LLM``——多厂商车道的
+    凭据隔离。三家网关都是 OpenAI 兼容端点，模型名不带 ``/`` 时统一补
+    ``openai/`` 前缀。值只进子进程 env（在 ``_spawn`` 的 env 合并里覆盖
+    父进程的同名变量），不进 argv、不落 state、不打印。
+
     Args:
         lane: 车道序号（0 起）。
+        lane_models: per-lane 厂商配置；None = 不覆盖（单厂商行为不变）。
 
     Returns:
         追加给子进程的环境变量。
     """
     base = int(os.environ.get("CTF_VPN_RELAY_BASE", "47444"))
     port = base + 2 * lane
-    return {
+    env = {
         "CTF_VPN_RELAY": f"192.168.38.1:{port}",
         "CTF_VPN_RELAY_CONTROL": f"192.168.38.1:{port + 1}",
     }
+    if lane_models:
+        cfg = lane_models[lane]
+        model = cfg["model"]
+        env["LLM_API_BASE"] = cfg["LLM_API_BASE"]
+        env["LLM_API_KEY"] = cfg["LLM_API_KEY"]
+        env["STRIX_LLM"] = model if "/" in model else f"openai/{model}"
+    return env
+
+
+def load_lane_config(path: Path) -> list[dict[str, str]]:
+    """读 per-lane 厂商配置（与部署侧 lanes.conf 同格式，一行一车道）。
+
+    行格式 ``名字|LLM_API_BASE|LLM_API_KEY|模型名``；``#`` 注释与空行跳过；
+    四段都非空，少一段/多一段/有空段都拒绝（宁可启动失败，也不要拿半份
+    凭据跑出一车道假 401）。文件在部署侧 chmod 600，本函数不做权限检查
+    （Windows 上没有这个语义），只在出错信息里提醒。
+
+    凭据从文件直接进子进程 env，**绝不出现在任何 print / argv / state**。
+    """
+    lanes: list[dict[str, str]] = []
+    text = Path(path).read_text(encoding="utf-8")
+    for lineno, raw in enumerate(text.splitlines(), 1):
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = [p.strip() for p in line.split("|")]
+        if len(parts) != 4 or not all(parts):
+            raise ValueError(
+                f"车道配置第 {lineno} 行不是「名字|base|key|模型」四段非空："
+                f"{raw[:40]}…"
+            )
+        name, api_base, api_key, model = parts
+        lanes.append(
+            {
+                "name": name,
+                "LLM_API_BASE": api_base,
+                "LLM_API_KEY": api_key,
+                "model": model,
+            }
+        )
+    if not lanes:
+        raise ValueError(f"车道配置 {path} 没有可用行（记得 chmod 600）")
+    return lanes
+
+
+def _mask_key(key: str) -> str:
+    """启动横表里的 key 脱敏：只露尾 4 位，帮对配置、不帮泄密。"""
+    return "…" + key[-4:] if len(key) >= 8 else "…(过短)"
 
 
 def build_retry_notes(
@@ -733,6 +862,7 @@ def _spawn(
     lane: int = 0,
     direction: tuple[str, str] | None = None,
     attempt: int = 1,
+    lane_models: list[dict[str, str]] | None = None,
 ) -> subprocess.Popen:
     """派一个 batch_eval 子进程跑单题（agent 上下文从零开始）。
 
@@ -768,7 +898,7 @@ def _spawn(
         notes.write_text(notes_text, encoding="utf-8")
         cmd += ["--retry-notes", str(notes)]
     log = open(runs / f"{cid}.stdout.log", "a", encoding="utf-8")
-    env = {**os.environ, **_lane_env(lane)}
+    env = {**os.environ, **_lane_env(lane, lane_models)}
     return subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT, env=env)
 
 
@@ -888,11 +1018,40 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="放行封存/烧毁池的题（仅练习场自测；正式赛不要用）",
     )
+    p.add_argument(
+        "--lane-config",
+        default="",
+        help="per-lane 厂商配置文件（名字|LLM_API_BASE|LLM_API_KEY|模型名，"
+        "一行一车道，chmod 600）；不配则所有车道共用当前进程的 LLM_* 环境",
+    )
     return p
 
 
 def main() -> int:
     args = build_parser().parse_args()
+
+    #: per-lane 厂商配置（可选）。加载失败/行数不够车道数 = 启动即退：
+    #  拿半份凭据跑起来的"成功"比失败贵得多（假 401 烧一整轮墙钟）。
+    lane_models: list[dict[str, str]] | None = None
+    if args.lane_config:
+        try:
+            lane_models = load_lane_config(Path(args.lane_config).expanduser())
+        except (OSError, ValueError) as exc:
+            print(f"[compete] 车道配置加载失败：{exc}", flush=True)
+            return 2
+        if len(lane_models) < args.lanes:
+            print(
+                f"[compete] 车道配置只有 {len(lane_models)} 行，"
+                f"不够 --lanes {args.lanes} 条车道",
+                flush=True,
+            )
+            return 2
+        for i, cfg in enumerate(lane_models):
+            print(
+                f"[compete] lane {i}: {cfg['name']} @ {cfg['LLM_API_BASE']} "
+                f"model={cfg['model']} key={_mask_key(cfg['LLM_API_KEY'])}",
+                flush=True,
+            )
 
     state_dir = Path(args.state_dir).expanduser()
     state = load_state(state_dir)
@@ -958,6 +1117,9 @@ def main() -> int:
     #: 池闸门：封存/烧毁题派出去只会被 batch_eval 拒跑，然后在车道里退避
     #: 重派（冒烟实测空转 8 分钟）。开跑前剔除一次；--allow-pools 显式放行。
     blocked_pools = set() if args.allow_pools else pool_blocked_ids()
+
+    #: 体量档位（题池规模未知，由题表自动判，见 _REGIME_PRESETS）。
+    last_regime: str | None = None
     pool_note_printed = False
 
     while not stop:
@@ -1019,7 +1181,24 @@ def main() -> int:
                 print(f"[compete] 平台已解回灌：{', '.join(added)}", flush=True)
                 my_solved |= set(added)
                 save_state(state_dir, state)
-        queue, notes = rank_queue(challenges, state, my_solved)
+        # 体量档位：按本轮未关闭题数判，分批放题/题目下线时自动换档。
+        n_open = sum(1 for c in challenges if not c.get("closed"))
+        regime_name, preset = regime_preset(n_open)
+        if regime_name != last_regime:
+            last_regime = regime_name
+            print(
+                f"[compete] 题池体量 N={n_open} → 档位 {regime_name}"
+                f"（max_failures={preset['max_failures']}，"
+                f"rerun_solves_jump={preset['rerun_solves_jump']}）",
+                flush=True,
+            )
+        queue, notes = rank_queue(
+            challenges,
+            state,
+            my_solved,
+            max_failures=int(preset["max_failures"]),
+            rerun_solves_jump=int(preset["rerun_solves_jump"]),
+        )
         (state_dir).mkdir(parents=True, exist_ok=True)
         (state_dir / "digest.md").write_text(
             build_digest(state, challenges), encoding="utf-8"
@@ -1072,6 +1251,9 @@ def main() -> int:
                 )[-5:]
             used = set(lane_of.values())
             lane = next(i for i in range(args.lanes) if i not in used)
+            if lane_models:
+                # 只进调度器账本（赛后分厂商统计用），不进任何子进程上下文。
+                rec["lane_model"] = lane_models[lane]["name"]
             running[cid] = _spawn(
                 chal,
                 args,
@@ -1080,11 +1262,15 @@ def main() -> int:
                 lane=lane,
                 direction=direction,
                 attempt=attempt,
+                lane_models=lane_models,
             )
             lane_of[cid] = lane
+            lane_label = (
+                f"{lane}({lane_models[lane]['name']})" if lane_models else str(lane)
+            )
             print(
                 f"[compete] 派单 {cid}（{len(running)}/{args.lanes} 车道，"
-                f"lane={lane} 中转 {_lane_env(lane)['CTF_VPN_RELAY']}"
+                f"lane={lane_label} 中转 {_lane_env(lane)['CTF_VPN_RELAY']}"
                 + (f"，换向={direction[0]}" if direction else "")
                 + "）",
                 flush=True,

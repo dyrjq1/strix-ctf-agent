@@ -666,3 +666,189 @@ def test_spawn_on_the_first_attempt_writes_no_notes(tmp_path, monkeypatch) -> No
     compete._spawn(_chal("A"), _args(), tmp_path, failure_path=None, direction=None, attempt=1)
     assert "--retry-notes" not in captured["cmd"]
     assert not (tmp_path / "runs" / "retry-notes-A.txt").exists()
+
+
+# ---------------------------------------------------------------- 车道厂商配置
+
+def _lane_conf(tmp_path: Path, lines: list[str]) -> Path:
+    p = tmp_path / "lanes.conf"
+    p.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return p
+
+
+def test_lane_config_parses_and_skips_comments(tmp_path: Path) -> None:
+    """一行一车道四段；# 注释与空行跳过；首尾空白剥掉。"""
+    p = _lane_conf(
+        tmp_path,
+        [
+            "# 三家厂商，凭据当天建会话",
+            "",
+            " deepseek | https://api.deepseek.com/v1 | sk-a | deepseek-v4.1-flash ",
+            "bailian|https://dashscope.aliyuncs.com/compatible-mode/v1|sk-b|qwen3-max",
+        ],
+    )
+    lanes = compete.load_lane_config(p)
+    assert [l["name"] for l in lanes] == ["deepseek", "bailian"]
+    assert lanes[0]["LLM_API_BASE"] == "https://api.deepseek.com/v1"
+    assert lanes[0]["LLM_API_KEY"] == "sk-a"
+    assert lanes[0]["model"] == "deepseek-v4.1-flash"
+
+
+def test_lane_config_rejects_malformed_line(tmp_path: Path) -> None:
+    """少一段/空段 = 启动即失败，报行号。半份凭据跑起来的假 401 更贵。"""
+    p = _lane_conf(tmp_path, ["ok|https://x/v1|sk-a|m", "bad|https://y/v1|"])
+    with pytest.raises(ValueError, match="第 2 行"):
+        compete.load_lane_config(p)
+
+
+def test_lane_config_rejects_empty_file(tmp_path: Path) -> None:
+    p = _lane_conf(tmp_path, ["", "# 只有注释"])
+    with pytest.raises(ValueError, match="没有可用行"):
+        compete.load_lane_config(p)
+
+
+def test_lane_env_without_config_is_unchanged(monkeypatch) -> None:
+    """不配 lane_models 时 _lane_env 只有 VPN 中转键（默认关、行为不变）。"""
+    monkeypatch.delenv("CTF_VPN_RELAY_BASE", raising=False)
+    env = compete._lane_env(1)
+    assert "LLM_API_BASE" not in env and "LLM_API_KEY" not in env
+    assert "STRIX_LLM" not in env
+
+
+def test_lane_env_maps_each_lane_to_its_own_vendor(monkeypatch) -> None:
+    """车道 i 拿到第 i 行厂商的 base/key/model；模型名补 openai/ 前缀。"""
+    monkeypatch.delenv("CTF_VPN_RELAY_BASE", raising=False)
+    lane_models = [
+        {"name": "a", "LLM_API_BASE": "https://a/v1", "LLM_API_KEY": "sk-a", "model": "m-a"},
+        {"name": "b", "LLM_API_BASE": "https://b/v1", "LLM_API_KEY": "sk-b", "model": "m-b"},
+    ]
+    env0 = compete._lane_env(0, lane_models)
+    env1 = compete._lane_env(1, lane_models)
+    assert env0["LLM_API_BASE"] == "https://a/v1" and env0["LLM_API_KEY"] == "sk-a"
+    assert env1["LLM_API_BASE"] == "https://b/v1" and env1["LLM_API_KEY"] == "sk-b"
+    assert env0["STRIX_LLM"] == "openai/m-a"
+    # VPN 端口隔离不因加厂商而丢。
+    assert env0["CTF_VPN_RELAY"].endswith(":47444")
+    assert env1["CTF_VPN_RELAY"].endswith(":47446")
+
+
+def test_lane_env_keeps_prefixed_model_as_is() -> None:
+    """模型名已带 provider 段（含 /）时不重复加前缀。"""
+    lane_models = [
+        {"name": "a", "LLM_API_BASE": "https://a/v1", "LLM_API_KEY": "k", "model": "openai/gpt-x"},
+    ]
+    assert compete._lane_env(0, lane_models)["STRIX_LLM"] == "openai/gpt-x"
+
+
+def test_mask_key_shows_only_the_tail() -> None:
+    """脱敏只露尾 4 位——横表可对配置，不可泄凭据。"""
+    assert compete._mask_key("sk-1234567890abcd") == "…abcd"
+    assert set(compete._mask_key("short")) <= {"…", "(", ")", "过", "短"}
+
+
+def _fake_popen_capturing_env(monkeypatch) -> dict:
+    """拦子进程启动，连 env 一起留——测「车道凭据真的传给了子进程」。"""
+    captured: dict = {}
+
+    def fake(cmd, **kwargs):
+        captured["cmd"] = list(cmd)
+        captured["env"] = dict(kwargs.get("env") or {})
+        stream = kwargs.get("stdout")
+        if hasattr(stream, "close"):
+            stream.close()
+        return object()
+
+    monkeypatch.setattr(compete.subprocess, "Popen", fake)
+    return captured
+
+
+def test_spawn_passes_lane_vendor_env_to_the_child(tmp_path, monkeypatch) -> None:
+    """_spawn 的 env 合并：车道厂商覆盖父进程 LLM_*（凭据隔离的贯通点）。
+
+    父进程有一套环境级 LLM 凭据时，车道配置必须赢——否则多厂商形同虚设。
+    """
+    monkeypatch.setenv("LLM_API_KEY", "ambient-key")
+    monkeypatch.setenv("LLM_API_BASE", "https://ambient/v1")
+    monkeypatch.setenv("STRIX_LLM", "openai/ambient")
+    captured = _fake_popen_capturing_env(monkeypatch)
+    lane_models = [
+        {"name": "a", "LLM_API_BASE": "https://a/v1", "LLM_API_KEY": "sk-a", "model": "m-a"},
+    ]
+    compete._spawn(
+        _chal("A"), _args(), tmp_path, lane=0, lane_models=lane_models
+    )
+    env = captured["env"]
+    assert env["LLM_API_KEY"] == "sk-a"
+    assert env["LLM_API_BASE"] == "https://a/v1"
+    assert env["STRIX_LLM"] == "openai/m-a"
+    # 凭据不进命令行（ps 可见面）。
+    assert "sk-a" not in " ".join(captured["cmd"])
+
+
+# ---------------------------------------------------------------- 题池体量档位
+
+def test_regime_bounds_cover_small_medium_large() -> None:
+    """边界值本身就是钉子：≤12 small，13–60 medium，≥61 large。
+
+    large 的门槛由时间算术定：10h×3 lanes ≈ 108000 车道秒，N≈100 才真正
+    绑死，61 是提前一个身位收紧；早于此收紧 = 白丢 29.2% 的同题重试解出率。
+    """
+    assert compete.regime_of(0) == "small"
+    assert compete.regime_of(12) == "small"
+    assert compete.regime_of(13) == "medium"
+    assert compete.regime_of(60) == "medium"
+    assert compete.regime_of(61) == "large"
+
+
+def test_infra_skip_budget_never_shrinks_below_two() -> None:
+    """环境故障的 defer 门槛不随体量档收紧（max(2, max_failures)）。
+
+    large 档 max_failures=1 时，一次平台瞬时故障不能把题搁置到复活门槛
+    之后——基础设施抖动不许替我们选题。
+    """
+    chal = _chal("A", solves_count=20)
+    state = {"A": {"status": "active", "skips": 1, "runs": 1}}
+    queue, _ = compete.rank_queue([chal], state, set(), max_failures=1)
+    assert [c["id"] for c in queue] == ["A"]
+    state2 = {"A": {"status": "active", "skips": 2, "runs": 2}}
+    queue2, notes2 = compete.rank_queue([chal], state2, set(), max_failures=1)
+    assert not queue2 and "infra-skip" in " ".join(notes2)
+
+
+def test_regime_presets_scale_attempts_not_the_attempt_box() -> None:
+    """分档只改调度参数，单次尝试时间盒（实测拐点）在三档里不许被动。"""
+    for name, preset in compete._REGIME_PRESETS.items():
+        assert set(preset) == {"max_failures", "rerun_solves_jump"}
+    small = compete._REGIME_PRESETS["small"]
+    medium = compete._REGIME_PRESETS["medium"]
+    large = compete._REGIME_PRESETS["large"]
+    assert small["max_failures"] > medium["max_failures"] > large["max_failures"]
+    # 小池更容易复活 deferred，大池更保守。
+    assert small["rerun_solves_jump"] < medium["rerun_solves_jump"] < large["rerun_solves_jump"]
+
+
+def test_regime_off_pin_returns_the_medium_default(monkeypatch) -> None:
+    """CTF_REGIME=off 时任何 N 都回到 medium 默认（= 改动前行为，对照臂）。"""
+    monkeypatch.setenv("CTF_REGIME", "0")
+    assert compete.regime_preset(5) == ("medium", compete._REGIME_PRESETS["medium"])
+    assert compete.regime_preset(500) == ("medium", compete._REGIME_PRESETS["medium"])
+
+
+def test_regime_default_is_on(monkeypatch) -> None:
+    monkeypatch.delenv("CTF_REGIME", raising=False)
+    assert compete.regime_enabled()
+    assert compete.regime_preset(8)[0] == "small"
+    assert compete.regime_preset(30)[0] == "medium"
+    assert compete.regime_preset(120)[0] == "large"
+
+
+def test_rank_queue_honours_the_regime_budget() -> None:
+    """档位参数真的进 rank_queue：large 档一次失败即 defer，small 档扛四次。"""
+    chal = _chal("A", difficulty="hard", solves_count=20)
+    state = {"A": {"status": "active", "fails": 1, "runs": 1}}
+    queue, notes = compete.rank_queue([chal], state, set(), max_failures=1)
+    assert not queue and "deferred" in " ".join(notes)
+
+    state2 = {"A": {"status": "active", "fails": 3, "runs": 3}}
+    queue2, _ = compete.rank_queue([chal], state2, set(), max_failures=4)
+    assert [c["id"] for c in queue2] == ["A"]

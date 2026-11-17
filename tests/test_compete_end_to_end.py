@@ -127,7 +127,7 @@ def _run(monkeypatch, base: str, state_dir: Path, spawned: list, *,
     monkeypatch.setattr(compete, "PLATFORM", base)
 
     def fake_spawn(chal, args, sdir, failure_path=None, lane=0,
-                   direction=None, attempt=1):
+                   direction=None, attempt=1, lane_models=None):
         runs = Path(sdir) / "runs"
         runs.mkdir(parents=True, exist_ok=True)
         # 真 _spawn 会先把派单 plan 落盘再起子进程；这里照做，好让"派单项里
@@ -148,6 +148,7 @@ def _run(monkeypatch, base: str, state_dir: Path, spawned: list, *,
             "attempt": attempt,
             "direction": direction[0] if direction else None,
             "failure_path": list(failure_path or []),
+            "lane_models": lane_models is not None,
         })
         rec = {"challenge": str(chal["id"]), "correct": correct}
         if not correct:
@@ -283,3 +284,37 @@ def test_digest_is_written_beside_the_state(platform, monkeypatch, tmp_path):
     _run(monkeypatch, base, tmp_path, [])
     text = (tmp_path / "digest.md").read_text(encoding="utf-8")
     assert "CHAL-1" in text and "solved" in text
+
+
+def test_lane_config_is_loaded_and_forwarded(platform, monkeypatch, tmp_path):
+    """--lane-config 全链路：加载→校验→lane_models 递进派单，plan 保持干净。"""
+    conf = tmp_path / "lanes.conf"
+    conf.write_text("# 当天建的会话\na|https://a/v1|sk-a|m-a\n", encoding="utf-8")
+    base, p = platform([_chal("CHAL-1")])
+    spawned: list = []
+    rc = _run(
+        monkeypatch, base, tmp_path, spawned,
+        argv_extra=("--lane-config", str(conf)),
+    )
+    assert rc == 0
+    assert spawned and spawned[0]["lane_models"] is True
+    # 隔离不变量：凭据只走 env，plan 项仍然只有题号与难度。
+    assert spawned[0]["plan"] == [{"id": "CHAL-1", "difficulty": "easy"}]
+    # state 账本记厂商名（赛后分厂商统计），不含 key。
+    state = json.loads((tmp_path / "state.json").read_text(encoding="utf-8"))
+    assert state["CHAL-1"].get("lane_model") == "a"
+    assert "sk-a" not in json.dumps(state)
+
+
+def test_lane_config_with_too_few_rows_refuses_to_start(platform, monkeypatch, tmp_path):
+    """配置行数 < 车道数 = 启动即退（rc 2），不起任何子进程。"""
+    conf = tmp_path / "lanes.conf"
+    conf.write_text("a|https://a/v1|sk-a|m-a\n", encoding="utf-8")
+    base, p = platform([_chal("CHAL-1")])
+    spawned: list = []
+    rc = _run(
+        monkeypatch, base, tmp_path, spawned,
+        argv_extra=("--lane-config", str(conf), "--lanes", "2"),
+    )
+    assert rc == 2
+    assert not spawned
