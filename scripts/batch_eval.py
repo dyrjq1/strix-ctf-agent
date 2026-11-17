@@ -3421,6 +3421,14 @@ def run_agent(
         "CTF_STRUCTURAL": os.environ.get("CTF_STRUCTURAL", ""),
         "CTF_CLASS_BLOCK": os.environ.get("CTF_CLASS_BLOCK", ""),
         "CTF_STRUCT_SIG": os.environ.get("CTF_STRUCT_SIG", ""),
+        # 多车道竞速（先解先停，2026-11-17）：目录与车道标签来自外层环境
+        # ——多车道 = 多个 batch 进程共享同一个 race 目录；题号由本函数
+        # 显式递（子进程不依赖 task 形状判定自己跑的是哪道题）。白名单
+        # 漏掉它们 = 车道各自为战，agent 永远看不到兄弟车道的胜局标记，
+        # 与上面的消融开关是同一类接线事故。
+        "CTF_RACE_DIR": os.environ.get("CTF_RACE_DIR", ""),
+        "CTF_RACE_LANE": os.environ.get("CTF_RACE_LANE", ""),
+        "CTF_RACE_CHALLENGE": str(challenge_id or ""),
         "STRIX_TELEMETRY": "false",
         # 每次 LLM 调用后原子落盘。进程被墙钟 SIGKILL 时，run_strix_ctf 末尾那行
         # `[usage]` 永远不会打印——两条 A/B 臂就这么丢了 token 数（只能记 n/a）。
@@ -3812,6 +3820,8 @@ def main() -> int:
         bridge = None
         tunnel = None
         svc_port = ""
+        # 多车道竞速：本进程是否参与「先解先停」（共享 race 目录）。
+        race_dir = os.environ.get("CTF_RACE_DIR", "").strip()
         if item.get("qa_only"):
             # QA 题库题：独立路径，不占实例配额、不 launch。
             try:
@@ -3829,6 +3839,27 @@ def main() -> int:
                 flush=True,
             )
             continue
+        # 多车道竞速：兄弟车道已用平台验证的提交解出本题 → 不占实例
+        # 配额、不跑 agent。记 skip 走 B-23 同款口径（不是题目失败，
+        # 不烧连败）；「谁解的」写进结果行，报表能对回车道。
+        if race_dir:
+            from ctf_strix.race_stop import read_win
+
+            won = read_win(race_dir, cid)
+            if won is not None:
+                rec["skipped"] = True
+                rec["error"] = "SKIPPED(race_won)"
+                rec["correct"] = False
+                rec["race_won_by"] = str(won.get("lane") or "?")
+                rec["total_s"] = round(time.time() - rec["started"], 1)
+                with out.open("a", encoding="utf-8") as fh:
+                    fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+                print(
+                    f"  -> SKIP 兄弟车道已解出（lane={rec['race_won_by']}），"
+                    "不占实例",
+                    flush=True,
+                )
+                continue
         try:
             t0 = time.time()
             iid = client.launch(cid)
@@ -4235,6 +4266,17 @@ def main() -> int:
                 if sample_names else {}
             )
             _merge_sidecar_verdict(rec, side)
+            # 多车道竞速的胜局广播：平台验证解出（rec["correct"]，含
+            # in-run autosubmit sidecar 的合并裁决）→ 落标记，兄弟车道
+            # 在跑的自停（stop_reason=race_lost）、未派的自发跳过。
+            # 只在 correct 为真时写：自报 flag 串不广播——autosubmit
+            # 假阳性 16 条的前科（台账 §4.252）会把三车道一起带沟里。
+            if race_dir and rec.get("correct"):
+                from ctf_strix.race_stop import record_win
+
+                lane = os.environ.get("CTF_RACE_LANE", "")
+                if record_win(race_dir, cid, lane=lane):
+                    print(f"  [race] 胜局标记已落盘（lane={lane or '-'}）", flush=True)
             # 失败路径落盘：下一轮由调度器注入（见 --retry-notes）。
             rec["failure_path"] = _failure_facts(
                 rec,

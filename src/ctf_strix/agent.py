@@ -48,7 +48,9 @@ from ctf_strix import deadline
 from ctf_strix import error_policy
 from ctf_strix import llm_preflight
 from ctf_strix import platform_attach as attach
+from ctf_strix import race_stop
 from ctf_strix.flag_extract import FLAG_RE
+from ctf_strix.race_stop import RaceLost
 from ctf_strix.success_stop import RecoveryExhausted
 from ctf_strix.success_stop import SolvedStop
 from ctf_strix.enum_guard import EnumExhausted
@@ -1184,6 +1186,17 @@ def _check_soft_timeout() -> None:
         raise WallclockExceeded("wall budget spent (watchdog flag)")
 
 
+def _check_race_lost() -> None:
+    """多车道竞速：兄弟车道已平台验证解出本题时，本 run 立即止损。
+
+    与 :func:`_check_soft_timeout` 同一挂点（事件汇点）。竞速关闭
+    （未设 ``CTF_RACE_DIR``）时是纯 no-op。抛 :class:`RaceLost` 走
+    ``main`` 现成的止损管线，``stop_reason="race_lost"`` 让串行轮转
+    直接换题，结果行不烧「连败」预算（这不是能力缺口）。
+    """
+    race_stop.checkpoint()
+
+
 #: 「止损」终止（以下异常类）：都继承 ``BaseException``，会绕过 ``main`` 里的普通收尾。
 #: 统计必须在抛出点挂到异常上，否则 result.json 只能写 ``turns=0``、诊断全空。
 _STOP_TYPES: tuple[type[BaseException], ...] = (
@@ -1195,6 +1208,7 @@ _STOP_TYPES: tuple[type[BaseException], ...] = (
     TargetAbsent,
     EnumExhausted,
     NoProgress,
+    RaceLost,
 )
 
 
@@ -2102,6 +2116,16 @@ def main() -> int:
         # 用 stop_reason 区分开，避免污染"error"的根因分析。
         error = str(exc)
         stop_reason = "wallclock"
+        stop_turns, stop_diag = _take_stop_state(exc)
+        turns_used = max(turns_used, stop_turns)
+        diag.update(stop_diag)
+        print(f"[ctfy] {exc}", flush=True)
+    except RaceLost as exc:
+        # 多车道竞速的败方收场：兄弟车道已用平台验证的提交解出本题，
+        # 继续烧本题预算只剩浪费。不是崩溃、不是能力缺口——stop_reason
+        # 单列，串行轮转据此换题，统计不把它混进 error 根因。
+        error = str(exc)
+        stop_reason = "race_lost"
         stop_turns, stop_diag = _take_stop_state(exc)
         turns_used = max(turns_used, stop_turns)
         diag.update(stop_diag)
@@ -3050,6 +3074,16 @@ def _run_agent(
     begin_usage_run()
     install_backend()
 
+    # 多车道竞速：本 run 的败方自停观察器。目录与车道标签由父进程经环境
+    # 白名单递进来；题号优先取环境（batch 侧显式给），取不到再从 task 落
+    # 回本进程自己的判定。未设 CTF_RACE_DIR 时 configure 返回 None，
+    # 之后 sink 里的检查是纯 no-op。
+    current_watcher = race_stop.configure(
+        challenge_id=str(challenge_id_of(task) or "") or None,
+    )
+    if current_watcher is not None:
+        diag["race"] = current_watcher.describe()
+
     # Replace strix's short retry ladder with the CTF policy.  Installing here
     # (before the first attempt) means every later attempt in this process
     # uses it as well.  A failure to install is reported once and leaves
@@ -3542,6 +3576,9 @@ def _run_agent(
         # exist the daemon can only raise this flag, and this is where the
         # run notices it.
         _check_soft_timeout()
+        # 多车道竞速的败方自停也挂在这里：标记落盘到被发现隔一个轮次，
+        # 是合作式自停（不跨进程杀兄弟车道，§4.113 的教训）的最小延迟。
+        _check_race_lost()
         # The item has to be read before any early return: a slow tool's
         # output event must refresh the clock before this function decides
         # anything about idleness, otherwise a 150s ``nmap`` is killed and
