@@ -33,6 +33,8 @@ tail -c 7000 NXz3x3fk.js
 
 from __future__ import annotations
 
+import json
+import os
 import re
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -41,6 +43,9 @@ from urllib.parse import urljoin, urlparse
 
 import requests
 import urllib3
+
+from ctf_strix import traffic
+from ctf_strix.http_probe import session_cookies
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
@@ -52,6 +57,10 @@ _MAX_ROUTES: Final = 30
 _MAX_ROWS: Final = 40
 #: 单次请求超时。发现阶段要快，慢的端点留给 http_probe 单独打。
 _TIMEOUT: Final = 8.0
+#: route_map 往台账里存的前缀长度。默认 16 KB 只能存下 bundle 的头几十行，
+#: 而"从 bundle 里读路由"这件事的全部价值在中后段——存半截等于没存。
+#: 12 个 chunk × 64 KB ≈ 768 KB，是这个工具能接受的上限。
+_BUNDLE_KEEP: Final = 64 * 1024
 
 #: HTML 里三种引用脚本的写法。Nuxt 用 modulepreload，Vite 用 script type=module，
 #: 老站点用 <script src>。三种都要吃。
@@ -162,6 +171,315 @@ def _derived_candidates(counts: dict[str, int], blob: str, limit: int = 8) -> li
     return out
 
 
+#: 结构派生候选的硬上限。三类加起来不超过这个数——20 条已经比一次
+#: method_sweep 能舒服打完的量还多，再多只是把预算摊薄到更差的方向上。
+_MAX_STRUCTURAL: Final = 20
+
+#: "这一段是个具体 id"的三种形状，都在靶机上见过：纯数字（/api/notes/42）、
+#: 带前缀的十六进制（note_d6e7380c）、长十六进制（16-40 位）。
+_ID_SEG_RE: Final = re.compile(
+    r"^(?:\d{1,12}|[0-9a-fA-F]{16,40}|[A-Za-z][A-Za-z0-9]{1,20}_[0-9a-fA-F]{6,40})$"
+)
+
+#: 只说明"这里是 id、但没有具体值"的占位段。它们证明端点属于实例族，
+#: 本身却不是可请求的路径，所以只用来截前缀。
+_ID_PLACEHOLDER_SEG: Final = frozenset(
+    {"id", "{id}", ":id", "$id", "<id>", "${id}", "uid", "{uid}", "slug", ":slug", "{slug}"}
+)
+
+#: 页面/JS 里出现过的 id 值。纯数字只从 HTML 属性与 URL 形状取（正文里的
+#: 数字全是噪声），带前缀/长十六进制才从全文取。
+_ID_TOKEN_RE: Final = re.compile(
+    r"\b([A-Za-z][A-Za-z0-9]{1,20}_[0-9a-fA-F]{6,40})\b|\b([0-9a-fA-F]{16,40})\b"
+)
+_ATTR_ID_RE: Final = re.compile(
+    r"""\b(?:data-[\w-]*id|id|value)\s*=\s*["'](\d{1,9})["']""", re.IGNORECASE
+)
+#: 写在 HTML 链接或 JS 字符串里的实例路径，如 ``/api/notes/43``。
+_URL_ID_RE: Final = re.compile(r"/[A-Za-z][A-Za-z0-9_\-]*/(\d{1,9})(?=[\"'/<>\s?#])")
+
+#: HTML form 控件名——参数面最可靠的来源，因为它是应用自己声明的字段。
+_FORM_NAME_RE: Final = re.compile(
+    r"""<(?:input|select|textarea|button)\b[^>]*\bname\s*=\s*"""
+    r"""["']([A-Za-z_][A-Za-z0-9_\-]{0,30})["']""",
+    re.IGNORECASE,
+)
+#: 查询串里出现过的参数名：``fetch("/api/x?limit=10")``、``/search?q=``。
+_QUERY_PARAM_RE: Final = re.compile(r"[?&]([A-Za-z_][A-Za-z0-9_\-]{0,30})=")
+#: JS 对象字面量的键。``{limit: 10}`` 是参数，``{method: "POST"}`` 是 fetch 选项。
+_OBJ_KEY_RE: Final = re.compile(r"""([{,]\s*)([A-Za-z_][A-Za-z0-9_]{1,30})\s*:""")
+_QUOTED_KEY_RE: Final = re.compile(r"""["']([A-Za-z_][A-Za-z0-9_\-]{1,30})["']\s*:""")
+
+#: fetch/请求选项的键与语言/框架内建名，出现在每个 bundle 里，不是应用字段。
+_JS_KEY_NOISE: Final = frozenset(
+    {
+        "method", "headers", "body", "mode", "credentials", "cache", "redirect",
+        "referrer", "referrerpolicy", "signal", "keepalive", "integrity", "window",
+        "document", "location", "function", "return", "const", "let", "var",
+        # 语言关键字与内建名（实测会从 bundle 文本里漏进子资源词表）
+        "typeof", "throw", "throws", "promise", "prototype", "constructor",
+        "instanceof", "extends", "super", "yield", "void", "catch", "finally",
+        "strict", "length", "callhook", "statenode", "tostring", "valueof",
+        "hasownproperty", "requestanimationframe", "addeventlistener",
+    }
+)
+
+#: 页面词汇里永远不是资源名的词：HTML 标签、框架关键字、HTTP 方法、虚词。
+#: 这不是"路径字典"——它只做减法，从不产出候选。
+_NOUN_STOPWORDS: Final = frozenset(
+    """
+    about above across after again against all also and any are because been before
+    being below between both but can could did does doing done down during each
+    few for from further had has have having here how into its itself just more
+    most must not now off once only other our out over own same should some such
+    than that the their them then there these they this those through too under
+    until very was were what when where which while who will with would you your
+    div span class style script src href html head body meta link rel http https
+    json charset utf viewport initial scale noscript svg path xmlns aria title
+    type name value placeholder button form input select option textarea
+    table thead tbody footer header section main nav article strong code img
+    true false null none undefined import export default async await fetch
+    get post put patch delete options head
+    """.split()
+)
+
+#: 页面"文字"的两处来源：HTML 文本节点、带空格的 JS 字符串（URL 不带空格）。
+_HTML_TEXT_RE: Final = re.compile(r">([^<>]{2,400})<")
+_JS_TEXT_RE: Final = re.compile(r"""["'`]([^"'`\n<>]*\s[^"'`\n<>]{2,300})["'`]""")
+#: 标签外的成串英文（按钮文案常直接写在模板里）。
+_PROSE_RUN_RE: Final = re.compile(
+    r"[A-Za-z][A-Za-z0-9_\-]*(?:[ \t,.!?]+[A-Za-z][A-Za-z0-9_\-]*){2,}"
+)
+#: 内联脚本/样式的正文，提取可见文案前先剥掉。
+_INLINE_CODE_RE: Final = re.compile(
+    r"<(script|style)\b[^>]*>.*?</\1\s*>", re.IGNORECASE | re.DOTALL
+)
+#: 人给控件起的名字（title / aria-label / placeholder 的值）。
+_LABEL_ATTR_RE: Final = re.compile(
+    r"""(?:title|aria-label|placeholder|alt)\s*=\s*["']([^"']{2,120})["']""",
+    re.IGNORECASE,
+)
+#: 出现这些字符的"文字"其实是代码/URL，不是文案。
+_PROSE_BAD_CHARS: Final = frozenset("{}[]:=()/<>;@#*+|\\\"`")
+
+
+def _norm_request(url: str) -> str:
+    """URL 或路径 → ``path?query``，用于和流量台账比较"请求过没有"。
+
+    和 ``traffic._normalise_path`` 的区别只有一个，但很关键：那边故意丢掉
+    query（它只回答"这个资源问过没有"），这里必须保留——[参数] 候选的全部
+    信息就在 query 里，丢掉就等于把它自己判成"已请求"。
+    """
+    text = (url or "").strip()
+    if "://" in text:
+        text = text.split("://", 1)[1]
+        slash = text.find("/")
+        text = text[slash:] if slash >= 0 else "/"
+    text = text.split("#", 1)[0]
+    if not text.startswith("/"):
+        text = "/" + text
+    path, sep, query = text.partition("?")
+    path = path.rstrip("/") or "/"
+    return path + (("?" + query) if sep else "")
+
+
+def _observed_ids(counts: dict[str, int], blob: str) -> list[str]:
+    """已观测到的具体 id 值，确定性排序（数字在前、按值；其余按字典序）。"""
+    found: list[str] = []
+
+    def add(value: str) -> None:
+        if value and value not in found:
+            found.append(value)
+
+    for path in sorted(counts):
+        for seg in path.split("/"):
+            if seg and _ID_SEG_RE.match(seg):
+                add(seg)
+    for match in _ID_TOKEN_RE.finditer(blob):
+        add(match.group(1) or match.group(2))
+    for match in _ATTR_ID_RE.finditer(blob):
+        add(match.group(1))
+    for match in _URL_ID_RE.finditer(blob):
+        add(match.group(1))
+    return sorted(found, key=lambda v: (0, int(v)) if v.isdigit() else (1, v))
+
+
+def _instance_parents(counts: dict[str, int]) -> list[str]:
+    """已发现路径里"实例族"的父路径，如 /api/notes/42 与 /api/notes/${id}。"""
+    parents: list[str] = []
+    for path in sorted(counts):
+        segs = [seg for seg in path.split("/") if seg]
+        if len(segs) < 2:
+            continue
+        last = segs[-1]
+        if not (_ID_SEG_RE.match(last) or last.lower() in _ID_PLACEHOLDER_SEG):
+            continue
+        parent = "/" + "/".join(segs[:-1])
+        if parent not in parents:
+            parents.append(parent)
+    return parents
+
+
+def _visible_texts(blob: str) -> list[str]:
+    """人类可见的文案：HTML 文本节点 + title/aria-label/placeholder 属性。
+
+    页面上写着 "Claim" "Redeem" 的按钮，就是后端资源的天然名字；JS 源码里
+    的 ``return`` / ``typeof`` / ``prototype`` 不是。内联 ``<script>`` /
+    ``<style>`` 的正文先剥掉——它们夹在 ``>`` 和 ``<`` 之间，会被文本节点
+    正则误当成可见文案（这是实测里关键字漏进词表的源头）。
+    SPA 外壳（几乎无文本节点）才退回 JS 字符串，保持旧覆盖面。
+    """
+    markup = _INLINE_CODE_RE.sub(" ", blob)
+    texts = [match.group(1) for match in _HTML_TEXT_RE.finditer(markup)]
+    texts += [match.group(1) for match in _LABEL_ATTR_RE.finditer(markup)]
+    if len(texts) >= 3:
+        return texts
+    texts += [match.group(1) for match in _JS_TEXT_RE.finditer(blob)]
+    texts += [match.group(0) for match in _PROSE_RUN_RE.finditer(blob)]
+    return texts
+
+
+def _page_nouns(blob: str, limit: int, exclude: frozenset[str] = frozenset()) -> list[str]:
+    """页面文字里的名词候选，按出现次数降序、同频按字典序。
+
+    只读**人类可见**的文案（见 ``_visible_texts``），不读 URL、属性名和
+    对象键——那些地方的名词（limit、offset、method）是参数，不是子资源。
+    语言关键字与框架内建名（``_JS_KEY_NOISE``）一律挡掉：它们在人眼可见的
+    文案里出现，只说明模板把代码渲染进了文本，不代表它是资源名。
+    ``exclude`` 用来把已识别的参数名再挡一遍。
+    """
+    freq: dict[str, int] = {}
+    for text in _visible_texts(blob):
+        if any(ch in _PROSE_BAD_CHARS for ch in text):
+            continue
+        for word in _WORD_RE.findall(text):
+            low = word.lower()
+            if (
+                len(low) < 4 or low.isdigit() or _ID_SEG_RE.match(low)
+                or low in _NOUN_STOPWORDS or low in _JS_KEY_NOISE or low in exclude
+            ):
+                continue
+            freq[low] = freq.get(low, 0) + 1
+    ranked = sorted(freq.items(), key=lambda kv: (-kv[1], kv[0]))
+    return [word for word, _ in ranked[:limit]]
+
+
+def _page_params(blob: str) -> list[str]:
+    """页面/JS/form 里出现过的参数名，按首次出现顺序（form 优先）。
+
+    只认**原文里出现过**的名字；没有静态参数表，页面没写的名字不会冒出来。
+    """
+    names: list[str] = []
+
+    def add(value: str) -> None:
+        low = value.lower()
+        if low in _JS_KEY_NOISE or low in _NOUN_STOPWORDS:
+            return
+        if value not in names:
+            names.append(value)
+
+    for match in _FORM_NAME_RE.finditer(blob):
+        add(match.group(1))
+    for match in _QUERY_PARAM_RE.finditer(blob):
+        add(match.group(1))
+    for match in _QUOTED_KEY_RE.finditer(blob):
+        add(match.group(1))
+    for match in _OBJ_KEY_RE.finditer(blob):
+        add(match.group(2))
+    return names
+
+
+def _structural_candidates(
+    counts: dict[str, int],
+    blob: str,
+    requested: set[str] | frozenset[str] = frozenset(),
+    limit: int = _MAX_STRUCTURAL,
+) -> list[tuple[str, str]]:
+    """从已发现端点确定性地派生三类结构候选（不爆破、不随机）。
+
+    阶梯思想取自 ipa-lab/hackingBuddyGPT 的 ``utils/web_api/exploration_steps.py``：
+    先沿着已确认存在的资源往下走一步，再横向拼同族的子资源，最后才碰查询参数。
+    但这里**不抄** ``random.choice``，也不查字典——每个候选的可变部分都必须
+    能在页面原文或已发现路径里找到出处。
+
+    Args:
+        counts: 已发现的路径 → 出现次数。
+        blob: 首页与 chunk 原文，既是 id 来源，也是词汇/参数名的唯一出处。
+        requested: 台账里已经请求过的 URL（或路径）。命中的候选一律不输出。
+        limit: 三类合计上限，默认 20。
+
+    Returns:
+        ``[(类别, 路径)]``，类别为 ``实例`` / ``子资源`` / ``参数``，
+        顺序固定（实例 → 子资源 → 参数），同输入必得同输出。
+    """
+    seen = {_norm_request(path) for path in counts}
+    seen |= {_norm_request(url) for url in requested}
+
+    def fresh(path: str) -> bool:
+        key = _norm_request(path)
+        if key in seen:
+            return False
+        seen.add(key)
+        return True
+
+    params = _page_params(blob)
+
+    # (a) 实例路径：父路径来自已发现路径里的 id 段/占位段，id 取观测到的具体值。
+    instance: list[tuple[str, str]] = []
+    ids = _observed_ids(counts, blob)
+    if ids:
+        parents = sorted(_instance_parents(counts), key=lambda p: (-_weight(p), p))
+        for parent in parents:
+            for ident in ids:
+                path = f"{parent}/{ident}"
+                if fresh(path):
+                    instance.append(("实例", path))
+                    if len(instance) >= 6:
+                        break
+            if len(instance) >= 6:
+                break
+
+    # (b) 子资源：已发现的 /api 前缀 × 页面文字里的名词。
+    subresource: list[tuple[str, str]] = []
+    prefix_set: set[str] = set()
+    for path in counts:
+        match = re.match(r"^(/api(?:/[a-z0-9_\-]{2,20})?)", path)
+        if match:
+            prefix_set.add(match.group(1))
+    prefixes = sorted(prefix_set, key=lambda p: (-_weight(p), -counts.get(p, 0), p))
+    nouns = _page_nouns(blob, 14, frozenset(p.lower() for p in params))
+    # 名词在外、前缀在内轮转：否则排第一的前缀会独吞全部名额。
+    for noun in nouns:
+        for prefix in prefixes:
+            if noun == prefix.rsplit("/", 1)[-1]:
+                continue
+            path = f"{prefix}/{noun}"
+            if fresh(path):
+                subresource.append(("子资源", path))
+                if len(subresource) >= 7:
+                    break
+        if len(subresource) >= 7:
+            break
+
+    # (c) 查询参数面：已发现端点 × 页面/form/JS 里出现过的参数名。
+    # 模板路径（/api/notes/${id}）不能直接请求，先排除。
+    query: list[tuple[str, str]] = []
+    endpoints = [
+        path for path in sorted(counts, key=lambda p: (-_weight(p), -counts[p], p))
+        if not any(ch in path for ch in "{}<>$:")
+    ][:10]
+    for param in params[:10]:
+        for endpoint in endpoints:
+            path = f"{endpoint}?{param}=1"
+            if fresh(path):
+                query.append(("参数", path))
+                if len(query) >= 7:
+                    break
+        if len(query) >= 7:
+            break
+
+    return (instance[:6] + subresource[:7] + query[:7])[: max(0, limit)]
+
 async def route_map(base_url: str, max_chunks: int = _MAX_CHUNKS) -> str:
     """从首页和它引用的 JS 里提取后端路径候选（只读 GET，一次调用完成）。
 
@@ -180,12 +498,33 @@ async def route_map(base_url: str, max_chunks: int = _MAX_CHUNKS) -> str:
     if not base_url.startswith(("http://", "https://")):
         return "[route_map] base_url 必须带 scheme，如 https://host/"
 
+    # 每一次出网都入台账，和 http_probe / method_sweep 同一口径：id 在发送**前**
+    # 预留，失败也记一条（"这个 URL 连不上"本身就是证据）。报告 WEB-9 的直接
+    # 要求——route_map 抓回来的 bundle 原文必须能被 traffic_list/traffic_view
+    # 看见；否则下面那句"不要再读 bundle"就只是一句没有出路的话。
+    home_id = traffic.ledger().next_id()
+    started = time.time()
     try:
         home = _get(base_url)
     except Exception as exc:  # noqa: BLE001
-        return f"[route_map] 首页取不到：{type(exc).__name__}: {exc}。先用 http_probe 确认可达。"
+        traffic.record(
+            request_id=home_id, method="GET", url=base_url,
+            phase=type(exc).__name__, elapsed=time.time() - started,
+            note=f"{type(exc).__name__}: {exc}"[:300],
+        )
+        return (
+            f"[route_map] 首页取不到：{type(exc).__name__}: {exc}。"
+            f"先用 http_probe 确认可达（本条已记台账 {home_id}）。"
+        )
+    home_text = home.text or ""
+    traffic.record(
+        request_id=home_id, method="GET", url=base_url,
+        status=home.status_code, resp_headers=dict(home.headers),
+        resp_body=home_text, size=len(home.content or b""),
+        elapsed=time.time() - started, body_keep=_BUNDLE_KEEP,
+    )
 
-    html = home.text or ""
+    html = home_text
     refs: list[str] = []
     for m in _SCRIPT_RE.finditer(html):
         ref = next((g for g in m.groups() if g), "")
@@ -199,16 +538,34 @@ async def route_map(base_url: str, max_chunks: int = _MAX_CHUNKS) -> str:
     counts: dict[str, int] = {}
     origin: dict[str, str] = {}
     blobs: list[str] = []
+    #: chunk 名字 -> 台账 id。列表下面要按名字指路，否则模型知道"有这个文件"
+    #: 却不知道该读哪一条，最后还是会去重下（WEB-9）。
+    chunk_ids: dict[str, str] = {}
     fetched = 0
     for ref in refs:
+        request_id = traffic.ledger().next_id()
+        started = time.time()
         try:
             resp = _get(ref)
-        except Exception:  # noqa: BLE001 — 单个 chunk 失败不该毁掉整张图
+        except Exception as exc:  # noqa: BLE001 — 单个 chunk 失败不该毁掉整张图
+            traffic.record(
+                request_id=request_id, method="GET", url=ref,
+                phase=type(exc).__name__, elapsed=time.time() - started,
+                note=f"{type(exc).__name__}: {exc}"[:300],
+            )
             continue
         fetched += 1
         name = ref.rsplit("/", 1)[-1]
-        blobs.append((resp.text or "")[:200_000])
-        for m in _ROUTE_RE.finditer(resp.text or ""):
+        text = resp.text or ""
+        blobs.append(text[:200_000])
+        chunk_ids[name] = request_id
+        traffic.record(
+            request_id=request_id, method="GET", url=ref,
+            status=resp.status_code, resp_headers=dict(resp.headers),
+            resp_body=text, size=len(resp.content or b""),
+            elapsed=time.time() - started, body_keep=_BUNDLE_KEEP,
+        )
+        for m in _ROUTE_RE.finditer(text):
             path = m.group(1).rstrip("/")
             if not path or _NOT_ROUTE.search(path):
                 continue
@@ -226,7 +583,8 @@ async def route_map(base_url: str, max_chunks: int = _MAX_CHUNKS) -> str:
         return (
             f"[route_map] {base_url} 抓到 {fetched} 个脚本，但没提到路径字面量。\n"
             "next: 说明路由不在前端 bundle 里（服务端渲染或全是动态拼接）。"
-            "改用 method_sweep 打已知路径，或直接读首页 HTML 里的表单 action。"
+            "改用 method_sweep 打已知路径，或直接读首页 HTML 里的表单 action"
+            f"（原文在台账 {home_id}，traffic_view(\"{home_id}\") 可取回）。"
         )
 
     def score(item: tuple[str, int]) -> tuple[int, int, int]:
@@ -236,6 +594,10 @@ async def route_map(base_url: str, max_chunks: int = _MAX_CHUNKS) -> str:
         return (_weight(path), n, -abs(depth - 2))
 
     ranked = sorted(counts.items(), key=score, reverse=True)[:_MAX_ROUTES]
+    ids_hint = (
+        "、".join(f"{name}={rid}" for name, rid in list(chunk_ids.items())[:4])
+        or "本次没取到 chunk"
+    )
     lines = [
         f"[route_map] {base_url} | html {len(html)}B | chunks {fetched}/{len(refs)} | "
         f"候选 {len(counts)} 条（列前 {len(ranked)} 条）",
@@ -244,7 +606,12 @@ async def route_map(base_url: str, max_chunks: int = _MAX_CHUNKS) -> str:
         # 用 cat/head 逐段读（第 17-21 次调用）。工具给了答案但没拦住旧习惯，
         # 于是答案被自己的"再看看"覆盖掉了。提示语放末尾没有用——模型读完
         # 列表就动手了，不会回头读最后一行。
+        #
+        # 但"不要读"必须配一条"要读就读这里"：bundle 原文已经随本次调用进了
+        # 台账（WEB-9），traffic_view 能按 id 分页读完，不需要再下一次。
         "⚠️ 上面就是全部路由，不要再下载或阅读 bundle 原文。下一步：method_sweep。",
+        f"（首页={home_id}；bundle 原文已在台账：{ids_hint}；"
+        "用 traffic_view(id, offset=N) 分页读，不要重下）",
         *[f"{i}. {p}  x{n}  ({origin.get(p, '?')})" for i, (p, n) in enumerate(ranked, 1)],
     ]
     if len(counts) > len(ranked):
@@ -255,8 +622,36 @@ async def route_map(base_url: str, max_chunks: int = _MAX_CHUNKS) -> str:
         lines.extend(f"  ? {p}" for p in derived)
     lines.append(
         "next: 把这些路径（含上面的 ? 候选）喂给 method_sweep——同一个路径换 POST/PUT "
-        "是最容易撞出未文档化入口的动作。不要再去读 bundle 原文。"
+        "是最容易撞出未文档化入口的动作。不要再去读 bundle 原文："
+        f"要看原文用 traffic_view(\"{home_id}\") 或 traffic_list(url_contains=…) 取台账。"
     )
+    structural: list[tuple[str, str]] = []
+    if os.environ.get("CTF_STRUCTURAL", "").strip() in ("1", "true", "on"):
+        requested = {item.url for item in traffic.ledger().items() if item.url}
+        structural = _structural_candidates(
+            counts, html + "\n" + "\n".join(blobs), requested
+        )
+        # 诊断：A/B 只认「派生了几条」这个数字，不认区块有没有出现。区块不出现
+        # 有两种原因（开关没到 / 派生为空），这一行把两者分开（台账 §4.251）。
+        print(
+            f"[route_map] structural on: counts={len(counts)} "
+            f"chunks={fetched} requested={len(requested)} derived={len(structural)}",
+            flush=True,
+        )
+    if structural:
+        # 新节放在末尾：上面那段路径表保持原样（<= 30 条），这里只追加
+        # "从已发现结构确定派生、且台账里从未请求过"的候选。
+        lines.append("")
+        lines.append(
+            f"── 结构派生候选（{len(structural)} 条，均从未请求；"
+            "由已发现端点/页面词汇确定性派生，未验证）──"
+        )
+        lines.extend(f"  [{kind}] {path}" for kind, path in structural)
+        lines.append(
+            "next: 先挑一条 [实例] 用 http_probe 打——同族端点已存在时，"
+            "实例路径通常直接返回那条数据；[参数] 则在同一路径上换方法/"
+            "补字段名继续。这些都是台账里没发过的 URL，试完自然去重。"
+        )
     return "\n".join(lines)
 
 
@@ -265,6 +660,8 @@ async def method_sweep(
     base_url: str = "",
     methods: str = "OPTIONS,GET,POST,PUT,PATCH",
     concurrency: int = 6,
+    headers_json: str = "",
+    session: str = "auto",
 ) -> str:
     """对一批路径换方法各打一遍，只回报有信息量的组合。
 
@@ -274,6 +671,12 @@ async def method_sweep(
         base_url: 相对路径的前缀，如 https://host 。全部路径都是绝对 URL 时可留空。
         methods: 逗号分隔的方法列表，默认 OPTIONS,GET,POST,PUT,PATCH。
         concurrency: 并发数，默认 6。别开太大——目标是比赛靶机，不是压测对象。
+        headers_json: 额外请求头，JSON 字符串，写法与 ``http_probe`` 的同名
+            参数一致，如 ``{"Authorization": "Bearer x"}``。
+        session: 会话选择，与 ``http_probe`` 同口径。默认 ``auto``：把
+            ``http_probe`` 在同一靶机上登录得到的 cookie 附到本批每个请求
+            （登录态对扫描生效）；``off`` 完全匿名。扫描期间的 Set-Cookie
+            不回写会话。
 
     Returns:
         命中的组合（状态码 + 方法 + 路径 + 长度 + body 片段），按信息量排序；
@@ -288,6 +691,13 @@ async def method_sweep(
     raw = [u.strip() for u in re.split(r"[\s,]+", urls or "") if u.strip()]
     if not raw:
         return "[method_sweep] urls 为空。传换行分隔的路径，如 /api/plugins/stats"
+
+    try:
+        extra_headers = json.loads(headers_json) if headers_json.strip() else {}
+    except json.JSONDecodeError as exc:
+        return f"[method_sweep] headers_json 不是合法 JSON：{exc}"
+    if not isinstance(extra_headers, dict):
+        return "[method_sweep] headers_json 必须是 JSON 对象（花括号），不能是数组或字符串。"
 
     targets: list[str] = []
     for u in raw:
@@ -312,8 +722,13 @@ async def method_sweep(
         url, method = pair
         wants_body = method in ("POST", "PUT", "PATCH")
         headers = {"Connection": "close"}
-        if wants_body:
+        headers.update(extra_headers)
+        if wants_body and not any(k.lower() == "content-type" for k in headers):
             headers["Content-Type"] = "application/json"
+        snap = carried.get(url) or {}
+        sent_headers = dict(headers)
+        if snap:
+            sent_headers["Cookie"] = "; ".join(f"{k}={v}" for k, v in snap.items())
 
         # 为什么最多试三次、且最后一次不带 body：
         # 靶机在参数校验失败时常常"不等请求体读完就回包并关连接"，
@@ -324,29 +739,58 @@ async def method_sweep(
         attempts: list[bytes | None] = [b"{}", b"{}", None] if wants_body else [None, None, None]
         last: Exception | None = None
         r = None
+        sent: bytes | None = None
+        # 和 http_probe 同一条规则：id 在**发请求前**预留。失败组合也入台账，
+        # 因为"这条路上这个方法被拒了"本身就是终止重复尝试的观测。
+        request_id = traffic.ledger().next_id()
+        started = time.time()
         for index, body in enumerate(attempts):
             try:
+                sent = body
                 r = requests.request(
                     method, url, timeout=_TIMEOUT, verify=False,
-                    allow_redirects=False, headers=headers, data=body,
+                    allow_redirects=False, headers=headers, cookies=snap or None,
+                    data=body,
                 )
                 break
             except Exception as exc:  # noqa: BLE001
                 last = exc
                 if index + 1 < len(attempts):
                     time.sleep(0.1 * (index + 1))
+        elapsed = time.time() - started
         if r is None:
+            note = f"{type(last).__name__} after {len(attempts)} tries"
+            traffic.record(
+                request_id=request_id, method=method, url=url, req_headers=sent_headers,
+                req_body=sent.decode("utf-8", "replace") if sent else "",
+                phase=type(last).__name__, elapsed=elapsed, note=note,
+            )
             return {
                 "method": method, "url": url, "status": 0,
-                "note": f"{type(last).__name__} after {len(attempts)} tries",
+                "note": note, "id": request_id,
             }
         allow = r.headers.get("allow", "")
-        text = (r.text or "").replace("\n", " ")[:160]
+        try:
+            body_text = r.text or ""
+        except Exception:  # noqa: BLE001 - 解码失败不影响这条证据本身
+            body_text = ""
+        traffic.record(
+            request_id=request_id, method=method, url=url, req_headers=sent_headers,
+            req_body=sent.decode("utf-8", "replace") if sent else "",
+            status=r.status_code, resp_headers=dict(r.headers), resp_body=body_text,
+            size=len(r.content or b""), elapsed=elapsed,
+        )
+        text = body_text.replace("\n", " ")[:160]
         return {
             "method": method, "url": url, "status": r.status_code,
             "size": len(r.content or b""), "allow": allow, "body": text,
+            "id": request_id,
         }
 
+    # WEB-1：扫描沿用 http_probe 的登录态。Session 不是线程安全的，所以
+    # 不共享 Session 对象，只把 jar 里匹配各目标 host 的 cookie 拍快照随请求
+    # 附带（扫描只读，Set-Cookie 不回写会话）。
+    carried = {t: session_cookies(session, t) for t in targets}
     pairs = [(t, m) for t in targets for m in mlist]
     with ThreadPoolExecutor(max_workers=max(1, min(12, int(concurrency)))) as pool:
         results = [r for r in pool.map(probe, pairs) if r]
@@ -389,15 +833,22 @@ async def method_sweep(
         f"[method_sweep] {len(targets)} 路径 × {len(mlist)} 方法 = {len(pairs)} 请求 | "
         f"有信息量 {len(kept)} 条（列前 {len(shown)}）"
     ]
+    if any(carried.values()):
+        n_auth = sum(1 for v in carried.values() if v)
+        lines.append(
+            f"auth: {n_auth}/{len(targets)} 个目标带上了会话 cookie"
+            "（http_probe 的登录态对本批生效；扫描不回写会话）"
+        )
     for r in shown:
         status = int(r["status"])
+        rid = str(r.get("id", ""))
         if status == 0:
-            lines.append(f"ERR {r['method']:7} {r['url']} | {r.get('note', '')}")
+            lines.append(f"{rid:<5} ERR {r['method']:7} {r['url']} | {r.get('note', '')}")
             continue
         extra = f" allow={r['allow']}" if r.get("allow") else ""
         body = str(r.get("body") or "")
         lines.append(
-            f"{status} {str(r['method']):7} {r['url']} | {r.get('size', 0)}B{extra}"
+            f"{rid:<5} {status} {str(r['method']):7} {r['url']} | {r.get('size', 0)}B{extra}"
             + (f" | {body}" if body else "")
         )
     if len(kept) > len(shown):
@@ -427,6 +878,19 @@ async def method_sweep(
             "next: 所有组合都是 404/405。别再换方法，换路径族"
             "（这条线上已经没有未文档化入口了）。"
         )
+
+    # 一次批量探索只回摘要：完整响应留在台账里，行首 id 就是取回的 key。
+    # 这一行无条件出现——404 组合虽然不占行，但同样在台账里，"我试过它"
+    # 这条证据要能被读回来，否则同一批组合会被反复重发。
+    example = str(shown[0].get("id", "")) if shown else (
+        str(results[0].get("id", "")) if results else ""
+    )
+    lines.append(
+        "next: 上面每一行、以及被省略的组合都已进流量台账（行首 id = request_id）"
+        + (f"，例如 traffic_view(\"{example}\") 可重读完整 body" if example else "")
+        + "。不要为了再看一眼 body 重发同一个请求；"
+        "某个路径到底试过哪些方法，用 traffic_list(url_contains=\"<路径>\") 找回。"
+    )
     return "\n".join(lines)
 
 
