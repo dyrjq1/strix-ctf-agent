@@ -20,7 +20,11 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "src"))
 
 from ctf_strix import traffic  # noqa: E402
-from ctf_strix.discovery import _structural_candidates, route_map  # noqa: E402
+from ctf_strix.discovery import (  # noqa: E402
+    _page_nouns,
+    _structural_candidates,
+    route_map,
+)
 
 COUNTS = {
     "/api/notes/${id}": 1,
@@ -122,6 +126,46 @@ def test_module_never_imports_random():
 
     source = Path(discovery.__file__).read_text(encoding="utf-8")
     assert not re.search(r"^\s*(?:import|from)\s+random\b", source, re.M)
+
+
+# -- 5b. 名词来源：只取人眼可见文案，语言关键字一律不是资源名 -------------
+
+def test_page_nouns_never_return_js_keywords():
+    # 关键字既出现在可见文本里，也出现在 bundle 文本里，都必须被挡掉。
+    blob = (
+        '<p>Return typeof prototype throw</p>'
+        '<button>Claim</button>'
+        '<span>Redeem</span>'
+        '<script>const copy = "return typeof promise";</script>'
+    )
+    nouns = _page_nouns(blob, 20)
+    assert "claim" in nouns and "redeem" in nouns
+    for noise in ("return", "typeof", "prototype", "throw", "promise", "const"):
+        assert noise not in nouns, (noise, nouns)
+
+
+def test_bundle_text_only_used_when_page_has_no_visible_text():
+    shell = '<div id="app"></div><script>const s = "claim bonus"; const route = "/api/x";</script>'
+    prose = _page_nouns(shell, 20)
+    assert "claim" in prose, "SPA 外壳没有可见文本时仍从 JS 字符串取词"
+
+    rich = '<p>Claim your reward</p><p>Redeem bonus</p><p>Invite friend</p><script>const s = "unrelated prose here";</script>'
+    visible = _page_nouns(rich, 20)
+    assert "claim" in visible and "redeem" in visible
+    assert "unrelated" not in visible, "有可见文案时不得再读 bundle 文本"
+
+
+def test_structural_subresources_prefer_visible_labels():
+    counts = {"/api/coins/welcome": 1}
+    blob = (
+        '<button aria-label="Claim coins">Claim</button>'
+        '<p>Redeem your bonus now</p>'
+        '<p>Invite a friend</p>'
+        '<script>const a = "return typeof prototype";</script>'
+    )
+    derived = kinds(_structural_candidates(counts, blob), "子资源")
+    assert any(path.endswith("/claim") for path in derived), derived
+    assert all(not path.endswith(("/return", "/typeof", "/prototype")) for path in derived)
 
 
 # -- 6. route_map 集成：新节追加在末尾，原有路径表不变 --------------------

@@ -210,12 +210,17 @@ _QUERY_PARAM_RE: Final = re.compile(r"[?&]([A-Za-z_][A-Za-z0-9_\-]{0,30})=")
 _OBJ_KEY_RE: Final = re.compile(r"""([{,]\s*)([A-Za-z_][A-Za-z0-9_]{1,30})\s*:""")
 _QUOTED_KEY_RE: Final = re.compile(r"""["']([A-Za-z_][A-Za-z0-9_\-]{1,30})["']\s*:""")
 
-#: fetch/请求选项的键，出现在每个 bundle 里，不是应用字段。
+#: fetch/请求选项的键与语言/框架内建名，出现在每个 bundle 里，不是应用字段。
 _JS_KEY_NOISE: Final = frozenset(
     {
         "method", "headers", "body", "mode", "credentials", "cache", "redirect",
         "referrer", "referrerpolicy", "signal", "keepalive", "integrity", "window",
         "document", "location", "function", "return", "const", "let", "var",
+        # 语言关键字与内建名（实测会从 bundle 文本里漏进子资源词表）
+        "typeof", "throw", "throws", "promise", "prototype", "constructor",
+        "instanceof", "extends", "super", "yield", "void", "catch", "finally",
+        "strict", "length", "callhook", "statenode", "tostring", "valueof",
+        "hasownproperty", "requestanimationframe", "addeventlistener",
     }
 )
 
@@ -244,6 +249,15 @@ _JS_TEXT_RE: Final = re.compile(r"""["'`]([^"'`\n<>]*\s[^"'`\n<>]{2,300})["'`]""
 #: 标签外的成串英文（按钮文案常直接写在模板里）。
 _PROSE_RUN_RE: Final = re.compile(
     r"[A-Za-z][A-Za-z0-9_\-]*(?:[ \t,.!?]+[A-Za-z][A-Za-z0-9_\-]*){2,}"
+)
+#: 内联脚本/样式的正文，提取可见文案前先剥掉。
+_INLINE_CODE_RE: Final = re.compile(
+    r"<(script|style)\b[^>]*>.*?</\1\s*>", re.IGNORECASE | re.DOTALL
+)
+#: 人给控件起的名字（title / aria-label / placeholder 的值）。
+_LABEL_ATTR_RE: Final = re.compile(
+    r"""(?:title|aria-label|placeholder|alt)\s*=\s*["']([^"']{2,120})["']""",
+    re.IGNORECASE,
 )
 #: 出现这些字符的"文字"其实是代码/URL，不是文案。
 _PROSE_BAD_CHARS: Final = frozenset("{}[]:=()/<>;@#*+|\\\"`")
@@ -306,25 +320,43 @@ def _instance_parents(counts: dict[str, int]) -> list[str]:
     return parents
 
 
-def _page_nouns(blob: str, limit: int, exclude: frozenset[str] = frozenset()) -> list[str]:
-    """页面/JS 文字里的名词候选，按出现次数降序、同频按字典序。
+def _visible_texts(blob: str) -> list[str]:
+    """人类可见的文案：HTML 文本节点 + title/aria-label/placeholder 属性。
 
-    只读"文字"（HTML 文本节点、带空格的 JS 字符串），不读 URL、属性名和
+    页面上写着 "Claim" "Redeem" 的按钮，就是后端资源的天然名字；JS 源码里
+    的 ``return`` / ``typeof`` / ``prototype`` 不是。内联 ``<script>`` /
+    ``<style>`` 的正文先剥掉——它们夹在 ``>`` 和 ``<`` 之间，会被文本节点
+    正则误当成可见文案（这是实测里关键字漏进词表的源头）。
+    SPA 外壳（几乎无文本节点）才退回 JS 字符串，保持旧覆盖面。
+    """
+    markup = _INLINE_CODE_RE.sub(" ", blob)
+    texts = [match.group(1) for match in _HTML_TEXT_RE.finditer(markup)]
+    texts += [match.group(1) for match in _LABEL_ATTR_RE.finditer(markup)]
+    if len(texts) >= 3:
+        return texts
+    texts += [match.group(1) for match in _JS_TEXT_RE.finditer(blob)]
+    texts += [match.group(0) for match in _PROSE_RUN_RE.finditer(blob)]
+    return texts
+
+
+def _page_nouns(blob: str, limit: int, exclude: frozenset[str] = frozenset()) -> list[str]:
+    """页面文字里的名词候选，按出现次数降序、同频按字典序。
+
+    只读**人类可见**的文案（见 ``_visible_texts``），不读 URL、属性名和
     对象键——那些地方的名词（limit、offset、method）是参数，不是子资源。
+    语言关键字与框架内建名（``_JS_KEY_NOISE``）一律挡掉：它们在人眼可见的
+    文案里出现，只说明模板把代码渲染进了文本，不代表它是资源名。
     ``exclude`` 用来把已识别的参数名再挡一遍。
     """
     freq: dict[str, int] = {}
-    texts = [match.group(1) for match in _HTML_TEXT_RE.finditer(blob)]
-    texts += [match.group(1) for match in _JS_TEXT_RE.finditer(blob)]
-    texts += [match.group(0) for match in _PROSE_RUN_RE.finditer(blob)]
-    for text in texts:
+    for text in _visible_texts(blob):
         if any(ch in _PROSE_BAD_CHARS for ch in text):
             continue
         for word in _WORD_RE.findall(text):
             low = word.lower()
             if (
                 len(low) < 4 or low.isdigit() or _ID_SEG_RE.match(low)
-                or low in _NOUN_STOPWORDS or low in exclude
+                or low in _NOUN_STOPWORDS or low in _JS_KEY_NOISE or low in exclude
             ):
                 continue
             freq[low] = freq.get(low, 0) + 1
@@ -593,15 +625,19 @@ async def route_map(base_url: str, max_chunks: int = _MAX_CHUNKS) -> str:
         "是最容易撞出未文档化入口的动作。不要再去读 bundle 原文："
         f"要看原文用 traffic_view(\"{home_id}\") 或 traffic_list(url_contains=…) 取台账。"
     )
-    structural = (
-        _structural_candidates(
-            counts,
-            html + "\n" + "\n".join(blobs),
-            {item.url for item in traffic.ledger().items() if item.url},
+    structural: list[tuple[str, str]] = []
+    if os.environ.get("CTF_STRUCTURAL", "").strip() in ("1", "true", "on"):
+        requested = {item.url for item in traffic.ledger().items() if item.url}
+        structural = _structural_candidates(
+            counts, html + "\n" + "\n".join(blobs), requested
         )
-        if os.environ.get("CTF_STRUCTURAL", "").strip() in ("1", "true", "on")
-        else []
-    )
+        # 诊断：A/B 只认「派生了几条」这个数字，不认区块有没有出现。区块不出现
+        # 有两种原因（开关没到 / 派生为空），这一行把两者分开（台账 §4.251）。
+        print(
+            f"[route_map] structural on: counts={len(counts)} "
+            f"chunks={fetched} requested={len(requested)} derived={len(structural)}",
+            flush=True,
+        )
     if structural:
         # 新节放在末尾：上面那段路径表保持原样（<= 30 条），这里只追加
         # "从已发现结构确定派生、且台账里从未请求过"的候选。

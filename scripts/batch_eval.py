@@ -3419,6 +3419,8 @@ def run_agent(
         "CTF_RECOVERY_NOTICE": os.environ.get("CTF_RECOVERY_NOTICE", ""),
         "CTF_RECOVERY_DEBUG": os.environ.get("CTF_RECOVERY_DEBUG", ""),
         "CTF_STRUCTURAL": os.environ.get("CTF_STRUCTURAL", ""),
+        "CTF_CLASS_BLOCK": os.environ.get("CTF_CLASS_BLOCK", ""),
+        "CTF_STRUCT_SIG": os.environ.get("CTF_STRUCT_SIG", ""),
         "STRIX_TELEMETRY": "false",
         # 每次 LLM 调用后原子落盘。进程被墙钟 SIGKILL 时，run_strix_ctf 末尾那行
         # `[usage]` 永远不会打印——两条 A/B 臂就这么丢了 token 数（只能记 n/a）。
