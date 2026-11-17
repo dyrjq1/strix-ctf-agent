@@ -852,3 +852,129 @@ def test_rank_queue_honours_the_regime_budget() -> None:
     state2 = {"A": {"status": "active", "fails": 3, "runs": 3}}
     queue2, _ = compete.rank_queue([chal], state2, set(), max_failures=4)
     assert [c["id"] for c in queue2] == ["A"]
+
+
+# ------------------------------------------------------- 竞速优先（race-first）
+#
+# 2026-11-17 用户拍板：开赛先竞速再分散。首跑解出概率低，分散派单会把
+# 没解出的题排到后期——既丢动态积分的早解优势，尾部还可能覆盖不到。
+# 竞速 = 队首题同时派所有车道先解先停（race_stop 输家 0 LLM 停车）。
+# 窗口过后回到分散派单；--race-first 0（默认）维持原行为 = A/B 对照臂。
+
+
+def test_race_phase_active_window_semantics() -> None:
+    """0=从未启用恒关；窗口内开；过期即关。"""
+    now = 1_000_000.0
+    assert compete.race_phase_active(0.0, now) is False
+    assert compete.race_phase_active(now + 60.0, now) is True
+    assert compete.race_phase_active(now - 0.001, now) is False
+
+
+def test_parser_race_first_defaults_off() -> None:
+    """默认 0 = 不竞速（对照臂），显式给正数才开窗。"""
+    assert _args().race_first == 0
+    assert _args(**{"race-first": 900}).race_first == 900
+
+
+def test_race_window_end_persists_across_restarts(tmp_path) -> None:
+    """窗口属于比赛不属于进程：重启不重置，坏文件按已过期。"""
+    end1 = compete._race_window_end(tmp_path, 900)
+    assert end1 > 0
+    # 第二次读盘必须拿到同一时刻——重启不得把窗口再拉长一遍。
+    assert compete._race_window_end(tmp_path, 900) == end1
+    (tmp_path / "race-window.json").write_text("{not json", encoding="utf-8")
+    assert compete._race_window_end(tmp_path, 900) == 0.0
+
+
+def _write_race_run(state_dir, cid: str, lane: int, rec: dict) -> None:
+    runs = state_dir / "runs"
+    runs.mkdir(exist_ok=True)
+    with open(runs / f"{cid}-lane{lane}.jsonl", "a", encoding="utf-8") as f:
+        f.write(json.dumps({"challenge": cid, **rec}) + "\n")
+
+
+def test_collect_race_any_lane_correct_is_solved(tmp_path) -> None:
+    """竞速先解先停：任一车道判对 = 全队 solved，另一车道的失败不记账。"""
+    state: dict = {}
+    _write_race_run(tmp_path, "A", 0, {"correct": False, "stop_reason": "race_lost"})
+    _write_race_run(tmp_path, "A", 1, {"correct": True})
+    assert compete._collect_race("A", state, tmp_path, 2) == compete.SOLVED
+    assert state["A"]["runs"] == 1
+    assert state["A"].get("fails", 0) == 0
+    assert "lane 1" in state["A"]["one_line"]
+    assert "failure_path" not in state["A"]
+
+
+def test_collect_race_all_fail_counts_one_attempt_not_per_lane(tmp_path) -> None:
+    """同题同盘的车道是相关样本：全败记一次 fail，不乘车道数。"""
+    state: dict = {}
+    _write_race_run(
+        tmp_path, "A", 0, {"correct": False, "stop_reason": "rounds_exhausted"}
+    )
+    _write_race_run(tmp_path, "A", 1, {"correct": False, "error": "x"})
+    assert compete._collect_race("A", state, tmp_path, 2) == compete.FAILED
+    assert state["A"]["fails"] == 1
+    assert state["A"]["runs"] == 1
+    # 失败路径取信息量最大的一条（有 stop_reason 的那条），不是随便一条。
+    assert "rounds_exhausted" in state["A"]["one_line"]
+
+
+def test_collect_race_all_skipped_is_skip_not_fail(tmp_path) -> None:
+    """全车道接入失败 ≠ 题不可解：只记 skip 连击（B-23 口径的竞速版）。"""
+    state: dict = {}
+    _write_race_run(tmp_path, "A", 0, {"skipped": True, "error": "SKIPPED(需隧道)"})
+    _write_race_run(tmp_path, "A", 1, {"skipped": True, "error": "SKIPPED(需隧道)"})
+    assert compete._collect_race("A", state, tmp_path, 2) == compete.FAILED
+    assert state["A"]["skips"] == 1
+    assert state["A"].get("fails", 0) == 0
+
+
+def test_collect_race_no_rows_is_infra(tmp_path) -> None:
+    """一条结果行都没写 = 环境问题，不计失败稍后重派（与 _collect 同口径）。"""
+    state = {"A": {"race_rows_before": [0, 0], "status": compete.RUNNING}}
+    assert compete._collect_race("A", state, tmp_path, 2) == compete.INFRA
+    assert state["A"]["infra_stops"] == 1
+    assert state["A"].get("fails", 0) == 0
+
+
+def test_collect_race_respects_platform_solved(tmp_path) -> None:
+    """B-28 竞速版：平台已解回灌的题，本地竞速判负不得降级。"""
+    state = {"A": {"status": compete.SOLVED, "race_rows_before": [0, 0]}}
+    _write_race_run(tmp_path, "A", 0, {"correct": False, "stop_reason": "x"})
+    _write_race_run(tmp_path, "A", 1, {"correct": False, "stop_reason": "y"})
+    assert compete._collect_race("A", state, tmp_path, 2) == compete.SOLVED
+
+
+def test_spawn_race_lane_gets_tag_and_race_env(tmp_path, monkeypatch) -> None:
+    """竞速车道：out/plan 文件带 -lane{N} 后缀（互不覆盖），env 带 CTF_RACE_*。"""
+    captured = _fake_popen_capturing_env(monkeypatch)
+    race_dir = tmp_path / "race"
+    compete._spawn(
+        _chal("A"),
+        _args(),
+        tmp_path,
+        lane=1,
+        tag="-lane1",
+        extra_env=compete._race_env(race_dir, "A", 1),
+    )
+    cmd = " ".join(captured["cmd"])
+    assert "A-lane1.jsonl" in cmd and "plan-A-lane1.json" in cmd
+    assert "A.jsonl" not in cmd  # 不写共享结果文件
+    env = captured["env"]
+    assert env["CTF_RACE_DIR"] == str(race_dir)
+    assert env["CTF_RACE_CHALLENGE"] == "A"
+    assert env["CTF_RACE_LANE"] == "1"
+
+
+def test_spawn_disjoint_clears_stale_race_env(tmp_path, monkeypatch) -> None:
+    """分散派单显式清残留 race 变量：race_stop 是纯 env 判定，父 shell
+    里残留的旧 CTF_RACE_DIR 不该让不相干的题去盯旧的胜局标记。"""
+    monkeypatch.setenv("CTF_RACE_DIR", "/tmp/old-race")
+    monkeypatch.setenv("CTF_RACE_CHALLENGE", "OLD-999")
+    monkeypatch.setenv("CTF_RACE_LANE", "3")
+    captured = _fake_popen_capturing_env(monkeypatch)
+    compete._spawn(_chal("A"), _args(), tmp_path)
+    env = captured["env"]
+    assert "CTF_RACE_DIR" not in env
+    assert "CTF_RACE_CHALLENGE" not in env
+    assert "CTF_RACE_LANE" not in env

@@ -637,9 +637,12 @@ def save_state(state_dir: Path, state: dict[str, Any]) -> None:
     os.replace(tmp, state_dir / "state.json")
 
 
-def _row_count(state_dir: Path, cid: str) -> int:
-    """这题的结果文件里现在有几条记录（判「本轮有没有写新行」）。"""
-    p = state_dir / "runs" / f"{cid}.jsonl"
+def _row_count(state_dir: Path, cid: str, tag: str = "") -> int:
+    """这题的结果文件里现在有几条记录（判「本轮有没有写新行」）。
+
+    ``tag`` 对应竞速模式的 per-lane 文件（``-lane{N}``）。
+    """
+    p = state_dir / "runs" / f"{cid}{tag}.jsonl"
     if not p.exists():
         return 0
     try:
@@ -648,9 +651,12 @@ def _row_count(state_dir: Path, cid: str) -> int:
         return 0
 
 
-def read_last_result(state_dir: Path, cid: str) -> dict[str, Any] | None:
-    """读 batch_eval 给这题追加的最后一条 jsonl 记录（判成败的唯一依据）。"""
-    p = state_dir / "runs" / f"{cid}.jsonl"
+def read_last_result(state_dir: Path, cid: str, tag: str = "") -> dict[str, Any] | None:
+    """读 batch_eval 给这题追加的最后一条 jsonl 记录（判成败的唯一依据）。
+
+    ``tag`` 对应竞速模式的 per-lane 文件（``-lane{N}``）。
+    """
+    p = state_dir / "runs" / f"{cid}{tag}.jsonl"
     if not p.exists():
         return None
     last: dict[str, Any] | None = None
@@ -863,17 +869,25 @@ def _spawn(
     direction: tuple[str, str] | None = None,
     attempt: int = 1,
     lane_models: list[dict[str, str]] | None = None,
+    tag: str = "",
+    extra_env: dict[str, str] | None = None,
 ) -> subprocess.Popen:
     """派一个 batch_eval 子进程跑单题（agent 上下文从零开始）。
 
     ``failure_path`` 与 ``direction`` 只来自同一道题**本进程自己**的失败
     记录（state.json 里按 cid 存放），经显式 ``--retry-notes`` 文件交界面
     注入，绝不从 digest/别的题读——题间隔离不变量保持不变。
+
+    ``tag`` 追加在该次 run 的所有落盘文件名上（竞速模式同题多车道并行，
+    各写各的 ``{cid}-lane{N}.jsonl``，互不覆盖）；``extra_env`` 是竞速
+    观察器的 ``CTF_RACE_*`` 通道。非竞速派单显式清掉这三个变量——
+    race_stop 是纯 env 判定，父进程 shell 里残留的旧值会让不相干的
+    分散派单也去盯一个早已结束的胜局标记。
     """
     cid = str(chal["id"])
     runs = state_dir / "runs"
     runs.mkdir(parents=True, exist_ok=True)
-    plan = runs / f"plan-{cid}.json"
+    plan = runs / f"plan-{cid}{tag}.json"
     item = build_plan_item(cid, chal, allow_pools=getattr(args, "allow_pools", False))
     plan.write_text(json.dumps([item]), encoding="utf-8")
     cmd = [
@@ -886,7 +900,7 @@ def _spawn(
         "--wallclock",
         str(args.wallclock),
         "--out",
-        str(runs / f"{cid}.jsonl"),
+        str(runs / f"{cid}{tag}.jsonl"),
         "--token",
         args.token,
     ]
@@ -894,11 +908,16 @@ def _spawn(
         cmd += ["--competition-id", args.competition]
     notes_text = build_retry_notes(failure_path, direction, attempt)
     if notes_text:
-        notes = runs / f"retry-notes-{cid}.txt"
+        notes = runs / f"retry-notes-{cid}{tag}.txt"
         notes.write_text(notes_text, encoding="utf-8")
         cmd += ["--retry-notes", str(notes)]
-    log = open(runs / f"{cid}.stdout.log", "a", encoding="utf-8")
+    log = open(runs / f"{cid}{tag}.stdout.log", "a", encoding="utf-8")
     env = {**os.environ, **_lane_env(lane, lane_models)}
+    if extra_env is None:
+        for stale in ("CTF_RACE_DIR", "CTF_RACE_CHALLENGE", "CTF_RACE_LANE"):
+            env.pop(stale, None)
+    else:
+        env.update(extra_env)
     return subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT, env=env)
 
 
@@ -984,6 +1003,103 @@ def _collect(
     return status
 
 
+# ------------------------------------------------------- 竞速优先（race-first）
+
+
+def race_phase_active(window_end: float, now: float) -> bool:
+    """竞速窗口是否还开着（``window_end <= 0`` 即从未启用，恒 False）。"""
+    return window_end > 0 and now < window_end
+
+
+def _race_env(race_dir: Path, cid: str, lane: int) -> dict[str, str]:
+    """给竞速车道子进程的 env 增量（race_stop 的纯 env 交界面）。"""
+    return {
+        "CTF_RACE_DIR": str(race_dir),
+        "CTF_RACE_CHALLENGE": cid,
+        "CTF_RACE_LANE": str(lane),
+    }
+
+
+def _race_window_end(state_dir: Path, race_first_s: int) -> float:
+    """竞速窗口的**绝对**截止时刻；``race_first_s <= 0`` 表示不启用。
+
+    窗口属于「这一场比赛」，不是「这一次进程」：compet.py 中途重启不得把
+    窗口再拉长一遍（重启两次 = 两倍竞速时间）。首启时把截止时刻落盘
+    （临时文件 + os.replace），此后一律读盘，坏了按已过期处理——宁可
+    少竞速一阵，也不要无窗口地竞速下去。
+    """
+    if race_first_s <= 0:
+        return 0.0
+    p = state_dir / "race-window.json"
+    if p.exists():
+        try:
+            return float(json.loads(p.read_text(encoding="utf-8"))["end"])
+        except (OSError, ValueError, KeyError, TypeError):
+            # 坏了按已过期处理：宁可少竞速一阵，也不要无窗口地竞速下去。
+            return 0.0
+    end = time.time() + race_first_s
+    state_dir.mkdir(parents=True, exist_ok=True)
+    tmp = p.with_name(p.name + ".tmp")
+    tmp.write_text(json.dumps({"end": end}), encoding="utf-8")
+    os.replace(tmp, p)
+    return end
+
+
+def _collect_race(
+    cid: str, state: dict[str, Any], state_dir: Path, n_lanes: int
+) -> str:
+    """一场竞速（所有车道都已退出）收一次账：一条竞速 = **一次**尝试。
+
+    - 任一车道判对 → SOLVED（先解先停，赢家的结果就是全队的结果）；
+    - 全败 → 记**一次** fail，不乘车道数——同题同盘的车道是相关样本，
+      乘上去只会把 max_failures 提前烧穿、把题挤进 deferred；
+    - 每条结果行都没写（连赛道都没跑起来）→ INFRA，不计失败，稍后重派
+      （口径与分散派单的 ``_collect`` 一致）；
+    - 全部车道 skipped → 只记 skip 连击，不记 fail（接入问题 ≠ 题不可解）。
+    失败路径取信息量最大的一条（``_failure_lines`` 最长的非 skip 记录）。
+    """
+    state_rec = state.setdefault(cid, {})
+    tags = [f"-lane{i}" for i in range(n_lanes)]
+    before = state_rec.get("race_rows_before")
+    if isinstance(before, list):
+        total_before = sum(int(x or 0) for x in before)
+        if sum(_row_count(state_dir, cid, tag=t) for t in tags) <= total_before:
+            state_rec["status"] = ACTIVE
+            state_rec["one_line"] = "infra: no result row (race)"
+            state_rec["infra_stops"] = int(state_rec.get("infra_stops") or 0) + 1
+            return INFRA
+    if state_rec.get("status") == SOLVED:
+        # B-28 同款：平台已解回灌的题，本地竞速判负不得降级。
+        return SOLVED
+    recs = [read_last_result(state_dir, cid, tag=t) or {} for t in tags]
+    state_rec["runs"] = int(state_rec.get("runs") or 0) + 1
+    state_rec["last_run_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+    solved_lane = next((i for i, r in enumerate(recs) if r.get("correct")), None)
+    if solved_lane is not None:
+        state_rec["status"] = SOLVED
+        state_rec["one_line"] = f"solved (race: lane {solved_lane})"
+        state_rec.pop("failure_path", None)
+        return SOLVED
+    state_rec["one_line"] = str(recs[0].get("stop_reason") or recs[0].get("error") or "")
+    if all(r.get("skipped") for r in recs):
+        state_rec["status"] = FAILED
+        state_rec["skips"] = int(state_rec.get("skips") or 0) + 1
+        return FAILED
+    state_rec["fails"] = int(state_rec.get("fails") or 0) + 1
+    # 真跑过一次（哪怕全败）说明接入已恢复，skip 连击清零。
+    state_rec["skips"] = 0
+    real = [r for r in recs if not r.get("skipped")] or recs
+    best = max(real, key=lambda r: len(_failure_lines(r)))
+    fp = _failure_lines(best)
+    if fp:
+        hist = list(state_rec.get("failure_path") or [])
+        hist.append("；".join(fp)[:300])
+        state_rec["failure_path"] = hist[-3:]
+        state_rec["one_line"] = state_rec["failure_path"][-1][:80]
+    state_rec["status"] = FAILED
+    return FAILED
+
+
 def build_parser() -> argparse.ArgumentParser:
     """命令行契约。单独成函数，好让测试钉住默认值（尤其时间盒）。"""
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
@@ -1012,6 +1128,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--dry-run", action="store_true", help="只打印队列，不派单")
     p.add_argument("--once", action="store_true", help="排一轮队跑完就退出（冒烟用）")
+    p.add_argument(
+        "--race-first",
+        type=int,
+        default=0,
+        help="开赛后先竞速 N 秒：窗口内队首题同时派给所有车道先解先停"
+        "（race_stop 输家 0 LLM 停车），窗口过后回到分散派单。"
+        "0（默认）= 不竞速，维持 A/B 对照臂。窗口截止时刻落 state-dir，"
+        "中途重启不重置",
+    )
     p.add_argument("--poll", type=float, default=10.0, help="车道轮询间隔（秒）")
     p.add_argument(
         "--allow-pools",
@@ -1074,6 +1199,18 @@ def main() -> int:
     running: dict[str, subprocess.Popen] = {}
     #: 题 → 车道号。车道号决定 VPN 中转端口（见 _lane_env）。
     lane_of: dict[str, int] = {}
+    #: 竞速在飞：题 → {车道号 → 子进程}。一场竞速占满所有车道，全部退出
+    #: 才收一次账（_collect_race）；与 running（分散派单）互斥——竞速只在
+    #: 所有车道空闲时起跑，所以两本账不会同时有活。
+    race_runs: dict[str, dict[int, subprocess.Popen]] = {}
+    race_window_end = _race_window_end(state_dir, args.race_first)
+    if race_window_end > 0:
+        remaining = max(0.0, race_window_end - time.time())
+        print(
+            f"[compete] 竞速优先：开赛后先同题竞速 {remaining:.0f}s"
+            "（窗口过后回到分散派单）",
+            flush=True,
+        )
     stop = False
     last_solve_sync = 0.0
     #: 连续「一行结果都没写」的车道数——用来把环境停跑的退避拉长到 5 分钟，
@@ -1214,7 +1351,19 @@ def main() -> int:
                 )
             return 0
         # 填车道
-        while len(running) < args.lanes and queue:
+        if (
+            race_phase_active(race_window_end, time.time())
+            and args.lanes > 1
+            and not running
+            and not race_runs
+            and queue
+        ):
+            # 竞速优先（2026-11-17 用户拍板）：开赛窗口内，队首题同时派给
+            # 所有车道先解先停，而不是各拿一题。理由：首次解出概率低，
+            # 分散派单会把没解出的题排到后期——既丢动态积分的早解优势，
+            # 尾部还可能覆盖不到；竞速把 N 个独立上下文押在同一题上，
+            # 任一车道解出即全队得分（race_stop 已双实例实测：输家
+            # 0 LLM 停车，比分散派单省 token）。窗口过后回到分散派单。
             chal = queue.pop(0)
             cid = str(chal["id"])
             needed = args.wallclock * _WALL_TIER.get(
@@ -1224,8 +1373,7 @@ def main() -> int:
                 time.time(), session_end, next_start, needed
             )
             if not ok:
-                # 会话边界前派单 = 跑到一半实例被删（实测 021/023 的
-                # error、003/017/018 的 ready 超时）。宁可空等下一场。
+                # 会话边界前的纪律与分散派单一致：宁空等，不派半场。
                 queue.insert(0, chal)
                 if not session_warned:
                     print(
@@ -1233,50 +1381,114 @@ def main() -> int:
                         f"{wait:.0f}s 后下一场再派",
                         flush=True,
                     )
-                    session_warned = True
-                break
-            session_warned = False
-            rec = state.setdefault(cid, {})
-            # 收车时用来判「本轮有没有写结果行」；必须在启动子进程之前取。
-            rec["rows_before"] = _row_count(state_dir, cid)
-            rec["status"] = RUNNING
-            # 第几次尝试决定入口方向：失败过的题换一个机制类别起步，首跑不注入。
-            # ``CTF_REDISPATCH=0`` 时退回改动前的行为，A/B 的对照臂靠它。
-            attempt = int(rec.get("runs") or 0) + 1
-            direction = entry_direction(attempt) if directions_enabled() else None
-            if direction is not None:
-                rec["direction"] = direction[0]
-                rec["directions"] = (
-                    list(rec.get("directions") or []) + [direction[0]]
-                )[-5:]
-            used = set(lane_of.values())
-            lane = next(i for i in range(args.lanes) if i not in used)
-            if lane_models:
-                # 只进调度器账本（赛后分厂商统计用），不进任何子进程上下文。
-                rec["lane_model"] = lane_models[lane]["name"]
-            running[cid] = _spawn(
-                chal,
-                args,
-                state_dir,
-                failure_path=rec.get("failure_path"),
-                lane=lane,
-                direction=direction,
-                attempt=attempt,
-                lane_models=lane_models,
-            )
-            lane_of[cid] = lane
-            lane_label = (
-                f"{lane}({lane_models[lane]['name']})" if lane_models else str(lane)
-            )
-            print(
-                f"[compete] 派单 {cid}（{len(running)}/{args.lanes} 车道，"
-                f"lane={lane_label} 中转 {_lane_env(lane)['CTF_VPN_RELAY']}"
-                + (f"，换向={direction[0]}" if direction else "")
-                + "）",
-                flush=True,
-            )
+                session_warned = True
+            else:
+                session_warned = False
+                rec = state.setdefault(cid, {})
+                tags = [f"-lane{i}" for i in range(args.lanes)]
+                # 收车判「本轮有没有写结果行」的基线，每车道各记各的。
+                rec["race_rows_before"] = [
+                    _row_count(state_dir, cid, tag=t) for t in tags
+                ]
+                rec["status"] = RUNNING
+                attempt = int(rec.get("runs") or 0) + 1
+                direction = entry_direction(attempt) if directions_enabled() else None
+                if direction is not None:
+                    rec["direction"] = direction[0]
+                    rec["directions"] = (
+                        list(rec.get("directions") or []) + [direction[0]]
+                    )[-5:]
+                if lane_models:
+                    # 只进调度器账本（赛后分厂商统计用），不进子进程上下文。
+                    rec["lane_models"] = [
+                        lane_models[i]["name"] for i in range(args.lanes)
+                    ]
+                race_dir = state_dir / "race"
+                race_dir.mkdir(parents=True, exist_ok=True)
+                race_runs[cid] = {}
+                for lane in range(args.lanes):
+                    race_runs[cid][lane] = _spawn(
+                        chal,
+                        args,
+                        state_dir,
+                        failure_path=rec.get("failure_path"),
+                        lane=lane,
+                        direction=direction,
+                        attempt=attempt,
+                        lane_models=lane_models,
+                        tag=f"-lane{lane}",
+                        extra_env=_race_env(race_dir, cid, lane),
+                    )
+                print(
+                    f"[compete] 竞速派单 {cid}（{args.lanes} 车道同题先解先停"
+                    + (f"，换向={direction[0]}" if direction else "")
+                    + "）",
+                    flush=True,
+                )
+        elif not race_runs:
+            while len(running) < args.lanes and queue:
+                chal = queue.pop(0)
+                cid = str(chal["id"])
+                needed = args.wallclock * _WALL_TIER.get(
+                    str(chal.get("difficulty") or ""), 1.0
+                )
+                ok, wait = session_allows_dispatch(
+                    time.time(), session_end, next_start, needed
+                )
+                if not ok:
+                    # 会话边界前派单 = 跑到一半实例被删（实测 021/023 的
+                    # error、003/017/018 的 ready 超时）。宁可空等下一场。
+                    queue.insert(0, chal)
+                    if not session_warned:
+                        print(
+                            f"[compete] 会话窗口不足（{cid} 需 {needed:.0f}s），"
+                            f"{wait:.0f}s 后下一场再派",
+                            flush=True,
+                        )
+                        session_warned = True
+                    break
+                session_warned = False
+                rec = state.setdefault(cid, {})
+                # 收车时用来判「本轮有没有写结果行」；必须在启动子进程之前取。
+                rec["rows_before"] = _row_count(state_dir, cid)
+                rec["status"] = RUNNING
+                # 第几次尝试决定入口方向：失败过的题换一个机制类别起步，首跑不注入。
+                # ``CTF_REDISPATCH=0`` 时退回改动前的行为，A/B 的对照臂靠它。
+                attempt = int(rec.get("runs") or 0) + 1
+                direction = entry_direction(attempt) if directions_enabled() else None
+                if direction is not None:
+                    rec["direction"] = direction[0]
+                    rec["directions"] = (
+                        list(rec.get("directions") or []) + [direction[0]]
+                    )[-5:]
+                used = set(lane_of.values())
+                lane = next(i for i in range(args.lanes) if i not in used)
+                if lane_models:
+                    # 只进调度器账本（赛后分厂商统计用），不进任何子进程上下文。
+                    rec["lane_model"] = lane_models[lane]["name"]
+                running[cid] = _spawn(
+                    chal,
+                    args,
+                    state_dir,
+                    failure_path=rec.get("failure_path"),
+                    lane=lane,
+                    direction=direction,
+                    attempt=attempt,
+                    lane_models=lane_models,
+                )
+                lane_of[cid] = lane
+                lane_label = (
+                    f"{lane}({lane_models[lane]['name']})" if lane_models else str(lane)
+                )
+                print(
+                    f"[compete] 派单 {cid}（{len(running)}/{args.lanes} 车道，"
+                    f"lane={lane_label} 中转 {_lane_env(lane)['CTF_VPN_RELAY']}"
+                    + (f"，换向={direction[0]}" if direction else "")
+                    + "）",
+                    flush=True,
+                )
         save_state(state_dir, state)
-        if not running:
+        if not running and not race_runs:
             if args.once:
                 print("[compete] --once：队列跑完，退出", flush=True)
                 return 0
@@ -1287,7 +1499,7 @@ def main() -> int:
             time.sleep(args.poll)
             continue
         # 等任一车道退出
-        while running and not stop:
+        while (running or race_runs) and not stop:
             if deadline_reached(deadline):
                 print("[compete] 到 --until，杀在跑车道…", flush=True)
                 stop = True
@@ -1317,11 +1529,46 @@ def main() -> int:
                 save_state(state_dir, state)
                 print(f"[compete] {cid} 收车：{status}", flush=True)
                 break
+            # 竞速收车：一条竞速要等它的**所有**车道退出才收一次账
+            # （先解先停由子进程自己执行：赢家写完胜局标记，输家
+            # race_stop 盯到即 0 LLM 自停；这里只负责归并结果）。
+            for rcid in list(race_runs):
+                lanes = race_runs[rcid]
+                for lane in list(lanes):
+                    proc = lanes[lane]
+                    if proc.poll() is None:
+                        continue
+                    del lanes[lane]
+                if lanes:
+                    continue
+                del race_runs[rcid]
+                status = _collect_race(rcid, state, state_dir, args.lanes)
+                if status == SOLVED:
+                    my_solved.add(rcid)
+                if status == INFRA:
+                    infra_streak += 1
+                    wait = min(300.0, 15.0 * (2 ** min(infra_streak - 1, 4)))
+                    print(
+                        f"[compete] {rcid} 竞速未派成（环境问题，不计失败），"
+                        f"{wait:.0f}s 后再试",
+                        flush=True,
+                    )
+                    save_state(state_dir, state)
+                    time.sleep(wait)
+                else:
+                    infra_streak = 0
+                    save_state(state_dir, state)
+                    print(f"[compete] {rcid} 竞速收车：{status}", flush=True)
+                break
         if stop:
             print("[compete] 收到停止信号，杀掉在跑车道…", flush=True)
-            for cid, proc in running.items():
+            for proc in [p for ls in race_runs.values() for p in ls.values()] + list(
+                running.values()
+            ):
                 proc.terminate()
-            for cid, proc in running.items():
+            for proc in [p for ls in race_runs.values() for p in ls.values()] + list(
+                running.values()
+            ):
                 try:
                     proc.wait(timeout=15)
                 except subprocess.TimeoutExpired:
