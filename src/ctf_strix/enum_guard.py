@@ -757,8 +757,17 @@ def _class_block_enabled() -> bool:
 
     Off by default because the per-class budget is an experiment: the family
     block and the class *hint* already ship, and turning a hint into a refusal
-    changes which calls reach the target.  The A/B decides the default; this
-    switch keeps both arms one env var apart.
+    changes which calls reach the target.  This switch keeps both arms one
+    env var apart.
+
+    The A/B ran 2026-11-17 and the verdict is **withdrawn, keep off**
+    (docs/11 §4.252): the ON arm fired zero refusals -- the miss counter
+    peaks at 1 because a class switch or any textually novel response resets
+    it, and breadth-style failure probes a new path every call.  A replay
+    that swapped the criterion for per-class *negative-response* streaks
+    (40x / not-found / empty) over 274 historical runs reached 8 on 1/189
+    failed runs and 2/85 *solved* ones -- the signal does not separate
+    winners from losers, so reachability was not worth fixing.
     """
     return os.environ.get("CTF_CLASS_BLOCK", "0").strip().lower() not in {
         "0",
