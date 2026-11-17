@@ -1,7 +1,9 @@
 """批量评测：串行跑 N 道题，边跑边记数据。
 
 约束（全部来自平台实测，不是假设）：
-- ``max_instances_per_team_effective = 1`` → 必须串行，不能并行
+- 正式套件的实例配额**实测是 3**（2026-11-10 API 抓取；练习套
+  CTFARENA 仍是 1）→ 可以三车道并行，但**清理必须按所有权收敛**，
+  见 ``Client.reap_orphans``
 - 实例 TTL 10800 s → 单题最多占这么久，超时前必须先删
 - 删实例后再起新的有 30-60 s 开销
 
@@ -18,6 +20,7 @@ import argparse
 import contextlib
 import json
 import os
+import random
 import re
 import secrets
 import shutil
@@ -25,6 +28,7 @@ import socket
 import subprocess
 import sys
 import time
+from datetime import datetime
 from pathlib import Path
 
 import requests
@@ -35,6 +39,223 @@ import urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 PLATFORM = "https://ctfy.tsinghua.edu.cn"
+
+#: 历史判据：创建时刻早于本进程启动这么多秒即视为"陈旧"。
+#: B-27 起 ``reap_orphans`` **不再用它**——并行车道同时起跑时，兄弟的
+#: 创建时刻同样早于我，按时间判会误杀。所有权以 ``_ledger_*`` 为准。
+#: 常量保留给诊断脚本与回归测试。
+_STALE_GRACE_S = 120.0
+
+
+def _instance_created_at(inst: dict) -> float | None:
+    """实例创建时刻（epoch 秒）；字段缺失或不可解析时返回 None。
+
+    平台没有承诺这个字段名，按常见拼写逐个试。拿不到就返回 None——
+    调用方据此**不**做跨进程清理：宁可等 3 小时 TTL，也不误杀兄弟车道。
+
+    Args:
+        inst: ``GET /api/v1/instances`` 列表里的一项。
+
+    Returns:
+        epoch 秒；无可用字段返回 None。
+    """
+    for key in ("created_at", "createdAt", "started_at", "launched_at"):
+        raw = inst.get(key)
+        if raw is None:
+            continue
+        if isinstance(raw, (int, float)):
+            return float(raw)
+        txt = str(raw).strip().replace("Z", "+00:00")
+        try:
+            return datetime.fromisoformat(txt).timestamp()
+        except ValueError:
+            try:
+                return float(txt)
+            except ValueError:
+                continue
+    return None
+
+
+#: 实例所有权台账（跨进程）。``reap_orphans(include_stale=True)`` 只删
+#: **台账里登记过、且登记它的进程已经死了**的实例。并行跑批时同 token 下
+#: 同时活着多个实例是正常状态；没有台账就无法证明某个实例是尸体。
+#: 旧实现按"创建时刻早于本进程"判定，而并行车道几乎同时起跑，兄弟的创建
+#: 时刻同样早于我 → 被连根拔掉。靶机在宽限期里还能访问，但该车道之后所有
+#: ``/check``、``/submissions`` 全变成 ``instance_not_found``，题做出来了
+#: 却交不上、成绩静默归零（11-13 run3 实测）。
+_LEDGER_ENV = "CTF_INSTANCE_LEDGER"
+#: 台账条目最长保留时间。实例 TTL 实测 10800s，留双倍余量。
+_LEDGER_TTL_S = 6 * 3600.0
+
+
+def _ledger_path() -> Path:
+    """台账文件路径；``CTF_INSTANCE_LEDGER`` 可覆写（测试与多账号隔离用）。"""
+    raw = os.environ.get(_LEDGER_ENV)
+    if raw:
+        return Path(raw)
+    return Path.home() / ".ctf_instances.json"
+
+
+def _pid_alive(pid: int) -> bool:
+    """进程是否还活着。
+
+    Windows 上**不能**用 ``os.kill(pid, 0)`` 探活：CPython 在 Windows 里把
+    任何非 CTRL_* 的信号实现成 ``TerminateProcess``，探活会把目标进程杀掉。
+    """
+    if pid <= 0:
+        return False
+    if os.name == "nt":  # pragma: no cover - Windows 分支
+        import ctypes
+
+        k32 = ctypes.windll.kernel32
+        handle = k32.OpenProcess(0x1000, False, pid)  # QUERY_LIMITED_INFORMATION
+        if not handle:
+            return False
+        try:
+            code = ctypes.c_ulong()
+            if not k32.GetExitCodeProcess(handle, ctypes.byref(code)):
+                return False
+            return code.value == 259  # STILL_ACTIVE
+        finally:
+            k32.CloseHandle(handle)
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+@contextlib.contextmanager
+def _ledger_lock(path: Path):
+    """跨进程互斥（O_EXCL 锁文件）。拿不到锁也放行——台账只是清理依据，
+    绝不能因为锁竞争挡住起实例的主流程；最坏结果是本次多留一个尸体。"""
+    lock = path.with_name(path.name + ".lock")
+    deadline = time.time() + 10
+    fd: int | None = None
+    while time.time() < deadline:
+        try:
+            fd = os.open(str(lock), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            break
+        except FileExistsError:
+            try:
+                if time.time() - lock.stat().st_mtime > 30:
+                    lock.unlink()
+                    continue
+            except OSError:
+                pass
+            time.sleep(0.05)
+    try:
+        yield
+    finally:
+        if fd is not None:
+            os.close(fd)
+            try:
+                lock.unlink()
+            except OSError:
+                pass
+
+
+def _ledger_update(mutator) -> None:
+    """读-改-写台账。任何 IO 失败都静默——最坏结果是本次不清理。"""
+    path = _ledger_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with _ledger_lock(path):
+            try:
+                data = json.loads(path.read_text("utf-8"))
+                if not isinstance(data, dict):
+                    data = {}
+            except (OSError, ValueError):
+                data = {}
+            inst = data.get("instances")
+            if not isinstance(inst, dict):
+                inst = {}
+            now = time.time()
+            inst = {
+                k: v
+                for k, v in inst.items()
+                if isinstance(v, dict) and now - float(v.get("ts") or 0) < _LEDGER_TTL_S
+            }
+            mutator(inst)
+            data["instances"] = inst
+            tmp = path.with_name(path.name + ".tmp")
+            tmp.write_text(json.dumps(data), encoding="utf-8")
+            os.replace(tmp, path)
+    except (OSError, TypeError, ValueError):
+        pass
+
+
+def _ledger_record(iid: str) -> None:
+    """登记"本进程刚起了这个实例"。"""
+    pid = os.getpid()
+
+    def _mut(inst: dict) -> None:
+        inst[iid] = {"pid": pid, "ts": time.time()}
+
+    _ledger_update(_mut)
+
+
+def _ledger_forget(iid: str) -> None:
+    """实例已删/已交回，从台账抹掉。"""
+
+    def _mut(inst: dict) -> None:
+        inst.pop(iid, None)
+
+    _ledger_update(_mut)
+
+
+def _ledger_live_owners() -> set[str]:
+    """台账里**主人进程还活着**的实例 id（= 别的车道正在用）。"""
+    try:
+        data = json.loads(_ledger_path().read_text("utf-8"))
+    except (OSError, ValueError):
+        return set()
+    inst = data.get("instances") if isinstance(data, dict) else None
+    if not isinstance(inst, dict):
+        return set()
+    live: set[str] = set()
+    for iid, meta in inst.items():
+        if not isinstance(meta, dict):
+            continue
+        try:
+            pid = int(meta.get("pid") or 0)
+        except (TypeError, ValueError):
+            pid = 0
+        if pid != os.getpid() and _pid_alive(pid):
+            live.add(iid)
+    return live
+
+
+def _ledger_dead_ids() -> set[str]:
+    """台账里**主人进程已死**的实例 id。
+
+    这是 ``include_stale`` 唯一允许跨进程删的集合：证明得了是尸体。
+    没登记的实例（别的工具起的、旧版本起的、平台自己的）一律不碰——
+    等 3 小时 TTL 兜底，也好过误杀一个正在跑题的车道。
+    """
+    try:
+        data = json.loads(_ledger_path().read_text("utf-8"))
+    except (OSError, ValueError):
+        return set()
+    inst = data.get("instances") if isinstance(data, dict) else None
+    if not isinstance(inst, dict):
+        return set()
+    dead: set[str] = set()
+    for iid, meta in inst.items():
+        if not isinstance(meta, dict):
+            continue
+        try:
+            pid = int(meta.get("pid") or 0)
+        except (TypeError, ValueError):
+            pid = 0
+        if not _pid_alive(pid):
+            dead.add(iid)
+    return dead
+
 
 #: 让本进程也能 import ``ctf_strix``。TCP 桥与 VPN 隧道要在**主进程**里起，
 #: 不是子进程。之前 batch_eval 从不 import 这个包，所以缺这行一直没露馅，
@@ -57,11 +278,229 @@ SUITES = {
     "SQLILABS": "f2348cfef1994a8082fedeb324efdbdc",
     "AGENTBENCH": "9f613f261b68469b9c4da805197983b2",
     "GAUNTLET": "2b3aecd6540b47419d45c294def49773",
+    # 2026-11-13: playground 的 competition 不在 /api/v1/suites 里，前缀路由
+    # 解析不到；真值取自 ctfwork/run_pg_1113.py 的运行时覆写
+    # (PLAYGROUND = "bc60dc1764f34413964a547102f17261")。
+    "SAMPLE": "bc60dc1764f34413964a547102f17261",
+    # 2026-11-16: CVE 套件（1474 题）此前只靠 /api/v1/suites 兜底解析；Go 后端
+    # 上线后该端点 404（§4.211 之后的迁移），CVE-2018-18778 这类题会以
+    # RoutingError 整题秒退。cap=1，与 CTFARENA 同级。id 取自 list_competitions
+    # 的 suite 行（title=CVE）。
+    "CVE": "52f4b0d57e644549934e343813a9ad8e",
 }
 
 #: `GET /api/v1/suites` 的解析结果缓存：前缀 → suite id。
 #: 进程级缓存，一次批测只问一次平台。
 _SUITE_CACHE: dict[str, str] = {}
+
+# ---------------------------------------------------------------------------
+# 平台 hint：只读那一半。
+#
+# `docs/47` §3 的 P1：hint 是弱模型上唯一有 2× 实证的杠杆（Cybench 405B
+# 7.5%→15%，arXiv 2408.08926），而本题 `hint_cost_mode=discount`——开提示只
+# 封顶本题收益，不扣总分。但**已释放且免费**的那几条根本不用付这个代价：
+# 作者放出来就是给人看的，读列表本身也不花钱。
+#
+# 所以这里只做不需要花任何代价的一半：低频探测 → 把**已有正文**的提示拼进
+# 题面。付费档（`status=available` 且无 body）一律不碰，`view_hint` 是团队内
+# 一次性的不可撤销扣费，要有实测数字之后单独决策，不能混在一次接线里悄悄花掉。
+#
+# 探测节奏按 §3.3：每题至多每 20 分钟问一次。判断"该不该问"优先用题目详情
+# 里本来就有的 `hints_released`（每次尝试都会重新取详情，等于顺带轮询了一遍）；
+# 该字段缺失时才按 20 分钟节奏直接问。
+_HINT_POLL_S = 1200
+
+#: 拼进题面的提示正文上限（字符）。单题预算 25 轮 × 每轮几千字符的上下文，
+#: 一条几千字的提示会把题面和失败事实挤到注意力边缘，得不偿失。
+_HINT_BRIEF_MAX = 1600
+
+
+def _hint_state_path(out_path: str | Path) -> Path:
+    """hint 轮询状态的落盘位置，与结果文件同目录同名。
+
+    必须落盘而不是留在进程内存里：``compete.py`` 是**一次尝试一个 batch_eval
+    进程**，20 分钟的探测节奏跨进程才成立。
+    """
+    return Path(out_path).with_suffix(".hints.json")
+
+
+def _hint_state_load(path: Path) -> dict:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {"challenges": {}}
+    if not isinstance(data, dict) or not isinstance(data.get("challenges"), dict):
+        return {"challenges": {}}
+    return data
+
+
+def _hint_state_save(path: Path, data: dict) -> None:
+    """原子写：临时文件 + ``os.replace``（Windows 上 replace 才是原子的）。"""
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with tmp.open("w", encoding="utf-8") as fh:
+            json.dump(data, fh, ensure_ascii=False, indent=1)
+            fh.write("\n")
+        os.replace(tmp, path)
+    except OSError:
+        # 状态文件写不了就退化成"每次都问一次"，不影响本次尝试。
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+
+
+def _hint_tiers_to_brief(payload: dict) -> str:
+    """把 hint 分层压成一段可直接进题面的文本；没有可用正文就返回空串。
+
+    只收 ``body`` 非空的那几层——那就是"已释放且不必再付费"的内容（免费的，
+    或本队此前已经开过的）。付费未开的层平台本来就不会给 body，这里自然跳过，
+    不去 `view_hint`。
+    """
+    tiers = payload.get("tiers") if isinstance(payload, dict) else None
+    if not isinstance(tiers, list):
+        return ""
+    default_mode = str(payload.get("cost_mode") or "")
+    blocks: list[str] = []
+    total = 0
+    for tier in tiers:
+        if not isinstance(tier, dict):
+            continue
+        body = str(tier.get("body") or "").strip()
+        if not body:
+            continue
+        head = f"### 提示 {len(blocks) + 1}"
+        mode = str(tier.get("cost_mode") or default_mode)
+        if mode == "discount":
+            head += "（本题已开启；平台按折扣封顶本题收益）"
+        block = f"{head}\n{body}"
+        if tier.get("link_url"):
+            block += f"\n链接：{tier['link_url']}"
+        if tier.get("attachment_name"):
+            block += f"\n附件：{tier['attachment_name']}"
+        if total + len(block) > _HINT_BRIEF_MAX:
+            break
+        blocks.append(block)
+        total += len(block)
+    if not blocks:
+        return ""
+    return (
+        "## 平台提示（本题作者在赛窗口内发布，调度器已替你取回）\n"
+        "提示只是方向，不等于答案：按它缩小范围，仍要自己验证。\n\n"
+        + "\n\n".join(blocks)
+    )
+
+
+def _hint_brief(
+    client: object,
+    challenge_id: str,
+    detail: dict,
+    state_path: Path,
+    now: float | None = None,
+) -> tuple[str, dict]:
+    """按 20 分钟节奏探测本题 hint，返回 (可拼进题面的文本, 记账字段)。
+
+    任何异常都吞掉并返回空串：hint 是锦上添花，不能因为它让一次尝试崩掉，
+    更不能让它烧掉调度器的连败预算。
+    """
+    now = time.time() if now is None else now
+    state = _hint_state_load(state_path)
+    entry = state["challenges"].setdefault(challenge_id, {})
+    cached = str(entry.get("brief") or "")
+    released = detail.get("hints_released") if isinstance(detail, dict) else None
+    known_empty = isinstance(released, int) and released == 0
+    last_poll = entry.get("last_poll")
+    try:
+        due = last_poll is None or now - float(last_poll) >= _HINT_POLL_S
+    except (TypeError, ValueError):
+        due = True  # 状态文件被写坏了就当没问过：多问一次比永不问要安全
+    polled = False
+    if not known_empty and due:
+        polled = True
+        try:
+            payload = client.hints(challenge_id)
+        except Exception:  # noqa: BLE001 - 平台侧任何异常都不该传染
+            payload = {}
+        if isinstance(payload, dict) and payload:
+            entry["last_poll"] = now
+            entry["tiers"] = len(payload.get("tiers") or [])
+            fresh = _hint_tiers_to_brief(payload)
+            if fresh:
+                entry["brief"] = fresh
+                cached = fresh
+            elif cached:
+                # 本队已经开过的层在列表里带 body；若这次没带，保留上次取到的。
+                pass
+            _hint_state_save(state_path, state)
+    rec = {"hint_polled": polled, "hint_chars": len(cached)}
+    if cached:
+        rec["hint_tiers"] = int(entry.get("tiers") or 0)
+    return cached, rec
+
+
+def _hint_payload(resp: object) -> dict:
+    """REST 响应 → ``{"tiers": [...]}`` 形状；认不出就返回 ``{}``。
+
+    REST 这一侧的返回体没有被协议文档写死（hint 只有 MCP 工具那侧的描述），
+    所以两种常见形状都收：带 ``tiers`` 的对象，或裸的层列表。
+    """
+    try:
+        data = resp.json()
+    except ValueError:
+        return {}
+    if isinstance(data, dict):
+        return data
+    if isinstance(data, list):
+        return {"tiers": data}
+    return {}
+
+
+def _mcp_result(text: str, content_type: str = "") -> dict:
+    """从 MCP 响应里取出 ``tools/call`` 的结果对象。
+
+    HTTP 传输可能是纯 JSON，也可能是 SSE（``event: message`` + ``data: {...}``，
+    CLAUDE.md §15 记的就是 SSE）。工具结果本身通常是
+    ``{"content": [{"type": "text", "text": "<json 字符串>"}]}``。
+    """
+    raw = None
+    stripped = text.lstrip()
+    if "text/event-stream" in (content_type or "") or stripped.startswith("event:"):
+        chunks = [
+            line[5:].strip()
+            for line in text.splitlines()
+            if line.startswith("data:")
+        ]
+        for chunk in reversed(chunks):
+            try:
+                raw = json.loads(chunk)
+                break
+            except ValueError:
+                continue
+    if raw is None:
+        try:
+            raw = json.loads(text)
+        except ValueError:
+            return {}
+    if not isinstance(raw, dict):
+        return {}
+    result = raw.get("result", raw)
+    if not isinstance(result, dict):
+        return {}
+    content = result.get("content")
+    if isinstance(content, list):
+        for item in content:
+            if isinstance(item, dict) and item.get("type") == "text":
+                try:
+                    obj = json.loads(item.get("text") or "")
+                except ValueError:
+                    continue
+                if isinstance(obj, dict):
+                    return obj
+    structured = result.get("structuredContent")
+    if isinstance(structured, dict):
+        return structured
+    return result if "tiers" in result else {}
 
 
 def _title_prefixes(title: str) -> list[str]:
@@ -126,7 +565,8 @@ def suite_for(challenge_id: str, token: str = "") -> str:
         suite id。
 
     Raises:
-        KeyError: 静态表、缓存、平台自述三处都找不到该前缀。
+        RoutingError: 静态表、缓存、平台自述三处都找不到该前缀（``KeyError``
+            子类，调用方可按 skip 口径处理）。
     """
     key = (challenge_id or "").strip().upper()
     for prefix, sid in SUITES.items():
@@ -146,7 +586,7 @@ def suite_for(challenge_id: str, token: str = "") -> str:
         f"题号 {challenge_id} 的前缀不在已知 suite 表里（已知：{known}）。"
         "如果平台新增了套件，检查 /api/v1/suites 是否可达"
     )
-    raise KeyError(msg)
+    raise RoutingError(msg)
 
 
 #: 端口 → 服务形态。只用于**兜底**：平台的 ``service_type`` 优先。
@@ -184,6 +624,130 @@ class TunnelRequiredError(RuntimeError):
     """题目只暴露 ``*.internal`` 私有域名，评测机无隧道时无法访问。"""
 
 
+#: 403 ``competition_paused`` 的可等待上限（秒）。超过就放弃，让上层记
+#: skip——练习场暂停窗口实测 750s 量级，30 分钟足够覆盖。
+_PAUSED_WAIT_CAP = 1800
+
+#: 暂停响应缺 ``retry_after_s`` 时的默认等待。
+_PAUSED_DEFAULT_S = 600
+
+
+class LaunchError(RuntimeError):
+    """实例起不来（平台过载/配额/5xx）——基础设施故障，不是题目失败。
+
+    开赛 02:02Z 实测：5 题里 2 题在启动阶段连撞 503 platform_busy，被记成
+    「题目失败」，两题后即被调度器 defer。它必须走 skip 口径（B-23），
+    否则平台一抖动就把题表整片判死。
+    """
+
+
+class RoutingError(KeyError):
+    """题号前缀三处都解析不出所属 suite——**选题崩了，不是题没做出来**。
+
+    台账 §4.29 的原话：这类"看起来是评测结果、其实是选题崩了"的数据比没有
+    数据更危险。它必须和实例起不来一样走 skip 口径（B-23），否则一道根本没
+    开跑的题会被记成一次失败，白烧调度器的连败预算。
+
+    仍是 ``KeyError`` 的子类：``docstring`` 里写明"解析不出来就抛 KeyError"的
+    契约、以及既有调用方（``_listed_detail`` 的兜底 ``except``）都不必改。
+    """
+
+
+class CompetitionPausedError(RuntimeError):
+    """平台处于暂停时段，且超出本轮可等待上限。"""
+
+    def __init__(self, retry_after_s: int) -> None:
+        super().__init__(
+            f"competition_paused，{int(retry_after_s)}s 后才恢复（超等待上限）"
+        )
+        self.retry_after_s = int(retry_after_s)
+
+
+def _capacity_note(detail: str) -> str:
+    """从 429 文案里抠出配额状态，供日志显示（``0 running, 1 still stopping``）。"""
+    m = re.search(r"\(([^)]*running[^)]*)\)", detail or "")
+    if m:
+        return m.group(1)
+    m = re.search(r"Max \d+ concurrent[^()]*", detail or "")
+    return m.group(0).strip() if m else "配额已满"
+
+
+def _paused_retry_after(r: object) -> int | None:
+    """把 403 ``competition_paused`` 解析成需要等待的秒数。
+
+    playground 实测响应体::
+
+        {"code": "competition_paused",
+         "detail": {"retry_after_s": 750, "next_session_starts_at": "..."}}
+
+    这不是失败，更不是 token 失效：按语料等下一场即可。判成能力失败会
+    白白烧掉一次「连败」，调度器随即 defer 这道题（run3 首撞）。
+
+    Args:
+        r: ``requests`` 响应。
+
+    Returns:
+        需要等待的秒数；不是暂停响应时返回 None。
+    """
+    if getattr(r, "status_code", 0) != 403:
+        return None
+    try:
+        body = r.json()
+    except Exception:  # noqa: BLE001 -- 非 JSON 的 403 不是暂停语义
+        return None
+    if not isinstance(body, dict) or body.get("code") != "competition_paused":
+        return None
+    detail = body.get("detail")
+    if isinstance(detail, dict):
+        try:
+            return max(1, int(float(detail.get("retry_after_s") or 0)))
+        except (TypeError, ValueError):
+            return _PAUSED_DEFAULT_S
+    return _PAUSED_DEFAULT_S
+
+
+#: ``503 platform_busy`` 的可等待上限（秒）。开赛瞬间几百支队伍同时抢实例，
+#: 平台会连续吐 503 长达十几分钟；这是平台过载，不是题目失败，也不是本进程
+#: 该放弃的理由。超过这个上限才回到普通重试预算。
+_BUSY_WAIT_CAP = 1800
+
+
+def _busy_retry_after(r: object) -> int | None:
+    """把 503 ``platform_busy`` 解析成需要等待的秒数。
+
+    实测响应体::
+
+        {"code": "platform_busy",
+         "detail": {"message": "...Send it again in 7 seconds.",
+                    "retry_after_s": 7}}
+
+    开赛 02:02Z 首题就撞上：5 次普通重试（10/20/40/60s）共 190 秒全部落在
+    过载窗口里，题目被判 failed，两题就被调度器 defer 掉。平台自己给了
+    ``retry_after_s``，照它等、且**不消耗重试预算**才是对的。
+
+    Args:
+        r: ``requests`` 响应。
+
+    Returns:
+        需要等待的秒数；不是 platform_busy 时返回 None。
+    """
+    if getattr(r, "status_code", 0) != 503:
+        return None
+    try:
+        body = r.json()
+    except Exception:  # noqa: BLE001 -- 非 JSON 的 503 走普通重试
+        return None
+    if not isinstance(body, dict) or body.get("code") != "platform_busy":
+        return None
+    detail = body.get("detail")
+    if isinstance(detail, dict):
+        try:
+            return max(1, int(float(detail.get("retry_after_s") or 0)))
+        except (TypeError, ValueError):
+            return 10
+    return 10
+
+
 #: 私有 DNS 后缀。这些域名只在题目容器的网络里能解析。
 _PRIVATE_SUFFIXES = (".internal", ".local", ".lan", ".svc", ".cluster.local")
 
@@ -202,6 +766,47 @@ def is_private_service(svc: dict) -> bool:
     """
     host = (svc.get("host") or "").strip().lower()
     return bool(host) and host.endswith(_PRIVATE_SUFFIXES)
+
+
+def _services_from_entry_urls(detail: dict) -> list[dict]:
+    """把 ``entry_urls`` 变成 ``services`` 形状的条目。
+
+    engagement 题的入口名会放在 ``entry_urls``（``http://portal.xxx.internal``），
+    而 ``attack_surface.services`` 为空——照旧只读 services 就等于把整类题
+    判成"无可直连地址"（SAMPLE-023/024 实测各 4 次全灭）。
+
+    私有后缀标 ``access=vpn``：这是"必须走隧道"的明确证据，_attach 不用再
+    去猜 profile 存不存在。
+
+    Args:
+        detail: ``GET /api/v1/instances/{id}`` 的响应。
+
+    Returns:
+        service 字典列表；``entry_urls`` 缺失或不可解析时为空。
+    """
+    from urllib.parse import urlsplit
+
+    out: list[dict] = []
+    for raw in detail.get("entry_urls") or []:
+        try:
+            parsed = urlsplit(str(raw))
+        except ValueError:
+            continue
+        host = parsed.hostname or ""
+        if not host:
+            continue
+        scheme = parsed.scheme or "http"
+        out.append(
+            {
+                "service_type": scheme,
+                "host": host,
+                "port": parsed.port or (443 if scheme == "https" else 80),
+                "path": parsed.path or "/",
+                "label": host.split(".")[0],
+                "access": "vpn" if host.endswith(_PRIVATE_SUFFIXES) else None,
+            }
+        )
+    return out
 
 
 def _public_url(svc: dict) -> str | None:
@@ -230,6 +835,105 @@ class Client:
         self.token = token
         self.s = requests.Session()
         self.s.headers["Authorization"] = f"Bearer {token}"
+        #: 本进程创建的实例 id。清理只认这份台账——并行跑批时本账号下
+        #: 还活着的别家实例是兄弟车道，不是残留。
+        self.owned: set[str] = set()
+        #: 本进程启动时刻，用来判定"早于我的实例才是尸体"。
+        self.started_at = time.time()
+        #: 最近一次 ``wait_ready`` 看到的本实例**全部** service。多服务题
+        #: （SAMPLE-022 auth+vault）只 bridge 第一个，其余必须进题面简报，
+        #: 否则 agent 只能猜地址。
+        self.endpoints: list[dict] = []
+        #: 显式 competition 覆盖（--competition-id / CTFY_COMPETITION_ID）。
+        #: 非空时 launch 的 payload 直接用它、不走 suite_for()：playground
+        #: 这类 competition 不是 /api/v1/suites 能解析到的普通 suite。
+        self.competition_id = os.environ.get("CTFY_COMPETITION_ID", "").strip()
+        #: ``CTF_REUSE=1``：建不到新实例时接管本队已存在的 ready 实例。
+        #: 正式赛开赛 02:02Z 起写接口连续 503，队里 3 个 ready 实例把配额
+        #: 占满又删不掉——不接管就只能干等 3 小时 TTL。
+        self.reuse = os.environ.get("CTF_REUSE", "").strip().lower() not in ("", "0", "false")
+
+    def adopt(self, challenge_id: str, competition_id: str) -> str | None:
+        """接管一个本队已存在、无人持有的 ready 实例。
+
+        判据（全部来自平台自述 + 本机台账，不猜）：
+        - 同 ``challenge_id``、``status == ready``；
+        - 剩余 TTL > 15 分钟（否则跑一半就到期的实例等于陷阱）；
+        - 台账里**没有活进程**持有它（兄弟车道在用的不能抢）。
+
+        Args:
+            challenge_id: 题号。
+            competition_id: 竞赛 id；空则按题号走 suite 解析。
+
+        Returns:
+            接管的实例 id；没有可接管的返回 None。
+        """
+        params = {"competition_id": competition_id} if competition_id else {}
+        try:
+            r = self.s.get(f"{PLATFORM}/api/v1/instances", params=params, timeout=60)
+        except requests.RequestException as exc:
+            print(f"  [reuse] 实例列表拉取失败：{exc}", flush=True)
+            return None
+        if r.status_code != 200:
+            return None
+        try:
+            items = r.json().get("items") or []
+        except ValueError:
+            return None
+        live = _ledger_live_owners()
+        now = time.time()
+        for it in items:
+            if not isinstance(it, dict):
+                continue
+            iid = str(it.get("id") or "")
+            if not iid or iid in self.owned or iid in live:
+                continue
+            if str(it.get("challenge_id") or "") != challenge_id:
+                continue
+            if str(it.get("status") or "") != "ready":
+                continue
+            try:
+                left = float(it.get("expires_at") or 0) - now
+            except (TypeError, ValueError):
+                continue
+            if left < 900:
+                continue
+            self.owned.add(iid)
+            _ledger_record(iid)
+            print(
+                f"  [reuse] 接管已存在实例 {iid}（剩 {left/60:.0f} 分钟）",
+                flush=True,
+            )
+            return iid
+        return None
+
+    def canary(self) -> tuple[bool, str]:
+        """只读探针：确认 token 至少能读一次实例列表。
+
+        403 有两种完全不同的含义，必须分开：
+        - 响应体含 ``competition_required`` ⇒ 只是缺 competition 作用域，
+          凭据是好的（CLAUDE.md 记过这条误判）；
+        - 其余 401/403 ⇒ 凭据失效/被回收，**这一批一题都不该跑**。
+
+        网络抖动与 5xx 不在这里判死：那是 ``launch`` 的退避重试该处理的事，
+        把一次超时升级成「整批停跑」比漏判更糟。
+
+        Returns:
+            ``(ok, detail)``；``ok=False`` 只代表凭据/权限问题。
+        """
+        params = {"competition_id": self.competition_id} if self.competition_id else {}
+        try:
+            r = self.s.get(f"{PLATFORM}/api/v1/instances", params=params, timeout=30)
+        except requests.RequestException as exc:
+            return True, f"skip:network:{type(exc).__name__}"
+        if r.status_code == 200:
+            return True, "ok"
+        if r.status_code in (401, 403):
+            body = (r.text or "")[:400]
+            if "competition_required" in body:
+                return True, "ok:competition_required"
+            return False, f"auth:{r.status_code}"
+        return True, f"skip:http:{r.status_code}"
 
     def launch(self, challenge_id: str, attempts: int = 5) -> str:
         """起一个实例。先兜底清理残留，再启动，平台故障时退避重试。
@@ -244,37 +948,111 @@ class Client:
         Raises:
             RuntimeError: 重试用尽。
 
-        ⚠️ **起之前必须清残留。** 队伍只有一个实例槽，任何一次被 SIGKILL 的
-        运行都会把实例留在 ``ready`` 状态直到 3 小时 TTL 到期。实测踩过：
-        停掉一轮批量后，后续 11 题全部 429 ``team_capacity_exceeded``，
-        看着像限流，其实是自 leak。
+        ⚠️ **起之前清残留，但只清自己的。** 被 SIGKILL 的运行会把实例留在
+        ``ready`` 状态直到 3 小时 TTL 到期，不删就会 429
+        ``team_capacity_exceeded``（实测踩过：停掉一轮批量后连续 11 题
+        撞这个错）。但正式套件配额是 3，并行时账号下的别的实例是兄弟
+        车道——全账号清理会把它们连根拔掉，靶面变 19 字节 Go 404。
 
         ⚠️ **5xx 要退避重试。** 平台维护期间会连续吐 503，实测一轮 11 题
         全部撞死在 503 上——那不是评测结果，是平台故障，重试才是对的。
         """
         self.reap_orphans()
-        payload = {"challenge_id": challenge_id, "competition_id": suite_for(challenge_id, self.token)}
+        competition_id = self.competition_id or suite_for(challenge_id, self.token)
+        if self.reuse:
+            adopted = self.adopt(challenge_id, competition_id)
+            if adopted:
+                return adopted
+        payload = {"challenge_id": challenge_id, "competition_id": competition_id}
         last = ""
-        for i in range(attempts):
+        tries = 0
+        cap_waited = 0.0
+        busy_waited = 0.0
+        while tries < attempts:
             r = self.s.post(f"{PLATFORM}/api/v1/instances", json=payload, timeout=120)
             if r.status_code < 400:
-                return r.json()["id"]
+                iid = r.json()["id"]
+                self.owned.add(iid)
+                _ledger_record(iid)
+                return iid
             last = f"HTTP {r.status_code}: {r.text[:160]}"
+            paused = _paused_retry_after(r)
+            if paused is not None:
+                # B-24：平台暂停时段。等下一场，不消耗重试预算——这条分支
+                # 一次都还没算过「尝试失败」。
+                if paused > _PAUSED_WAIT_CAP:
+                    raise CompetitionPausedError(paused)
+                print(
+                    f"  [paused] 平台暂停中，{paused}s 后恢复 → 等待（不消耗重试）",
+                    flush=True,
+                )
+                time.sleep(paused + 5)
+                continue
+            busy = _busy_retry_after(r)
+            if busy is not None and busy_waited < _BUSY_WAIT_CAP:
+                # 开赛过载：照平台给的 retry_after_s 等，不消耗重试预算。
+                # 只有累计等待超过 _BUSY_WAIT_CAP 才退回普通重试/放弃。
+                #
+                # 下限 20s + 抖动：几百支队伍都在按 retry_after_s 打同一个
+                # 写接口，跟着平台给的秒数精确重试等于参与踩踏。拉长间隔
+                # 反而更容易排上（02:22Z 那次成功就是隔了更久）。
+                wait = min(120, max(busy, 20) + random.uniform(0, 8))
+                busy_waited += wait
+                print(
+                    f"  [busy] 平台过载（platform_busy），等 {wait}s 再试"
+                    f"（累计 {busy_waited:.0f}s/{_BUSY_WAIT_CAP}，不消耗重试）",
+                    flush=True,
+                )
+                time.sleep(wait)
+                continue
             if r.status_code not in (429, 500, 502, 503, 504):
                 r.raise_for_status()
-            wait = min(60, 10 * (2**i))
-            print(f"  [retry {i+1}/{attempts}] {last} → 等 {wait}s", flush=True)
+            if r.status_code == 429 and "team_capacity_exceeded" in r.text:
+                # 配额满了。最常见的原因不是真的并发，而是**上一题刚删、
+                # 平台还在异步销毁**（CYBENCH cap=1 实测：每题白等 10+20+40s）。
+                # 这一段等待不消耗重试预算——它不是「尝试失败」，等的是
+                # 平台把上一个实例真正销毁完。
+                self.reap_orphans(include_stale=True)
+                wait = self._capacity_backoff(r.text, cap_waited)
+                if wait:
+                    cap_waited += wait
+                    print(
+                        f"  [capacity] 配额满（{_capacity_note(r.text)}），"
+                        f"等 {wait:.0f}s 再试（累计 {cap_waited:.0f}s/180s，不消耗重试）",
+                        flush=True,
+                    )
+                    time.sleep(wait)
+                    continue
+            wait = min(60, 10 * (2**tries))
+            print(f"  [retry {tries+1}/{attempts}] {last} → 等 {wait}s", flush=True)
             if r.status_code == 429:
-                self.reap_orphans()
+                # 真到顶了才把范围放到"早于本进程启动"的尸体上。
+                self.reap_orphans(include_stale=True)
             time.sleep(wait)
+            tries += 1
         msg = f"启动实例失败（重试 {attempts} 次）：{last}"
-        raise RuntimeError(msg)
+        raise LaunchError(msg)
 
-    def reap_orphans(self) -> list[str]:
-        """删掉所有本账号名下仍在运行的实例，返回被删的 id。
+    def reap_orphans(self, include_stale: bool = False) -> list[str]:
+        """清理**本进程**留下的实例，返回被删的 id。
 
-        批量评测是串行的，任何时刻都不该有第二个实例存活——所以"有实例"
-        就等于"上一轮泄漏了"。清理是安全的，不会误删正在跑的题。
+        并行跑批时同 token 下同时活着多个实例是正常状态（正式套件配额实测
+        为 3），所以"账号下有实例" **不等于** "上一轮泄漏"。盲删会拔掉兄弟
+        车道的靶机，靶面退回 19 字节 ``404 page not found``。
+
+        清理范围按所有权收敛：
+
+        1. ``self.owned`` 里的实例（本进程起的）；
+        2. ``include_stale=True`` 时，额外删**所有权台账里主人进程已死**的
+           实例——那才是上次运行留下、不会有人再提交的尸体。台账主人还
+           活着的、以及根本没登记的实例，一律不碰。
+
+        Args:
+            include_stale: 是否放宽到本进程启动前的实例（只在真正撞上
+                ``team_capacity_exceeded`` 时才该为 True）。
+
+        Returns:
+            被删掉的实例 id。
         """
         reaped: list[str] = []
         try:
@@ -285,15 +1063,24 @@ class Client:
         except (requests.RequestException, json.JSONDecodeError):
             return reaped
 
-        for inst in data.get("items", []):
-            if inst.get("status") in {"ready", "starting"}:
+        items = data.get("items", [])
+        targets = set(self.owned)
+        if include_stale:
+            # B-27：只认台账证明得了的死亡主人。旧实现按"早于本进程
+            # 启动"判定，并行车道几乎同时起跑，兄弟同样早于我 → 被拔掉，
+            # 该车道后面所有 /check、/submissions 全部 instance_not_found。
+            targets |= _ledger_dead_ids()
+
+        for inst in items:
+            if inst.get("id") in targets and inst.get("status") in {"ready", "starting"}:
                 self.teardown(inst["id"])
                 reaped.append(inst["id"])
         if reaped:
-            print(f"  [reap] 清理残留实例 {len(reaped)} 个", flush=True)
+            print(f"  [reap] 清理本进程残留实例 {len(reaped)} 个", flush=True)
             # 删除是**异步**的：平台返回 200 时节点可能还在销毁，紧接着起新实例会
             # 撞 `team_capacity_exceeded`。027 就这样连吃两次 429，白等 100 秒。
-            # 这里等到列表真的空了再走。
+            # 这里只等**被删的那几个**真的消失——不能等"列表为空"：并行时
+            # 兄弟车道的实例一直都在，等空等于每轮白等 60 秒。
             deadline = time.time() + 60
             while time.time() < deadline:
                 time.sleep(3)
@@ -304,9 +1091,41 @@ class Client:
                     left = json.loads(r.text, strict=False).get("items", [])
                 except (requests.RequestException, json.JSONDecodeError):
                     continue
-                if not any(i.get("status") in {"ready", "starting"} for i in left):
+                still = [
+                    i.get("id")
+                    for i in left
+                    if i.get("id") in targets and i.get("status") in {"ready", "starting"}
+                ]
+                if not still:
                     break
         return reaped
+
+    def _capacity_backoff(self, detail: str, waited: float, timeout: float = 180.0) -> float:
+        """配额满时该睡多久；0 表示别等，交给退避逻辑。
+
+        ⚠️ **不能靠 ``GET /instances`` 判断槽位空没空。** 平台删实例是异步
+        的：``DELETE`` 返回 200 后节点进入 ``still stopping``，此时它已经从
+        列表里消失，但**仍然占着配额**——429 文案里写得明明白白
+        ``(0 running, 1 still stopping)``。第一版按列表判空，两题当场连撞
+        5 次 429 判错（CYBENCH-028/037，2026-11-13 实测），比原来的退避还差。
+
+        唯一可靠的信号是 POST 自己的 429 文案，所以这里只根据文案给一个
+        固定步长，由调用方重发 POST 去探。
+
+        Args:
+            detail: 429 响应体文本。
+            waited: 本轮已经为配额等过的秒数（调用方累计）。
+            timeout: 单题最多为配额等多久。
+
+        Returns:
+            下一次重试前应睡的秒数；0 表示不再等。
+        """
+        if "Max " not in (detail or ""):
+            return 0.0
+        remaining = timeout - waited
+        if remaining <= 0:
+            return 0.0
+        return float(min(10.0, remaining))
 
     def vpn_config(self, iid: str) -> str:
         """拉实例级 WireGuard profile。
@@ -323,11 +1142,38 @@ class Client:
             )
             if r.status_code == 200:
                 return r.text
-        except requests.RequestException:
-            pass
+            # 别把「平台过载」和「这题真没 profile」混成一句空串：正式赛
+            # 开赛期间 5xx 很常见，判据必须能自证是哪种（否则只能靠猜，
+            # 02:22Z 就是这么丢掉一整道的）。
+            print(
+                f"  [vpn] profile 端点 HTTP {r.status_code}"
+                f"：{r.text[:120]}",
+                flush=True,
+            )
+        except requests.RequestException as exc:
+            print(f"  [vpn] profile 拉取异常：{exc}", flush=True)
         return ""
 
-    def wait_ready(self, iid: str, timeout: int = 180) -> str:
+    def instance(self, iid: str) -> dict:
+        """``GET /instances/{id}``：status 不带的 ``entry_urls``/``services`` 在这。
+
+        Args:
+            iid: 实例 id。
+
+        Returns:
+            响应字典；失败时返回空字典（调用方按"没有额外信息"处理）。
+        """
+        try:
+            r = self.s.get(f"{PLATFORM}/api/v1/instances/{iid}", timeout=40)
+            if r.status_code == 200:
+                body = r.json()
+                if isinstance(body, dict):
+                    return body
+        except (requests.RequestException, ValueError):
+            pass
+        return {}
+
+    def wait_ready(self, iid: str, timeout: int = 600) -> str:
         """轮询到 ready，返回可访问的靶机 URL。
 
         Raises:
@@ -338,13 +1184,47 @@ class Client:
         才能解析，从评测机直连是 100% 失败。实测过：CTFARENA-052 就是这样，
         白烧了一整轮预算。所以这里必须校验地址形态，不可用就立刻抛错换题。
         """
-        deadline = time.time() + timeout
+        self.endpoints = []
+        started = time.time()
+        deadline = started + timeout
+        last_note = started
         while time.time() < deadline:
+            if time.time() - last_note >= 60:
+                # 017/018 实测启动要 4–6 分钟（远超旧的 180/300s 上限），
+                # 没有进度行时看起来像"卡死"，实际是平台在排节点。
+                last_note = time.time()
+                print(f"  [wait] {int(last_note - started)}s 仍未就绪…", flush=True)
             r = self.s.get(f"{PLATFORM}/api/v1/instances/{iid}/status", timeout=40)
             if r.status_code == 200:
                 d = r.json()
                 if d.get("status") == "ready":
-                    services = (d.get("attack_surface") or {}).get("services") or []
+                    surface = d.get("attack_surface") or {}
+                    services = surface.get("services") or []
+                    if not services:
+                        # 纯附件题（SAMPLE-017/018）：实例只下发文件、不起服务，
+                        # start_timeline 停在 attachments。旧码在这里等满
+                        # 180/300s 再判「实例未就绪」，把一整类题当基础设施故障。
+                        if surface.get("provided_files") and not surface.get(
+                            "estate_names"
+                        ):
+                            self.endpoints = []
+                            return {
+                                "service_type": "file",
+                                "host": "",
+                                "port": 0,
+                                "access": "files",
+                            }
+                    if not services:
+                        # B-20：ready 不等于 estate 已接通。详情端点先给
+                        # services，再退到 entry_urls；两者都空就继续等，
+                        # 不能在第一瞬间判死并把实例拆掉（023/024 四次全灭）。
+                        detail = self.instance(iid)
+                        services = detail.get("services") or []
+                        if not services:
+                            services = _services_from_entry_urls(detail)
+                        if not services:
+                            time.sleep(2)
+                            continue
                     for svc in services:
                         # TCP 题没有"URL"：桥起来之后 agent 看到的是
                         # 127.0.0.1:PORT。这里仍然先确认它有一个**可达地址**
@@ -355,16 +1235,29 @@ class Client:
                         if is_private_service(svc):
                             # service 级 access 不是唯一证据：实例级 /vpn-config
                             # 非空同样说明隧道可用（052 的 access=null，profile 有 277B）。
-                            if (
-                                str(svc.get("access") or "").lower() in _VPN_ACCESS
-                                or self.vpn_config(iid).strip()
-                            ):
+                            #
+                            # ⚠️ profile 是 **ready 之后几秒** 才签发的（B-20）。
+                            # 2026-11-14 02:13Z 实测：本处只读一眼，空就 continue，
+                            # 整题被判「无可直连地址」跳过——而 _attach 里同一份
+                            # profile 有 6×5s 重试。两处必须同口径，否则正式赛
+                            # 的 vpn 题会被自己的判据整类丢掉。
+                            vpn_ok = str(svc.get("access") or "").lower() in _VPN_ACCESS
+                            if not vpn_ok:
+                                for _ in range(12):
+                                    if self.vpn_config(iid).strip():
+                                        vpn_ok = True
+                                        break
+                                    time.sleep(5)
+                            if vpn_ok:
+                                self.endpoints = list(services)
                                 return svc
                             continue
                         if is_tcp_service(svc):
+                            self.endpoints = list(services)
                             return svc
                         url = _public_url(svc)
                         if url:
+                            self.endpoints = list(services)
                             return url
                     names = [s.get("host") for s in services]
                     msg = f"instance {iid} 无可直连地址（需要隧道？）services={names}"
@@ -427,6 +1320,127 @@ class Client:
         )
         return r.json()
 
+    def list_attachments(self, cid: str) -> list[dict]:
+        """挑战附件清单：``GET /api/v1/challenges/{id}/attachments``。
+
+        CTFY-0001 §1.2 说附件会在启动时投进 ``/ctfy/work/attachments/``，
+        但**评测 harness 路径没有平台投递**——本仓库的 batch_eval 起的是
+        自己的沙箱，不做这一步，于是 003/005/017/018/021 这类附件题对
+        agent 等于「题面提到一个文件，文件不存在」。这里补上。
+        """
+        try:
+            r = self.s.get(
+                f"{PLATFORM}/api/v1/challenges/{cid}/attachments", timeout=30
+            )
+            data = r.json()
+        except (requests.RequestException, ValueError):
+            return []
+        files = data.get("files") if isinstance(data, dict) else None
+        return [f for f in (files or []) if isinstance(f, dict) and f.get("name")]
+
+    def fetch_attachments(self, cid: str, cap_bytes: int = 64 * 1024 * 1024) -> dict[str, bytes]:
+        """把本题附件全部取回内存（名字 → 内容）。
+
+        总量封顶：附件是题目给的，不是攻击面；一次 run 往沙箱里塞几百 MB
+        会把 agent 的 ``ls``/``find`` 全部拖慢。超限的直接放弃并在记录里留痕。
+        """
+        out: dict[str, bytes] = {}
+        total = 0
+        for meta in self.list_attachments(cid):
+            name = str(meta["name"])
+            try:
+                r = self.s.get(
+                    f"{PLATFORM}/api/v1/challenges/{cid}/attachments/{name}",
+                    timeout=60,
+                )
+            except requests.RequestException:
+                continue
+            if r.status_code != 200:
+                continue
+            body = r.content
+            if total + len(body) > cap_bytes:
+                continue
+            out[name] = body
+            total += len(body)
+        return out
+
+    def qa_submit(self, challenge_id: str, qid: str, answer: str) -> dict:
+        """QA 题库题提交（无实例）。``POST /api/v1/qa/submissions``。
+
+        平台原文（CTFY-0001 §2）：qa 模式没有实例，答案走这条路由，
+        body 必须带 ``challenge_id`` + ``competition_id`` + ``question_id``。
+        """
+        try:
+            r = self.s.post(
+                f"{PLATFORM}/api/v1/qa/submissions",
+                json={
+                    "challenge_id": challenge_id,
+                    "competition_id": self.competition_id,
+                    "question_id": qid,
+                    "answer": answer,
+                },
+                timeout=60,
+            )
+            body = r.json()
+        except (requests.RequestException, ValueError) as exc:
+            return {"error": f"{type(exc).__name__}: {str(exc)[:120]}"}
+        return body if isinstance(body, dict) else {}
+
+    def check(self, iid: str, qid: str) -> dict:
+        """让侧车按靶机当前状态裁决一道 checker 题（"Verify exploit"）。
+
+        checker 题（deface / outage / persist）没有 flag 字符串：交付的是
+        靶机副作用，平台在 ``POST /instances/{id}/check`` 里读状态裁决，并把
+        结果记成 ``claimed="<checker>"``。往 ``/submissions`` 交值对这类题
+        恒判否（SAMPLE-006/007/008 实测：一次都没走对通道）。
+        """
+        try:
+            r = self.s.post(
+                f"{PLATFORM}/api/v1/instances/{iid}/check",
+                json={"question_id": qid},
+                timeout=60,
+            )
+            body = r.json()
+        except (requests.RequestException, ValueError):
+            return {}
+        return body if isinstance(body, dict) else {}
+
+    def verify(self, iid: str, answer: str, qid: str = "flag") -> bool | None:
+        """Ask the platform's checker whether ``answer`` is right — without submitting.
+
+        Why this exists: the extractor is deliberately broad now (any label-shaped
+        prefix), so ``div{margin}`` and other source-code artefacts reach the
+        submission path.  The platform's own checker is the only authority on
+        which of them is a real answer, and this endpoint does **not** consume
+        ``attempts_remaining``, so asking first is free.
+
+        Args:
+            iid: instance id.
+            answer: one candidate answer.
+            qid: question id.
+
+        Returns:
+            True/False from ``body["correct"]``; ``None`` when the endpoint is
+            missing, errors, returns non-2xx, returns non-JSON, or omits
+            ``correct``.  Callers treat ``None`` as "no precheck available"
+            (fail-open) rather than "wrong".
+        """
+        try:
+            r = self.s.post(
+                f"{PLATFORM}/api/v1/instances/{iid}/verify-answer",
+                json={"question_id": qid, "answer": answer},
+                timeout=30,
+            )
+            if not 200 <= r.status_code < 300:
+                return None
+            body = r.json()
+        except Exception:  # noqa: BLE001 — a precheck must never break scoring
+            return None
+        if not isinstance(body, dict):
+            return None
+        correct = body.get("correct")
+        return correct if isinstance(correct, bool) else None
+
     def detail(self, challenge_id: str) -> dict:
         """取题目详情（描述 + 标签）。拿不到就返回空字典，不阻断评测。
 
@@ -470,10 +1484,18 @@ class Client:
         has 115 challenges.
         """
         offset = 0
+        # 已显式给了 competition id 就不要再去猜前缀：开赛时前缀可能是新的
+        # （`/api/v1/suites` 又不一定可达），而父进程 `compete.py` 早就知道
+        # 这道题属于哪个竞赛。这是接线缺口，不是能力问题。
+        # 解析失败仍返回空表、由调用方退回单题详情接口——这条路只是锦上添花。
+        try:
+            suite_id = self.competition_id or suite_for(challenge_id, self.token)
+        except RoutingError:
+            return {}
         for _ in range(10):
             try:
                 r = self.s.get(
-                    f"{PLATFORM}/api/v1/competitions/{suite_for(challenge_id, self.token)}/challenges",
+                    f"{PLATFORM}/api/v1/competitions/{suite_id}/challenges",
                     params={"limit": 200, "offset": offset},
                     timeout=40,
                 )
@@ -490,11 +1512,193 @@ class Client:
             offset += len(items)
         return {}
 
-    def teardown(self, iid: str) -> None:
+    def hints(self, challenge_id: str) -> dict:
+        """取本题的 hint 分层（只读）。任何失败都返回 ``{}``。
+
+        两条入口都试：协议文档说 MCP 工具是 REST 的投影（`docs/08` §mcp.json），
+        所以先打 REST；404/405 再退 MCP JSON-RPC。两条都不通就静默——hint 是
+        锦上添花，平台没开这个口子不能让整次尝试崩掉。
+        """
+        competition = self.competition_id
+        if competition:
+            url = (
+                f"{PLATFORM}/api/v1/competitions/{competition}"
+                f"/challenges/{challenge_id}/hints"
+            )
+            try:
+                r = self.s.get(url, timeout=20)
+                if r.status_code == 200:
+                    return _hint_payload(r)
+            except (requests.RequestException, ValueError):
+                pass
+        return self._mcp_tool(
+            "list_hints",
+            {"competition_id": competition, "challenge_id": challenge_id},
+        )
+
+    def _mcp_tool(self, name: str, arguments: dict, timeout: int = 25) -> dict:
+        """一次 MCP ``tools/call``，返回结果对象；失败返回 ``{}``。"""
+        body = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {"name": name, "arguments": arguments},
+        }
         try:
-            self.s.delete(f"{PLATFORM}/api/v1/instances/{iid}", timeout=90)
+            r = self.s.post(
+                f"{PLATFORM}/api/v1/mcp/",
+                json=body,
+                timeout=timeout,
+                headers={"Accept": "application/json, text/event-stream"},
+            )
         except requests.RequestException:
-            pass  # 删不掉不算错，TTL 会兜底
+            return {}
+        if r.status_code != 200:
+            return {}
+        return _mcp_result(r.text, r.headers.get("Content-Type", ""))
+
+    def fetch_instance_attachments(
+        self, iid: str, cap_bytes: int = 64 * 1024 * 1024
+    ) -> dict[str, bytes]:
+        """下载**实例下发**的附件（纯附件题的唯一输入）。
+
+        SAMPLE-017/018 实测：挑战级 attachments 只有 README/说明，真正的
+        payload（``checkin`` 二进制、``welcome.txt``）挂在实例上，走
+        ``/api/v1/instances/{iid}/attachments``，挑战接口下载不到。
+        """
+        out: dict[str, bytes] = {}
+        try:
+            r = self.s.get(
+                f"{PLATFORM}/api/v1/instances/{iid}/attachments", timeout=40
+            )
+            if r.status_code >= 400:
+                return out
+            data = r.json()
+            files = data.get("files") if isinstance(data, dict) else data
+        except (requests.RequestException, ValueError):
+            return out
+        for item in files or []:
+            name = item.get("name") if isinstance(item, dict) else str(item)
+            if not name:
+                continue
+            try:
+                rr = self.s.get(
+                    f"{PLATFORM}/api/v1/instances/{iid}/attachments/{name}",
+                    timeout=120,
+                )
+            except requests.RequestException:
+                continue
+            if rr.status_code != 200 or len(rr.content) > cap_bytes:
+                continue
+            out[name] = rr.content
+        return out
+
+    def teardown(self, iid: str) -> None:
+        """删实例。5xx 重试；**删成功才注销台账**。
+
+        实测踩过（2026-11-14 02:13–02:21Z）：收尾时平台 503，旧实现无论
+        成败都 ``_ledger_forget``。于是正式赛积累出 3 个 ready 僵尸实例，
+        正好占满配额 3，而台账里一条记录都没有——下一次 ``reap_orphans``
+        无从回收，只能等 3 小时 TTL。台账是所有权凭据，不能在没删掉时丢。
+
+        Args:
+            iid: 实例 id。
+        """
+        ok = False
+        for attempt in range(6):
+            try:
+                r = self.s.delete(f"{PLATFORM}/api/v1/instances/{iid}", timeout=90)
+                if r.status_code < 400 or r.status_code == 404:
+                    ok = True
+                    break
+                if r.status_code < 500 and r.status_code != 429:
+                    break  # 4xx 不是抖动，重试也不会变
+            except requests.RequestException:
+                pass
+            time.sleep(min(20, 5 * (attempt + 1)))
+        self.owned.discard(iid)
+        if ok:
+            _ledger_forget(iid)
+            return
+        print(
+            f"  [teardown] {iid} 删除未确认（平台 5xx/网络），保留台账待下次回收",
+            flush=True,
+        )
+
+
+#: 传输层异常的判定词：限定名里出现这些子串即视为 LLM 链路/socket 级崩溃。
+#: 机制级名单（按模块前缀 + 常见异常名），不针对任何具体题或具体文案。
+_TRANSPORT_MARKS = (
+    "httpx.",
+    "httpcore.",
+    "anyio.",
+    "openai.",
+    "litellm.",
+    "ssl.SSLError",
+    "ConnectionError",
+    "ConnectionResetError",
+    "ConnectionAbortedError",
+    "BrokenPipeError",
+    "TimeoutError",
+    "ReadError",
+    "WriteError",
+    "ConnectError",
+    "ConnectTimeout",
+    "ReadTimeout",
+    "WriteTimeout",
+    "RemoteProtocolError",
+    "LocalProtocolError",
+    "ProtocolError",
+    "IncompleteRead",
+    "SocketError",
+)
+
+
+def _is_transport_error(qualified_type: str) -> bool:
+    """异常限定名是否属于传输层（LLM 链路 / socket）崩溃。
+
+    Args:
+        qualified_type: ``[run-error]`` 行解析出的 ``module.TypeName``。
+
+    Returns:
+        属于传输层返回 True，该 run 在结果表里记 ``transport:<type>``，
+        与"能力不足的正常失败"区分开。
+    """
+    return any(mark in qualified_type for mark in _TRANSPORT_MARKS)
+
+
+def _crash_error(log: str) -> tuple[str, str] | None:
+    """从 run.log 文本解析子进程崩溃标记，返回 ``(error, detail)``。
+
+    标记来源有两处：``run_strix_ctf.py`` 异常收场时打的 ``[run-error]``
+    行，以及 ``run_agent`` 在子进程负/异常退出码时打的 ``[agent-exit]``
+    行。轮次打满（``MaxTurnsExceeded``）是正常收场，返回 ``None``。
+
+    Args:
+        log: 子进程完整日志文本。
+
+    Returns:
+        ``(error, detail)``；detail 可能为空串。没有崩溃标记时返回 None。
+    """
+    m_err = re.search(r"^\[run-error\] ([\w.]+): (.*)$", log, re.M)
+    m_rc = re.search(r"^\[agent-exit\] rc=(-?\d+)$", log, re.M)
+    if m_err:
+        etype = m_err.group(1)
+        if "MaxTurnsExceeded" in etype:
+            return None  # 轮次打满是收场，不是错误
+        detail = m_err.group(2)[:300]
+        if _is_transport_error(etype):
+            return f"transport:{etype}", detail
+        return f"crash:{etype}", detail
+    if m_rc:
+        if int(m_rc.group(1)) == _preflight_exit_rc() and _PREFLIGHT_MARK in log:
+            # 「没跑起来」不是崩溃。rc=3 已经由 _stop_reason_of 归因为
+            # llm_unreachable / credential_failure / misconfigured；这里再
+            # 写一条 agent-exit:rc3，下一轮提示就会读到「异常：agent-exit:rc3」，
+            # 把拒绝出跑重新说成代码炸了（Codex 复核 N3）。
+            return None
+        return f"agent-exit:rc{m_rc.group(1)}", ""
+    return None
 
 
 def _probe_tcp(endpoint: str, attempts: int = 3) -> tuple[bool, str]:
@@ -565,6 +1769,18 @@ _GUARD_LINE_RE = re.compile(
     r"prompts=(\d+) \| finish: refused=(\d+)"
 )
 
+#: Stall diagnostics, appended after every existing field.  Optional on purpose:
+#: logs written before 2026-11-15 do not carry the suffix, and a parser that
+#: insists on it would make every archived run unreadable.
+_STALL_LINE_RE = re.compile(
+    r"\| stall: max=(\d+) hits=(\d+) class_max=(\d+) class_hits=(\d+)"
+)
+
+#: Mechanism-class counts, printed between the finish fields and the stall
+#: suffix. Optional on purpose: archived lines predate the field, and the
+#: sidecar is the fallback for a run killed before its summary line.
+_MECH_LINE_RE = re.compile(r"\| mechanisms: ([^|\n]+)")
+
 
 def _int_field(value: object) -> int:
     """把 JSON 里的计数安全转成 int（缺失/None/坏值都记 0）。"""
@@ -572,6 +1788,61 @@ def _int_field(value: object) -> int:
         return int(value)  # type: ignore[arg-type]
     except (TypeError, ValueError):
         return 0
+
+
+def _stall_fields(block: object) -> dict[str, int]:
+    """Read the stall diagnostics from the sidecar, tolerating an old file."""
+    if not isinstance(block, dict):
+        return {"stall_max": 0, "stall_hits": 0, "class_max": 0, "class_hits": 0}
+    return {
+        "stall_max": _int_field(block.get("max")),
+        "stall_hits": _int_field(block.get("hits")),
+        "class_max": _int_field(block.get("class_max")),
+        "class_hits": _int_field(block.get("class_hits")),
+    }
+
+
+def _mechanism_fields(state: object) -> dict[str, object]:
+    """从 sidecar 里抬出机制类别计数与台账写入次数。
+
+    ``mechanisms`` 说的是这一场到底碰了哪些 CAPEC 类别；不抬进结果行，
+    就只能靠离线重放 transcript 才能恢复，"整场待在一个类别里"和"守卫
+    根本没装"在表上长得一样。旧 sidecar 没有这两个键，读成"没观测到"，
+    不是错误。
+    """
+    out: dict[str, object] = {"mechanisms": {}, "ledger_injections": 0}
+    if not isinstance(state, dict):
+        return out
+    body = state.get("mechanisms")
+    if isinstance(body, dict):
+        counts = {
+            str(name): _int_field(count)
+            for name, count in body.items()
+            if str(name).strip()
+        }
+        if counts:
+            out["mechanisms"] = counts
+    finish = state.get("finish")
+    if isinstance(finish, dict):
+        out["ledger_injections"] = _int_field(finish.get("ledger_injections"))
+    return out
+
+
+def _parse_mechanism_line(log: str) -> dict[str, int]:
+    """解析冻结汇总行里的 ``| mechanisms: name=count,...`` 段。"""
+    m = _MECH_LINE_RE.search(log)
+    if not m:
+        return {}
+    body = m.group(1).strip()
+    if not body or body in {"(none)", "none"}:
+        return {}
+    counts: dict[str, int] = {}
+    for part in body.split(","):
+        name, sep, value = part.partition("=")
+        name = name.strip()
+        if sep and name:
+            counts[name] = _int_field(value)
+    return counts
 
 
 def _parse_guard(
@@ -609,6 +1880,12 @@ def _parse_guard(
         "journey_hits": log.count("USER JOURNEY GUARD"),
         "finish_refused": 0,
         "finish_hits": log.count("REFUSED: this summary"),
+        "stall_max": 0,
+        "stall_hits": 0,
+        "class_max": 0,
+        "class_hits": 0,
+        "mechanisms": {},
+        "ledger_injections": 0,
         **v11_fields(None),
     }
     m = _GUARD_LINE_RE.search(log)
@@ -623,11 +1900,29 @@ def _parse_guard(
             journey_prompts=int(m.group(7)),
             finish_refused=int(m.group(8)),
         )
+        stall = _STALL_LINE_RE.search(log)
+        if stall:
+            out.update(
+                stall_max=int(stall.group(1)),
+                stall_hits=int(stall.group(2)),
+                class_max=int(stall.group(3)),
+                class_hits=int(stall.group(4)),
+            )
         # reach=0 说明守卫一次都没被调用过——这一题的守卫数据全是废的，
         # 不能当成"行为良好"的证据。标出来，免得又被读成"今天没触发"。
         out["mount_broken"] = out["reach"] == 0
         # v1.1 counters are only in the sidecar; the line format is frozen.
-        out.update(v11_fields(read_state(guard_state)))
+        state = read_state(guard_state)
+        out.update(v11_fields(state))
+        # The mechanism breakdown is on the line but was never lifted into the
+        # result row; the sidecar carries it too and wins when they disagree.
+        line_mechanisms = _parse_mechanism_line(log)
+        if line_mechanisms:
+            out["mechanisms"] = line_mechanisms
+        sidecar_mechanisms = _mechanism_fields(state)
+        if sidecar_mechanisms["mechanisms"]:
+            out["mechanisms"] = sidecar_mechanisms["mechanisms"]
+        out["ledger_injections"] = sidecar_mechanisms["ledger_injections"]
         return out
 
     state = read_state(guard_state)
@@ -652,6 +1947,8 @@ def _parse_guard(
         journey_payloads=_int_field(journey.get("payloads")),
         journey_prompts=_int_field(journey.get("prompts")),
         finish_refused=_int_field(finish.get("refused")),
+        **_stall_fields(state.get("stall")),
+        **_mechanism_fields(state),
         **v11_fields(state),
     )
     # 文件存在时只看启动时 verify_mount 的结果：True→装好了；False→没装上。
@@ -659,15 +1956,23 @@ def _parse_guard(
     return out
 
 
-def _proxy_blackhole(target: str) -> dict[str, str]:
+def _proxy_blackhole(
+    target: str, extra_hosts: list[str] | tuple[str, ...] = ()
+) -> dict[str, str]:
     """把"外网不可达"从"卡 60 秒"变成"立刻拒绝"。
 
     只做一件事：把 HTTP(S)_PROXY 指到一个关闭的本地端口，并用 NO_PROXY
     放行本题靶机与 LLM 网关。这样 agent 再想 `curl github.com/...` 会拿到
     瞬时 connection refused，而不是挂满超时——两者对模型的信息量完全不同。
 
+    ⚠️ 多服务题必须把**每个** service 主机都放行，不只是接成主目标的那一个。
+    064 实测：第二个服务（包索引）与主靶机同一个 IP，因为不在白名单里，被
+    自家黑洞代理吞成瞬时拒绝，pip 重试 5 次共 30s；agent 又花一轮诊断代理，
+    才用 ``--noproxy '*'`` 打通。
+
     Args:
         target: 本题靶机地址（URL 或 host:port）。
+        extra_hosts: 同一实例的其余 service 主机名（``Client.endpoints``）。
 
     Returns:
         可直接并入子进程环境变量的字典。
@@ -678,12 +1983,31 @@ def _proxy_blackhole(target: str) -> dict[str, str]:
     host = urlsplit(target if "://" in target else f"//{target}").hostname
     if host:
         allowed.append(host)
+    for extra in extra_hosts:
+        extra = str(extra or "").strip()
+        if extra:
+            allowed.append(extra)
     llm_host = urlsplit(os.environ.get("LLM_API_BASE", "")).hostname
     if llm_host:
         allowed.append(llm_host)
     allowed.extend(
         h.strip() for h in os.environ.get("CTF_NO_PROXY_EXTRA", "").split(",") if h.strip()
     )
+    # 宿主机出站坏掉时的兜底：``CTF_EGRESS_PROXY`` 指向一个带白名单的中转
+    # 代理（只有靶场/LLM/平台能过，其余 403），语义仍是「无外网」，只是把
+    # 直连换成经宿主转发。此时 NO_PROXY 只能留回环——靶机与 LLM 也要走代理，
+    # 否则又退回那条坏掉的直连。
+    relay = os.environ.get("CTF_EGRESS_PROXY", "").strip()
+    if relay:
+        no_proxy = "localhost,127.0.0.1,::1"
+        return {
+            "HTTP_PROXY": relay,
+            "HTTPS_PROXY": relay,
+            "http_proxy": relay,
+            "https_proxy": relay,
+            "NO_PROXY": no_proxy,
+            "no_proxy": no_proxy,
+        }
     no_proxy = ",".join(dict.fromkeys(allowed))
     dead = "http://127.0.0.1:9"
     return {
@@ -694,6 +2018,32 @@ def _proxy_blackhole(target: str) -> dict[str, str]:
         "NO_PROXY": no_proxy,
         "no_proxy": no_proxy,
     }
+
+
+def _allow_platform_in_no_proxy(env: dict[str, str], platform: str) -> None:
+    """子进程代理黑洞放行平台域名（B-4 断链1 接线的隐藏坑）。
+
+    ``_proxy_blackhole`` 只放行靶机与 LLM 网关；agent 侧 autosubmit 的提交
+    请求要打平台 API——不放行等于接线接了个寂寞：提交全被黑洞代理吞成
+    瞬时 connection refused，日志上看着像「平台拒绝」，其实是自己人拦的。
+
+    Args:
+        env: 子进程环境变量字典（就地修改 NO_PROXY/no_proxy，幂等）。
+        platform: 平台 base URL（如 ``https://ctfy.tsinghua.edu.cn``）。
+    """
+    from urllib.parse import urlsplit
+
+    if os.environ.get("CTF_EGRESS_PROXY", "").strip():
+        # 走中转代理时白名单在代理端判，NO_PROXY 里加平台反而会退回坏直连。
+        return
+    host = (urlsplit(platform).hostname or "").strip()
+    if not host:
+        return
+    for key in ("NO_PROXY", "no_proxy"):
+        cur = [h.strip() for h in env.get(key, "").split(",") if h.strip()]
+        if host not in cur:
+            cur.append(host)
+        env[key] = ",".join(cur)
 
 
 def _new_run_id(cid: str) -> str:
@@ -845,6 +2195,72 @@ def _guard_state_path(name: str, root: str | Path | None = None) -> Path:
     """
     base = Path(root) if root is not None else Path(_BOX_ROOT)
     return base / name / "guard_state.json"
+
+
+def _submit_sidecar_path(name: str, root: str | Path | None = None) -> Path:
+    """autosubmit 裁决 sidecar 的宿主路径（与 ``CTF_SUBMIT_PATH`` 同源）。"""
+    base = Path(root) if root is not None else Path(_BOX_ROOT)
+    return base / name / "submit.json"
+
+
+def _read_submit_sidecar(path: Path) -> dict:
+    """回读 in-run autosubmit 的裁决；读不到返回空字典。"""
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _merge_sidecar_verdict(rec: dict, side: dict) -> None:
+    """把 run 内 autosubmit 的裁决并进父进程的记录（就地改 ``rec``）。
+
+    平台自己说的「全解了」优先于父进程事后重放——实例已被 delete，事后
+    重放必然被拒，那是传输层的假否，不是题目判否。SAMPLE-007 实测同一
+    条记录同时出现 ``answers_ok=False`` 与 ``correct=True``，看报表的人
+    会以为是失败。
+    """
+    if not side:
+        return
+    rec["autosubmit_verdict"] = {
+        "tried": len(side.get("tried") or []),
+        "correct": [str(x)[:120] for x in (side.get("correct") or [])][:5],
+        "fully_solved": bool(side.get("challenge_fully_solved")),
+        "unlocked": [str(x) for x in (side.get("unlocked") or [])],
+        "skipped": side.get("skipped"),
+    }
+    if not (side.get("challenge_fully_solved") and not rec.get("correct")):
+        return
+    rec["correct"] = True
+    rec["solved_by"] = "in_run_autosubmit"
+    ok = rec.setdefault("answers_ok", {})
+    rejected = rec.get("answers_rejected")
+    for item in side.get("correct") or []:
+        qid = str(item).split("=", 1)[0]
+        ok[qid] = True
+        if isinstance(rejected, dict):
+            rejected.pop(qid, None)
+    if isinstance(rejected, dict) and not rejected:
+        rec.pop("answers_rejected", None)
+
+
+def _stall_markers_path(name: str, root: str | Path | None = None) -> Path:
+    """停滞标记文件路径，与 :func:`_fresh_box` 的沙箱规则一致。
+
+    子进程通过 ``CTFY_STALL_MARKERS`` 拿到这个路径；父进程重开下一轮时
+    从这里读回"上一轮停在哪"。路径只在 ``run_agent`` 里拼一次、经环境变量
+    交给子进程，父进程这一侧的读取也必须走同一个函数，否则第二轮的换向
+    提示会读到一个永远空的文件。
+
+    Args:
+        name: 运行名（唯一）；每个样本各自一个名字。
+        root: 沙箱根目录；``None`` 表示用与 ``_fresh_box`` 相同的默认值。
+
+    Returns:
+        ``<root>/<name>/stall_markers.jsonl``。
+    """
+    base = Path(root) if root is not None else Path(_BOX_ROOT)
+    return base / name / "stall_markers.jsonl"
 
 
 def _git_commit(root: Path) -> str:
@@ -1037,39 +2453,185 @@ def _attach(
         TunnelRequiredError: 声明了 vpn 但 stage/parse/up 任一环节失败。
             宁可记为"环境不可用"，也不要让 agent 在必然失败的目标上烧预算。
     """
-    from ctf_strix.tcp_bridge import TcpBridge
+    from ctf_strix.tcp_bridge import TcpBridge, UdpRelay
 
     host = str(svc.get("host") or "")
     access = str(svc.get("access") or "").lower()
     tunnel: VpnTunnel | None = None
-    if access in _VPN_ACCESS or is_private_service(svc):
-        from ctf_strix.vpn import VpnTunnel as _Tunnel
+    bridge: TcpBridge | None = None
+    relay: UdpRelay | None = None
+    try:
+        if access in _VPN_ACCESS or is_private_service(svc):
+            from ctf_strix.vpn import VpnTunnel as _Tunnel
 
-        profile = client.vpn_config(iid)
-        if not profile.strip():
-            msg = f"{iid} 声明 vpn 但 /vpn-config 为空（{host}）"
-            raise TunnelRequiredError(msg)
-        # 接口名带 pid：同一台机器上并行两条隧道时不撞名，同时保证
-        # 上一次崩溃留下的同名接口会被 up() 的第一步删掉。
-        tunnel = _Tunnel.from_profile(profile, f"wg{os.getpid() % 100000}")
-        if not tunnel.up():
-            msg = f"{iid} 隧道 up 失败（{host}，iface={tunnel.iface}）"
-            raise TunnelRequiredError(msg)
-        real = tunnel.resolve(host)
-        if real == host:
-            raise TunnelRequiredError(f"{iid} 隧道内 DNS 解析不出 {host}")
-        host = real
+            # B-20：profile 有同一竞态——ready 后过几秒才签发。短重试，
+            # 一次读空就判死等于把 estate 题整类跳过。
+            #
+            # 2026-11-14 开赛实测：这个端点在平台拥塞时和写接口一起 503，
+            # 一挂就是半小时（02:02Z 起）。跳过 vpn 题 = 0 分，等 120 秒
+            # 换一次可能解出的机会是划算的。
+            profile = client.vpn_config(iid)
+            for _ in range(12):
+                if profile.strip():
+                    break
+                time.sleep(10)
+                profile = client.vpn_config(iid)
+            if not profile.strip():
+                msg = f"{iid} 声明 vpn 但 /vpn-config 为空（{host}）"
+                raise TunnelRequiredError(msg)
+            # 接口名带 pid：同一台机器上并行两条隧道时不撞名，同时保证
+            # 上一次崩溃留下的同名接口会被 up() 的第一步删掉。
+            tunnel = _Tunnel.from_profile(profile, f"wg{os.getpid() % 100000}")
+            if not tunnel.up():
+                msg = f"{iid} 隧道 up 失败（{host}，iface={tunnel.iface}）"
+                raise TunnelRequiredError(msg)
+            real = tunnel.resolve(host)
+            for _ in range(6):
+                if real != host:
+                    break
+                # B-25：实例刚 ready 时 estate DNS 记录可能还没下发。run3
+                # 实测暂停恢复后的第一秒解析失败、整题被误判「需隧道」跳过，
+                # 而同批实例几秒后就能解析。重试窗口与 vpn-config 同量级。
+                time.sleep(5)
+                real = tunnel.resolve(host)
+            if real == host:
+                raise TunnelRequiredError(f"{iid} 隧道内 DNS 解析不出 {host}")
+            host = real
 
-    bridge = TcpBridge(host, int(svc["port"]), access=access).start()
-    # A bridged HTTP service is still HTTP from the agent's point of view.  The
-    # bridge only removes the network/tunnel tax; it must not change the tool
-    # surface, or the run loses http_probe/route_map exactly when it needs them.
-    # Only ``service_type=http`` maps to web: an https target is carried by TLS
-    # inside the pipe for some access modes, so its local endpoint is not
-    # necessarily plaintext HTTP.
-    if tunnel is not None and str(svc.get("service_type") or "").lower() == "http":
-        return bridge, tunnel, f"http://{bridge.local_url}/", "web", host, access
-    return bridge, tunnel, bridge.local_url, "tcp", host, access
+        # B-19：UDP 服务不能套 TCP 桥——桥只转发 TCP，agent 发的每个数据报
+        # 都会超时（SAMPLE-015 实测整轮 25 turns 全花在这上面）。
+        if str(svc.get("service_type") or "").lower() == "udp":
+            relay = UdpRelay(host, int(svc["port"])).start()
+            result = (relay, tunnel, relay.local_url, "udp", host, access)
+            # 所有权移交调用方，finally 不再拆。
+            relay = None
+            tunnel = None
+            return result
+        bridge = TcpBridge(host, int(svc["port"]), access=access).start()
+        # A bridged HTTP service is still HTTP from the agent's point of view.  The
+        # bridge only removes the network/tunnel tax; it must not change the tool
+        # surface, or the run loses http_probe/route_map exactly when it needs them.
+        # Only ``service_type=http`` maps to web: an https target is carried by TLS
+        # inside the pipe for some access modes, so its local endpoint is not
+        # necessarily plaintext HTTP.
+        if tunnel is not None and str(svc.get("service_type") or "").lower() == "http":
+            result = (bridge, tunnel, f"http://{bridge.local_url}/", "web", host, access)
+        else:
+            result = (bridge, tunnel, bridge.local_url, "tcp", host, access)
+        # 成功返回即把桥/隧道的所有权交给调用方（main 的 finally 负责收尾）；
+        # 置空让下面的 finally 不再拆一次已经交付的资源。
+        bridge = None
+        tunnel = None
+        return result
+    finally:
+        # 只有异常路径会带着非空资源走到这里：up() 成功后 DNS 解析失败、
+        # bridge.start() 抛错等都会留下 wg 接口。down()/stop() 幂等，
+        # 且清理出错不能掩盖原本的 TunnelRequiredError。
+        if bridge is not None:
+            with contextlib.suppress(Exception):
+                bridge.stop()
+        if relay is not None:
+            with contextlib.suppress(Exception):
+                relay.stop()
+        if tunnel is not None:
+            with contextlib.suppress(Exception):
+                tunnel.down()
+
+
+def _endpoints_brief(
+    endpoints: list[dict], resolve=None
+) -> str:
+    """把实例的全部 service 列成题面简报的一节。
+
+    为什么需要：``_attach`` 只把第一个服务接成 agent 的主目标，多服务题
+    （auth + vault）的第二个地址就此消失。SAMPLE-022 实测：agent 25 轮一直
+    在猜 vault 主机名，最后写"vault 在暴露地址里不可达"——平台其实给了。
+
+    私有域名先解析成 IP 再写进简报：agent 的 sandbox 不保证能解析 estate
+    的 ``.internal``（SAMPLE-003 的 DNS 就超时过），但隧道路由是通的。
+
+    Args:
+        endpoints: ``Client.endpoints`` 的全部 service。
+        resolve: 可选的解析函数（隧道 ``resolve``）；解析失败按原名写。
+
+    Returns:
+        多行文本；不足两个端点时返回空串（单服务题不需要这一节）。
+    """
+    if len(endpoints) < 2:
+        return ""
+    lines = ["## 本实例暴露的服务（都在作用域内，隧道已就绪，可直接访问）", ""]
+    for svc in endpoints:
+        host = str(svc.get("host") or "").strip()
+        if not host:
+            continue
+        port = svc.get("port")
+        path = str(svc.get("path") or "/")
+        label = str(svc.get("label") or host)
+        shown = host
+        if resolve is not None and host.endswith(_PRIVATE_SUFFIXES):
+            try:
+                resolved = str(resolve(host) or "")
+            except Exception:  # noqa: BLE001 -- 解析失败不阻断简报
+                resolved = ""
+            if resolved and resolved != host:
+                shown = f"{resolved}（{host}）"
+        addr = f"{shown}:{port}" if port else shown
+        if path and path != "/":
+            addr += path
+        lines.append(f"- {label}: {addr}（{svc.get('service_type') or 'tcp'}）")
+    if len(lines) <= 2:
+        return ""
+    lines.append("")
+    lines.append(
+        "第一个是你当前的主目标；其余按上面的地址直接用。"
+        "服务之间可能互相可达，逐步 pivot 前先把每个地址都探一遍。"
+    )
+    return "\n".join(lines)
+
+
+def _tunnel_brief(tunnel) -> str:
+    """隧道内网说明：可达网段 + 内部 DNS + 代理绕行。
+
+    SAMPLE-023 实测（Split Horizon）：portal 只是入口，真正的内容在
+    ``files.<x>.internal``。agent 既解析不了这个名字（sandbox 的
+    resolv.conf 不是 estate 的），又因为 ``http_proxy`` 黑洞把 172.16.x
+    的直连当成了 connection refused，25 轮全花在猜地址上。隧道是平台
+    允许的接入方式，把「能用什么」写清楚是题面的一部分，不是提示。
+    """
+    if tunnel is None:
+        return ""
+    routes = [r for r in getattr(tunnel, "routes", []) if r]
+    dns = [d for d in (getattr(tunnel, "dns", None) or []) if d]
+    if not routes and not dns:
+        return ""
+    lines = ["## 隧道内网（WireGuard 已就绪）"]
+    if routes:
+        lines.append(f"- 可达网段：{', '.join(routes)}")
+    if dns:
+        lines.append(
+            f"- 内部 DNS：{', '.join(dns)}"
+            f"（用 `dig +short @{dns[0]} <主机名>` 解析 .internal）"
+        )
+    lines.append(
+        "- 内网 IP / 解析出的 IP 直接访问；curl 一律加 `--noproxy '*'`——"
+        "环境里的 http_proxy 指向一个关闭端口（断网用），会挡掉内网地址。"
+    )
+    lines.append(
+        "- 场景可能不止一台主机：入口页面里出现的其它内部主机名都在作用域内，"
+        "先解析、再直连，不要因为一个地址不通就判定整题不可解。"
+    )
+    return "\n".join(lines)
+
+
+def _retry_notes_brief(path: str) -> str:
+    """读取调度器给的重试失败路径（同题、显式文件），限长后拼进题面。"""
+    if not path:
+        return ""
+    try:
+        text = Path(path).read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
+    return text[:900]
 
 
 def _challenge_brief(detail: dict) -> str:
@@ -1105,6 +2667,30 @@ def _challenge_brief(detail: dict) -> str:
         lines.append("tags: " + ", ".join(tags[:12]) + "\n")
     if desc:
         lines.append(desc[:1500] + ("\n" if len(desc) <= 1500 else "…\n"))
+    # 选择题（single_select / multi_select）：选项必须在题面里，否则 agent
+    # 只能自由发挥；平台对越界值直接 refused，答对也白答。
+    choice_lines: list[str] = []
+    for q in questions:
+        opts = [str(c) for c in (q.get("choices") or []) if str(c).strip()]
+        if not opts:
+            continue
+        multi = str(q.get("mode") or "").strip().lower() == "multi_select"
+        verb = "选出**全部**正确项（写成 `A,C` 或 `A C`）" if multi else "只选一个"
+        choice_lines.append(
+            f"- `{q['id']}`：{verb}；可选值（逐字使用，大小写敏感）："
+            f"{', '.join(opts)}\n"
+        )
+    if choice_lines:
+        lines.append("## 选择题选项（平台提供）\n" + "".join(choice_lines))
+    # 题型适配（2026-11-13 试跑教训）：判分方式不同，交付方式必须提前说清，
+    # 否则 agent 用 flag 题的直觉提交非 flag 题，答案对也拿不到分。
+    modes = {str(q.get("mode") or "").strip().lower() for q in questions}
+    if "checker" in modes:
+        lines.append(
+            "⚠️ 本题含 **checker** 题型：判分器直接读靶机状态，verify-answer "
+            "可能恒判否（别据此认定答案错）。拿到结果就按 "
+            "`ANSWER[<问题id>]=<值>` 单独一行交付，评测脚本会用 /check 复核。\n"
+        )
     # 多问题题：不写清楚会让 agent 答完第一个就收工。001 实测就是这样——它交了
     # flag，`xhr_token` 那一问空着，平台按"未完全解出"记，一分没有。
     if len(questions) > 1:
@@ -1115,6 +2701,29 @@ def _challenge_brief(detail: dict) -> str:
             "每拿到一个，就用**单独一行**写成 `ANSWER[<问题id>]=<答案>`，"
             "例如 `ANSWER[user]=FLAG{...}`。评测脚本按这个格式取答案。\n"
         )
+    elif questions and str(questions[0]["id"]) != "flag":
+        # 断链3（平台试跑 2026-11-13）：ANSWER 行教学此前只在多问题题发，
+        # 单问题非 flag 题（slug / counter 类）从未被教过交付格式——agent
+        # 把答案写进摘要段落，评测脚本一行都取不到。flag 单问题题的简报
+        # 保持原样，不给它塞「不一定是 flag」的误导。
+        qid = str(questions[0]["id"])
+        lines.append(
+            f"⚠️ 本题的答案不一定是 `FLAG{{...}}` 形态——数字、短字符串、"
+            f"路径、布尔值都可能是答案，按题目要求原样交付。拿到答案就立刻用"
+            f"**单独一行**写成 `ANSWER[{qid}]=<答案>`（例如 `ANSWER[{qid}]=3`），"
+            "并保持这个值不再改动——评测脚本只按这个格式取答案，"
+            "写在摘要段落里等于没交。\n"
+        )
+    # 门控问题在 payload 里根本不存在（2026-11-16 实测：capture 掉第一问之后，
+    # questions 仍然只有那一问；两个问题都解完的题也一样），所以上面"全部都要
+    # 交"和"含 checker"两条规则对这类题一声不响。题面 description 则把整条链
+    # 写全了（先取什么、再打哪个接口），人类照做即得分；agent 拿到第一个 flag
+    # 就收工，后半段白丢。这里补一条与题面字符串无关的收工纪律。
+    lines.append(
+        "完成度：题面若把解法写成多步（第一步 / 第二步 / Step 1 / 然后……），"
+        "每一步都要真正做完再收工；由平台侧（judge / checker）自动判定的步骤"
+        "不需要你提交字符串，做完即自动记账。\n"
+    )
     moves = _tag_moves(tags)
     if moves:
         lines.append(moves)
@@ -1136,6 +2745,17 @@ def _answer_values(text: str) -> dict[str, str]:
         Mapping of question id to the last answer seen for that question.
     """
     pairs: dict[str, str] = {}
+    # 日志里 finish_scan 的参数是**原始 JSON 串**：真实换行被转义成两个字
+    # 符 ``\n``。正则里的 ``\s`` 不认它，于是 ``ANSWER[outage]=true\n\nAn
+    # availability ...`` 会把后面整段说明吞成答案（SAMPLE-007 实测：
+    # 提交 ``true\n\nAn`` 被判否，正确答案就是 ``true``）。先还原转义再扫。
+    text = (
+        (text or "")
+        .replace("\\r\\n", "\n")
+        .replace("\\n", "\n")
+        .replace("\\r", "\n")
+        .replace("\\t", " ")
+    )
     pattern = re.compile(
         r"ANSWER\[([A-Za-z0-9_.-]+)\]\s*=\s*[`'\"]?([^\s*`'\"]+)"
     )
@@ -1144,6 +2764,162 @@ def _answer_values(text: str) -> dict[str, str]:
         if value:
             pairs[match.group(1)] = value
     return pairs
+
+
+#: 能靠 ``verify_answer`` 预检的 question mode。checker/judge 题没有可预检
+#: 的字符串——平台判定器读靶机当前状态裁决，``verify_answer`` 对它们恒判否。
+#: 对这些题预检等于把唯一一次提交机会掐死（SAMPLE-006/007 实测：
+#: ``answers_ok=false`` 而 ``answers_submitted=null``，一次 submit 都没发）。
+_PRECHECK_MODES = frozenset({"dynamic", "static", "seeded"})
+
+
+def _should_precheck(mode: str) -> bool:
+    """该 question mode 是否值得先打 ``verify_answer`` 预检。
+
+    Args:
+        mode: 平台给的 question ``mode``（checker / dynamic / static / seeded…）。
+
+    Returns:
+        True 表示预检结论可信；False 时直接提交首个候选，交给平台裁决。
+    """
+    return str(mode or "") in _PRECHECK_MODES
+
+
+def _checker_passed(client: object, iid: str, qid: str, multiple: bool) -> bool:
+    """checker 题先让平台侧车裁决；True 表示这道题已经记账。
+
+    ``/check`` 与 ``/submissions`` 是两套契约：前者报 ``passed`` +
+    ``timed_out``，多问题题还要求 ``challenge_fully_solved``。这里复用
+    ``success_stop.check_verdict``，与 run 内 ``CheckerProbe`` 保持同一判据，
+    四个入口不会各自发明一套"通过"的定义。
+
+    Fail-closed：取不到裁决就当没过，后面还有值通道兜底；反过来把网络错误
+    当"通过"会记一笔假解出。
+
+    Args:
+        client: 带 ``check(iid, qid)`` 的客户端。
+        iid: 实例 id。
+        qid: 问题 id。
+        multiple: 本题是否多问题（多问题要求平台显式说全解）。
+
+    Returns:
+        True 仅当侧车给出完整、未超时的通过裁决。
+    """
+    from ctf_strix.success_stop import check_verdict
+
+    try:
+        body = client.check(iid, qid)  # type: ignore[attr-defined]
+    except Exception:  # noqa: BLE001 -- 交付失败不能打断后面的题
+        return False
+    if os.environ.get("CTF_SUBMIT_DEBUG"):
+        # 只读观测：判否时唯一能定位"为什么"的原始回执。
+        print(
+            f"  [check-debug] {qid}: "
+            f"{json.dumps(body, ensure_ascii=False)[:400]}",
+            flush=True,
+        )
+    return check_verdict(body, qid, multiple=multiple)
+
+
+def _deliverable_questions(detail: dict, inst: dict) -> list[dict]:
+    """合并 challenge payload 与实例记录里的 question，只留现在能交付的那批。
+
+    ``requires`` 锁住的问题**只**出现在实例记录里：challenge payload 的
+    ``questions`` 里没有它们，解完之后也没有（2026-11-16 实测；两问都解完的
+    题同样如此）。而 ``GET /instances/{id}`` 的 ``questions`` 带 id / mode /
+    unlocked，正是 run 内 ``autosubmit`` 读的同一份列表。跑后提交链若只看
+    payload，这些问题的 qid 就从未进过 ``/check``——checker 题本来就没有答案
+    串，交付全在侧车，漏掉的直接后果是题级半解。
+
+    还锁着的（``unlocked`` 显式为 false）不进来：答案没解锁，交什么都是白烧
+    尝试次数；把它算进 ``multi`` 还会让同题的单 checker 问题在
+    ``challenge_fully_solved`` 上永远判否。
+
+    Args:
+        detail: challenge payload（可能只含未锁问题）。
+        inst: 实例记录；拿不到时传空字典，行为退回只看 payload。
+
+    Returns:
+        question 字典列表：payload 定顺序，实例的非空字段覆盖同名项；
+        同 id 合并为一项，``id`` 一律归一成字符串。
+    """
+    out: dict[str, dict] = {}
+    for source in (detail.get("questions"), inst.get("questions")):
+        for q in source or []:
+            if not isinstance(q, dict) or not q.get("id"):
+                continue
+            qid = str(q["id"])
+            cur = out.setdefault(qid, {})
+            cur["id"] = qid
+            for key, value in q.items():
+                if key == "id":
+                    continue
+                # 实例记录里的 choices=None / requires=[] / mode="" 是"这里
+                # 没有"，不是"覆盖 payload 的值"——空值一律跳过。
+                if value is None or value == [] or value == {} or value == "":
+                    continue
+                cur[key] = value
+    return [q for q in out.values() if q.get("unlocked") is not False]
+
+
+def _ranked_answers(*values: str | None, limit: int = 4) -> list[str]:
+    """Candidate answers in priority order, deduplicated, at most ``limit``.
+
+    Priority is the argument order: ``ANSWER[...]`` lines > ``best_flag`` >
+    ``fallback_flag``.  Empty and duplicate values are dropped — verifying the
+    same token twice costs a round trip and tells us nothing new.
+
+    Args:
+        values: candidates, most trustworthy first.
+        limit: cap on returned candidates (the platform's attempts budget is
+            small; four is enough to cover a decoy or two).
+
+    Returns:
+        Non-empty candidates, deduplicated, in order.
+    """
+    out: list[str] = []
+    for value in values:
+        text = (value or "").strip()
+        if text and text not in out:
+            out.append(text)
+    return out[:limit]
+
+
+def _verify_pick(
+    client: object, iid: str, qid: str, candidates: list[str]
+) -> tuple[str | None, str]:
+    """Pick the answer to submit by asking the platform's checker first.
+
+    Fail-open on purpose: a missing ``verify`` method, an exception, or a ``None``
+    verdict all mean "we cannot precheck", so the first candidate is submitted
+    exactly as before.  Only a *definite* False on every candidate suppresses
+    the submission — that keeps ``attempts_remaining`` clean instead of spending
+    it on answers the platform has already rejected.
+
+    Args:
+        client: harness client; ``verify`` is optional.
+        iid: instance id.
+        qid: question id.
+        candidates: answers in priority order.
+
+    Returns:
+        ``(value to submit or None, "hit" | "miss" | "unavailable")``.
+    """
+    if not candidates:
+        return None, "unavailable"
+    verify = getattr(client, "verify", None)
+    if not callable(verify):
+        return candidates[0], "unavailable"
+    for value in candidates:
+        try:
+            verdict = verify(iid, value, qid)
+        except Exception:  # noqa: BLE001 — precheck is advisory, never fatal
+            return candidates[0], "unavailable"
+        if verdict is True:
+            return value, "hit"
+        if verdict is None:
+            return candidates[0], "unavailable"
+    return None, "miss"
 
 
 def _archive_run(box: Path, name: str, dest_root: Path) -> Path:
@@ -1187,6 +2963,375 @@ def _deadline_args(timeout_s: int) -> list[str]:
     return ["--soft-deadline", str(soft), "--wall-deadline", str(wall)]
 
 
+#: 收场原因 → 允许重开。只有「有证据的收场」才值得换策略再跑一次：
+#: 整窗零新观测、同一族被硬拒、靶面非应答、模型空转。solved/completed 是
+#: 已经拿到东西，wallclock/error 是预算或基础设施问题——重开只是重复烧钱。
+_RESAMPLE_REASONS = frozenset(
+    {"no_progress", "enum_exhausted", "target_absent", "agent_idle"}
+)
+
+
+def _preflight_exit_rc() -> int | None:
+    """启动预检的退出码，取不到时返回 ``None``（归因退回原判据）。
+
+    ``run_strix_ctf`` 与 ``batch_eval`` 分属两个进程，共享这个数只能靠约定；
+    把它收在一处，免得 ``_stop_reason_of`` 认 3、``_crash_error`` 不认 3，
+    同一条记录既写 ``stop_reason=llm_unreachable`` 又写 ``error=agent-exit:rc3``
+    （Codex 复核 N3 实测）。
+    """
+    try:
+        from ctf_strix import llm_preflight
+
+        return int(llm_preflight.EXIT_CODE)
+    except Exception:  # noqa: BLE001 - 归因失败只能是「没有这项归因」
+        return None
+
+
+#: 日志里证明「这一轮是被预检拒绝出跑」的那一行。退出码单独不足以判定：
+#: 3 是 ``llm_preflight.EXIT_CODE``，但将来任何以 3 退出的真崩溃也会撞上，
+#: 那时 ``error=None`` + ``llm_unreachable`` 就是把「炸了」说成套话（Codex 三轮）。
+_PREFLIGHT_MARK = "[llm] preflight ok=False"
+
+#: 预检拒绝出跑时，``kind`` → 结果表的 stop_reason。死 key 与错路径换个
+#: 端点还是同一个答案，不能和「主机不在」共用一个归因（Codex 复核 N2）。
+_PREFLIGHT_KIND_REASONS = {
+    "credential": "credential_failure",
+    "misconfigured": "misconfigured",
+    "unreachable": "llm_unreachable",
+}
+
+
+def _stop_reason_of(log: str) -> str:
+    """从一次 run 的日志里读出它是怎么收场的。
+
+    ``[stop] reason=…`` 只有一种来源：守卫判定「这次 run 已经没有新信息」
+    （progress / enum / target-absent），它自己 exit 0。其余收场只能从父进程
+    这一侧的特征推断：
+
+    * 墙钟杀：父进程先写 ``[WALLCLOCK TIMEOUT after Ns]``，随后整组被杀，
+      退出码 -9 又会被写成 ``[agent-exit] rc=-9``。进程内 watchdog 的击杀
+      （exit 0，见 ``deadline.HARD_EXIT_CODE``）只留 ``[ctfy] wallclock
+      hard stop`` 日志行，没有 [agent-exit] 行。**必须先判墙钟**，否则
+      每次超时都会被记成 error，重开判据跟着全错。
+    * 异常收场：``[run-error] module.Type: msg``（含 MaxTurnsExceeded）。
+    * 正常跑完：以上都没有，返回 ``unknown``——从 harness 视角它就是
+      「自己跑到了头」，不重开。
+
+    Returns:
+        ``[stop]`` 行优先（它只由守卫打印），其次 wallclock，其次 error。
+    """
+    m = re.search(r"^\[stop\] reason=(\w+)", log, re.M)
+    if m:
+        return m.group(1)
+    if "WALLCLOCK TIMEOUT" in log:
+        return "wallclock"
+    if re.search(r"^\[ctfy\] wallclock hard stop", log, re.M):
+        # watchdog 击杀的 exit code 是 0（CTFY-0001 契约），[agent-exit]
+        # 行不会再出现；这条日志行是唯一的机器可读归因。
+        return "wallclock"
+    m_err = re.search(r"^\[run-error\] ([\w.]+):", log, re.M)
+    if m_err:
+        # 轮次打满是正常收场（不是崩溃），单独归类——否则重试提示里只剩
+        # 一句「收场：error」，下一轮看不出是预算不够还是代码炸了。
+        if "MaxTurnsExceeded" in m_err.group(1):
+            return "turn_capped"
+        return "error"
+    m_rc = re.search(r"^\[agent-exit\] rc=(-?\d+)$", log, re.M)
+    if m_rc:
+        # 启动预检拒绝出跑（端点不可达）有自己的退出码。它既不是崩溃也不是
+        # 「跑了没解出」，混进 error 会让归因重新变成猜——2026-11-14 三条
+        # lane 就是这么把 66 分钟记成「能力不行」的。
+        if int(m_rc.group(1)) == _preflight_exit_rc() and _PREFLIGHT_MARK in log:
+            # 退出码把三种死因压成了同一个数，``kind`` 只留在日志行里：
+            # 死 key / 错路径换端点也救不回来，和不达标的处置方向相反。
+            m_kind = re.search(r"^\[llm\] preflight ok=False .*kind=(\w+)", log, re.M)
+            if m_kind:
+                return _PREFLIGHT_KIND_REASONS.get(m_kind.group(1), "preflight_refused")
+            return "preflight_refused"
+        return "error"
+    return "unknown"
+
+
+def _parse_usage(log: str) -> dict[str, int]:
+    """token 用量进结果行（DEF-13 缺键收口）。
+
+    与 ``eval_sample.parse_usage`` 同一契约（[usage-final] 优先、普通
+    ``[usage]`` 行兜底、缺行给零），但本脚本在 VM 独立运行，不 import
+    兄弟脚本——那会把平台端点依赖整只拖进跑批进程。``run_agent`` 已把
+    usage.json sidecar 回填成 ``[usage]`` 行，被杀路径也有数。
+    """
+    # 两次搜索而不是一个 (?:...) 合并式：合并式 search 会命中日志里**最靠前**
+    # 的那行 [usage]，而契约是 final 行（收尾 sidecar 回写）优先于过程行。
+    m = re.search(
+        r"\[usage-final\] calls=(\d+) in=(\d+) out=(\d+) total=(\d+)", log
+    ) or re.search(
+        r"\[usage\] calls=(\d+) in=(\d+) out=(\d+) total=(\d+)", log
+    )
+    if not m:
+        return {
+            "llm_calls": 0,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "total_tokens": 0,
+        }
+    return {
+        "llm_calls": int(m.group(1)),
+        "input_tokens": int(m.group(2)),
+        "output_tokens": int(m.group(3)),
+        "total_tokens": int(m.group(4)),
+    }
+
+
+def _resample_allowed(reason: str) -> bool:
+    """这次收场值不值得用剩下的样本换策略重开。
+
+    判据不是「有没有找到 flag」（那是事后抽取的事），而是「这次 run 是否
+    有证据地停在没有新信息上」。答案由 agent 落盘，**要不要重开由这里决定**
+    ——agent 不自己决定。
+    """
+    return reason in _RESAMPLE_REASONS
+
+
+def _last_marker_facts(markers: Path | None) -> list[str]:
+    """读停滞标记的最后一行，取 host/family/mechanism/stage 四元组。"""
+    if markers is None:
+        return []
+    try:
+        lines = markers.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return []
+    last: dict = {}
+    for line in reversed(lines):
+        if line.strip():
+            try:
+                parsed = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(parsed, dict):
+                last = parsed
+                break
+    return [
+        f"{key}={last[key]}"
+        for key in ("host", "family", "mechanism", "stage")
+        if str(last.get(key) or "").strip()
+    ]
+
+
+def _activity_fact(guard: dict) -> str:
+    """把守卫计数压成一行「这一轮把时间花在哪」。
+
+    为什么需要：``wallclock`` / ``turn_capped`` 这类收场本身不含任何方向
+    信息，重试提示只剩「上一轮超时」——模型下一轮会原样重来。2026-11-13
+    CYBENCH-037 实测：52 次工具调用、92 次请求、23 个端点键、finish 被拒
+    2 次，全程没建立已认证会话，而失败的 ``failure_path`` 只有一行
+    「收场：wallclock」。
+
+    只搬计数布尔，不搬任何目标字符串——不构成对着失败日志写死提示。
+
+    Args:
+        guard: 记录里的 ``guard`` 字典。
+
+    Returns:
+        一行不超过 140 字符的事实；计数太少时返回空串。
+    """
+    if not isinstance(guard, dict) or not guard:
+        return ""
+    bits: list[str] = []
+
+    def _n(key: str) -> int:
+        try:
+            return int(guard.get(key) or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    reach, keys, dup = _n("reach"), _n("enum_keys"), _n("negative_groups")
+    refused = _n("finish_refused")
+    if reach:
+        bits.append(f"{reach} 次请求")
+    if keys:
+        bits.append(f"{keys} 个端点键")
+    if dup:
+        bits.append(f"{dup} 组重复响应")
+    if refused:
+        bits.append(f"finish 被拒 {refused} 次")
+    if guard.get("journey_authed") is False and (_n("journey_created") or _n("journey_wall")):
+        bits.append("未取得已认证会话")
+    if len(bits) < 2:
+        return ""
+    return ("轨迹：" + " / ".join(bits))[:140]
+
+
+def _failure_facts(rec: dict, markers: Path | None) -> list[str]:
+    """把一次失败压成 1–3 行结构化事实，供调度器落盘并注入下一次重试。
+
+    只带机器可读的收场值与停滞四元组，不搬日志正文：重试提示里塞正文
+    会过拟合，也会把无关内容带进下一轮上下文。
+    """
+    if rec.get("correct"):
+        return []
+    facts: list[str] = []
+    if rec.get("error"):
+        facts.append(f"异常：{str(rec['error'])[:120]}")
+    elif rec.get("stop_reason"):
+        facts.append(f"收场：{rec['stop_reason']}")
+    activity = _activity_fact(rec.get("guard") or {})
+    if activity:
+        facts.append(activity)
+    rejected = rec.get("answers_rejected")
+    if isinstance(rejected, dict) and rejected:
+        shown = "、".join(f"{k}={v}" for k, v in list(rejected.items())[:3])
+        facts.append(f"提交被判否：{shown[:140]}")
+    tried = _last_marker_facts(markers)
+    if tried:
+        facts.append("探到：" + " ".join(tried)[:140])
+    return facts[:3]
+
+
+def _resume_steer(markers: Path, reason: str, sample_no: int) -> str:
+    """用上一轮落盘的停滞事实生成换向提示。
+
+    只带结构事实（host / path family / 机制类 / 停止阶段），不带响应正文：
+    正文进提示就是对着失败日志写死字符串，既过拟合，又会把别的题的残留
+    带进上下文。读不到标记文件时退回只说「换一类机制」的通用提示。
+
+    Args:
+        markers: 上一轮样本的 ``stall_markers.jsonl``。
+        reason: 上一轮的 stop_reason，写进提示让模型知道这不是崩溃。
+        sample_no: 即将开始的样本序号，从 2 起。
+
+    Returns:
+        追加在题面后面的短提示。
+    """
+    last: dict = {}
+    try:
+        for line in reversed(markers.read_text(encoding="utf-8").splitlines()):
+            if line.strip():
+                last = json.loads(line)
+                break
+    except (OSError, ValueError):
+        last = {}
+    if not isinstance(last, dict):
+        last = {}
+    facts = [
+        f"{key}={last[key]}"
+        for key in ("host", "family", "mechanism", "stage")
+        if str(last.get(key) or "").strip()
+    ]
+    tried = "、".join(facts) if facts else "（上一轮没留下可用的停滞事实）"
+    return (
+        f"[重开 {sample_no}] 上一轮以 {reason} 收场：整轮探测没有产生新观测，"
+        "不是模型崩溃，是证据。\n"
+        f"已经试到：{tried}。\n"
+        "这一轮不要重复同一组探测、不要再看同一份响应。换一个机制类别："
+        "换根组件、换参数语义、换认证边界、换数据流向各算一类。"
+        "先看 traffic_list 里目标给过但从没请求过的 id，再决定第一条请求。"
+    )
+
+
+def run_qa_item(
+    client: Any,
+    cid: str,
+    name: str,
+    turns: int,
+    wallclock: int,
+) -> dict:
+    """QA 题库题（``is_qa_only``）：无实例、无靶机，直接读题作答。
+
+    2026-11-13 实测：playground 的 SAMPLE-005/020 是 qa_only，compete 的
+    ``challenge_score`` 直接把这类题判成 None——整整一类题型从未进入过
+    派单。这里走独立路径：不 launch、不建桥，agent 只读题面/选项，答案
+    经 ``/qa/submissions`` 提交。
+    """
+    detail = client.detail(cid)
+    brief = _challenge_brief(detail)
+    quiz = (
+        "## QA 题库题（无靶机）\n"
+        "本题没有实例、没有可攻击的目标：**不要**扫描或请求任何地址。"
+        "直接依据题面与选项作答。每个问题单独一行 "
+        "`ANSWER[<问题id>]=<答案>`；选择题只用给定字母，多选可写 `A,C`。\n"
+    )
+    brief = f"{brief}\n\n{quiz}" if brief else quiz
+    # qa 题也可能带附件（SAMPLE-005 是三层压缩包，solves_count=0 就是
+    # 因为没人能拿到文件）。这里与实例路径同一套投递。
+    attachments = client.fetch_attachments(cid) if hasattr(client, "fetch_attachments") else {}
+    if attachments:
+        listing = "\n".join(
+            f"- `{n}` ({len(b)} bytes)" for n, b in sorted(attachments.items())
+        )
+        brief += "\n\n## 附件（已放进你的工作目录）\n" + listing
+    # 给一个必然拒绝的本机端口：网络工具瞬时失败，模型不会把预算耗在探测上。
+    log, wall = run_agent(
+        "http://127.0.0.1:1",
+        turns,
+        wallclock,
+        name,
+        extra=brief,
+        files=attachments,
+        tags=[t for t in (detail.get("tags") or []) if isinstance(t, str)],
+    )
+    rec: dict[str, Any] = {
+        "samples_used": 1,
+        "agent_s": round(wall, 1),
+        "tool_calls": log.count(" TOOL "),
+        "usage": _parse_usage(log),
+        "stop_reason": _stop_reason_of(log),
+        "qa_only": True,
+    }
+    pairs = _answer_values(log)
+    questions = [
+        q for q in (detail.get("questions") or [])
+        if isinstance(q, dict) and q.get("id")
+    ]
+    submitted: dict[str, bool] = {}
+    rejected: dict[str, str] = {}
+    from ctf_strix.autosubmit import fits_choices
+
+    for q in questions:
+        qid = str(q["id"])
+        value = pairs.get(qid)
+        if not value:
+            continue
+        choices = [str(c) for c in (q.get("choices") or [])]
+        if not fits_choices(value, str(q.get("mode") or ""), choices):
+            continue
+        res = client.qa_submit(cid, qid, value)
+        ok = bool(res.get("correct"))
+        submitted[qid] = ok
+        rec.setdefault("answers_submitted", {})[qid] = value
+        if not ok:
+            rejected[qid] = value
+    rec["answers_ok"] = submitted
+    if rejected:
+        rec["answers_rejected"] = rejected
+    rec["correct"] = (
+        bool(submitted) and all(submitted.values()) and len(submitted) == len(questions)
+    )
+    rec["failure_path"] = _failure_facts(rec, None)
+    return rec
+
+
+#: Platform tags are identifiers (``ssrf``, ``software_supply_chain``).  The
+#: child process uses them only for card / AI-gate selection; they never reach
+#: prompt text (``method_cards`` intersects sets and renders literals).  Anything
+#: that could be read as a CLI flag is dropped here rather than trusted.
+_TAG_OK = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.+-]*")
+
+
+def _tags_arg(tags: list[str] | None) -> list[str]:
+    """``["--tags", *tags]`` for the child command line; empty when no tag survives.
+
+    Why this exists: ``run_strix_ctf.py`` has accepted ``--tags`` since the AI
+    gate landed, but this caller never passed it, so the tag-keyed method-card
+    block was never rendered in any batch run (ledger §4.209).
+    """
+    out: list[str] = []
+    for tag in tags or ():
+        text = str(tag).strip()
+        if text and _TAG_OK.fullmatch(text) and text not in out:
+            out.append(text)
+    return ["--tags", *out] if out else []
+
+
 def run_agent(
     target: str,
     turns: int,
@@ -1196,6 +3341,13 @@ def run_agent(
     archive_dir: Path | None = None,
     model: str | None = None,
     target_kind: str = "web",
+    instance: str = "",
+    platform: str = "",
+    token: str = "",
+    challenge_id: str = "",
+    files: dict[str, bytes] | None = None,
+    tags: list[str] | None = None,
+    extra_hosts: list[str] | None = None,
 ) -> tuple[str, float]:
     """跑一次 strix，返回 (完整日志, 墙钟耗时)。
 
@@ -1216,6 +3368,21 @@ def run_agent(
     # 每次都是全新沙箱：见 `_fresh_box` 里关于 session resume 的记录。
     box, log = _fresh_box(name)
 
+    # 附件投递：题面里写的文件必须真的在，否则 003/005/017/018/021 这类
+    # 附件题对 agent 就是「文件不存在」。run_strix_ctf 的 --files-dir 会把
+    # 这里的内容复制进 agent 工作区。
+    files_dir = None
+    if files:
+        files_dir = box / "attachments"
+        files_dir.mkdir(parents=True, exist_ok=True)
+        for fname, blob in files.items():
+            safe = Path(str(fname)).name  # 只取基名，拒绝 ../ 逃逸
+            if not safe or safe in (".", ".."):
+                continue
+            tmp = files_dir / f".{safe}.tmp"
+            tmp.write_bytes(blob)
+            os.replace(tmp, files_dir / safe)
+
     env = {
         "PYTHONPATH": "src:vendor/src",
         # 外网黑洞：比赛规定 agent_internet=deny，但沙箱里 curl 一个外网域名
@@ -1225,7 +3392,7 @@ def run_agent(
         # 指到一个必然拒绝的本地端口，失败就从"慢"变成"瞬时"，模型立刻换路。
         # ⚠️ NO_PROXY 必须放行两类：本题靶机（否则打不到目标）和 LLM 网关
         # （否则 strix 自己连不上模型，整题直接挂）。
-        **_proxy_blackhole(target),
+        **_proxy_blackhole(target, extra_hosts=extra_hosts or ()),
         "STRIX_RUNTIME_BACKEND": "local",
         "PYTHONUNBUFFERED": "1",
         # 凭据只来自环境。仓库里写死 key 的代价不是"泄漏"，而是几个月后
@@ -1233,10 +3400,41 @@ def run_agent(
         "LLM_API_KEY": os.environ.get("LLM_API_KEY", ""),
         "LLM_API_BASE": os.environ.get("LLM_API_BASE", ""),
         "STRIX_LLM": model or os.environ.get("STRIX_LLM", ""),
+        # 网关端点要求请求显式携带 max_tokens（缺失时全 400，2026-11-14 冒烟
+        # 实测）。子进程 env 是白名单，不转发等于 agent 里永远看不到开关。
+        "LLM_MAX_TOKENS": os.environ.get("LLM_MAX_TOKENS", ""),
+        # 能力消融开关同理：批跑验证「关掉探针」的对照臂必须能传进去，否则
+        # 两条臂实际是同一条（2026-11-14 P0-4 消融臂事故）。
+        "CTF_VIABILITY": os.environ.get("CTF_VIABILITY", ""),
+        # 方法卡 A/B（台账 §4.235）：A 臂必须是「这张卡不在」，只能靠环境开关
+        # 让同一份工作树渲染出两臂；不转发就等于两臂同一份提示词。
+        "CTF_CARDS_OFF": os.environ.get("CTF_CARDS_OFF", ""),
+        # 并行竞速子 agent（台账 §4.65，默认关）。同样必须转发：白名单漏掉它，
+        # ON 臂就是 OFF 臂，跑完只会得到"开了也没变化"的假象——11-14 消融臂
+        # 事故是同一类错。
+        "CTF_ALLOW_SUBAGENTS": os.environ.get("CTF_ALLOW_SUBAGENTS", ""),
+        # 机制移植的 A/B 开关（台账 §4.250 起）。白名单不转发 = 两臂同一份代码，
+        # 2026-11-17 Q2 首跑就是这么废掉的：CTF_RECOVERY_NOTICE 已 export，
+        # 子进程里 `[trim]` 只有 race_spawn 一行，notice 从未安装。
+        "CTF_RECOVERY_NOTICE": os.environ.get("CTF_RECOVERY_NOTICE", ""),
+        "CTF_RECOVERY_DEBUG": os.environ.get("CTF_RECOVERY_DEBUG", ""),
+        "CTF_STRUCTURAL": os.environ.get("CTF_STRUCTURAL", ""),
+        "CTF_CLASS_BLOCK": os.environ.get("CTF_CLASS_BLOCK", ""),
+        "CTF_STRUCT_SIG": os.environ.get("CTF_STRUCT_SIG", ""),
         "STRIX_TELEMETRY": "false",
         # 每次 LLM 调用后原子落盘。进程被墙钟 SIGKILL 时，run_strix_ctf 末尾那行
         # `[usage]` 永远不会打印——两条 A/B 臂就这么丢了 token 数（只能记 n/a）。
         "CTF_USAGE_PATH": str(box / "usage.json"),
+        # run 内 autosubmit 的裁决落盘。没有它，父进程只能从 run.log 里
+        # 重解析 ANSWER 行；而 gated / checker / 选择题的正确答案往往是
+        # 子进程在 finish 时自己提交掉的，父进程看不到 → 已解出也记 FAILED，
+        # 调度器重派同一题，白烧配额与墙钟（SAMPLE-001 实测）。
+        "CTF_SUBMIT_PATH": str(_submit_sidecar_path(name)),
+        # 停滞标记（host + path family + 机制类 + 响应签名）落到本次样本的
+        # 沙箱里。父进程重开下一轮时要读它生成换向提示——子进程无从知道
+        # 父进程把这次 run 的目录放在哪，所以路径由启动方显式给，两边共用
+        # `_stall_markers_path` 一处定义。
+        "CTFY_STALL_MARKERS": str(_stall_markers_path(name)),
         "PATH": "/usr/local/bin:/usr/bin:/bin",
     }
     # 软截止：墙钟的 75% 处。父进程到点会 SIGKILL 整组，被杀的那次 run
@@ -1251,8 +3449,36 @@ def run_agent(
         # 守卫遥测的落盘路径必须由启动方显式给：子进程 stdout 被重定向到
         # run.log，它自己无从知道父进程把这次 run 的目录放在哪里。
         "--guard-state", str(_guard_state_path(name)),
+        # 硬墙钟兜底落盘。不给这个路径，watchdog 就以 result_path=None 装表：
+        # 2026-11-14 三条 lane 被打死时 box 里连骨架 result.json 都没有，
+        # 赛后只能从日志反推它们一次模型调用都没成功。
+        "--result-out", str(box / "result.json"),
         *_deadline_args(timeout_s),
     ]
+    if files_dir is not None:
+        cmd += ["--files-dir", str(files_dir)]
+    if instance and platform and token:
+        # B-4 断链1（接线，平台试跑 2026-11-13 实录）：非 flag 答案链
+        # （显式 flag > ``answer:`` 行 > 裸 hex）挂在子进程的 autosubmit 上，
+        # 此前这里什么都不传——agent 侧一次都没装过，单测全绿、真题零提交。
+        # 凭据走 env 不进 argv（argv 会出现在 ps 输出与归档 run.log 里）。
+        cmd += [
+            "--autosubmit",
+            "--platform",
+            platform,
+            "--instance",
+            instance,
+            # G1：gated 题答对后的轮内刷新需要题号。
+            "--challenge-id",
+            challenge_id,
+        ]
+        env["CTF_PLATFORM_TOKEN"] = token
+        # 代理黑洞只放行靶机与 LLM 网关：平台域名不放行，提交请求会被
+        # 黑洞代理吞成瞬时 connection refused——接线等于没接。
+        _allow_platform_in_no_proxy(env, platform)
+    # 标签要进子进程，卡片才有输入：`run_strix_ctf.py` 的 --tags 此前只有
+    # aisec 闸门在用，方法卡在批跑里从未触发（台账 §4.209）。
+    cmd += _tags_arg(tags)
     started = time.time()
     # PYTHONPATH 是相对路径，必须配合 cwd=root 才能 import 到 ctf_strix，
     # 而沙箱隔离又要求 cwd=box——改成绝对路径，cwd 就能放心交给 box。
@@ -1283,6 +3509,11 @@ def run_agent(
             fh.write(f"\n[WALLCLOCK TIMEOUT after {timeout_s}s]\n")
             fh.flush()
             _kill_group(proc)
+        # 崩溃取证：子进程负退出（信号）或异常退出码时留一条机器可读行。
+        # 退出码本身消失后，"崩在 import"和"正常跑完没解出"在日志上无法区分。
+        if proc.returncode not in (0, None):
+            fh.write(f"\n[agent-exit] rc={proc.returncode}\n")
+            fh.flush()
     text = log.read_text(encoding="utf-8", errors="ignore")
     # 把持久化的用量补写成与 run_strix_ctf 相同的格式，末尾追加。
     # 被 SIGKILL 的那条路径下，这是唯一还能拿到的数字。
@@ -1322,6 +3553,126 @@ def _kill_group(proc: subprocess.Popen) -> None:
             os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
 
 
+#: 派单闸门的开关。``CTF_CANARY=0`` / ``--no-canary`` 可整体关掉。
+_CANARY_OFF = ("0", "false", "off", "no")
+
+
+def _probe_endpoint(client: Client, target, target_kind: str) -> tuple[bool, str]:
+    """按目标类型探一次可达性。四种口径不能混：
+    TCP 要原始套接字、UDP 没有 connect 探测、附件题没有网络目标、web 走 HTTP。
+    """
+    if target_kind == "tcp":
+        return _probe_tcp(target)
+    if target_kind == "udp":
+        # UDP 无连接，"connect 探测"不成立。中继已经起来，可达性由构建保证；
+        # 真发数据报需要题目协议，探测会误判并换掉好实例。
+        return True, "udp relay open"
+    if target_kind == "file":
+        return True, "file-only"
+    return client.probe_reachable(target)
+
+
+#: 同实例重探的等待序列（秒）。2026-11-15 docs/40 §5：7 道题在单次抖动后
+#: 永久失联，而「node4 不可达 / ready 后端口未起」都是瞬断——换实例常常换来
+#: 同一个坏节点，还多付一次起停与配额。先在同一实例上等 30+60 秒再换。
+_PROBE_REUSE_WAITS = (30, 60)
+
+
+def _probe_reuse_waits(env=None) -> tuple[int, ...]:
+    """``CTF_PROBE_REUSE=0`` 时返回空序列（回到「立刻换实例」的旧行为）。"""
+    env = os.environ if env is None else env
+    if str(env.get("CTF_PROBE_REUSE", "")).strip().lower() in _CANARY_OFF:
+        return ()
+    return _PROBE_REUSE_WAITS
+
+
+def _reprobe(probe, waits=(30, 60), sleep=time.sleep):
+    """在同一实例上重探，直到出现可达。
+
+    Returns:
+        ``(ok, detail, waited_s)``；``waits`` 为空时等价于不重探。
+    """
+    waited = 0.0
+    detail = ""
+    for pause in waits:
+        sleep(pause)
+        waited += float(pause)
+        ok, detail = probe()
+        if ok:
+            return True, detail, waited
+    return False, detail, waited
+
+
+#: ``wait_ready`` 超时后，沿用同一实例再等一轮的秒数（docs/40 §8-B）。
+#: 实测 017/018 启动要 4–6 分钟；被旧 180s 上限判死的题，再等一轮就能起。
+_READY_REUSE_TIMEOUT = 180
+
+
+def _ready_reuse_timeout(env=None) -> int:
+    """``CTF_READY_REUSE=0`` 关掉复用；给数字则用该秒数（默认 180）。"""
+    env = os.environ if env is None else env
+    raw = str(env.get("CTF_READY_REUSE", "")).strip()
+    if raw.lower() in _CANARY_OFF:
+        return 0
+    if raw.isdigit():
+        return int(raw)
+    return _READY_REUSE_TIMEOUT
+
+
+def _canary_enabled(env=None) -> bool:
+    env = os.environ if env is None else env
+    return str(env.get("CTF_CANARY", "")).strip().lower() not in _CANARY_OFF
+
+
+def _canary_exit_code() -> int:
+    """闸门拒绝时的退出码：沿用 ``llm_preflight.EXIT_CODE``（3）。
+
+    与「一题跑完但没解出」区分开——后者才写结果行。
+    """
+    try:
+        from ctf_strix import llm_preflight
+
+        return int(llm_preflight.EXIT_CODE)
+    except Exception:  # noqa: BLE001 — 模块缺席时仍要有一个稳定值
+        return 3
+
+
+def _canary_llm(env=None) -> tuple[bool, str]:
+    """一次 1-token 探针。只有「端点明确拒绝」才返回 False。
+
+    探针缺席、被显式关闭、provider 不在探测白名单、超时 —— 一律放行，
+    宁可漏判也不能因为探针本身的问题停掉整批。
+    """
+    try:
+        from ctf_strix import llm_preflight
+    except Exception as exc:  # noqa: BLE001
+        return True, f"skip:import:{type(exc).__name__}"
+    env = os.environ if env is None else env
+    if not llm_preflight.enabled(env):
+        return True, "skip:disabled"
+    res = llm_preflight.probe(env=env)
+    if res.ok:
+        return True, res.reason or "ok"
+    return False, f"{res.kind}:{res.reason}"
+
+
+def _dispatch_canary(client: Client, env=None) -> tuple[bool, str]:
+    """开跑前的整队闸门：平台凭据 + LLM 端点各探一次。
+
+    2026-11-13 实测：一个失效的 LLM key 连续烧掉 10 道题的派单，
+    ``compete`` 还把每题记成 failed（两连败后整题 deferred）。
+    这里把「环境不可用」和「题目失败」彻底分开：闸门不过 ⇒ 整批停跑、
+    一题都不派、一行结果都不写。
+    """
+    ok, detail = client.canary()
+    print(f"[canary] platform ok={ok} {detail}", flush=True)
+    if not ok:
+        return False, f"platform:{detail}"
+    ok_llm, detail_llm = _canary_llm(env)
+    print(f"[canary] llm ok={ok_llm} {detail_llm}", flush=True)
+    return ok_llm, f"llm:{detail_llm}"
+
+
 def main() -> int:
     p = argparse.ArgumentParser()
     p.add_argument("--plan", required=True, help="JSON 文件：题目计划")
@@ -1338,12 +3689,36 @@ def main() -> int:
     p.add_argument("--out", default="/tmp/batch/results.jsonl")
     p.add_argument("--token", required=True)
     p.add_argument(
+        "--competition-id", default="",
+        help="显式指定 competition_id；设置时不走 suite_for() 前缀路由"
+             "（也可用环境变量 CTFY_COMPETITION_ID）",
+    )
+    p.add_argument(
         "--archive-dir", default="~/runs",
         help="取证归档根目录（run.log + agents.db），默认 ~/runs",
     )
     p.add_argument(
         "--no-archive", action="store_true",
         help="不归档，只适合冒烟验证（会丢掉事后回放轨迹的能力）",
+    )
+    p.add_argument(
+        "--max-samples", type=int, default=1,
+        help="每题最多跑几次；>1 时仅在无进展收场（stop_reason）后换策略重开，"
+             "solved/error/wallclock 不重开。默认 1 = 每题一次机会",
+    )
+    p.add_argument(
+        "--retry-notes", default="",
+        help="重试注入：上一轮失败路径文件（由 compete 按题生成，只含同题事实）",
+    )
+    p.add_argument(
+        "--no-hints", action="store_true",
+        help="关掉平台 hint 的只读探测（默认开：只取已释放且免费的正文，"
+             "付费层一律不开启）",
+    )
+    p.add_argument(
+        "--no-canary", action="store_true",
+        help="关掉开跑前的整队闸门（平台凭据 + LLM 端点各探一次）；"
+             "仅用于故障演练，默认开",
     )
     args = p.parse_args()
 
@@ -1365,11 +3740,30 @@ def main() -> int:
 
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
+    # hint 探测节奏要跨进程（每尝试一个进程），所以状态跟着结果文件走。
+    hint_state = _hint_state_path(out)
     archive = Path(args.archive_dir).expanduser()
     if not args.no_archive:
         archive.mkdir(parents=True, exist_ok=True)
     commit = _git_commit(Path(__file__).resolve().parent.parent)
     client = Client(args.token)
+    if args.competition_id:
+        # CLI 覆盖优先于环境变量：显式参数比进程环境更贴近本次调用意图。
+        client.competition_id = args.competition_id.strip()
+
+    # 派单闸门：环境不可用 ⇒ 一题都不跑、一行结果都不写。
+    # 放在「按难度分层预算」之前：预算还没用上就该停了。
+    if args.no_canary or not _canary_enabled():
+        print("[canary] 已关闭（--no-canary / CTF_CANARY=0）", flush=True)
+    else:
+        ok, detail = _dispatch_canary(client)
+        if not ok:
+            print(
+                f"[canary] ok=False {detail} —— 停队：本批不派任何题，也不写结果行"
+                "（环境问题不是题目失败）",
+                flush=True,
+            )
+            return _canary_exit_code()
 
     # 按难度分层预算，但**上限要贴着实测值**，不能拍脑袋放大。
     #
@@ -1406,6 +3800,9 @@ def main() -> int:
 
         rec = {"idx": idx, "challenge": cid, "difficulty": diff, "started": time.time()}
         rec["model"] = model or os.environ.get("STRIX_LLM", "")
+        # 消融臂别在这里就要落盘：实例没起来就 SKIP 的行也得能归属到某条臂，
+        # 否则一次 INFRA 就把「哪一臂丢了」从结果表上抹掉（§4.236 的教训）。
+        rec["cards_off"] = os.environ.get("CTF_CARDS_OFF", "")
         # 每次运行一个唯一名字。它同时是沙箱目录名和 agent name，所以
         # 唯一性直接等于"不会续跑"。随机后缀是防同一秒内的重复调用。
         run_id = _new_run_id(cid)
@@ -1415,17 +3812,55 @@ def main() -> int:
         bridge = None
         tunnel = None
         svc_port = ""
+        if item.get("qa_only"):
+            # QA 题库题：独立路径，不占实例配额、不 launch。
+            try:
+                rec.update(run_qa_item(client, cid, run_id, turns, wallclock))
+            except Exception as exc:  # noqa: BLE001
+                rec["error"] = f"{type(exc).__name__}: {exc}"
+                rec["correct"] = False
+                print(f"  -> ERROR {rec['error']}", flush=True)
+            rec["total_s"] = round(time.time() - rec["started"], 1)
+            with out.open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+            print(
+                f"  -> {'SOLVED' if rec.get('correct') else 'FAILED'}  "
+                f"tools={rec.get('tool_calls', 0)} agent={rec.get('agent_s', 0)}s",
+                flush=True,
+            )
+            continue
         try:
             t0 = time.time()
             iid = client.launch(cid)
-            target = client.wait_ready(iid)
+            try:
+                target = client.wait_ready(iid)
+            except TimeoutError as exc:
+                # B-31（docs/40 §8-B）：超时先别销毁重起。实例往往只是慢，
+                # 同实例再等一轮比重新排队便宜；换实例还可能落到同一个坏节点。
+                extra = _ready_reuse_timeout()
+                if not extra:
+                    raise
+                print(f"  ! {exc}；实例还在，沿用同一实例再等 {extra}s", flush=True)
+                target = client.wait_ready(iid, timeout=extra)
+                rec["ready_reuse_s"] = extra
             rec["launch_s"] = round(time.time() - t0, 1)
 
             # TCP / VPN 题必须建桥。不建的话 `_public_url()` 会把它拼成
             # http://host:1337/ 交给 agent，它拿 curl 打原始 TCP 服务，
             # 必然失败且日志上看不出原因（SAMPLE-014 实测）。
             target_kind = "web"
-            if isinstance(target, dict):
+            file_only = isinstance(target, dict) and target.get("service_type") == "file"
+            if file_only:
+                # 纯附件题：没有网络目标，输入是实例下发的文件。
+                target = ""
+                target_kind = "file"
+                rec["service"] = {"host": "", "access": "files"}
+                print(
+                    f"  ready in {rec['launch_s']}s -> 纯附件题（无服务，"
+                    "文件从实例下载）",
+                    flush=True,
+                )
+            elif isinstance(target, dict):
                 svc_port = target.get("port")
                 bridge, tunnel, target, target_kind, real_host, access = _attach(
                     iid, target, client
@@ -1441,42 +3876,59 @@ def main() -> int:
             else:
                 rec["target"] = target
                 print(f"  ready in {rec['launch_s']}s -> {target}", flush=True)
+            if file_only:
+                rec["target"] = ""
 
             # 「ready」是平台对实例状态的说法，不是从这台机器能连上的证明。
             # 实测踩过：实例正常、沙箱 curl 全程 000，agent 把整道题的预算
             # 都花在重试上。坏实例要当场发现，不能让它先烧掉十几分钟。
-            if target_kind == "tcp":
-                reachable, detail = _probe_tcp(target)
-            else:
-                reachable, detail = client.probe_reachable(target)
+            reachable, detail = _probe_endpoint(client, target, target_kind)
             rec["reachable"] = reachable
             if not reachable:
-                print(f"  ! 不可达（{detail}），换一个实例重试", flush=True)
-                if bridge is not None:
-                    bridge.stop()
-                    bridge = None
-                if tunnel is not None:
-                    tunnel.down()
-                    tunnel = None
-                client.teardown(iid)
-                iid = client.launch(cid)
-                target = client.wait_ready(iid)
-                if isinstance(target, dict):
-                    bridge, tunnel, target, target_kind, real_host, access = _attach(
-                        iid, target, client
+                # 先在同一实例上重探（docs/40 §5 / B-31）：单次抖动就让 7 道题
+                # 永久失联，而「node4 不可达」「ready 后端口未起」都是瞬断。
+                # 换实例要重新排队、占配额，节点级故障时还换到同一个坏节点。
+                waits = _probe_reuse_waits()
+                if waits:
+                    print(f"  ! 不可达（{detail}），先在同一实例上重探 {waits}", flush=True)
+                    ok, detail2, waited = _reprobe(
+                        lambda: _probe_endpoint(client, target, target_kind), waits
                     )
-                    rec["service"] = {"host": real_host, "access": access, "bridge": target}
-                    rec["vpn"] = {"iface": tunnel.iface} if tunnel else None
-                rec["target"] = target
-                if target_kind == "tcp":
-                    reachable, detail = _probe_tcp(target)
-                else:
-                    reachable, detail = client.probe_reachable(target)
-                rec["reachable"] = reachable
+                    if ok:
+                        reachable, detail = True, detail2
+                        rec["reachable"] = True
+                        rec["reprobe_s"] = waited
+                        print(f"  重探可达（{waited:.0f}s，{detail2}）", flush=True)
+                    else:
+                        detail = detail2
                 if not reachable:
-                    msg = f"两个实例都不可达: {detail}"
-                    raise TimeoutError(msg)
-                print(f"  重建后可达 -> {target}", flush=True)
+                    # 重探成功就继续用这个实例：重建要重新排队、再占一次配额，
+                    # 而「重探可达」已经证明服务是活的。这段曾经缩进错一层，
+                    # 于是重探成功也照样拆实例重来——第一次抖动就把一臂的
+                    # 数据赔进去（2026-11-16 卡 A A/B 首题，SKIPPED）。
+                    print(f"  ! 仍不可达（{detail}），换一个实例重试", flush=True)
+                    if bridge is not None:
+                        bridge.stop()
+                        bridge = None
+                    if tunnel is not None:
+                        tunnel.down()
+                        tunnel = None
+                    client.teardown(iid)
+                    iid = client.launch(cid)
+                    target = client.wait_ready(iid)
+                    if isinstance(target, dict):
+                        bridge, tunnel, target, target_kind, real_host, access = _attach(
+                            iid, target, client
+                        )
+                        rec["service"] = {"host": real_host, "access": access, "bridge": target}
+                        rec["vpn"] = {"iface": tunnel.iface} if tunnel else None
+                    rec["target"] = target
+                    reachable, detail = _probe_endpoint(client, target, target_kind)
+                    rec["reachable"] = reachable
+                    if not reachable:
+                        msg = f"两个实例都不可达: {detail}"
+                        raise TimeoutError(msg)
+                    print(f"  重建后可达 -> {target}", flush=True)
             else:
                 print(f"  可达 ({detail})", flush=True)
 
@@ -1485,18 +3937,136 @@ def main() -> int:
             # 题面是公开信息（人类选手在页面上就能看到），不给等于让 agent 盲猜。
             challenge_detail = client.detail(cid)
             brief = _challenge_brief(challenge_detail)
-            rec["brief_chars"] = len(brief)
-            log, wall = run_agent(
-                target, turns, wallclock, run_id,
-                extra=brief,
-                archive_dir=None if args.no_archive else archive,
-                model=model or None,
-                target_kind=target_kind,
+            # B-21：多服务实例其余端点必须进题面，否则 agent 只能猜地址。
+            extra_endpoints = _endpoints_brief(
+                getattr(client, "endpoints", []) or [],
+                resolve=(tunnel.resolve if tunnel is not None else None),
             )
-            rec["agent_s"] = round(wall, 1)
+            if extra_endpoints:
+                brief = f"{brief}\n\n{extra_endpoints}" if brief else extra_endpoints
+            # 单服务也多主机（023 的 files 主机不是 service）：隧道网段与
+            # 内部 DNS 必须写进题面，否则 agent 连救援路径都没有。
+            tunnel_note = _tunnel_brief(tunnel)
+            if tunnel_note:
+                brief = f"{brief}\n\n{tunnel_note}" if brief else tunnel_note
+            # 重试失败路径（用户 11-13 定调）：调度器把同一道题上一轮的结构化
+            # 失败事实写进显式文件，这里只做拼接，不读 digest/别的题。
+            retry_brief = _retry_notes_brief(args.retry_notes)
+            if retry_brief:
+                brief = f"{brief}\n\n{retry_brief}" if brief else retry_brief
+                rec["retry_notes_chars"] = len(retry_brief)
+            # P1：平台hint 的只读一半（docs/47 §3）。作者放出且免费的那几条
+            # 直接进题面；付费未开的一律不碰。探测按 20 分钟节奏、状态跨进程
+            # 落盘——compete 是一次尝试一个进程，节奏必须靠文件。
+            if not args.no_hints:
+                hint_note, hint_rec = _hint_brief(
+                    client, cid, challenge_detail, hint_state,
+                )
+                rec.update(hint_rec)
+                if hint_note:
+                    brief = f"{brief}\n\n{hint_note}" if brief else hint_note
+            # 附件投递：平台把文件挂在挑战上，不会自动出现在我们自己的沙箱里。
+            attachments = (
+                client.fetch_attachments(cid)
+                if hasattr(client, "fetch_attachments") else {}
+            )
+            if file_only and hasattr(client, "fetch_instance_attachments"):
+                # 实例下发的 payload（017 的 checkin、018 的 welcome.txt）
+                # 不在挑战级附件里，只能从实例接口拿。
+                inst_files = client.fetch_instance_attachments(iid)
+                if inst_files:
+                    attachments = {**attachments, **inst_files}
+            if attachments:
+                rec["attachments"] = sorted(attachments)
+                listing = "\n".join(
+                    f"- `{n}` ({len(b)} bytes)"
+                    for n, b in sorted(attachments.items())
+                )
+                note = (
+                    "## 附件（已放进你的工作目录，直接读，别去平台下载）\n"
+                    + listing
+                )
+                brief = f"{brief}\n\n{note}" if brief else note
+            rec["brief_chars"] = len(brief)
+            # 每题默认一次机会；--max-samples>1 时，只有「有证据的早停」才
+            # 换策略重开（见 _resample_allowed）。判据与重开决定都在 harness
+            # 这一侧：agent 只负责把「停在哪」落盘（host/family/mechanism/
+            # signature），不自己决定再跑一次——这是本轮机制的分工。
+            samples = max(int(args.max_samples), 1)
+            sample_names: list[str] = []
+            stop_reasons: list[str] = []
+            logs: list[str] = []
+            total_wall = 0.0
+            steer = ""
+            for sample in range(1, samples + 1):
+                # 名字唯一 == 沙箱目录唯一 == 不会续跑（run_agent 的约定）。
+                sample_name = run_id if sample == 1 else f"{run_id}-s{sample}"
+                sample_names.append(sample_name)
+                sample_log, sample_wall = run_agent(
+                    target, turns, wallclock, sample_name,
+                    extra=f"{brief}\n\n{steer}" if steer else brief,
+                    archive_dir=None if args.no_archive else archive,
+                    model=model or None,
+                    # UDP 中继仍是原始字节流：工具面与 tcp 相同，run_strix_ctf
+                    # 只认 web/tcp/file，别把新 kind 漏进参数校验。
+                    target_kind="tcp" if target_kind == "udp" else target_kind,
+                    # B-4 断链1：实例号/平台/凭据三件套传给子进程，agent 侧
+                    # autosubmit 才能装上（单问题非 flag 题的提交从此不再
+                    # 依赖跑后父进程兜底——实例销毁前完成提交）。
+                    instance=iid,
+                    platform=PLATFORM,
+                    token=client.token,
+                    challenge_id=cid,
+                    files=attachments,
+                    tags=[
+                        t for t in (challenge_detail.get("tags") or []) if isinstance(t, str)
+                    ],
+                    # 白名单要覆盖本实例**所有** service 主机：只放行主目标时，
+                    # 第二个服务（包索引/管理面）会被自家黑洞代理吞掉。
+                    extra_hosts=[
+                        str(svc.get("host") or "").strip()
+                        for svc in (getattr(client, "endpoints", []) or [])
+                        if svc.get("host")
+                    ],
+                )
+                logs.append(sample_log)
+                total_wall += sample_wall
+                reason = _stop_reason_of(sample_log)
+                stop_reasons.append(reason)
+                if not _resample_allowed(reason) or sample >= samples:
+                    break
+                # 换向提示只读上一轮样本自己的标记文件，读不到就退回通用提示。
+                steer = _resume_steer(
+                    _stall_markers_path(sample_name), reason, sample + 1
+                )
+                print(
+                    f"  无进展（{reason}），换策略重开："
+                    f"sample {sample + 1}/{samples}",
+                    flush=True,
+                )
+            log = "\n".join(logs)
+            rec["samples_used"] = len(logs)
+            rec["stop_reasons"] = stop_reasons
+            rec["stop_reason"] = stop_reasons[-1] if stop_reasons else "unknown"
+            rec["agent_s"] = round(total_wall, 1)
             rec["tool_calls"] = log.count(" TOOL ")
             rec["turn_capped"] = "MaxTurnsExceeded" in log
-            rec["wallclock_hit"] = "WALLCLOCK TIMEOUT" in log
+            # DEF-13：token 用量此前只在 eval_sample 的 rec 里有，跑批结果
+            # 表一律缺——对照实验的成本列永远 n/a。
+            rec["usage"] = _parse_usage(log)
+            # 子进程 watchdog 的干净收场（[stop] reason=wallclock，B-2）同样
+            # 计入墙钟命中——否则干净退出被记成普通失败，重开判据失真。
+            rec["wallclock_hit"] = (
+                "WALLCLOCK TIMEOUT" in log or "[stop] reason=wallclock" in log
+            )
+            # 崩溃进结果表：子进程里的异常和负退出码此前只留在 run.log 里，
+            # 结果表一律 error=None——008 的传输断流就是这么被记成"正常失败"
+            # 的，非能力损失（该重跑的证据）完全不可见。
+            crash = _crash_error(log)
+            if crash:
+                rec["error"], detail = crash
+                if detail:
+                    rec["error_detail"] = detail
 
             # 不能"排序取最后一个"，也不能只做不带靶机信息的启发式。
             # 实测踩过三种误判，全部由 flag_extract 处理：
@@ -1505,6 +4075,7 @@ def main() -> int:
             #   3. 日志截断：flag 跨在 event_sink 截断边界上
             # 判据必须带本题靶机 host，否则分不清"这题的证据"和"别题的残留"。
             from ctf_strix.flag_extract import (
+                CANDIDATE_RE,
                 best_flag,
                 fallback_flag,
                 host_of,
@@ -1514,16 +4085,19 @@ def main() -> int:
             # 守卫是否真的介入了，必须进数据。上一轮枚举守卫装在代码里、
             # 单测通过、真实日志重放也通过，但真实运行里一次都没触发——
             # 如果不记录，这种"装了等于没装"在结果表里完全看不出来。
-            rec["guard"] = _parse_guard(log, _guard_state_path(run_id))
+            rec["guard"] = _parse_guard(log, _guard_state_path(sample_names[-1]))
 
             own = host_of(target)
-            flag = best_flag(log, own)
+            best = best_flag(log, own)
             # 主判据挑不出时，用"唯一候选"兜底。理由见 fallback_flag 的 docstring：
             # 009 复跑里 agent 真的解出来了，却因为 host 与 flag 隔着一个
             # heredoc 而被判无证据——**解出来不提交，比交错更亏**。
+            flag = best
+            low: str | None = None
             rec["flag_confidence"] = "high" if flag else None
             if flag is None:
-                flag = fallback_flag(log, own)
+                low = fallback_flag(log, own)
+                flag = low
                 if flag:
                     rec["flag_confidence"] = "low"
             rec["flags_found"] = [flag] if flag else []
@@ -1544,45 +4118,145 @@ def main() -> int:
                     rec["flag_confidence"] = "contaminated"
                     print("  !! flag 疑似来自本地文档污染，不提交", flush=True)
                     flag = None
+                    # 兜底值就是被判污染的那一个，别让它在候选列表里复活。
+                    low = None
             # 多问题题：每个问题单独提交。平台按"全部正确"才算完全解出，
             # 只交 flag 等于白答（001 就吃过这个亏：flag 对了、另一问空着，
             # `my_fully_solved` 仍是 false）。
-            multi = [
-                str(q["id"]) for q in (challenge_detail.get("questions") or [])
-                if isinstance(q, dict) and q.get("id")
-            ]
+            # gated 问题只在实例记录里可见（见 ``_deliverable_questions``）。
+            # 读不到就退回 payload——多一次 GET，不能多一次失败。
+            inst_record: dict = {}
+            fetch_inst = getattr(client, "instance", None)
+            if callable(fetch_inst):
+                try:
+                    inst_record = fetch_inst(iid) or {}
+                except Exception:  # noqa: BLE001 — 拿不到按"没有额外信息"处理
+                    inst_record = {}
+                if not isinstance(inst_record, dict):
+                    inst_record = {}
+            questions = _deliverable_questions(challenge_detail, inst_record)
+            multi = [str(q["id"]) for q in questions]
             pairs = _answer_values(log)
+            # 观测：日志里"flag 形状"的串有几条。只记数字——结果行会被贴进
+            # 报告和 issue，正文（尤其是真答案）不能进去。
+            rec["flag_shaped_tokens"] = len(CANDIDATE_RE.findall(log))
+            rec["flag_shaped_but_unsubmitted"] = 0
             if multi:
                 submitted: dict[str, bool] = {}
+                q_modes = {
+                    str(q.get("id")): str(q.get("mode") or "")
+                    for q in questions
+                }
+                multiple_q = len(multi) > 1
                 for qid in multi:
-                    value = pairs.get(qid)
+                    # B-18：checker 题的交付是靶机副作用，先让平台侧车裁决。
+                    # 没有 ANSWER 行也要问——006/007/008 的正解就是这么交的，
+                    # 而这条跑后路径此前对它们一次都没发。
+                    if q_modes.get(qid, "") == "checker":
+                        if _checker_passed(client, iid, qid, multiple_q):
+                            submitted[qid] = True
+                            rec.setdefault("checker_passed", []).append(qid)
+                            print(f"  [check] {qid} passed via /check", flush=True)
+                            continue
+                        rec.setdefault("checker_checked", []).append(qid)
                     # A single-question challenge whose id is ``flag`` often
                     # ends with the token in a normal summary rather than an
                     # ANSWER line. Keep that evidence path, but never guess
                     # values for non-flag question ids.
-                    if not value and qid == "flag":
-                        value = flag
-                    if not value:
+                    candidates = _ranked_answers(
+                        pairs.get(qid),
+                        flag if qid == "flag" else None,
+                        low if qid == "flag" else None,
+                    )
+                    q_choices = [
+                        str(c) for q in questions
+                        if q.get("id") == qid
+                        for c in (q.get("choices") or []) if str(c).strip()
+                    ]
+                    if q_choices:
+                        from ctf_strix.autosubmit import fits_choices
+
+                        q_mode = q_modes.get(qid, "")
+                        candidates = [
+                            c for c in candidates
+                            if fits_choices(c, q_mode, q_choices)
+                        ]
+                    if not candidates:
+                        continue
+                    if _should_precheck(q_modes.get(qid, "")):
+                        value, precheck = _verify_pick(client, iid, qid, candidates)
+                        if qid == "flag":
+                            rec["verify_precheck"] = precheck
+                    else:
+                        # checker/judge 题：判定器读靶机状态，verify_answer 恒
+                        # 判否；预检会把唯一一次提交机会掐死。直接交首选候选。
+                        value = candidates[0]
+                        rec.setdefault("verify_precheck_skipped", []).append(qid)
+                    if value is None:
+                        # 平台判分器明确说这些都不对：不提交。交上去只会
+                        # 白白消耗 attempts，并污染台账。
+                        if qid == "flag":
+                            rec["flag_shaped_but_unsubmitted"] = len(candidates)
+                        submitted[qid] = False
                         continue
                     verdict = client.submit(iid, value, qid)
                     submitted[qid] = bool(verdict.get("correct"))
                     rec.setdefault("answers_submitted", {})[qid] = value
+                    if not submitted[qid]:
+                        rec.setdefault("answers_rejected", {})[qid] = value
                     if qid == "flag":
                         rec["flag_submitted"] = value
                     if verdict.get("solve_time_s") is not None:
                         rec["solve_time_s"] = verdict.get("solve_time_s")
                 rec["answers_ok"] = submitted
                 rec["correct"] = bool(submitted) and all(submitted.values()) and len(submitted) == len(multi)
-            elif flag:
-                rec["flag_submitted"] = flag
-                verdict = client.submit(iid, flag)
-                rec["correct"] = bool(verdict.get("correct"))
-                rec["solve_time_s"] = verdict.get("solve_time_s")
-                rec["solve_rank"] = verdict.get("solve_rank")
             else:
-                rec["correct"] = False
+                candidates = _ranked_answers(pairs.get("flag"), flag, low)
+                if not candidates:
+                    rec["correct"] = False
+                else:
+                    value, precheck = _verify_pick(client, iid, "flag", candidates)
+                    rec["verify_precheck"] = precheck
+                    if value is None:
+                        rec["flag_shaped_but_unsubmitted"] = len(candidates)
+                        rec["correct"] = False
+                    else:
+                        rec["flag_submitted"] = value
+                        verdict = client.submit(iid, value)
+                        rec["correct"] = bool(verdict.get("correct"))
+                        rec["solve_time_s"] = verdict.get("solve_time_s")
+                        rec["solve_rank"] = verdict.get("solve_rank")
+                        if not rec["correct"]:
+                            rec.setdefault("answers_rejected", {})["flag"] = value
+            # 回读 run 内 autosubmit 的裁决：平台自己说的「全解了」优先于
+            # 父进程事后重放（实例已被 delete，事后路径天然看不见已提交项）。
+            side = (
+                _read_submit_sidecar(_submit_sidecar_path(sample_names[-1]))
+                if sample_names else {}
+            )
+            _merge_sidecar_verdict(rec, side)
+            # 失败路径落盘：下一轮由调度器注入（见 --retry-notes）。
+            rec["failure_path"] = _failure_facts(
+                rec,
+                _stall_markers_path(sample_names[-1]) if sample_names else None,
+            )
             print(f"  -> {'SOLVED' if rec['correct'] else 'FAILED'}  "
                   f"tools={rec['tool_calls']} agent={rec['agent_s']}s", flush=True)
+        except LaunchError as exc:
+            # 实例起不来 = 平台侧故障（过载/配额/5xx），不是能力缺口。
+            # 记 skip 走 B-23 口径：不烧「连败」，但计入 skip 连击，
+            # 平台持续不可用时仍会收敛（连续两次 skip → defer）。
+            rec["error"] = f"SKIPPED(实例启动失败): {exc}"
+            rec["correct"] = False
+            rec["skipped"] = True
+            print("  -> SKIP 实例启动失败（平台侧），跳过", flush=True)
+        except CompetitionPausedError as exc:
+            # B-24：暂停不是题目失败。记 skip 让调度器按 infra 处理
+            # （B-23 口径单独计数），不烧「连败」预算。
+            rec["error"] = f"SKIPPED(平台暂停): {exc}"
+            rec["correct"] = False
+            rec["skipped"] = True
+            print("  -> SKIP 平台暂停，跳过", flush=True)
         except TunnelRequiredError as exc:
             # 隧道类题跳过，不跑 agent。白跑一轮的代价是 13 分钟，而
             # 结果必然是失败——那不是数据，是噪音。
@@ -1590,6 +4264,22 @@ def main() -> int:
             rec["correct"] = False
             rec["skipped"] = True
             print(f"  -> SKIP 需隧道，跳过", flush=True)
+        except TimeoutError as exc:
+            # 实例启动超时是**平台容量/调度**问题，不是题目做不出来。
+            # 2026-11-13 夜实测：017/018/021 三题连续 "not ready in 180s"，
+            # 旧码把它记成题目失败，两次就把题 defer 掉——那是把基础设施
+            # 故障当能力缺口。标 skip 走 B-23 口径单独计数。
+            rec["error"] = f"SKIPPED(实例未就绪): {exc}"
+            rec["correct"] = False
+            rec["skipped"] = True
+            print("  -> SKIP 实例未就绪，跳过", flush=True)
+        except RoutingError as exc:
+            # 题号前缀解析不出所属 suite：题**根本没开跑**，不是做不出来。
+            # 记 skip 走 B-23 口径（与实例起不来同档），不烧连败预算。
+            rec["error"] = f"SKIPPED(套件路由失败): {exc}"
+            rec["correct"] = False
+            rec["skipped"] = True
+            print(f"  -> SKIP 套件路由失败：{exc}", flush=True)
         except Exception as exc:  # noqa: BLE001
             rec["error"] = f"{type(exc).__name__}: {exc}"
             rec["correct"] = False
@@ -1597,12 +4287,17 @@ def main() -> int:
         finally:
             # 桥必须在实例之前拆：实例删掉后远端连接会挂起，桥的转发线程
             # 要等 socket 超时才退出，批测会被拖慢。
+            # 清理分步容错：一步抛错不能挡住后面的 down()/teardown，否则
+            # skip / 异常收场会留下 wg 接口残留；down() 幂等，重复调无害。
             if bridge is not None:
-                bridge.stop()
+                with contextlib.suppress(Exception):
+                    bridge.stop()
             if tunnel is not None:
-                tunnel.down()
+                with contextlib.suppress(Exception):
+                    tunnel.down()
             if iid:
-                client.teardown(iid)
+                with contextlib.suppress(Exception):
+                    client.teardown(iid)
             rec["total_s"] = round(time.time() - rec["started"], 1)
             with out.open("a", encoding="utf-8") as fh:
                 fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
