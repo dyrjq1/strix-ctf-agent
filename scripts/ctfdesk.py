@@ -134,7 +134,9 @@ def now_iso() -> str:
 
 
 def read_json(path: Path) -> Any:
-    return json.loads(path.read_text(encoding="utf-8"))
+    # utf-8-sig：agent 在 Windows 上写出的 JSON 常带 BOM（codex 实测），
+    # 用 utf-8 读会 JSONDecodeError，风控退化成 stdout 正则、置信度丢失。
+    return json.loads(path.read_text(encoding="utf-8-sig"))
 
 
 def write_json(path: Path, data: Any) -> None:

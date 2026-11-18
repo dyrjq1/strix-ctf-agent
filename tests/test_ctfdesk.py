@@ -299,6 +299,16 @@ def test_init_writes_mcp_free_codex_home(tmp_path: Path) -> None:
     assert env["OPENAI_API_KEY"] == "@secret:QWEN_KEY"
 
 
+def test_result_json_with_bom_is_parsed(tmp_path: Path) -> None:
+    """codex 在 Windows 上写出的 RESULT.json 带 BOM：不能退化成 stdout 正则。"""
+    mod = _module()
+    p = tmp_path / "RESULT.json"
+    p.write_bytes(b'\xef\xbb\xbf{"flag": "flag{bom}", "confidence": 0.97}\r\n')
+    flags, confidence, _ = mod.extract_result(p, "no flag in stdout")
+    assert flags == ["flag{bom}"]
+    assert confidence == 0.97
+
+
 def test_plan_workers_narrows_on_memory() -> None:
     mod = _module()
     # 拿不到内存信息：按请求放行
