@@ -174,10 +174,13 @@ for attempt in range(1, ATTEMPTS + 1):
             time.sleep(3)
 PY
 )
-      case "$probe" in
-        HTTP\ 2*) pass "lane $n '$name' -> $probe" ;;
-        *)        fail "lane $n '$name' -> $probe" ;;
-      esac
+      # 重试时 probe 可能是多行（前几次的 # 说明 + 最后一次结果），
+      # 所以不能只看字符串开头，要在任意一行里找 HTTP 2xx。
+      if printf '%s\n' "$probe" | grep -qE '^HTTP 2'; then
+        pass "lane $n '$name' -> $probe"
+      else
+        fail "lane $n '$name' -> $probe"
+      fi
     done < "$LANES_CONF"
   fi
 else
