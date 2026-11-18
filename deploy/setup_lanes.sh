@@ -42,7 +42,8 @@ chmod 600 "$TMP"
 
 n=0
 fail=0
-while IFS='|' read -r name base key model; do
+# 注意 `|| [ -n ... ]`：spec 最后一行常常没有换行符，read 会返回非零把整行丢掉
+while IFS='|' read -r name base key model || [ -n "${name:-}" ]; do
   name=$(printf '%s' "${name:-}" | tr -d ' \r'); base=$(printf '%s' "${base:-}" | tr -d ' \r')
   key=$(printf '%s' "${key:-}" | tr -d ' \r'); model=$(printf '%s' "${model:-}" | tr -d ' \r')
   [ -z "$name" ] && continue
@@ -55,17 +56,26 @@ while IFS='|' read -r name base key model; do
   echo "  base=$base  key=$(mask "$key")"
 
   host=$(printf '%s' "$base" | sed -E 's#^[a-z]+://##; s#/.*$##; s#:[0-9]+$##')
-  if ! getent hosts "$host" >/dev/null 2>&1; then
-    echo "  DNS 没有 $host → 钉边缘 IP"
-    GATEWAY_KEY="$key" LANES_CONF="$OUT" bash "$HERE/pick_gateway_ip.sh" "$host" || {
+  # 每次都重钉，不看 DNS 有没有结果：内网解析器对这些域名有时只给 AAAA
+  # （Cloudflare IPv6，路径不稳），有时给 A 但可能是坏边缘节点。只有钉死一个
+  # 实测 200 的 IPv4 才算数。NO_PIN=1 可跳过（仅用于离线演练）。
+  if [ "${NO_PIN:-0}" != "1" ]; then
+    GATEWAY_KEY="$key" LANES_CONF="$OUT" bash "$HERE/pick_gateway_ip.sh" "$host" >/tmp/pin.$$ 2>&1 || {
+      sed -n 's/^/    /p' /tmp/pin.$$; rm -f /tmp/pin.$$
       echo "  FAIL: 钉 IP 没选出可用节点"; fail=$((fail+1)); continue; }
+    grep -E 'PICK_OK|WARN' /tmp/pin.$$ | sed -n 's/^/  /p'; rm -f /tmp/pin.$$
   fi
 
-  # 模型名：没给就用 /v1/models 现查
-  models=$(curl -sS -m 30 -H "Authorization: Bearer $key" "$base/models" 2>/dev/null |
-           tr ',' '\n' | sed -n 's/.*"id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+  # 模型名：没给就用 /v1/models 现查（3 次，网关偶发丢一发）
+  models=""
+  for attempt in 1 2 3; do
+    models=$(curl -sS -m 30 -H "Authorization: Bearer $key" "$base/models" 2>/dev/null |
+             tr ',' '\n' | sed -n 's/.*"id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+    [ -n "$models" ] && break
+    [ "$attempt" -lt 3 ] && sleep 3
+  done
   if [ -z "$models" ]; then
-    echo "  FAIL: $base/models 没返回模型清单（凭据过期？网关边缘又坏了？）"
+    echo "  FAIL: $base/models 三次都没返回模型清单（凭据过期？网关整个坏了？）"
     fail=$((fail+1)); continue
   fi
   echo "  models: $(printf '%s' "$models" | tr '\n' ' ')"
@@ -73,7 +83,7 @@ while IFS='|' read -r name base key model; do
     case "$name" in
       *deepseek*) pref="deepseek-flash" ;;
       *zhipu*|*glm*) pref="glm-5.3-flashx" ;;
-      *bailian*|*qwen*) pref="qwen4-max" ;;
+      *bailian*|*qwen*|*dashscope*) pref="qwen4-max" ;;
       *xiaomi*|*mimo*) pref="mimo-v2.6-pro" ;;
       *) pref="" ;;
     esac

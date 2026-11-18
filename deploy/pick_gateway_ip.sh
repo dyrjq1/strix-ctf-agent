@@ -43,12 +43,18 @@ if [ -z "$KEY" ]; then
 fi
 [ -n "$KEY" ] || { echo "no gateway key (set GATEWAY_KEY or LANES_CONF)"; exit 2; }
 
-TRIES=3
+TRIES=5
 RC=0
 for HOST in "${HOSTS[@]}"; do
   BEST_IP=""; BEST_OK=-1; BEST_TOTAL=999999
-  echo "== host=$HOST  tries=$TRIES =="
-  for ip in "${IPS[@]}"; do
+  # DNS 有时能给回 A（只是可能指向坏边缘）：顺手当候选，多一个选择
+  CANDS=("${IPS[@]}")
+  for a in $(getent ahostsv4 "$HOST" 2>/dev/null | awk '{print $1}' | sort -u); do
+    case "$a" in *:*) continue ;; esac
+    case " ${CANDS[*]} " in *" $a "*) ;; *) CANDS+=("$a") ;; esac
+  done
+  echo "== host=$HOST  tries=$TRIES  candidates=${CANDS[*]} =="
+  for ip in "${CANDS[@]}"; do
     ok=0; total=0
     for i in $(seq 1 $TRIES); do
       r=$(curl -sS -m 20 -o /dev/null -w '%{http_code} %{time_total}' \
@@ -73,6 +79,10 @@ for HOST in "${HOSTS[@]}"; do
     continue
   fi
   echo "PICK_OK  $HOST -> $BEST_IP  (ok=$BEST_OK/$TRIES total=${BEST_TOTAL}s)"
+  # 2-3/5 这类边缘样本能用但会拖重试；提示换时间再跑一遍
+  if [ "$BEST_OK" -lt 4 ]; then
+    echo "  WARN marginal edge ($BEST_OK/$TRIES) —— 能用但会多花重试；有空再跑一次可能换到更好的节点"
+  fi
 
   if [ "$DRY" -eq 1 ]; then continue; fi
   if [ "$(id -u)" != "0" ]; then echo "need root to rewrite /etc/hosts"; exit 2; fi
