@@ -96,6 +96,56 @@ import batch_eval  # noqa: E402
 #: 平台地址。batch_eval.Client 同源，不另起一份。
 PLATFORM = batch_eval.PLATFORM if hasattr(batch_eval, "PLATFORM") else "https://ctfy.tsinghua.edu.cn"
 
+def ensure_bundle_tool_env() -> dict[str, str]:
+    """把 bundle 部署树里的系统工具挂进本进程 env（非 bundle 布局 = no-op）。
+
+    bootstrap.sh 把 gdb/nmap/rg/sqlmap 解到 ``<DEPLOY>/tools``，repo 在
+    ``<DEPLOY>/strix-ctf-agent``，但**从不写 ~/.bashrc**；而车道的子进程只
+    继承本进程 env（见 ``spawn`` 里的 ``{**os.environ, ...}``）。于是从裸
+    shell 直接起 compete.py 时，干净 VPS 上 agent 的 exec_command 找不到
+    这些工具（代价是静默的能力退化，不是报错）。
+
+    库序必须是**宿主目录在前**：bundle 自带 libsystemd 252，若排最前，宿主
+    的 ls/bash/curl/tar 会全挂（台账 §4.263）。
+
+    Returns:
+        实际改动的 ``{"PATH": ..., "LD_LIBRARY_PATH": ...}`` 子集，空表示没动。
+    """
+    # HERE = <DEPLOY>/strix-ctf-agent/scripts  →  tools 在 <DEPLOY>/tools
+    deploy = HERE.parent.parent
+    tools = deploy / "tools"
+    if not tools.is_dir():
+        return {}
+    changed: dict[str, str] = {}
+
+    path_parts = [p for p in os.environ.get("PATH", "").split(os.pathsep) if p]
+    add_bins = [
+        str(d)
+        for d in (tools / "usr/bin", tools / "usr/sbin")
+        if d.is_dir() and str(d) not in path_parts
+    ]
+    if add_bins:
+        os.environ["PATH"] = os.pathsep.join(add_bins + path_parts)
+        changed["PATH"] = os.environ["PATH"]
+
+    lib_dirs = [
+        d
+        for d in (
+            "/lib/x86_64-linux-gnu",
+            "/usr/lib/x86_64-linux-gnu",
+            str(tools / "usr/lib/x86_64-linux-gnu"),
+            str(tools / "lib/x86_64-linux-gnu"),
+        )
+        if os.path.isdir(d)
+    ]
+    cur_libs = [p for p in os.environ.get("LD_LIBRARY_PATH", "").split(os.pathsep) if p]
+    merged = lib_dirs + [p for p in cur_libs if p not in lib_dirs]
+    if merged and merged != cur_libs:
+        os.environ["LD_LIBRARY_PATH"] = os.pathsep.join(merged)
+        changed["LD_LIBRARY_PATH"] = os.environ["LD_LIBRARY_PATH"]
+    return changed
+
+
 # ---------------------------------------------------------------- 策略纯函数
 
 #: 状态机：active（可跑）/ running / solved / failed / deferred（放弃，
@@ -1153,6 +1203,9 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main() -> int:
+    added = ensure_bundle_tool_env()
+    if "PATH" in added:
+        print(f"[compete] bundle 工具已挂进 PATH（{len(added['PATH'].split(os.pathsep))} 段）", flush=True)
     args = build_parser().parse_args()
 
     #: per-lane 厂商配置（可选）。加载失败/行数不够车道数 = 启动即退：

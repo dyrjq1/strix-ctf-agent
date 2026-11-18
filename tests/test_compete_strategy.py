@@ -978,3 +978,72 @@ def test_spawn_disjoint_clears_stale_race_env(tmp_path, monkeypatch) -> None:
     assert "CTF_RACE_DIR" not in env
     assert "CTF_RACE_CHALLENGE" not in env
     assert "CTF_RACE_LANE" not in env
+
+
+def _bundle_layout(tmp_path):
+    """造一个 bootstrap.sh 产出的布局：<D>/strix-ctf-agent/scripts + <D>/tools。"""
+    repo = tmp_path / "strix-ctf-agent"
+    scripts = repo / "scripts"
+    scripts.mkdir(parents=True)
+    bin_dir = tmp_path / "tools" / "usr" / "bin"
+    sbin_dir = tmp_path / "tools" / "usr" / "sbin"
+    lib_dir = tmp_path / "tools" / "usr" / "lib" / "x86_64-linux-gnu"
+    lib2_dir = tmp_path / "tools" / "lib" / "x86_64-linux-gnu"
+    for d in (bin_dir, sbin_dir, lib_dir, lib2_dir):
+        d.mkdir(parents=True)
+    return scripts
+
+
+def test_ensure_bundle_tool_env_noop_outside_bundle(tmp_path, monkeypatch) -> None:
+    """非 bundle 布局（开发机）必须一个字节都不改 env。"""
+    scripts = tmp_path / "plain" / "scripts"
+    scripts.mkdir(parents=True)
+    monkeypatch.setattr(compete, "HERE", scripts)
+    monkeypatch.setenv("PATH", compete.os.pathsep.join(["/usr/bin", "/bin"]))
+    monkeypatch.delenv("LD_LIBRARY_PATH", raising=False)
+    assert compete.ensure_bundle_tool_env() == {}
+    assert compete.os.environ["PATH"] == compete.os.pathsep.join(["/usr/bin", "/bin"])
+    assert "LD_LIBRARY_PATH" not in compete.os.environ
+
+
+def test_ensure_bundle_tool_env_puts_bundle_bins_first(tmp_path, monkeypatch) -> None:
+    """bundle 布局：tools/usr/bin|sbin 排在最前，原有 PATH 段保留在后。"""
+    scripts = _bundle_layout(tmp_path)
+    monkeypatch.setattr(compete, "HERE", scripts)
+    monkeypatch.setenv("PATH", compete.os.pathsep.join(["/usr/bin", "/bin"]))
+    changed = compete.ensure_bundle_tool_env()
+    parts = compete.os.environ["PATH"].split(compete.os.pathsep)
+    assert parts[0] == str(tmp_path / "tools" / "usr" / "bin")
+    assert parts[1] == str(tmp_path / "tools" / "usr" / "sbin")
+    assert "/usr/bin" in parts and "/bin" in parts
+    assert "PATH" in changed
+
+
+def test_ensure_bundle_tool_env_keeps_host_libs_first(tmp_path, monkeypatch) -> None:
+    """库序：bundle 的 lib 目录只能在宿主目录之后（否则宿主二进制全挂）。"""
+    scripts = _bundle_layout(tmp_path)
+    monkeypatch.setattr(compete, "HERE", scripts)
+    monkeypatch.setenv("LD_LIBRARY_PATH", "/opt/custom")
+    compete.ensure_bundle_tool_env()
+    libs = compete.os.environ["LD_LIBRARY_PATH"].split(compete.os.pathsep)
+    bundle_usr_lib = str(tmp_path / "tools" / "usr" / "lib" / "x86_64-linux-gnu")
+    bundle_lib = str(tmp_path / "tools" / "lib" / "x86_64-linux-gnu")
+    assert bundle_usr_lib in libs and bundle_lib in libs
+    assert "/opt/custom" in libs  # 外部已有值不被丢弃
+    # 宿主目录（若本机存在）必须都排在 bundle 目录之前
+    for host in ("/lib/x86_64-linux-gnu", "/usr/lib/x86_64-linux-gnu"):
+        if host in libs:
+            assert libs.index(host) < libs.index(bundle_usr_lib)
+
+
+def test_ensure_bundle_tool_env_is_idempotent(tmp_path, monkeypatch) -> None:
+    """重复调用不再改 env（第二次返回空），避免 PATH 越跑越长。"""
+    scripts = _bundle_layout(tmp_path)
+    monkeypatch.setattr(compete, "HERE", scripts)
+    monkeypatch.setenv("PATH", compete.os.pathsep.join(["/usr/bin", "/bin"]))
+    first = compete.ensure_bundle_tool_env()
+    after_first = compete.os.environ["PATH"]
+    second = compete.ensure_bundle_tool_env()
+    assert "PATH" in first
+    assert compete.os.environ["PATH"] == after_first
+    assert "PATH" not in second
