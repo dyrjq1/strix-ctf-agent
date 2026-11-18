@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -85,6 +86,55 @@ def test_pipeline_end_to_end(tmp_path: Path) -> None:
     assert rec.returncode == 0, rec.stderr
     verify_log = (root / "outbox" / "verify" / "CH1.md").read_text(encoding="utf-8")
     assert "cat files/a.txt" in verify_log and "pass" in verify_log
+
+
+def test_resolve_secret_forms() -> None:
+    mod = _module()
+    secrets = {"K": "v1"}
+    assert mod.resolve_secret("@secret:K", secrets) == "v1"
+    assert mod.resolve_secret("@secret:MISSING", secrets) == ""
+    assert mod.resolve_secret("plain", secrets) == "plain"
+    os.environ["CTFDESK_TEST_ENV"] = "e1"
+    assert mod.resolve_secret("@env:CTFDESK_TEST_ENV", secrets) == "e1"
+
+
+SECRET_AGENT = '''
+import json, os, sys
+from pathlib import Path
+work = Path(sys.argv[1])
+(work / "seen.txt").write_text(os.environ.get("FAKE_KEY", "MISSING"), encoding="utf-8")
+(work / "RESULT.json").write_text(json.dumps({"flag": "flag{sec}", "confidence": 0.9}),
+                                 encoding="utf-8")
+'''
+
+
+def test_secret_reaches_agent_env(tmp_path: Path) -> None:
+    """secrets.json 里的密钥要通过 @secret: 注入到子进程，且不写进 agents.json。"""
+    root = tmp_path / "desk"
+    assert _run("init", "--root", str(root)).returncode == 0
+
+    fake = tmp_path / "sec_agent.py"
+    fake.write_text(SECRET_AGENT, encoding="utf-8")
+    (root / "agents.json").write_text(
+        json.dumps({"fake": {"cmd": [sys.executable, str(fake), "{workdir}"],
+                             "env": {"FAKE_KEY": "@secret:FAKE"},
+                             "result": "{workdir}/RESULT.json"}}),
+        encoding="utf-8",
+    )
+    (root / "secrets.json").write_text(json.dumps({"FAKE": "s3cr3t"}), encoding="utf-8")
+
+    ch = root / "inbox" / "CH3"
+    (ch / "files").mkdir(parents=True)
+    (ch / "meta.json").write_text(
+        json.dumps({"id": "CH3", "name": "sec", "category": "misc",
+                    "agents": ["fake"], "target_kind": "file"}),
+        encoding="utf-8",
+    )
+    (ch / "statement.md").write_text("x", encoding="utf-8")
+
+    assert _run("watch", "--root", str(root), "--once", "--workers", "1").returncode == 0
+    seen = (root / "work" / "CH3" / "fake" / "seen.txt").read_text(encoding="utf-8")
+    assert seen == "s3cr3t"
 
 
 def test_plan_workers_narrows_on_memory() -> None:

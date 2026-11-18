@@ -214,11 +214,31 @@ DEFAULT_AGENTS_SPEC: dict[str, dict[str, Any]] = {
         "result": "{workdir}/RESULT.json",
     },
     "claude": {
+        # 显式给模型：全局 settings.json 里的 ANTHROPIC_MODEL 可能与网关不同步
+        # （实测 gateway 回 unrecognized_model 后降级，既慢又不可控）。
         "cmd": [
             "claude", "-p", "--permission-mode", "acceptEdits",
+            "--model", "deepseek-v4.1-flash",
             "--allowedTools", "Bash,Read,Write,Edit,Glob,Grep",
             "{prompt}",
         ],
+        "result": "{workdir}/RESULT.json",
+    },
+    # 异构第二模型：智谱 GLM 走 Anthropic 兼容口，复用 claude CLI。
+    # 密钥放 <root>/secrets.json 的 ZHIPU_KEY，agents.json 里只写 @secret: 引用。
+    "claude-glm": {
+        "cmd": [
+            "claude", "-p", "--permission-mode", "acceptEdits",
+            "--model", "glm-5",
+            "--allowedTools", "Bash,Read,Write,Edit,Glob,Grep",
+            "{prompt}",
+        ],
+        "env": {
+            "ANTHROPIC_BASE_URL": "https://open.bigmodel.cn/api/anthropic",
+            "ANTHROPIC_AUTH_TOKEN": "@secret:ZHIPU_KEY",
+            "ANTHROPIC_API_KEY": "@secret:ZHIPU_KEY",
+            "ANTHROPIC_MODEL": "glm-5",
+        },
         "result": "{workdir}/RESULT.json",
     },
 }
@@ -340,6 +360,27 @@ def extract_result(result_path: Path, stdout: str) -> tuple[list[str], float, st
 
 # ---------------------------------------------------------------- run
 
+def load_secrets(root: Path) -> dict[str, str]:
+    """<root>/secrets.json 里的密钥。文件在仓库外，不进 git。"""
+    path = root / "secrets.json"
+    if not path.exists():
+        return {}
+    try:
+        data = read_json(path)
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return {str(k): str(v) for k, v in data.items() if isinstance(v, (str, int))}
+
+
+def resolve_secret(value: str, secrets: dict[str, str]) -> str:
+    """`@secret:NAME` 从 secrets.json 取值，`@env:NAME` 从环境变量取，其余原样。"""
+    if value.startswith("@secret:"):
+        return secrets.get(value.split(":", 1)[1], "")
+    if value.startswith("@env:"):
+        return os.environ.get(value.split(":", 1)[1], "")
+    return value
+
+
 class Runner:
     def __init__(self, root: Path, conn: sqlite3.Connection,
                  agents: dict[str, dict[str, Any]], budget: int,
@@ -347,6 +388,7 @@ class Runner:
         self.root = root
         self.conn = conn
         self.agents = agents
+        self.secrets = load_secrets(root)
         self.budget = budget
         self.turns = turns
         self.verbose = verbose
@@ -403,7 +445,7 @@ class Runner:
             return {"run_id": run_id, "status": "config_error", "error": str(exc)}
         env = os.environ.copy()
         for k, v in (spec.get("env") or {}).items():
-            env[str(k)] = str(v).format(**vals)
+            env[str(k)] = resolve_secret(str(v).format(**vals), self.secrets)
 
         started = now_iso()
         with self._lock:
