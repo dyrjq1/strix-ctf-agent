@@ -16,6 +16,10 @@ from pathlib import Path
 
 work = Path(sys.argv[1])
 (work / "transcript.md").write_text("fake solver ran\\n", encoding="utf-8")
+(work / "VERIFY.md").write_text(
+    "## 复现命令\\n`cat files/a.txt`\\n## 期望输出\\nflag{test_123}\\n",
+    encoding="utf-8",
+)
 (work / "RESULT.json").write_text(
     json.dumps({"flag": "flag{test_123}", "confidence": 0.95, "notes": "fake"}),
     encoding="utf-8",
@@ -61,6 +65,17 @@ def test_pipeline_end_to_end(tmp_path: Path) -> None:
     assert "flag{test_123}" in sheet
     assert (root / "outbox" / "wp" / "CH1.md").exists()
     assert (root / "outbox" / "evidence" / "CH1" / "fake" / "RESULT.json").exists()
+    assert (root / "outbox" / "evidence" / "CH1" / "fake" / "VERIFY.md").exists()
+    wp = (root / "outbox" / "wp" / "CH1.md").read_text(encoding="utf-8")
+    assert "人工验证记录" in wp
+    assert "复现命令" in wp  # agent 产出的验证材料已并入 WP
+
+    rec = _run("record", "--root", str(root), "--id", "CH1",
+               "--command", "cat files/a.txt", "--observed", "flag{test_123}",
+               "--source", "本队实例", "--result", "pass")
+    assert rec.returncode == 0, rec.stderr
+    verify_log = (root / "outbox" / "verify" / "CH1.md").read_text(encoding="utf-8")
+    assert "cat files/a.txt" in verify_log and "pass" in verify_log
 
 
 def test_pipeline_records_failure_without_fabricating_flag(tmp_path: Path) -> None:

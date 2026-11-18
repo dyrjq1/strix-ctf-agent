@@ -66,6 +66,11 @@ PROMPT = """你在一场 CTF 比赛中独立解一道题。只允许使用本工
    {{"flag": "...", "confidence": 0.0, "notes": "怎么得到的"}}
    confidence 用 0-1 表示你对 flag 正确的把握。
 3. 找不到就写 {{"flag": null, "confidence": 0.0, "notes": "卡在哪里"}}，不要编造。
+4. 写 ./VERIFY.md，让人（不需要安全背景）能验证这个 flag 确实来自本题：
+   - `## 复现命令`：一条可直接执行的命令（附件题给本地命令；靶机题给最小 curl/脚本）
+   - `## 期望输出`：执行后应看到的关键片段（含 flag 或可判定字符串）
+   - `## 来源核对`：怎么确认这是本题/本实例的 flag，而不是别处的
+   - `## 人工核对要点`：人只需要看哪一行、比对什么
 """
 
 
@@ -390,6 +395,9 @@ class Runner:
         transcript = workdir / "transcript.md"
         if transcript.exists():
             shutil.copy2(transcript, log_dir / "transcript.md")
+        verify_doc = workdir / "VERIFY.md"
+        if verify_doc.exists():
+            shutil.copy2(verify_doc, log_dir / "VERIFY.md")
 
         finished = now_iso()
         with self._lock:
@@ -433,7 +441,7 @@ class Runner:
         if rows:
             wp = outbox / "wp" / f"{cid}.md"
             if not wp.exists():
-                atomic_write(wp, wp_skeleton(self.conn, cid, rows[0], notes))
+                atomic_write(wp, wp_skeleton(self.conn, self.root, cid, rows[0], notes))
         self.regenerate_sheet()
 
     def regenerate_sheet(self) -> None:
@@ -457,13 +465,16 @@ class Runner:
         atomic_write(self.root / "outbox" / "submit-sheet.md", "\n".join(lines))
 
 
-def wp_skeleton(conn: sqlite3.Connection, cid: str, flag_row: sqlite3.Row,
-                notes: str) -> str:
+def wp_skeleton(conn: sqlite3.Connection, root: Path, cid: str,
+                flag_row: sqlite3.Row, notes: str) -> str:
     ch = conn.execute("SELECT * FROM challenges WHERE id=?", (cid,)).fetchone()
     runs = conn.execute(
         "SELECT agent,status,started_at,finished_at,log_path FROM runs WHERE challenge_id=? "
         "ORDER BY started_at", (cid,)
     ).fetchall()
+    verify_path = root / "outbox" / "evidence" / cid / flag_row["agent"] / "VERIFY.md"
+    verify = verify_path.read_text(encoding="utf-8", errors="replace") \
+        if verify_path.exists() else "（agent 未产出 VERIFY.md，按 transcript 手工整理）"
     lines = [
         f"# {cid} · {ch['name']}", "",
         f"- 题型：{ch['category']}",
@@ -471,10 +482,18 @@ def wp_skeleton(conn: sqlite3.Connection, cid: str, flag_row: sqlite3.Row,
         f"- Flag：`{flag_row['flag']}`（来源 {flag_row['agent']}，置信度 {flag_row['confidence']:.2f}）",
         "", "## 关键分析", "", notes or "（待补）", "",
         "## 复现步骤", "", "（按 evidence 里的 transcript / stdout 整理）", "",
+        "## 验证材料（agent 产出）", "", verify, "",
         "## AI 使用说明", "",
-        "> 规则要求写明 AI 的作用与人工验证过程。",
+        "> 规则要求写明 AI 的作用与人工验证过程。按实际写，不要替人声称未做过的验证。",
         "", "- 使用的 agent / 模型：",
-        "- 人工验证了什么：",
+        "- AI 完成了哪些步骤：",
+        "", "## 人工验证记录", "",
+        "> 由本人执行后填写；`ctfdesk record` 会把同样的记录写进 outbox/verify/。",
+        "", "- 验证时间：",
+        "- 执行的命令：",
+        "- 观察到的输出（须含 flag 或可判定片段）：",
+        "- 来源核对（本题 / 本实例）：",
+        "- 结论：",
         "", "## 运行记录", "",
     ]
     for r in runs:
@@ -583,6 +602,26 @@ def cmd_add(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_record(args: argparse.Namespace) -> int:
+    """人执行验证后落一条带时间戳的存证（WP 的人工验证记录由此汇总）。"""
+    root = Path(args.root).expanduser()
+    out = root / "outbox" / "verify" / f"{args.id}.md"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    block = "\n".join([
+        f"## {args.id} · {now_iso()}",
+        f"- 执行的命令：`{args.command}`",
+        f"- 观察到的输出：{args.observed}",
+        f"- 来源核对：{args.source or '（未填）'}",
+        f"- 结论：{args.result}",
+        f"- 备注：{args.note or '（无）'}",
+        "",
+    ])
+    with out.open("a", encoding="utf-8") as fh:
+        fh.write(block)
+    print(f"recorded -> {out}")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="local CTF solving desk (platform-free)")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -617,6 +656,16 @@ def build_parser() -> argparse.ArgumentParser:
     add.add_argument("--agents", default="")
     add.add_argument("--files", default="")
     add.set_defaults(func=cmd_add)
+
+    rec = sub.add_parser("record", help="log a human verification run (timestamped)")
+    rec.add_argument("--root", default="~/ctf-desk")
+    rec.add_argument("--id", required=True)
+    rec.add_argument("--command", required=True)
+    rec.add_argument("--observed", required=True)
+    rec.add_argument("--source", default="")
+    rec.add_argument("--result", default="pass", choices=("pass", "fail", "partial"))
+    rec.add_argument("--note", default="")
+    rec.set_defaults(func=cmd_record)
     return p
 
 
