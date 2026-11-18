@@ -30,6 +30,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import sqlite3
 import subprocess
 import sys
@@ -188,6 +189,22 @@ def load_agents(root: Path) -> dict[str, dict[str, Any]]:
     return DEFAULT_AGENTS_SPEC
 
 
+def CLAUDE_SETTINGS(base_url: str, token_ref: str, model: str,
+                    fast_model: str | None = None) -> dict[str, str]:
+    """claude CLI 的 --settings env 块。token_ref 保持 @secret: 引用，运行时解析。"""
+    return {
+        "ANTHROPIC_BASE_URL": base_url,
+        "ANTHROPIC_AUTH_TOKEN": token_ref,
+        "ANTHROPIC_API_KEY": token_ref,
+        "ANTHROPIC_MODEL": model,
+        "ANTHROPIC_DEFAULT_OPUS_MODEL": model,
+        "ANTHROPIC_DEFAULT_SONNET_MODEL": model,
+        "ANTHROPIC_DEFAULT_HAIKU_MODEL": fast_model or model,
+        "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
+        "CLAUDE_CODE_AUTO_MODE_SERVER": "0",
+    }
+
+
 DEFAULT_AGENTS_SPEC: dict[str, dict[str, Any]] = {
     "strix": {
         "cmd": [
@@ -210,35 +227,71 @@ DEFAULT_AGENTS_SPEC: dict[str, dict[str, Any]] = {
         },
     },
     "codex": {
-        "cmd": ["codex", "exec", "--cd", "{workdir}", "--skip-git-repo-check", "{prompt}"],
+        # `codex exec -` 从 stdin 读 prompt（实测可用），避免 .cmd 壳吞多行。
+        # CODEX_HOME 指向 desk 自己的配置：全局那份挂着 ctfy 平台 MCP，不能用。
+        "cmd": ["codex", "exec", "--cd", "{workdir}", "--skip-git-repo-check", "-"],
+        "stdin": "{prompt}",
+        "env": {"CODEX_HOME": "{root}/codex-home",
+                "OPENAI_API_KEY": "@secret:QWEN_KEY"},
         "result": "{workdir}/RESULT.json",
     },
+    # 三条 claude 车道，各自钉死一个网关。
+    # 必须用 --settings：claude CLI 会用 ~/.claude/settings.json 的 env 覆盖
+    # 进程环境变量（实测把 ANTHROPIC_BASE_URL 指向死端口仍能正常应答），
+    # 只靠 adapter.env 会静默走到用户全局配置的那个网关上去。
+    # prompt 走 stdin（适配器 "stdin" 键）：长文本经 npm 的 .cmd 壳会被拆坏。
     "claude": {
-        # 显式给模型：全局 settings.json 里的 ANTHROPIC_MODEL 可能与网关不同步
-        # （实测 gateway 回 unrecognized_model 后降级，既慢又不可控）。
         "cmd": [
-            "claude", "-p", "--permission-mode", "acceptEdits",
+            "claude", "--settings", "{settings}", "-p",
+            # 空 MCP 配置 + strict：不继承用户全局 MCP（ctfy 平台工具绝不能进
+            # agent 的工具面——人机协同赛道禁止 agent 接触平台）。
+            "--strict-mcp-config", "--mcp-config", '{{"mcpServers":{{}}}}',
+            "--permission-mode", "acceptEdits",
             "--model", "deepseek-v4.1-flash",
             "--allowedTools", "Bash,Read,Write,Edit,Glob,Grep",
-            "{prompt}",
+            "-",
         ],
+        "stdin": "{prompt}",
+        "settings": CLAUDE_SETTINGS(
+            "https://maas.qianwenaiapi.com/apps/anthropic",
+            "@secret:QWEN_KEY", "deepseek-v4.1-flash", "deepseek-v4.1-flash"),
         "result": "{workdir}/RESULT.json",
     },
-    # 异构第二模型：智谱 GLM 走 Anthropic 兼容口，复用 claude CLI。
+    # 异构第二模型：智谱 GLM 的 Anthropic 兼容口。
     # 密钥放 <root>/secrets.json 的 ZHIPU_KEY，agents.json 里只写 @secret: 引用。
     "claude-glm": {
         "cmd": [
-            "claude", "-p", "--permission-mode", "acceptEdits",
+            "claude", "--settings", "{settings}", "-p",
+            # 空 MCP 配置 + strict：不继承用户全局 MCP（ctfy 平台工具绝不能进
+            # agent 的工具面——人机协同赛道禁止 agent 接触平台）。
+            "--strict-mcp-config", "--mcp-config", '{{"mcpServers":{{}}}}',
+            "--permission-mode", "acceptEdits",
             "--model", "glm-5",
             "--allowedTools", "Bash,Read,Write,Edit,Glob,Grep",
-            "{prompt}",
+            "-",
         ],
-        "env": {
-            "ANTHROPIC_BASE_URL": "https://open.bigmodel.cn/api/anthropic",
-            "ANTHROPIC_AUTH_TOKEN": "@secret:ZHIPU_KEY",
-            "ANTHROPIC_API_KEY": "@secret:ZHIPU_KEY",
-            "ANTHROPIC_MODEL": "glm-5",
-        },
+        "stdin": "{prompt}",
+        "settings": CLAUDE_SETTINGS(
+            "https://open.bigmodel.cn/api/anthropic",
+            "@secret:ZHIPU_KEY", "glm-5", "glm-5"),
+        "result": "{workdir}/RESULT.json",
+    },
+    # 异构第三模型：小米 MiMo 的 Anthropic 兼容口（OpenAI 口也通）。
+    "claude-mimo": {
+        "cmd": [
+            "claude", "--settings", "{settings}", "-p",
+            # 空 MCP 配置 + strict：不继承用户全局 MCP（ctfy 平台工具绝不能进
+            # agent 的工具面——人机协同赛道禁止 agent 接触平台）。
+            "--strict-mcp-config", "--mcp-config", '{{"mcpServers":{{}}}}',
+            "--permission-mode", "acceptEdits",
+            "--model", "mimo-v2.6-pro",
+            "--allowedTools", "Bash,Read,Write,Edit,Glob,Grep",
+            "-",
+        ],
+        "stdin": "{prompt}",
+        "settings": CLAUDE_SETTINGS(
+            "https://api.xiaomimimo.com/anthropic",
+            "@secret:XIAOMI_KEY", "mimo-v2.6-pro", "mimo-v2.6-flash"),
         "result": "{workdir}/RESULT.json",
     },
 }
@@ -381,6 +434,36 @@ def resolve_secret(value: str, secrets: dict[str, str]) -> str:
     return value
 
 
+def kill_tree(proc: "subprocess.Popen[str]") -> None:
+    """超时后连同子进程一起杀。npm 的 .cmd 壳会留下 node 孙进程攥住管道。"""
+    if os.name == "nt":
+        subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                       capture_output=True)
+    else:
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        except OSError:
+            proc.kill()
+
+
+def write_settings_file(path: Path, env: dict[str, Any],
+                        secrets: dict[str, str]) -> Path:
+    """把适配器的 settings 块落成 claude CLI 的 --settings 文件。
+
+    为什么要文件而不是环境变量：claude CLI 启动时会用 ~/.claude/settings.json
+    的 env 覆盖进程环境变量（实测把 ANTHROPIC_BASE_URL 指向死端口仍能正常应答），
+    只有 --settings 的优先级够高。文件放 <root>/runtime/，不进 workdir，
+    避免明文密钥落进证据目录。写完用 os.replace，避免 Windows 截断写。
+    """
+    resolved = {str(k): resolve_secret(str(v), secrets) for k, v in env.items()}
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps({"env": resolved}, indent=2, ensure_ascii=False),
+                   encoding="utf-8")
+    os.replace(tmp, path)
+    return path
+
+
 class Runner:
     def __init__(self, root: Path, conn: sqlite3.Connection,
                  agents: dict[str, dict[str, Any]], budget: int,
@@ -423,7 +506,14 @@ class Runner:
             ),
             "pathsep": os.pathsep,
             "agent": agent,
+            "settings": "",
         }
+
+    def _config_error(self, run_id: str, cid: str, agent: str,
+                      msg: str) -> dict[str, Any]:
+        """配置错误必须在日志里留痕：静默 config_error 会表现为「点了不动」。"""
+        self.log(f"[ctfdesk] config_error {cid} agent={agent}: {msg}")
+        return {"run_id": run_id, "status": "config_error", "error": msg}
 
     def run_one(self, row: sqlite3.Row, agent: str) -> dict[str, Any]:
         cid = row["id"]
@@ -439,10 +529,22 @@ class Runner:
         run_id = f"{cid}-{agent}-{datetime.now(TZ).strftime('%H%M%S')}"
 
         vals = self._values(row, agent, workdir, result_out, files_dir, statement)
+        if spec.get("settings"):
+            vals["settings"] = str(write_settings_file(
+                self.root / "runtime" / f"settings-{agent}.json",
+                spec["settings"], self.secrets))
         try:
             cmd = [str(part).format(**vals) for part in spec["cmd"]]
         except KeyError as exc:
-            return {"run_id": run_id, "status": "config_error", "error": str(exc)}
+            return self._config_error(run_id, cid, agent,
+                                      f"unresolved placeholder {exc}")
+        # npm 装的 CLI 在 Windows 是 claude.cmd / codex.cmd，CreateProcess 不认
+        # 无扩展名的 "claude"（WinError 2）。PATHEXT 解析交给 shutil.which。
+        resolved_exe = shutil.which(cmd[0])
+        if not resolved_exe:
+            return self._config_error(run_id, cid, agent,
+                                      f"executable not found: {cmd[0]}")
+        cmd[0] = resolved_exe
         env = os.environ.copy()
         for k, v in (spec.get("env") or {}).items():
             env[str(k)] = resolve_secret(str(v).format(**vals), self.secrets)
@@ -462,19 +564,37 @@ class Runner:
         self.log(f"[ctfdesk] start {cid} agent={agent}")
 
         status, code, out = "error", None, ""
+        # 长 prompt 走命令行会被 Windows 的 .cmd 壳拆坏（多行直接丢），
+        # 适配器用 "stdin" 声明改用标准输入喂。
+        stdin_text = str(spec["stdin"]).format(**vals) if spec.get("stdin") else None
         try:
-            proc = subprocess.run(
-                cmd, cwd=str(workdir), env=env, capture_output=True,
+            proc = subprocess.Popen(
+                cmd, cwd=str(workdir), env=env, stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                 text=True, encoding="utf-8", errors="replace",
-                timeout=self.budget + 180,
+                creationflags=(getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x200)
+                               if os.name == "nt" else 0),
+                start_new_session=(os.name != "nt"),
             )
-            code, out = proc.returncode, (proc.stdout or "") + "\n" + (proc.stderr or "")
-            status = "ok" if code == 0 else "error"
-        except subprocess.TimeoutExpired as exc:
-            status = "timeout"
-            out = (exc.stdout or "") + "\n" + (exc.stderr or "") if isinstance(exc.stdout, str) else ""
         except OSError as exc:
-            status, out = "error", str(exc)
+            proc, status, out = None, "error", str(exc)
+        if proc is not None:
+            try:
+                out, _ = proc.communicate(
+                    stdin_text, timeout=float(spec.get("timeout") or (self.budget + 180)))
+                code = proc.returncode
+                status = "ok" if code == 0 else "error"
+            except subprocess.TimeoutExpired:
+                # .cmd 壳被杀只死 cmd.exe，node 子进程还攥着管道 → 必须杀整棵树，
+                # 否则 communicate() 永远等不到 EOF（实测卡死 8 分钟以上）。
+                status = "timeout"
+                kill_tree(proc)
+                try:
+                    out, _ = proc.communicate(timeout=30)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    out = ""
+            out = out or ""
 
         result_path = Path(str(spec.get("result") or result_out).format(**vals))
         if not result_path.exists() and result_out.exists():
@@ -598,12 +718,40 @@ def wp_skeleton(conn: sqlite3.Connection, root: Path, cid: str,
 
 # ---------------------------------------------------------------- commands
 
+CODEX_CONFIG = """# ctfdesk 专用 CODEX_HOME：故意不声明任何 mcp_servers。
+# 用户全局 ~/.codex/config.toml 里挂着 ctfy 平台 MCP，绝不能带进解题进程。
+model = "deepseek-v4.1-flash-1017"
+model_provider = "qianwen-maas"
+approval_policy = "never"
+sandbox_mode = "danger-full-access"
+
+[model_providers.qianwen-maas]
+name = "Qianwen MaaS"
+base_url = "https://maas.qianwenaiapi.com/compatible-mode/v1"
+wire_api = "responses"
+env_key = "OPENAI_API_KEY"
+"""
+
+
+def ensure_codex_home(root: Path) -> Path:
+    """写一份不含 MCP 的 codex 配置。密钥走 OPENAI_API_KEY 环境变量，不落盘。"""
+    home = root / "codex-home"
+    home.mkdir(parents=True, exist_ok=True)
+    cfg = home / "config.toml"
+    if not cfg.exists():
+        tmp = cfg.with_name(cfg.name + ".tmp")
+        tmp.write_text(CODEX_CONFIG, encoding="utf-8", newline="\n")
+        os.replace(tmp, cfg)
+    return home
+
+
 def cmd_init(args: argparse.Namespace) -> int:
     root = Path(args.root).expanduser()
     for sub in ("inbox", "work", "outbox/wp", "outbox/evidence"):
         (root / sub).mkdir(parents=True, exist_ok=True)
     connect(root).close()
     load_agents(root)
+    ensure_codex_home(root)
     print(f"initialized {root}")
     return 0
 

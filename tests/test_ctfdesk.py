@@ -137,6 +137,168 @@ def test_secret_reaches_agent_env(tmp_path: Path) -> None:
     assert seen == "s3cr3t"
 
 
+SETTINGS_AGENT = '''
+import json, sys
+from pathlib import Path
+
+args = sys.argv[1:]
+settings = json.loads(Path(args[args.index("--settings") + 1]).read_text(encoding="utf-8"))
+env = settings["env"]
+(Path.cwd() / "seen.json").write_text(json.dumps(env), encoding="utf-8")
+(Path("RESULT.json")).write_text(
+    json.dumps({"flag": "flag{" + env["ANTHROPIC_API_KEY"] + "}", "confidence": 0.9}),
+    encoding="utf-8")
+'''
+
+
+def test_settings_file_carries_secret_and_stays_out_of_workdir(tmp_path: Path) -> None:
+    """claude 车道靠 --settings 钉网关：密钥要解析进去，且不落在 workdir/证据里。"""
+    root = tmp_path / "desk"
+    assert _run("init", "--root", str(root)).returncode == 0
+
+    fake = tmp_path / "settings_agent.py"
+    fake.write_text(SETTINGS_AGENT, encoding="utf-8")
+    (root / "agents.json").write_text(
+        json.dumps({"fake": {
+            "cmd": [sys.executable, str(fake), "--settings", "{settings}"],
+            "settings": {"ANTHROPIC_API_KEY": "@secret:FAKE",
+                         "ANTHROPIC_BASE_URL": "https://example.invalid/anthropic"},
+            "result": "{workdir}/RESULT.json"}}),
+        encoding="utf-8",
+    )
+    (root / "secrets.json").write_text(json.dumps({"FAKE": "s3cr3t"}), encoding="utf-8")
+
+    ch = root / "inbox" / "CH4"
+    (ch / "files").mkdir(parents=True)
+    (ch / "meta.json").write_text(
+        json.dumps({"id": "CH4", "name": "cfg", "category": "web",
+                    "agents": ["fake"], "target_kind": "url"}),
+        encoding="utf-8",
+    )
+    (ch / "statement.md").write_text("x", encoding="utf-8")
+
+    proc = _run("watch", "--root", str(root), "--once", "--workers", "1")
+    assert proc.returncode == 0, proc.stderr
+    assert "flag{s3cr3t}" in (root / "outbox" / "flags.jsonl").read_text(encoding="utf-8")
+
+    written = root / "runtime" / "settings-fake.json"
+    assert written.exists()
+    payload = json.loads(written.read_text(encoding="utf-8"))
+    assert payload["env"]["ANTHROPIC_API_KEY"] == "s3cr3t"  # @secret: 已解析
+    assert payload["env"]["ANTHROPIC_BASE_URL"] == "https://example.invalid/anthropic"
+    workdir = root / "work" / "CH4" / "fake"
+    assert not list(workdir.glob("settings-*.json"))  # 密钥不落 workdir
+
+
+STDIN_AGENT = '''
+import json, sys
+from pathlib import Path
+
+prompt = sys.stdin.read()
+(Path("seen_prompt.txt")).write_text(prompt, encoding="utf-8")
+(Path("RESULT.json")).write_text(
+    json.dumps({"flag": "flag{stdin_ok}" if "MULTILINE" in prompt else "flag{bad}",
+                "confidence": 0.9}), encoding="utf-8")
+'''
+
+SLEEPY_AGENT = '''
+import subprocess, sys, time
+subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"])
+print("started", flush=True)
+time.sleep(120)
+'''
+
+
+def test_prompt_goes_through_stdin(tmp_path: Path) -> None:
+    """多行 prompt 必须走 stdin：Windows 的 .cmd 壳会把它拆坏。"""
+    root = tmp_path / "desk"
+    assert _run("init", "--root", str(root)).returncode == 0
+
+    fake = tmp_path / "stdin_agent.py"
+    fake.write_text(STDIN_AGENT, encoding="utf-8")
+    (root / "agents.json").write_text(
+        json.dumps({"fake": {
+            "cmd": [sys.executable, str(fake), "-"],
+            "stdin": "{prompt}",
+            "result": "{workdir}/RESULT.json"}}),
+        encoding="utf-8",
+    )
+
+    ch = root / "inbox" / "CH5"
+    (ch / "files").mkdir(parents=True)
+    (ch / "meta.json").write_text(
+        json.dumps({"id": "CH5", "name": "stdin multi\nline", "category": "misc",
+                    "agents": ["fake"], "target_kind": "file"}),
+        encoding="utf-8",
+    )
+    (ch / "statement.md").write_text("MULTILINE\nsecond line\n", encoding="utf-8")
+
+    assert _run("watch", "--root", str(root), "--once", "--workers", "1").returncode == 0
+    assert "flag{stdin_ok}" in (root / "outbox" / "flags.jsonl").read_text(encoding="utf-8")
+
+
+def test_timeout_kills_whole_process_tree(tmp_path: Path) -> None:
+    """超时要连孙进程一起杀，否则 communicate() 等不到 EOF，worker 永久挂死。"""
+    import time
+
+    root = tmp_path / "desk"
+    assert _run("init", "--root", str(root)).returncode == 0
+
+    fake = tmp_path / "sleepy_agent.py"
+    fake.write_text(SLEEPY_AGENT, encoding="utf-8")
+    (root / "agents.json").write_text(
+        json.dumps({"fake": {
+            "cmd": [sys.executable, str(fake)],
+            "timeout": 3,
+            "result": "{workdir}/RESULT.json"}}),
+        encoding="utf-8",
+    )
+
+    ch = root / "inbox" / "CH6"
+    (ch / "files").mkdir(parents=True)
+    (ch / "meta.json").write_text(
+        json.dumps({"id": "CH6", "name": "sleepy", "category": "misc",
+                    "agents": ["fake"], "target_kind": "file"}),
+        encoding="utf-8",
+    )
+    (ch / "statement.md").write_text("x", encoding="utf-8")
+
+    started = time.monotonic()
+    proc = _run("watch", "--root", str(root), "--once", "--workers", "1")
+    elapsed = time.monotonic() - started
+    assert proc.returncode == 0, proc.stderr
+    assert elapsed < 60, f"watch 没有及时返回（{elapsed:.1f}s），进程树可能没杀干净"
+    assert "status=timeout" in proc.stdout
+
+
+def test_claude_lanes_have_no_platform_mcp() -> None:
+    """人机协同赛道禁止 agent 接触平台：claude 车道必须屏蔽全局 MCP。"""
+    mod = _module()
+    for name, spec in mod.DEFAULT_AGENTS_SPEC.items():
+        if not name.startswith("claude"):
+            continue
+        cmd = spec["cmd"]
+        assert "--strict-mcp-config" in cmd, name
+        mcp_arg = cmd[cmd.index("--mcp-config") + 1]
+        assert mcp_arg.format(settings="x") == '{"mcpServers":{}}', name  # 模板转义正确
+        assert spec["settings"]["ANTHROPIC_BASE_URL"].startswith("https://"), name
+        assert spec["stdin"] == "{prompt}", name
+
+
+def test_init_writes_mcp_free_codex_home(tmp_path: Path) -> None:
+    """codex 车道用 desk 自己的 CODEX_HOME，不能继承全局的 ctfy 平台 MCP。"""
+    root = tmp_path / "desk"
+    assert _run("init", "--root", str(root)).returncode == 0
+    cfg = (root / "codex-home" / "config.toml").read_text(encoding="utf-8")
+    assert "[mcp_servers" not in cfg
+    assert 'env_key = "OPENAI_API_KEY"' in cfg
+
+    mod = _module()
+    env = mod.DEFAULT_AGENTS_SPEC["codex"]["env"]
+    assert env["CODEX_HOME"] == "{root}/codex-home"
+    assert env["OPENAI_API_KEY"] == "@secret:QWEN_KEY"
+
+
 def test_plan_workers_narrows_on_memory() -> None:
     mod = _module()
     # 拿不到内存信息：按请求放行
