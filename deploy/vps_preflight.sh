@@ -143,19 +143,35 @@ key = os.environ["LLM_P_KEY"]
 model = os.environ["LLM_P_MODEL"]
 body = json.dumps({"model": model, "max_tokens": 16,
                    "messages": [{"role": "user", "content": "reply with the single word ok"}]}).encode()
-req = urllib.request.Request(base + "/chat/completions", data=body,
-                             headers={"Authorization": "Bearer " + key, "Content-Type": "application/json"})
-t0 = time.time()
-try:
-    with urllib.request.urlopen(req, timeout=45) as r:
-        d = json.load(r)
-    el = time.time() - t0
-    print("HTTP %s  %.1fs  model=%s  %r" % (r.status, el, d.get("model"),
-          (d.get("choices", [{}])[0].get("message", {}) or {}).get("content", "")[:40]))
-except urllib.error.HTTPError as e:
-    print("HTTP %s  %s" % (e.code, e.read()[:160].decode("utf-8", "replace")))
-except Exception as e:
-    print("ERROR %s: %s" % (type(e).__name__, e))
+# 平台上偶发边缘节点丢包：单次探测会把「网关可用但这一发坏了」判成失败。
+# 3 次尝试、每次 40s 上限；HTTP 错误（401/404/402）是真配置问题，立刻停止重试。
+ATTEMPTS = 3
+for attempt in range(1, ATTEMPTS + 1):
+    req = urllib.request.Request(base + "/chat/completions", data=body,
+                                 headers={"Authorization": "Bearer " + key,
+                                          "Content-Type": "application/json"})
+    t0 = time.time()
+    try:
+        with urllib.request.urlopen(req, timeout=40) as r:
+            d = json.load(r)
+        el = time.time() - t0
+        print("HTTP %s  %.1fs  try=%d/%d  model=%s  %r" % (
+            r.status, el, attempt, ATTEMPTS, d.get("model"),
+            (d.get("choices", [{}])[0].get("message", {}) or {}).get("content", "")[:40]))
+        break
+    except urllib.error.HTTPError as e:
+        print("HTTP %s  try=%d/%d  %s" % (
+            e.code, attempt, ATTEMPTS, e.read()[:160].decode("utf-8", "replace")))
+        break
+    except Exception as e:
+        el = time.time() - t0
+        if attempt == ATTEMPTS:
+            print("ERROR %s: %s (after %d tries, last %.1fs)" % (
+                type(e).__name__, e, ATTEMPTS, el))
+        else:
+            print("# try %d/%d failed after %.1fs: %s: %s" % (
+                attempt, ATTEMPTS, el, type(e).__name__, e), flush=True)
+            time.sleep(3)
 PY
 )
       case "$probe" in
