@@ -47,6 +47,58 @@ DEFAULT_TURNS = 25
 DEFAULT_BUDGET = 900
 DEFAULT_AGENTS = ["strix"]
 
+# 并发闸门：每个 agent 进程按 ~700 MB 估，低于保留下限就不再开新的一路。
+MIN_FREE_MB = 1500
+PER_WORKER_MB = 700
+
+
+def free_mem_mb() -> int | None:
+    """当前可用物理内存（MB）。拿不到时返回 None，交由调用方按原并发放行。"""
+    if sys.platform == "win32":
+        import ctypes
+
+        class _MemStatus(ctypes.Structure):
+            _fields_ = [
+                ("dwLength", ctypes.c_ulong),
+                ("dwMemoryLoad", ctypes.c_ulong),
+                ("ullTotalPhys", ctypes.c_ulonglong),
+                ("ullAvailPhys", ctypes.c_ulonglong),
+                ("ullTotalPageFile", ctypes.c_ulonglong),
+                ("ullAvailPageFile", ctypes.c_ulonglong),
+                ("ullTotalVirtual", ctypes.c_ulonglong),
+                ("ullAvailVirtual", ctypes.c_ulonglong),
+                ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+            ]
+
+        st = _MemStatus()
+        st.dwLength = ctypes.sizeof(_MemStatus)
+        try:
+            if not ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(st)):
+                return None
+        except (AttributeError, OSError):
+            return None
+        return int(st.ullAvailPhys // (1024 * 1024))
+    try:
+        with open("/proc/meminfo", encoding="utf-8") as fh:
+            for line in fh:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) // 1024
+    except (OSError, ValueError):
+        pass
+    return None
+
+
+def plan_workers(requested: int, free_mb: int | None,
+                 min_free_mb: int = MIN_FREE_MB,
+                 per_worker_mb: int = PER_WORKER_MB) -> int:
+    """按可用内存收窄并发：保住 min_free_mb，其余每 per_worker_mb 放一路。"""
+    requested = max(1, requested)
+    if free_mb is None:
+        return requested
+    if free_mb < min_free_mb:
+        return 1
+    return max(1, min(requested, (free_mb - min_free_mb) // max(1, per_worker_mb)))
+
 PROMPT = """你在一场 CTF 比赛中独立解一道题。只允许使用本工作区里的材料，不要访问任何比赛平台或提交接口。
 
 题号：{challenge_id}
@@ -541,7 +593,14 @@ def cmd_watch(args: argparse.Namespace) -> int:
                 break
             time.sleep(args.interval)
             continue
-        with ThreadPoolExecutor(max_workers=max(1, args.workers)) as pool:
+        free_mb = free_mem_mb()
+        workers = plan_workers(args.workers, free_mb, args.min_free_mb,
+                               args.per_worker_mb)
+        mem_note = "unknown" if free_mb is None else f"{free_mb} MB"
+        suffix = "" if workers == args.workers else f" (requested {args.workers})"
+        print(f"[ctfdesk] free mem={mem_note} -> workers={workers}{suffix}; "
+              f"jobs={len(jobs)}", flush=True)
+        with ThreadPoolExecutor(max_workers=workers) as pool:
             futs = [pool.submit(runner.run_one, row, agent) for row, agent in jobs]
             for fut in as_completed(futs):
                 fut.result()
@@ -632,7 +691,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     watch = sub.add_parser("watch", help="scan inbox and dispatch agents")
     watch.add_argument("--root", default="~/ctf-desk")
-    watch.add_argument("--workers", type=int, default=3)
+    watch.add_argument("--workers", type=int, default=3,
+                       help="并发上限；实际值还会按可用内存收窄")
+    watch.add_argument("--min-free-mb", type=int, default=MIN_FREE_MB,
+                       help="保底空闲内存（MB），低于它只跑 1 路")
+    watch.add_argument("--per-worker-mb", type=int, default=PER_WORKER_MB,
+                       help="每个 agent 大约吃多少内存，用来换算并发")
     watch.add_argument("--budget", type=int, default=DEFAULT_BUDGET)
     watch.add_argument("--turns", type=int, default=DEFAULT_TURNS)
     watch.add_argument("--interval", type=float, default=30.0,

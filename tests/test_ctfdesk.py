@@ -2,12 +2,20 @@
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import subprocess
 import sys
 from pathlib import Path
 
 SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "ctfdesk.py"
+
+
+def _module():
+    spec = importlib.util.spec_from_file_location("ctfdesk_under_test", SCRIPT)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
 
 FAKE_AGENT = '''
 import json
@@ -57,6 +65,7 @@ def test_pipeline_end_to_end(tmp_path: Path) -> None:
 
     proc = _run("watch", "--root", str(root), "--once", "--workers", "1")
     assert proc.returncode == 0, proc.stderr
+    assert "free mem=" in proc.stdout  # 内存闸门在派发时留痕
 
     flags = (root / "outbox" / "flags.jsonl").read_text(encoding="utf-8")
     assert "flag{test_123}" in flags
@@ -76,6 +85,25 @@ def test_pipeline_end_to_end(tmp_path: Path) -> None:
     assert rec.returncode == 0, rec.stderr
     verify_log = (root / "outbox" / "verify" / "CH1.md").read_text(encoding="utf-8")
     assert "cat files/a.txt" in verify_log and "pass" in verify_log
+
+
+def test_plan_workers_narrows_on_memory() -> None:
+    mod = _module()
+    # 拿不到内存信息：按请求放行
+    assert mod.plan_workers(3, None) == 3
+    # 内存充足：不超过请求上限
+    assert mod.plan_workers(3, 6400) == 3
+    assert mod.plan_workers(6, 10000) == 6
+    # 内存偏紧：按每路 700 MB 收窄，但至少留 1 路
+    assert mod.plan_workers(4, 3600) == 3
+    assert mod.plan_workers(3, 2300) == 1
+    # 低于保底线：只跑 1 路
+    assert mod.plan_workers(3, 800) == 1
+    # 请求为 0 或负数也要有 1 路
+    assert mod.plan_workers(0, 6400) == 1
+    # 真实读数可用（拿不到也算通过，只要不抛异常）
+    got = mod.free_mem_mb()
+    assert got is None or got > 0
 
 
 def test_pipeline_records_failure_without_fabricating_flag(tmp_path: Path) -> None:
