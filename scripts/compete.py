@@ -93,6 +93,10 @@ import requests  # noqa: E402
 
 import batch_eval  # noqa: E402
 
+#: 单题墙钟硬上限（2026-11-19 用户定：900s）。batch_eval import 时已把
+#: ``src`` 前置进 sys.path，所以这里能直接读单一真值。
+from ctf_strix.limits import MAX_WALLCLOCK_S as _LIMITS_MAX_WALL_S  # noqa: E402
+
 #: 平台地址。batch_eval.Client 同源，不另起一份。
 PLATFORM = batch_eval.PLATFORM if hasattr(batch_eval, "PLATFORM") else "https://ctfy.tsinghua.edu.cn"
 
@@ -207,7 +211,9 @@ _QA_BONUS = 30
 _PROVEN_BONUS = 460
 
 #: 难度对墙钟的放大倍数（与 batch_eval 的 tiers 同源）。派单前用真实
-#: 上限判会话窗口够不够，而不是拿基准 wallclock 猜。
+#: 上限判会话窗口够不够，而不是拿基准 wallclock 猜。2026-11-19 起上限
+#: 由 ``ctf_strix.limits.MAX_WALLCLOCK_S`` 统一夹住（900s），放大倍数不会
+#: 再把线推过它。
 _WALL_TIER = {"easy": 1.0, "medium": 1.5, "hard": 2.3}
 
 #: 单次尝试的时间盒基准（easy 档；medium ×1.5、hard ×2.3 由 ``_WALL_TIER``
@@ -223,7 +229,11 @@ _WALL_TIER = {"easy": 1.0, "medium": 1.5, "hard": 2.3}
 #:
 #: 12.3% 的盈亏平衡线 vs 29.2% 的实测重试率，是这个数字唯一的依据。**硬上限仍然
 #: 是上限**：这改的是一次尝试的长度，不是允许它无限跑。
-_ATTEMPT_BOX_S = 300
+#:
+#: 2026-11-19 用户改定：300 → 900。当天 14 次尝试全部在 450/690s 的墙钟上死掉、
+#: ``turn_capped`` 一次都没有——切得早的不是模型，是钟。同时轮次上限放到 60
+#: （``ctf_strix.limits``），所以时间盒的基准与上限现在都是 900s。
+_ATTEMPT_BOX_S = 900
 
 #: 重派时的入口方向表。**换的是入口，不是预算**：第二次尝试的开销与第一次
 #: 完全一样，改的只有「从哪个机制类别开始」。依据是重试的实测收益集中在
@@ -1182,7 +1192,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=2,
         help="并发车道（默认 2：平台配额 3，留 1 个余量给停止中/重试实例）",
     )
-    p.add_argument("--turns", type=int, default=25)
+    p.add_argument("--turns", type=int, default=60, help="单题轮次（上限 60）")
     p.add_argument(
         "--wallclock",
         type=int,
@@ -1439,8 +1449,10 @@ def main() -> int:
             # 0 LLM 停车，比分散派单省 token）。窗口过后回到分散派单。
             chal = queue.pop(0)
             cid = str(chal["id"])
-            needed = args.wallclock * _WALL_TIER.get(
-                str(chal.get("difficulty") or ""), 1.0
+            needed = min(
+                args.wallclock
+                * _WALL_TIER.get(str(chal.get("difficulty") or ""), 1.0),
+                _LIMITS_MAX_WALL_S,
             )
             ok, wait = session_allows_dispatch(
                 time.time(), session_end, next_start, needed
@@ -1502,8 +1514,10 @@ def main() -> int:
             while len(running) < args.lanes and queue:
                 chal = queue.pop(0)
                 cid = str(chal["id"])
-                needed = args.wallclock * _WALL_TIER.get(
-                    str(chal.get("difficulty") or ""), 1.0
+                needed = min(
+                    args.wallclock
+                    * _WALL_TIER.get(str(chal.get("difficulty") or ""), 1.0),
+                    _LIMITS_MAX_WALL_S,
                 )
                 ok, wait = session_allows_dispatch(
                     time.time(), session_end, next_start, needed

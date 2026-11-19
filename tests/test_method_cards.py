@@ -56,19 +56,44 @@ def test_rendered_text_never_echoes_tags() -> None:
     assert sentinel not in text.lower()
 
 
+def _every_card() -> list:
+    return [
+        *method_cards.CARDS,
+        *method_cards.DOMAIN_CARDS,
+        *method_cards.CATEGORY_FALLBACK.values(),
+    ]
+
+
 def test_every_backticked_name_is_a_registered_tool() -> None:
+    """The user's tool-alignment rule, mechanically: no card names a ghost tool.
+
+    The reference project's cards name pwnkit/rsatool/aesblock/z3solve; ported
+    verbatim they would tell the model to call tools this image does not ship.
+    Every backticked span in every card *and* every playbook is checked against
+    the catalogue, so substituting a tool name is the only way to add one.
+    """
     registered = {info.name for info in catalogue.CATALOGUE}
+    blobs = [card.text for card in _every_card()] + [
+        method_cards.PLAYBOOK,
+        method_cards.FILE_PLAYBOOK,
+        method_cards.TCP_PLAYBOOK,
+    ]
     bad: set[str] = set()
-    for blob in [card.text for card in method_cards.CARDS] + [method_cards.PLAYBOOK]:
+    for blob in blobs:
         bad |= {name for name in re.findall(r"`([^`]+)`", blob) if name not in registered}
     assert bad == set(), f"cards name tools that are not registered: {sorted(bad)}"
 
 
 def test_every_card_names_at_least_one_tool() -> None:
     registered = {info.name for info in catalogue.CATALOGUE}
-    for index, card in enumerate(method_cards.CARDS, start=1):
+    for index, card in enumerate(_every_card(), start=1):
         named = {n for n in re.findall(r"`([a-z0-9_]+)`", card.text) if n in registered}
         assert named, f"card #{index} names no tool: {card.text}"
+
+
+def test_cards_have_unique_ids() -> None:
+    ids = [card.cid for card in _every_card()]
+    assert len(ids) == len(set(ids)), "two cards share an id; the menu is ambiguous"
 
 
 def test_playbook_has_five_stages_and_fits() -> None:
@@ -101,11 +126,62 @@ def test_worst_and_typical_render_stay_under_budget() -> None:
     assert 0 < len(typical) <= method_cards.MAX_CHARS
 
 
-def test_prompt_hint_carries_cards_for_web_only() -> None:
+def test_prompt_hint_carries_the_playbook_for_every_kind() -> None:
+    """The start block is playbook-first since 2026-11-19.
+
+    Before it, a tag miss rendered zero characters -- which on the competition
+    entry was every challenge, because the platform's tags are topic words and
+    the card keys are technique words.
+    """
     from ctf_strix import skillpack
 
-    assert "[Method cards]" in skillpack.prompt_hint([], kind="web", tags=["sqli"])
-    assert skillpack.prompt_hint([], kind="file", tags=["sqli"]) == ""
+    web = skillpack.prompt_hint([], kind="web", tags=["sqli"])
+    assert "[Web playbook]" in web and "[Method cards]" in web
+    bare = skillpack.prompt_hint([], kind="web", tags=["linux"])
+    assert "[Web playbook]" in bare
+    assert "[Method cards]" not in bare, "a tag miss must not dump the table head"
+    assert "[File playbook]" in skillpack.prompt_hint([], kind="file", tags=["misc"])
+    assert "[TCP playbook]" in skillpack.prompt_hint([], kind="tcp", tags=["heap"])
+    assert skillpack.prompt_hint([], kind=None) == ""
+
+
+def test_category_of_prefers_the_declared_field() -> None:
+    assert method_cards.category_of(["web"], "file", declared="reverse") == "rev"
+    assert method_cards.category_of(["Pwn", "heap"], "tcp") == "pwn"
+    assert method_cards.category_of([], "file") == "misc"
+    assert method_cards.category_of([], "tcp") == "pwn"
+    assert method_cards.category_of([], "web") == ""
+    assert method_cards.category_of(None, None) == ""
+
+
+def test_pool_falls_back_to_the_whole_web_table_without_tag_hits() -> None:
+    """The picker exists for exactly this case: the platform said ``linux``."""
+    assert method_cards.pool("web", "", ["linux"]) == list(method_cards.CARDS)
+    assert method_cards.pool("web", "", ["sqli"]) == method_cards.select(["sqli"], "web")
+
+
+def test_pool_never_lists_a_card_whose_tools_are_missing() -> None:
+    pool = method_cards.pool("web", "", ["linux"], available={"exec_command"})
+    assert pool
+    for card in pool:
+        assert method_cards.tools_named(card.text) <= {"exec_command"}
+
+
+def test_start_cards_do_not_dump_the_table_head_on_a_tag_miss() -> None:
+    assert method_cards.start_cards("web", "", ["linux"]) == []
+    assert method_cards.start_cards("web", "", ["sqli"]), "a hit still starts a card"
+
+
+def test_render_start_is_playbook_plus_hits() -> None:
+    text = method_cards.render_start("web", "", ["sqli"])
+    assert text.startswith("[Web playbook]")
+    assert "[Method cards]" in text
+
+    file_text = method_cards.render_start("file", "rev", [])
+    assert file_text.startswith("[File playbook]")
+    assert "REV 决策表" in file_text, "the category fallback card must ride along"
+
+    assert method_cards.render_start("file", "", []) == method_cards.FILE_PLAYBOOK
 
 
 def test_tags_of_ignores_name_and_description() -> None:

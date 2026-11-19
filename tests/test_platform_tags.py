@@ -113,8 +113,36 @@ def test_garbage_bodies_degrade_to_no_tags(
     assert agent._platform_tags(TASK) == []
 
 
+def test_category_comes_back_from_the_same_request(
+    platform_env: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """task.json carries no category either; the fallback card keys on it."""
+    monkeypatch.setattr(
+        urllib.request,
+        "urlopen",
+        lambda req, timeout=None: _Resp(
+            json.dumps({"data": {"tags": ["heap"], "category": "Pwn"}}).encode()
+        ),
+    )
+    assert agent._platform_meta(TASK) == (["heap"], "Pwn")
+
+
+def test_a_non_string_category_is_dropped(
+    platform_env: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        urllib.request,
+        "urlopen",
+        lambda req, timeout=None: _Resp(
+            json.dumps({"data": {"tags": [], "category": {"id": 3}}}).encode()
+        ),
+    )
+    assert agent._platform_meta(TASK) == ([], "")
+
+
 def test_the_hint_uses_it_only_when_the_task_carries_no_tags() -> None:
     src = agent.__file__
     with open(src, encoding="utf-8") as fh:
         text = fh.read()
-    assert "tags=skillpack.tags_of(task) or _platform_tags(task)" in text
+    assert "tags = skillpack.tags_of(task)" in text
+    assert "tags, declared = _platform_meta(task)" in text

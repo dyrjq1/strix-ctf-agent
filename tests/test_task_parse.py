@@ -462,16 +462,16 @@ def test_scope_still_wins_when_both_are_present(monkeypatch: pytest.MonkeyPatch)
     assert _target_endpoints(task) == []
 
 
-def test_turn_budget_absent_means_no_cap(monkeypatch: pytest.MonkeyPatch) -> None:
-    """协议是 absent means no budget；退回 25 会提前砍掉难题。
+def test_turn_budget_absent_means_our_cap(monkeypatch: pytest.MonkeyPatch) -> None:
+    """协议是 absent means no budget；容器里这被落成 ``limits.MAX_TURNS``。
 
-    这里断言的是"退回上游默认值"，不是某个具体数字——上游升级时数字可以变，
-    但绝不能回到一个凭空的 25。
+    2026-11-19 用户定 60。此前是"退回上游默认值"（500），但 11-19 实测 460s
+    里只发得出 ~27 次调用——500 从未被碰到，却让四处预算描述互相对不上。
+    现在断言的是单一真值，不是某个恰好够大的数。
     """
     monkeypatch.delenv("CTFY_EVAL_MAX_TURNS", raising=False)
     monkeypatch.delenv("CTF_MAX_TURNS", raising=False)
-    budget = _turn_budget({})
-    assert budget >= 100
+    assert _turn_budget({}) == 60
 
 
 def test_turn_budget_prefers_task_json(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -479,10 +479,19 @@ def test_turn_budget_prefers_task_json(monkeypatch: pytest.MonkeyPatch) -> None:
     assert _turn_budget({"max_turns": 7}) == 7
 
 
+def test_turn_budget_never_exceeds_the_cap(monkeypatch: pytest.MonkeyPatch) -> None:
+    """平台/环境给多大都按 60 跑：上限只有一个真值。"""
+    monkeypatch.setenv("CTF_MAX_TURNS", "500")
+    assert _turn_budget({"max_turns": 200}) == 60
+    monkeypatch.delenv("CTF_MAX_TURNS", raising=False)
+    monkeypatch.setenv("CTFY_EVAL_MAX_TURNS", "1000")
+    assert _turn_budget({}) == 60
+
+
 def test_turn_budget_ignores_zero(monkeypatch: pytest.MonkeyPatch) -> None:
     """0 表示"平台没给"，不是"零轮"；后者会让 run 立刻结束。"""
     monkeypatch.setenv("CTFY_EVAL_MAX_TURNS", "0")
-    assert _turn_budget({"max_turns": 0}) >= 100
+    assert _turn_budget({"max_turns": 0}) == 60
 
 
 def test_bare_attachment_at_work_root_is_a_file_challenge(monkeypatch, tmp_path) -> None:

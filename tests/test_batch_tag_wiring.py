@@ -57,6 +57,35 @@ def test_cards_off_switch_reaches_the_child_and_the_row() -> None:
     assert 'rec["cards_off"] = os.environ.get("CTF_CARDS_OFF", "")' in BE_SRC
 
 
+def test_both_entrypoints_install_the_picker_and_the_menu() -> None:
+    """One agent, two entrypoints: the harness must not measure a different one.
+
+    The competition path is ``agent.py``; every A/B runs ``run_strix_ctf.py``.
+    A mechanism wired into only one of them means the measured configuration is
+    not the delivered one (the drift CLAUDE.md §6 warns about).
+    """
+    root = ROOT  # ROOT 已经是仓库根（__file__.parent 的 parent）
+    agent_src = (root / "src" / "ctf_strix" / "agent.py").read_text(encoding="utf-8")
+    harness = (root / "scripts" / "run_strix_ctf.py").read_text(encoding="utf-8")
+    for src, label in ((agent_src, "agent.py"), (harness, "run_strix_ctf.py")):
+        assert "card_pick.set_pool(" in src, f"{label} never seeds the card pool"
+        assert "card_pick.install()" in src, f"{label} never registers the picker"
+        assert "card_menu.install()" in src, f"{label} never arms the round-5 menu"
+    assert "_reset_card_pick()" in agent_src, "attempts would see the menu once"
+    assert "_reset_card_menu()" in agent_src
+
+
+def test_card_rotation_state_reaches_the_child() -> None:
+    """Without the state dir the menu cannot mark a used card (2026-11-19).
+
+    Same class of failure as ``CTF_CARDS_OFF``: the mechanism is in the agent,
+    the switch and the state path are in the parent, and a missing forward
+    makes the feature silently inert.
+    """
+    assert '"CTF_CARDS_STATE": str(box / "cards")' in BE_SRC
+    assert '"CTF_CARD_MENU": os.environ.get("CTF_CARD_MENU", "")' in BE_SRC
+
+
 def test_both_run_agent_call_sites_pass_tags() -> None:
     """Instance path and QA path: a challenge answered without a target still
     carries the tags its challenge was published with."""

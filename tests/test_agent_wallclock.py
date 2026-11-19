@@ -32,19 +32,30 @@ def test_wall_budget_env_garbage_disables_not_crashes(monkeypatch):
 
 
 def test_wall_budget_tiers_match_harness(monkeypatch):
-    """容器侧分层必须与 batch_eval 的难度分层同源，不允许漂移。"""
+    """容器侧分层必须与 batch_eval 的难度分层同源，不允许漂移。
+
+    2026-11-19 用户定：三档一律 900s（``limits.MAX_WALLCLOCK_S``）。此前是
+    600/900/1380——11-19 测试赛 14 次尝试全部死在墙钟、无一死于轮次，说明
+    真正卡住的是"方向没选对"，不是"给的时间不够长"；分档只制造了配置漂移。
+    """
     monkeypatch.delenv("CTFY_WALL_DEADLINE", raising=False)
-    assert agent._wall_budget({"challenge": {"difficulty": "easy"}}) == 600
+    assert agent._wall_budget({"challenge": {"difficulty": "easy"}}) == 900
     assert agent._wall_budget({"challenge": {"difficulty": "medium"}}) == 900
-    assert agent._wall_budget({"challenge": {"difficulty": "hard"}}) == 1380
+    assert agent._wall_budget({"challenge": {"difficulty": "hard"}}) == 900
 
 
 def test_wall_budget_unknown_difficulty_uses_hard_tier(monkeypatch):
     """task.json 不带难度（协议示例就没有）时取 hard 档，而不是 0。"""
     monkeypatch.delenv("CTFY_WALL_DEADLINE", raising=False)
-    assert agent._wall_budget({}) == 1380
-    assert agent._wall_budget({"challenge": {}}) == 1380
-    assert agent._wall_budget({"challenge": {"difficulty": "impossible"}}) == 1380
+    assert agent._wall_budget({}) == 900
+    assert agent._wall_budget({"challenge": {}}) == 900
+    assert agent._wall_budget({"challenge": {"difficulty": "impossible"}}) == 900
+
+
+def test_wall_budget_env_is_clamped_to_the_single_cap(monkeypatch):
+    """环境变量不能越过 900s：上限只有一个真值，不在各处各写一遍。"""
+    monkeypatch.setenv("CTFY_WALL_DEADLINE", "3600")
+    assert agent._wall_budget({"challenge": {"difficulty": "hard"}}) == 900
 
 
 def test_wall_budget_env_unset_in_fresh_container(monkeypatch):

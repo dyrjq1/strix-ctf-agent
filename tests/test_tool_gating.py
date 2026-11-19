@@ -140,6 +140,9 @@ def test_catalogue_does_not_promise_tools_nobody_registers():
     # websec: authdiff / jsrecon (logic reused from ctfy_project, 2026-11-17).
     from ctf_strix import websec
     registered |= {fn.__name__ for fn in websec.TOOLS}
+    # Method cards: ``card_pick`` registers this whenever the challenge has a
+    # card pool (every kind), so the catalogue row is honest.
+    registered |= {"method_cards_pick"}
     # The base four are vendor tools; they are asserted separately below.
     base = {"exec_command", "load_skill", "think"}
 

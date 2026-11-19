@@ -65,14 +65,26 @@ PLAYBOOK = (
 
 @dataclass(frozen=True)
 class Card:
-    """One method card: the tags that select it and its fixed text."""
+    """One method card: a stable id, the tags that select it, its fixed text.
 
+    ``cid`` 是给"第五轮自选"那条链路用的稳定标识（模型按 id 点卡）。默认取
+    第一个键，这样新增卡不必手工编号；同一张表里出现重复首键时必须显式给 id。
+    """
+
+    cid: str
     keys: frozenset[str]
     text: str
 
+    @property
+    def title(self) -> str:
+        """菜单里显示的一行标题：正文第一句，截到 24 字。"""
+        head = self.text.split("：", 1)[0].split("。", 1)[0]
+        return head[:24]
 
-def _card(keys: str, text: str) -> Card:
-    return Card(frozenset(k.strip() for k in keys.split(",") if k.strip()), text)
+
+def _card(keys: str, text: str, cid: str = "") -> Card:
+    parts = frozenset(k.strip() for k in keys.split(",") if k.strip())
+    return Card(cid or (sorted(parts)[0] if parts else ""), parts, text)
 
 
 #: Table order is priority: AI cards first (narrower), then technique cards,
@@ -143,6 +155,7 @@ CARDS: tuple[Card, ...] = (
         "2fa_bypass,account_recovery,password_reset",
         "认证流程：`route_map` 列全登录/OTP/找回/绑定端点并画状态机；先测顺序再测值——同码重放、"
         "跳步、乱序提交、A 的对象带进 B 的会话；每步记状态码与长度差，合并/绑定类看哪侧属性被覆盖。",
+        cid="auth.flow",
     ),
     _card(
         "software_supply_chain,supply_chain,malicious_install,dependency_confusion,typosquatting",
@@ -152,6 +165,7 @@ CARDS: tuple[Card, ...] = (
     _card(
         "idor,broken_access_control,mass_assignment,2fa_bypass,account_merge",
         "越权：两个账号互换同名资源 id，看是否 200 且内容不同；`traffic_list` 回看已发请求里的 id/role 字段。两个账号放两个具名会话（session 参数分别写 alice 与 bob），否则后登录的会把前一个的 cookie 覆盖掉。",
+        cid="authz.idor",
     ),
     _card(
         "weak_password,default_credentials,brute_force,authentication_bypass,password_reset",
@@ -317,3 +331,285 @@ def render(
         lines.append(line)
         used += cost
     return "\n".join([HEADER, *lines])
+
+
+# ---------------------------------------------------------------- 非 web 方向卡
+#
+# 2026-11-19 从参考工程（D:\ycjctf\ctfy_project\src\ctfy_agent\method_cards.py 的
+# DOMAIN_CARDS / CATEGORY_FALLBACK）移植：结构与"先看什么、按什么顺序"的判据
+# 照抄，**工具名全部改成本仓库 catalogue 里的**（它点名 pwnkit/rsatool/aesblock/
+# z3solve 等我们没有的工具，直接抄会让 tests/test_method_cards.py 的
+# "backticked name must be registered" 断言失败，模型也会调不存在的工具）。
+#
+# 键取自平台真实 tag 词表：今天的 pwn 题带 heap、reverse 题带 reverse，都能命中。
+
+DOMAIN_CARDS: tuple[Card, ...] = (
+    _card(
+        "reverse,stripped,per_team_artifact,per-team-artifact",
+        "REV 定型四步：`hexpeek` 看魔数判型（ELF/PE/pyc/脚本）→ `elfpeek` view=info 看架构/PIE/入口 → "
+        "view=symbols 找校验函数（被 strip 就靠 view=strings 的提示串与常量推理）→ view=disasm 只反汇编"
+        "可疑函数那一段。别整段反汇编，步数会烧光；.pyc/PyInstaller 先用 `exec_command` 跑反编译再读。",
+        cid="rev.triage",
+    ),
+    _card(
+        "xor,rc4,rc4_xor,bytecode",
+        "REV 算法复现：先用已知输入（全 0、全 1、题面样例）在本地把加密函数跑出来，再对密文求逆；"
+        "XOR/查表/位运算优先用 `exec_command` 写 python 复现并对拍。爆破空间 <1e6 直接穷举；更大就找"
+        "前缀匹配、CRC、长度、字符集约束收窄，不要盲爆。",
+        cid="rev.alg",
+    ),
+    _card(
+        "bof,stack,elf",
+        "PWN 栈溢出四步：`elfpeek` view=info 看 PIE/NX/canary → view=symbols/strings 找 gets/read/"
+        "system/win → `exec_command` 生成 cyclic 模式串、`tcp` 发超长触发崩溃 → `elffind` 反查精确偏移。"
+        "有附件 libc 就照它的符号算 system 与 /bin/sh；payload 落盘后用 `tcp` 发，别手搓转义串。"
+        "崩溃看不懂就在 `exec_command` 里跑 gdb -batch 看 rip 与栈。",
+        cid="pwn.stack",
+    ),
+    _card(
+        "format_string,rop,seccomp",
+        "PWN 进阶：格式化串先用 `tcp_batch` 批量试 %1$p..%20$p 一次收敛、定位自己的输入位置，再谈 %n 写；"
+        "没有 win 函数走 ROP，`elfpeek` view=gadgets filter=rdi|rsi|rdx|syscall；堆题先看 malloc/free "
+        "顺序与 tcache 是否 double-free，别急着一次打通；远程先泄漏 libc 基址再算偏移。",
+        cid="pwn.adv",
+    ),
+    _card(
+        "heap,asan,sanitizer,use_after_free,uaf,arbitrary_read",
+        "PWN 泄漏链四步（ASan/记录管理器类）：① 先用已打通的任意读写读『结构固定字段』——self/label/"
+        "blob.data 里通常就有 heap 与 PIE 指针；② 用 `elfpeek` view=info/symbols 加附件 libc 的符号偏移"
+        "把 PIE 指针→PIE base、GOT 项→libc base；③ 每次读 8 字节都打印 hex 与**实际长度**并断言长度=8"
+        "（短读先修读取长度，别假设成功）；④ 拿到 base 后再构造 openat/read/write 或 ret2libc。"
+        "每步落一个可重跑脚本 + 一条断言，失败先看是哪一步。",
+        cid="pwn.leak",
+    ),
+    _card(
+        "rsa,small_e,wiener,common_modulus",
+        "CRYPTO RSA 先自动试：`exec_command` 写 python（pycryptodome/gmpy2）依次试 小指数开方 / wiener / "
+        "共模 / fermat（p、q 相邻）。有「明文结构」线索就走格攻击（Coppersmith 小根、LLL）；都不中就找 n 的"
+        "分解线索（题面提示、共享因子、p=q），拿到 d 后用 `hexpeek` 拼明文再 `decode_blob` 剥编码。",
+        cid="crypto.rsa",
+    ),
+    _card(
+        "aes,ecb,oracle,cbc",
+        "CRYPTO 分组密码：先判模式——16 字节对齐后出现相同块 = ECB；ECB 打块剪切/字节翻转移位取目标块；"
+        "CBC 打 IV 与前一密文块的位翻转；padding oracle 用 `tcp_batch` 一次批量试末字节（≤200/轮）。"
+        "密钥已知就用 `exec_command` 本地算（ecb/cbc/ctr），别手搓分组填充。",
+        cid="crypto.block",
+    ),
+    _card(
+        "zip,archive,forensics",
+        "MISC 归档/取证：`unpack_archive` 按魔数解包（zip 加密先判 ZipCrypto 还是 AES，别硬跑）；"
+        "常见套路是伪加密（改通用标志位）、注释/文件名/额外字段藏值、CRC 与明文碰撞；取证先 `hexpeek` "
+        "看头与尾部附加数据，再 `decode_blob` 剥编码链，不要整文件打印。",
+        cid="misc.archive",
+    ),
+    _card(
+        "udp,connectivity,pcap,stego,image_encoding",
+        "MISC 通道/隐写：先判可达（不可达=环境问题，立刻收口）；UDP/自定义协议没有专用工具——用 "
+        "`exec_command` 落一个 python socket 脚本再跑；隐写/图片先 `hexpeek` 看尾部与 ZIP/PNG 文本块，"
+        "再 `decode_blob` 逐层剥。",
+        cid="misc.channel",
+    ),
+)
+
+#: 按 category 的兜底决策表：tag 一个都不中时用（题型词太粗是常态）。
+#: 文案照参考工程的 CATEGORY_FALLBACK，工具名换成本仓库的。
+CATEGORY_FALLBACK: dict[str, Card] = {
+    "pwn": _card(
+        "pwn",
+        "PWN 决策表（按保护与可用原语选路线，先本地验证再打远端）：① 有后门/win 且栈可执行 → ret2text，"
+        "`elffind` 取函数偏移；② 无后门但能泄露 → ret2libc：`elfpeek` view=symbols 定位 GOT/plt → libc base"
+        " → system(/bin/sh)；③ 静态链接无 libc → ret2syscall 或 SROP；④ 64 位无 pop rdi → ret2csu；"
+        "⑤ 有格式化串 → `tcp_batch` 批量试 %p 定位再 %n；⑥ 堆题 → malloc/free 顺序、tcache double-free/UAF。"
+        "纪律：`exec_command` 里跑 gdb 本地确认偏移，本地不通不打远端；payload 落盘后 `tcp` 发。",
+        cid="fallback.pwn",
+    ),
+    "rev": _card(
+        "rev",
+        "REV 决策表：① 先判型（ELF/PE/.pyc/APK/脚本/压缩包）；② `elfpeek` 的 strings+symbols 定位校验函数与"
+        "硬编码比较值，只反汇编该函数（不要全文读）；③ 能本地执行就差分验证：不同输入比对分支/输出，把"
+        "「输入→比较→输出」钉死；④ 校验是方程/约束 → 用 `exec_command` 跑 z3 解；⑤ 常见算法手工复现"
+        "（异或/RC4/TEA/迷宫/矩阵）；⑥ 被 strip → 用字符串与常量交叉定位。",
+        cid="fallback.rev",
+    ),
+    "crypto": _card(
+        "crypto",
+        "CRYPTO 决策表：① 先判题型（RSA/分组/流密码/哈希/格/协议）；② RSA 先试 小指数/wiener/共模/fermat，"
+        "再考虑 Coppersmith 与 LLL；③ 分组先判模式（ECB 重复块、CBC 位翻转、CTR 复用流）；④ 流密码查 "
+        "nonce/密钥复用；⑤ 一切「给定方程/多项式」优先喂 z3，不要手推。`exec_command` 里跑 python 对拍。",
+        cid="fallback.crypto",
+    ),
+    "misc": _card(
+        "misc",
+        "MISC 决策表：① 先 `file_triage` 判家族（归档/图片/流量/硬件描述/编码）；② 归档与取证走 "
+        "`unpack_archive`+`hexpeek`+`decode_blob`；③ 硬件/逻辑题先照题面重建状态机或真值表，再用 "
+        "`exec_command` 复算并与给定输出对拍；④ 一段时间没进展就回到题面找「输入-输出样例」，"
+        "有样例优先做差分而不是继续猜。",
+        cid="fallback.misc",
+    ),
+}
+
+#: file / tcp 的短流程（web 那份见 :data:`PLAYBOOK`）。粒度与 web 一致：
+#: 只讲先后与出口判据，不点具体技术。
+FILE_PLAYBOOK = (
+    "[File playbook] 五阶段，每阶段有出口判据。\n"
+    "0 取证：`file_triage` 判家族与下一步，一行写下文件类型、保护、flag 形态。\n"
+    "1 拆包：`unpack_archive` 递归到最内层，记下每层的格式与是否加密。\n"
+    "2 读：`hexpeek` / `elfpeek` 定点读，不整包打印；被 strip 只看 strings 与符号。\n"
+    "3 复现：`exec_command` 写 python 脚本把「输入→输出」跑通，用题面样例对拍。\n"
+    "4 收口：拿到即原样提交；无逐字依据就写未验证。"
+)
+
+TCP_PLAYBOOK = (
+    "[TCP playbook] 五阶段，每阶段有出口判据。\n"
+    "0 连接：`tcp` 拿 banner，记下协议与交互格式。\n"
+    "1 静态：`elfpeek` view=info/symbols 看保护、后门、输入函数。\n"
+    "2 触发：`tcp` 发超长或畸形输入看崩溃/回显，`tcp_batch` 批量试参数。\n"
+    "3 定位：`elffind` 反查偏移，本地复现后再打远端。\n"
+    "4 收口：payload 落盘再发，flag 原样提交。"
+)
+
+#: kind → 起手 playbook。
+PLAYBOOKS: dict[str, str] = {"web": PLAYBOOK, "file": FILE_PLAYBOOK, "tcp": TCP_PLAYBOOK}
+
+
+def playbook(kind: str | None) -> str:
+    """该 kind 的起手流程文本；未知 kind 返回空串。"""
+    return PLAYBOOKS.get(str(kind or ""), "")
+
+
+#: 平台类别词 → 兜底表的键。平台写 ``reverse``，表里写 ``rev``。
+CATEGORY_ALIASES: dict[str, str] = {
+    "web": "web",
+    "pwn": "pwn",
+    "crypto": "crypto",
+    "rev": "rev",
+    "reverse": "rev",
+    "reversing": "rev",
+    "misc": "misc",
+    "forensics": "misc",
+    "forensic": "misc",
+}
+
+#: 题面没有类别线索时按接入面兜底：远程二进制服务就是 pwn；
+#: 纯附件题先按 misc 的"取证→拆包"走，第一张卡就让它自己再定型。
+_KIND_DEFAULT_CATEGORY: dict[str, str] = {"tcp": "pwn", "file": "misc"}
+
+
+def category_of(
+    tags: Iterable[str] | None,
+    kind: str | None = None,
+    declared: str | None = None,
+) -> str:
+    """题目大类：平台显式字段优先，其次 tags 里的类别词，最后按 kind 兜底。
+
+    Args:
+        tags: 题目 tags（平台词表，已小写化比较）。
+        kind: ``agent._challenge_kind`` 的结果。
+        declared: 平台详情接口的 ``category`` 字段（可缺）。
+
+    Returns:
+        ``pwn`` / ``rev`` / ``crypto`` / ``misc`` / ``web`` 之一；都没线索时
+        返回空串（此时非 web 题不进兜底卡）。
+    """
+    first = str(declared or "").strip().lower()
+    if first in CATEGORY_ALIASES:
+        return CATEGORY_ALIASES[first]
+    for tag in sorted(_keys(tags)):
+        if tag in CATEGORY_ALIASES:
+            return CATEGORY_ALIASES[tag]
+    return _KIND_DEFAULT_CATEGORY.get(str(kind or ""), "")
+
+
+def _usable(cards: Iterable[Card], available: Collection[str] | None) -> list[Card]:
+    """按本 run 的真实工具面与 ``CTF_CARDS_OFF`` 过滤（同一套规则，一处实现）。"""
+    known = None if available is None else frozenset(available)
+    disabled = _disabled_keys()
+    return [
+        card
+        for card in cards
+        if not (card.keys & disabled)
+        and (known is None or tools_named(card.text) <= known)
+    ]
+
+
+def pool(
+    kind: str | None,
+    category: str | None,
+    tags: Iterable[str] | None,
+    available: Collection[str] | None = None,
+) -> list[Card]:
+    """该题的候选卡池（第五轮菜单用）：web 走技术键，非 web 走方向键→category 兜底。
+
+    web 的 tag 一个都不中时（平台给的是题型词，这是常态）返回**整张 web 表**：
+    菜单只有 id + 一行标题，让模型按已观测的证据自己挑，这正是这个池存在的
+    理由。返回空列表表示这题确实没有卡。
+
+    Args:
+        kind: 题型。
+        category: :func:`category_of` 的结果。
+        tags: 题目 tags，只做集合求交，原文不进提示。
+        available: 本进程实际注册的工具名；卡点名了未注册工具就剔卡。
+    """
+    k = str(kind or "")
+    if k in WEB_KINDS:
+        hits = _usable(select(tags, k), available)
+        return hits or _usable(CARDS, available)
+    if k not in {"file", "tcp"}:
+        return []
+    wanted = _keys(tags)
+    hit = _usable([card for card in DOMAIN_CARDS if card.keys & wanted], available)
+    if hit:
+        return hit
+    fallback = CATEGORY_FALLBACK.get(str(category or "").strip().lower())
+    return _usable([fallback], available) if fallback is not None else []
+
+
+def start_cards(
+    kind: str | None,
+    category: str | None,
+    tags: Iterable[str] | None,
+    *,
+    limit: int = 3,
+    available: Collection[str] | None = None,
+) -> list[Card]:
+    """起手就发的那几张：tag 命中的卡；非 web 没命中时发一张 category 兜底卡。
+
+    web 没命中时**不发整表的前三张**——表序是优先级（AI 卡在前），把 AI 打法
+    塞给一道普通 web 题是 2026-11-19 复核里点名的反模式。没命中就只给
+    playbook，具体打法交给第五轮的自选。
+    """
+    cap = max(int(limit), 0)
+    k = str(kind or "")
+    if k in WEB_KINDS:
+        return _usable(select(tags, k), available)[:cap]
+    if k not in {"file", "tcp"}:
+        return []
+    wanted = _keys(tags)
+    hit = _usable([card for card in DOMAIN_CARDS if card.keys & wanted], available)
+    if hit:
+        return hit[:cap]
+    fallback = CATEGORY_FALLBACK.get(str(category or "").strip().lower())
+    if fallback is None:
+        return []
+    usable = _usable([fallback], available)
+    return usable[:cap]
+
+
+def render_start(
+    kind: str | None,
+    category: str | None,
+    tags: Iterable[str] | None,
+    *,
+    limit: int = 3,
+    available: Collection[str] | None = None,
+) -> str:
+    """起手注入块：playbook（只看 kind）+ 至多 ``limit`` 张起手卡。
+
+    与旧的 :func:`render` 的差别：playbook 不再因为卡片未命中而整块不发——
+    2026-11-19 的实跑里 5 道题 0 张卡命中，旧渲染因此一个字都没发。
+    """
+    cards = start_cards(kind, category, tags, limit=limit, available=available)
+    parts = [p for p in (playbook(kind), HEADER if cards else "") if p]
+    parts.extend("- " + card.text for card in cards)
+    return "\n".join(parts)

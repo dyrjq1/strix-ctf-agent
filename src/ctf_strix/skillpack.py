@@ -331,6 +331,7 @@ def prompt_hint(
     ref: str | None = None,
     kind: str | None = None,
     tags: list[str] | None = None,
+    category: str | None = None,
     available: Collection[str] | None = None,
 ) -> str:
     """生成写进 ``user_instructions`` 的路由契约。
@@ -347,6 +348,8 @@ def prompt_hint(
         ref: 子文件根路径，默认 :func:`ref_root`。
         kind: 题型（web/file/tcp/...）；只渲染该题型能执行的工具方向。
         tags: 题目 tags；只用于方法卡求交集，原文不进提示。
+        category: 题目大类（``method_cards.category_of`` 的结果）；非 web 题
+            在 tag 未命中时用它挑兜底卡。
         available: 本进程实际注册的工具名；方法卡点名了未注册的工具就剔卡。
             ``None`` 关闭过滤（单测、或工具面未知时）。
 
@@ -361,7 +364,9 @@ def prompt_hint(
 
     skill_names = names if names is not None else [f"{c}/{n}" for c, n, _ in index_skills()]
     routing_text = routing.render(skill_names, ref or ref_root(), kind=kind) if skill_names else ""
-    cards_text = method_cards.render(tags, kind=kind, available=available)
+    cards_text = method_cards.render_start(
+        kind, category, tags, available=available
+    )
     return _cap_hint("\n\n".join(part for part in (routing_text, cards_text) if part))
 
 

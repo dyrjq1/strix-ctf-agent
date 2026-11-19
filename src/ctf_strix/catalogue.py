@@ -86,6 +86,14 @@ CATALOGUE: Final[tuple[ToolInfo, ...]] = (
         ALL_KINDS,
         "base",
     ),
+    # -- method cards (only registered when this challenge has a card pool) --
+    ToolInfo(
+        "method_cards_pick",
+        "pick up to three method cards by id when the menu appears, and get "
+        "their bodies back",
+        ALL_KINDS,
+        "cards",
+    ),
     # -- web ---------------------------------------------------------------
     ToolInfo(
         "http_probe",

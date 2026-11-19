@@ -60,7 +60,12 @@ def parse_args() -> argparse.Namespace:
             "challenges, which have no network target."
         ),
     )
-    p.add_argument("--turns", type=int, default=12, help="Max agent turns (cost cap)")
+    p.add_argument(
+        "--turns",
+        type=int,
+        default=60,
+        help="Max agent turns; capped at ctf_strix.limits.MAX_TURNS (60)",
+    )
     p.add_argument("--name", default=None, help="Scan id; defaults to a timestamp")
     p.add_argument(
         "--tags",
@@ -310,6 +315,19 @@ def _guard_state_payload(
 
 async def main() -> int:
     args = parse_args()
+
+    # 单题上限 60 轮 / 900 秒（2026-11-19 用户定，见 ctf_strix.limits）。
+    # 父进程 batch_eval 已经夹过一次，这里是同源的第二道——直接手跑本脚本
+    # 时同样不会越过上限。
+    from ctf_strix.limits import MAX_WALLCLOCK_S as _MAX_WALL_S
+    from ctf_strix.limits import clamp_turns as _clamp_turns
+    from ctf_strix.limits import clamp_wallclock as _clamp_wallclock
+
+    args.turns = _clamp_turns(args.turns)
+    if args.wall_deadline > 0:
+        args.wall_deadline = _clamp_wallclock(args.wall_deadline)
+    if args.soft_deadline > 0:
+        args.soft_deadline = min(args.soft_deadline, _MAX_WALL_S)
 
     # 端点预检必须在所有 guard 之前：2026-11-14 三条 lane 打到了不可达的主机，
     # 两套重试梯度各烧 20 分钟，墙钟杀掉时 result.json 都没落。一次 1-token
@@ -707,6 +725,9 @@ async def main() -> int:
     # 是没有 frontmatter 的参考子文件，对模型零信息量。索引里的相对链接由
     # skillpack 插进去的路径提示兜住（指向 jail 内的 bind 挂载点）。
     try:
+        from ctf_strix import card_menu
+        from ctf_strix import card_pick
+        from ctf_strix import method_cards
         from ctf_strix import skillpack
         from ctf_strix.capabilities import live_tool_names
 
@@ -720,11 +741,28 @@ async def main() -> int:
         # 只列名字，不会告诉模型"先 triage、再只挑一个方向"。
         # 方法卡按 tags 选，与技能包无关；过滤用的是上面装完的工具面（AI-5），
         # 所以这一段必须排在所有安装器之后。
+        #
+        # 卡池与第五轮自选必须在这里同样装上：评测 harness 和提交镜像跑的是
+        # 同一份 agent，少一条接线，A/B 测的就不是交付物（本仓库为此吃过多次
+        # 测量/实现分裂的亏）。
+        tags = list(args.tags or [])
+        category = method_cards.category_of(tags, args.target_kind)
+        live = live_tool_names() or None
+        pool = method_cards.pool(args.target_kind, category, tags, available=live)
+        card_pick.set_pool(pool, str(args.challenge_id or args.name or ""))
+        pick_tools = card_pick.install()
+        menu = card_menu.install()
+        print(
+            f"[cards] kind={args.target_kind} category={category or '-'} "
+            f"pool={len(pool)} pick={','.join(pick_tools) or 'off'} "
+            f"menu={'on' if menu is not None else 'off'}"
+        )
         hint = skillpack.prompt_hint(
             names,
             kind=args.target_kind,
-            tags=list(args.tags or []),
-            available=live_tool_names() or None,
+            tags=tags,
+            category=category,
+            available=live,
         )
         if hint:
             args.instruction = (hint + "\n\n" + args.instruction).strip()

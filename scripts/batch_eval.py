@@ -3409,6 +3409,11 @@ def run_agent(
         # 方法卡 A/B（台账 §4.235）：A 臂必须是「这张卡不在」，只能靠环境开关
         # 让同一份工作树渲染出两臂；不转发就等于两臂同一份提示词。
         "CTF_CARDS_OFF": os.environ.get("CTF_CARDS_OFF", ""),
+        # 方法卡"第五轮自选"（2026-11-19）：菜单把上一 attempt 用过的卡标出来，
+        # 记录落在本题盒子里。不转发 = 每次 Attempt 看到同一份没标过的菜单，
+        # "下一轮换几张"就只剩一句空话。菜单本身的消融开关一并转发。
+        "CTF_CARDS_STATE": str(box / "cards"),
+        "CTF_CARD_MENU": os.environ.get("CTF_CARD_MENU", ""),
         # 并行竞速子 agent（台账 §4.65，默认关）。同样必须转发：白名单漏掉它，
         # ON 臂就是 OFF 臂，跑完只会得到"开了也没变化"的假象——11-14 消融臂
         # 事故是同一类错。
@@ -3684,8 +3689,8 @@ def _dispatch_canary(client: Client, env=None) -> tuple[bool, str]:
 def main() -> int:
     p = argparse.ArgumentParser()
     p.add_argument("--plan", required=True, help="JSON 文件：题目计划")
-    p.add_argument("--turns", type=int, default=25)
-    p.add_argument("--wallclock", type=int, default=900, help="单题墙钟上限（秒）")
+    p.add_argument("--turns", type=int, default=60, help="单题轮次基准（上限见 ctf_strix.limits）")
+    p.add_argument("--wallclock", type=int, default=900, help="单题墙钟基准（秒，上限 900）")
     p.add_argument(
         "--max-turns", type=int, default=0,
         help="所有难度共用的轮次硬上限；0 表示只按难度分层",
@@ -3789,6 +3794,14 @@ def main() -> int:
         "easy": (args.turns, args.wallclock),
         "medium": (int(args.turns * 1.6), int(args.wallclock * 1.5)),
         "hard": (int(args.turns * 2.4), int(args.wallclock * 2.3)),
+    }
+    # 2026-11-19 用户定：单题上限 60 轮 / 900 秒（ctf_strix.limits）。分档
+    # 只决定"给多少"，不决定"最多给多少"——medium/hard 的放大在这里被夹回来。
+    from ctf_strix.limits import clamp_turns as _clamp_turns
+    from ctf_strix.limits import clamp_wallclock as _clamp_wallclock
+
+    tiers = {
+        tier: (_clamp_turns(t), _clamp_wallclock(w)) for tier, (t, w) in tiers.items()
     }
 
     for idx, item in enumerate(plan, 1):

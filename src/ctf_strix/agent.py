@@ -33,6 +33,10 @@ paths per identical body hash, and the sink ends the run as
 
 from __future__ import annotations
 
+from ctf_strix.limits import MAX_TURNS as _MAX_TURNS
+from ctf_strix.limits import clamp_turns as _clamp_turns
+from ctf_strix.limits import clamp_wallclock as _clamp_wallclock
+
 import json
 import os
 import re
@@ -947,13 +951,15 @@ def _first_int(*values: object) -> int:
 
 
 def _turn_budget(task: dict[str, Any]) -> int:
-    """解析 turn 预算。
+    """解析 turn 预算，**任何路径都不超过** ``limits.MAX_TURNS``（2026-11-19：60）。
 
-    协议是 ``absent means no budget``：``task.json`` 与
-    ``CTFY_EVAL_MAX_TURNS`` 都没有时**不设上限**。上游
-    ``run_strix_scan`` 需要一个正整数，所以退回 strix 自己的
-    ``DEFAULT_MAX_TURNS``（500），而不是过去硬编码的 25——25 会在难题上
-    提前砍掉 agent，且和"没有预算"矛盾。
+    协议里 ``absent means no budget`` 仍然成立，但"不设上限"在容器里等于让
+    上游默认值（500）说话，而 11-19 实测 460s 里只来得及发 ~27 次调用——
+    500 这条线从未被碰到，却让每一处预算描述都对不上。用户定调后这里改成
+    "没声明就用上限"：一个具体、可测、和墙钟同量级的数字。
+
+    声明值也照样夹：`task.json.max_turns` 给 200 时按 60 跑，给 0 时按 60 跑
+    （0 = 平台没给，不是"零轮"）。
     """
     declared = _first_int(
         task.get("max_turns"),
@@ -961,17 +967,13 @@ def _turn_budget(task: dict[str, Any]) -> int:
         os.environ.get("CTF_MAX_TURNS"),
     )
     if declared:
-        return declared
-    try:
-        from strix.config.settings import DEFAULT_MAX_TURNS
-
-        return int(DEFAULT_MAX_TURNS)
-    except Exception:  # noqa: BLE001 — 运行时缺失时给一个足够大的值
-        return 500
+        return _clamp_turns(declared)
+    return _MAX_TURNS
 
 
 #: Default idle limit.  Long enough for normal tool-call gaps, far below
-#: the 1380s hard wall clock that a dead-target run spent idling.
+#: the 900s hard wall clock (``limits.MAX_WALLCLOCK_S``) that a dead-target
+#: run would otherwise spend idling.
 _IDLE_DEFAULT_SECONDS = 150.0
 
 
@@ -1114,9 +1116,11 @@ class WallclockExceeded(BaseException):
 #: （协议只有 ``max_turns``），评测 harness 的进程组 SIGKILL 也只存在于内部
 #: 跑批：正式赛/部署验证走本入口，此前没有任何墙钟，一次挂死的 run 既烧
 #: 比赛窗口又写不出 result.json（``no_result_file`` 是 blocking 判据）。
-#: 难度未知取 hard 档：成功题 p90=253s、失败题 max=815s，1380s 已是实测
-#: 失败上限的 1.7 倍，再紧只会误伤还在推进的题。
-_WALL_TIERS: dict[str, int] = {"easy": 600, "medium": 900, "hard": 1380}
+#: 难度未知取 hard 档。2026-11-19 用户拍板：三档统一 900s（见
+#: :mod:`ctf_strix.limits`）——当天 14 次尝试全部在 450/690s 的墙钟上死掉、
+#: 一次 turn_capped 都没有，说明切得早的不是模型而是钟。上限本身仍由
+#: ``limits.MAX_WALLCLOCK_S`` 夹住，档位表只决定默认值。
+_WALL_TIERS: dict[str, int] = {"easy": 900, "medium": 900, "hard": 900}
 
 #: 内部 wall deadline 比外层击杀时刻提前这么多秒。
 #:
@@ -1136,11 +1140,11 @@ def _wall_budget(task: dict[str, Any]) -> int:
     raw = os.environ.get("CTFY_WALL_DEADLINE")
     if raw is not None:
         try:
-            return max(int(str(raw).strip()), 0)
+            return _clamp_wallclock(int(str(raw).strip()))
         except (TypeError, ValueError):
             return 0
     difficulty = str((task.get("challenge") or {}).get("difficulty") or "").strip().lower()
-    return _WALL_TIERS.get(difficulty, _WALL_TIERS["hard"])
+    return _clamp_wallclock(_WALL_TIERS.get(difficulty, _WALL_TIERS["hard"]))
 
 
 def _budget_for_stop(wall_budget: int) -> int:
@@ -2523,7 +2527,7 @@ def _measured_groups(kind: str) -> list[str]:
         for info in catalogue.for_kind(kind)
         if info.group != "base" and info.name in present
     }
-    return [group for group in ("web", "file", "tcp", "aisec") if group in found]
+    return [group for group in ("web", "file", "tcp", "aisec", "cards") if group in found]
 
 
 def _silent_checker_fallback_needed(
@@ -2589,29 +2593,35 @@ def _autosubmit_target(task: dict[str, Any]) -> tuple[str, str, str] | None:
 
 
 def _platform_tags(task: dict[str, Any]) -> list[str]:
-    """Ask the platform for this challenge's tags when ``task.json`` has none.
+    """Ask the platform for this challenge's tags (see :func:`_platform_meta`)."""
+    return _platform_meta(task)[0]
 
-    ``task.json`` carries ``challenge.{id,name,description,difficulty}`` and no
-    tags, so on the official entry every tag-keyed method card was unreachable:
-    the evaluation harness passes ``--tags`` but the competition path had
-    nothing to pass.  The detail endpoint is the same one the harness reads, so
-    the vocabulary is identical and nothing has to be derived from prose.
+
+def _platform_meta(task: dict[str, Any]) -> tuple[list[str], str]:
+    """Ask the platform for this challenge's tags and category, once.
+
+    ``task.json`` has no tags *and no category*, so on the official entry the
+    tag-keyed method cards were unreachable and the category fallback card had
+    nothing to key on either.  One request now answers both: the same detail
+    endpoint the harness reads, so the vocabulary is identical and nothing is
+    derived from prose.
 
     Best effort by design: a scored run must not stall or fail because metadata
-    was slow.  Any error, timeout or unexpected shape returns ``[]``, which is
-    exactly the behaviour before this existed.
+    was slow.  Any error, timeout or unexpected shape returns ``([], "")``,
+    which is exactly the behaviour before this existed.
 
     Args:
         task: parsed ``task.json`` (``challenge.id``; platform of record).
 
     Returns:
-        The challenge's tags, or an empty list when they cannot be fetched.
+        ``(tags, category)``; empty when they cannot be fetched.  A category
+        that is not a plain word is dropped rather than passed through.
     """
     try:
         from ctf_strix.engagement import challenge_id_of
         from ctf_strix.engagement import platform_of
     except Exception:  # noqa: BLE001 -- metadata must never stop the run
-        return []
+        return [], ""
     platform = platform_of(task)
     challenge_id = challenge_id_of(task)
     token = (
@@ -2620,7 +2630,7 @@ def _platform_tags(task: dict[str, Any]) -> list[str]:
         or str(task.get("token") or "")
     ).strip()
     if not (platform and challenge_id and token):
-        return []
+        return [], ""
     try:
         import json as _json
         import urllib.parse as _parse
@@ -2639,13 +2649,20 @@ def _platform_tags(task: dict[str, Any]) -> list[str]:
         )
         with _request.urlopen(req, timeout=8) as resp:  # noqa: S310 -- platform URL
             payload = _json.loads(resp.read(1 << 20).decode("utf-8", "replace"))
-    except Exception:  # noqa: BLE001 -- see docstring: [] is the old behaviour
-        return []
+    except Exception:  # noqa: BLE001 -- see docstring: empty is the old behaviour
+        return [], ""
     data = payload.get("data", payload) if isinstance(payload, dict) else {}
-    tags = data.get("tags") if isinstance(data, dict) else None
-    if not isinstance(tags, list):
-        return []
-    return [t.strip() for t in tags if isinstance(t, str) and t.strip()]
+    if not isinstance(data, dict):
+        return [], ""
+    raw_tags = data.get("tags")
+    tags = (
+        [t.strip() for t in raw_tags if isinstance(t, str) and t.strip()]
+        if isinstance(raw_tags, list)
+        else []
+    )
+    raw_category = data.get("category") or data.get("topic") or ""
+    category = str(raw_category).strip() if isinstance(raw_category, str) else ""
+    return tags, category
 
 
 def _qa_target(task: dict[str, Any]) -> tuple[str, str, str, str] | None:
@@ -2821,8 +2838,16 @@ def install_toolset(task: dict[str, Any], kind: str) -> tuple[str, list[str]]:
     # 技能包：12 个方向索引，走 strix 自带的 load_skill。只注册索引、不注册
     # 整包——整包 145 条进 system prompt，其中 133 条是没有 frontmatter 的参考
     # 子文件，对模型零信息量。
+    #
+    # 方法卡（2026-11-19）：起手只给 playbook + 命中的卡；这道题的候选卡池
+    # 进 card_pick，第 5 次工具调用时 card_menu 把菜单摆出来，模型自己点 3 张。
+    # 这是"平台 tag 是题型词、卡表键是技术词、交集恒空"的直接修复：确定性命中
+    # 不了的部分交给看到证据之后的模型。
     hint = ""
     try:
+        from ctf_strix import card_menu
+        from ctf_strix import card_pick
+        from ctf_strix import method_cards
         from ctf_strix import skillpack
 
         names = skillpack.register()
@@ -2830,18 +2855,42 @@ def install_toolset(task: dict[str, Any], kind: str) -> tuple[str, list[str]]:
         # hint even when no index registered, so a broken pack still gets them.
         # The filter reads the live registry, so this runs after every installer
         # above (AI-5).
-        # task.json has no tags, so the official entry asks the platform for
-        # them once; the harness path already gets them on the command line.
+        # task.json has no tags and no category, so the official entry asks the
+        # platform for both once; the harness path already gets the tags on the
+        # command line.
+        tags = skillpack.tags_of(task)
+        declared = ""
+        if not tags:
+            tags, declared = _platform_meta(task)
+        category = method_cards.category_of(tags, kind, declared=declared)
+        live = live_tool_names() or None
+        pool = method_cards.pool(kind, category, tags, available=live)
+        try:
+            from ctf_strix.engagement import challenge_id_of
+
+            card_id = challenge_id_of(task)
+        except Exception:  # noqa: BLE001 -- an id-less run just loses rotation
+            card_id = ""
+        card_pick.set_pool(pool, card_id)
+        pick_tools = card_pick.install()
+        menu_guard = card_menu.install()
         hint = skillpack.prompt_hint(
             names,
             kind=kind,
-            tags=skillpack.tags_of(task) or _platform_tags(task),
-            available=live_tool_names() or None,
+            tags=tags,
+            category=category,
+            available=live,
         )
         if names:
             print(f"[ctfy] skills registered={len(names)} ref={skillpack.ref_root()}", flush=True)
         else:
             print("[ctfy] skills pack missing, routing hint skipped", flush=True)
+        print(
+            f"[ctfy] method cards: kind={kind} category={category or '-'} "
+            f"pool={len(pool)} pick={','.join(pick_tools) or 'off'} "
+            f"menu={'on' if menu_guard is not None else 'off'}",
+            flush=True,
+        )
         if hint:
             print(f"[ctfy] user hint chars={len(hint)}", flush=True)
     except Exception as exc:  # noqa: BLE001 — 技能装不上也要能把题跑完
@@ -4034,6 +4083,16 @@ def _run_agent(
             from ctf_strix.turn_budget import reset_current as _reset_turn_budget
 
             _reset_turn_budget(budget)
+            # 卡菜单同样按 attempt 复位：每个 attempt 都有自己的第 5 次工具
+            # 调用，也都在"已选过卡"上挂住的话，第二次起菜单永远不出现。
+            try:
+                from ctf_strix.card_menu import reset_current as _reset_card_menu
+                from ctf_strix.card_pick import reset_attempt as _reset_card_pick
+
+                _reset_card_menu()
+                _reset_card_pick()
+            except Exception:  # noqa: BLE001 -- 卡片层故障不能停掉挑战
+                pass
             # 只有「这块沙箱还是全新的」那一次才铺附件：后续 attempt 复用同一
             # 沙箱，重铺会覆盖容器里已经改过的文件。
             extras = (attachment_files or None) if first_on_sandbox else None
