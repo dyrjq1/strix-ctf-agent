@@ -1073,7 +1073,7 @@ class Client:
 
         for inst in items:
             if inst.get("id") in targets and inst.get("status") in {"ready", "starting"}:
-                self.teardown(inst["id"])
+                self.teardown(inst["id"], budget_s=60)
                 reaped.append(inst["id"])
         if reaped:
             print(f"  [reap] 清理本进程残留实例 {len(reaped)} 个", flush=True)
@@ -1593,7 +1593,7 @@ class Client:
             out[name] = rr.content
         return out
 
-    def teardown(self, iid: str) -> None:
+    def teardown(self, iid: str, budget_s: float | None = None) -> None:
         """删实例。5xx 重试；**删成功才注销台账**。
 
         实测踩过（2026-11-14 02:13–02:21Z）：收尾时平台 503，旧实现无论
@@ -1603,11 +1603,24 @@ class Client:
 
         Args:
             iid: 实例 id。
+            budget_s: 整次删除的时间预算（秒）。``None`` = 旧行为（6 次
+                重试、每次 90s 超时，最长可挂 ~10 分钟）。收尾路径必须给
+                预算：2026-11-19 两题就是卡在这段重试里，进程被强杀后
+                实例一直 ready 到 TTL。没删掉时台账保留，由调度器的
+                ``_sweep_orphans`` 在进程退出后回收。
         """
+        deadline = None if budget_s is None else time.time() + budget_s
         ok = False
         for attempt in range(6):
+            if deadline is None:
+                timeout = 90.0
+            else:
+                left = deadline - time.time()
+                if left <= 0:
+                    break
+                timeout = min(90.0, max(5.0, left))
             try:
-                r = self.s.delete(f"{PLATFORM}/api/v1/instances/{iid}", timeout=90)
+                r = self.s.delete(f"{PLATFORM}/api/v1/instances/{iid}", timeout=timeout)
                 if r.status_code < 400 or r.status_code == 404:
                     ok = True
                     break
@@ -1615,7 +1628,10 @@ class Client:
                     break  # 4xx 不是抖动，重试也不会变
             except requests.RequestException:
                 pass
-            time.sleep(min(20, 5 * (attempt + 1)))
+            pause = min(20, 5 * (attempt + 1))
+            if deadline is not None:
+                pause = min(pause, max(0.0, deadline - time.time()))
+            time.sleep(pause)
         self.owned.discard(iid)
         if ok:
             _ledger_forget(iid)
@@ -3957,7 +3973,7 @@ def main() -> int:
                     if tunnel is not None:
                         tunnel.down()
                         tunnel = None
-                    client.teardown(iid)
+                    client.teardown(iid, budget_s=90)
                     iid = client.launch(cid)
                     target = client.wait_ready(iid)
                     if isinstance(target, dict):
@@ -4352,7 +4368,11 @@ def main() -> int:
                     tunnel.down()
             if iid:
                 with contextlib.suppress(Exception):
-                    client.teardown(iid)
+                    # 120s 上限：正常 DELETE 是 202/几十毫秒；平台抖动时
+                    # 6×90s 的重试会把车道挂在收场上（11-19 实测 12 分钟），
+                    # 结果行写不出来，调度器只能看到"没结束"。超时的实例
+                    # 留在台账里，由 compete 的 _sweep_orphans 回收。
+                    client.teardown(iid, budget_s=120)
             rec["total_s"] = round(time.time() - rec["started"], 1)
             with out.open("a", encoding="utf-8") as fh:
                 fh.write(json.dumps(rec, ensure_ascii=False) + "\n")

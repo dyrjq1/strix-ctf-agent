@@ -201,6 +201,44 @@ def test_teardown_forgets_the_instance(no_sleep, isolated_ledger) -> None:
     assert "gone" not in ledger["instances"]
 
 
+def test_teardown_honours_its_time_budget(monkeypatch, isolated_ledger) -> None:
+    """收尾必须带预算：DELETE 一直超时时不能把车道挂在收场上。
+
+    2026-11-19 实测两题在 agent 收车后卡了 12 分钟（jsonl 一行都没写），
+    进程被强杀后实例一直 ready 到 3 小时 TTL。带预算时超时就放弃，
+    台账保留，交给 ``compete._sweep_orphans`` 在进程退出后回收。
+    """
+
+    class TimeoutSession(FakeSession):
+        def __init__(self) -> None:
+            super().__init__([])
+            self.tries = 0
+
+        def delete(self, url: str, timeout: int = 90) -> FakeResponse:
+            self.tries += 1
+            raise batch_eval.requests.RequestException("timed out")
+
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(batch_eval.time, "time", lambda: clock["t"])
+
+    def _sleep(seconds: float) -> None:
+        clock["t"] += seconds
+
+    monkeypatch.setattr(batch_eval.time, "sleep", _sleep)
+
+    session = TimeoutSession()
+    client = _client(session)
+    client.owned.add("stuck")
+    batch_eval._ledger_record("stuck")
+
+    client.teardown("stuck", budget_s=30)
+
+    assert session.tries <= 3, "预算 30s 不该打满 6 次 90s 重试"
+    assert clock["t"] - 1000.0 <= 35, "整次删除不该超出预算太多"
+    ledger = json.loads(isolated_ledger.read_text("utf-8"))
+    assert "stuck" in ledger["instances"], "没删掉就不能丢台账（否则无从回收）"
+
+
 def test_ledger_dead_ids_reports_only_dead_owners() -> None:
     """活着的 pid 即使在台账里也不算尸体；死 pid 才算。"""
     _write_ledger(

@@ -78,6 +78,7 @@ import argparse
 import json
 import os
 import signal
+import socket
 import subprocess
 import sys
 import time
@@ -823,8 +824,47 @@ def drop_pool_blocked(
     return [c for c in challenges if str(c.get("id") or "") not in blocked]
 
 
+#: 宿主机 UDP 中转的地址。VM 上就是局域网网关；VPS 上没有这个东西，探测会
+#: 在 0.5s 内失败，此时不注入 ``CTF_VPN_RELAY*``——否则每个实例都先吃一次
+#: 控制口 3s 超时 + 一次注定失败的握手（11-19 实测每次白花 5–20s），
+#: 而真正让隧道起来的是排在后面的直连路径。
+_RELAY_HOST = os.environ.get("CTF_VPN_RELAY_HOST", "192.168.38.1")
+_relay_state: dict[str, bool] = {}
+
+
+def _relay_up(host: str | None = None) -> bool:
+    """宿主机中转是否真在这台机器上跑着（连一次控制口，结果按进程缓存）。
+
+    Args:
+        host: 中转地址；None 取 :data:`_RELAY_HOST`。
+
+    Returns:
+        True = 控制口接受连接，可以走中转；False = 只有直连一条路。
+    """
+    target = host or _RELAY_HOST
+    if target in _relay_state:
+        return _relay_state[target]
+    base = int(os.environ.get("CTF_VPN_RELAY_BASE", "47444"))
+    ok = False
+    try:
+        with socket.create_connection((target, base + 1), timeout=0.5):
+            ok = True
+    except (OSError, ValueError):
+        ok = False
+    _relay_state[target] = ok
+    if not ok:
+        print(
+            f"[compete] 宿主机中转 {target} 不可达（控制口 {base + 1}）——"
+            "车道回落到直连 WireGuard",
+            file=sys.stderr,
+        )
+    return ok
+
+
 def _lane_env(
-    lane: int, lane_models: list[dict[str, str]] | None = None
+    lane: int,
+    lane_models: list[dict[str, str]] | None = None,
+    relay_up: bool | None = None,
 ) -> dict[str, str]:
     """给第 ``lane`` 条车道的子进程分配**独立**的 VPN 中转端口。
 
@@ -834,6 +874,8 @@ def _lane_env(
     所以端口分配在派单处就固定下来，不靠运行时猜。
 
     ``CTF_VPN_RELAY_BASE`` 默认 47444，车道 i 用 ``BASE+2i``（控制口 +1）。
+    中转地址那台机器没在跑（VPS 上没有 192.168.38.1）时**不注入**这两个变量，
+    子进程只走直连——省掉每个实例一次注定失败的中转尝试。
 
     ``lane_models``（:func:`load_lane_config` 的产物）存在时，车道 i 额外
     覆盖 ``LLM_API_BASE`` / ``LLM_API_KEY`` / ``STRIX_LLM``——多厂商车道的
@@ -844,16 +886,17 @@ def _lane_env(
     Args:
         lane: 车道序号（0 起）。
         lane_models: per-lane 厂商配置；None = 不覆盖（单厂商行为不变）。
+        relay_up: 中转可用性；None = 运行 :func:`_relay_up` 现探，测试里直接给值。
 
     Returns:
         追加给子进程的环境变量。
     """
     base = int(os.environ.get("CTF_VPN_RELAY_BASE", "47444"))
     port = base + 2 * lane
-    env = {
-        "CTF_VPN_RELAY": f"192.168.38.1:{port}",
-        "CTF_VPN_RELAY_CONTROL": f"192.168.38.1:{port + 1}",
-    }
+    env: dict[str, str] = {}
+    if _relay_up() if relay_up is None else relay_up:
+        env["CTF_VPN_RELAY"] = f"{_RELAY_HOST}:{port}"
+        env["CTF_VPN_RELAY_CONTROL"] = f"{_RELAY_HOST}:{port + 1}"
     if lane_models:
         cfg = lane_models[lane]
         model = cfg["model"]
@@ -992,13 +1035,61 @@ def _spawn(
         notes.write_text(notes_text, encoding="utf-8")
         cmd += ["--retry-notes", str(notes)]
     log = open(runs / f"{cid}{tag}.stdout.log", "a", encoding="utf-8")
-    env = {**os.environ, **_lane_env(lane, lane_models)}
+    lane_env = _lane_env(lane, lane_models)
+    env = {**os.environ, **lane_env}
+    if "CTF_VPN_RELAY" not in lane_env:
+        # 中转不可用时也要把父进程可能残留的这两个变量摘掉，否则子进程
+        # 还是会先去敲一个不存在的控制口。
+        env.pop("CTF_VPN_RELAY", None)
+        env.pop("CTF_VPN_RELAY_CONTROL", None)
     if extra_env is None:
         for stale in ("CTF_RACE_DIR", "CTF_RACE_CHALLENGE", "CTF_RACE_LANE"):
             env.pop(stale, None)
     else:
         env.update(extra_env)
     return subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT, env=env)
+
+
+def _sweep_orphans(token: str) -> list[str]:
+    """删掉台账里**主人进程已死**的实例，返回删掉的 id。
+
+    为什么需要这一层：``batch_eval`` 的 ``finally`` 会拆桥、拆隧道、删实例，
+    但那是"进程能走到 finally"的前提。2026-11-19 实测两题在 agent 收车之后
+    卡在清理段（jsonl 一行都没写），12 分钟后进程被停止信号 SIGKILL，实例
+    就一直 ready 到 3 小时 TTL 结束——平台上看起来就是"没解出也没结束"。
+
+    判定沿用 ``batch_eval`` 的所有权台账：只删"登记过、且登记时的 pid 已经
+    不在了"的实例。兄弟车道（pid 还活着）和没登记的实例一律不碰——这条
+    与 B-27 的教训一致（盲删会把并行车道正在用的靶机拔掉）。
+
+    Args:
+        token: 平台 token（删实例要认证）。
+
+    Returns:
+        实际删掉的实例 id 列表。
+    """
+    try:
+        ids = batch_eval._ledger_dead_ids()
+    except Exception:  # noqa: BLE001 — 台账坏了不该拖垮调度器
+        return []
+    done: list[str] = []
+    for iid in sorted(ids):
+        try:
+            r = requests.delete(
+                f"{PLATFORM}/api/v1/instances/{iid}",
+                headers={"Authorization": f"Bearer {token}"},
+                timeout=20,
+            )
+        except requests.RequestException as exc:
+            print(f"[compete] 回收 {iid[:8]} 失败：{exc}", flush=True)
+            continue
+        if r.status_code < 400 or r.status_code == 404:
+            batch_eval._ledger_forget(iid)
+            done.append(iid)
+            print(f"[compete] 回收残留实例 {iid[:8]}（主人进程已退出）", flush=True)
+        else:
+            print(f"[compete] 回收 {iid[:8]} 返回 HTTP {r.status_code}", flush=True)
+    return done
 
 
 def _failure_lines(rec: dict[str, Any]) -> list[str]:
@@ -1219,6 +1310,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--poll", type=float, default=10.0, help="车道轮询间隔（秒）")
     p.add_argument(
+        "--lane-stagger",
+        type=float,
+        default=30.0,
+        help="连续派两条车道之间的最小间隔秒数（默认 30）。三条车道同一秒"
+        "起实例会同时压 platform/DNS/边缘节点，也容易在同一秒收场撞 DELETE；"
+        "0 = 关闭错峰（旧行为）",
+    )
+    p.add_argument(
         "--allow-pools",
         action="store_true",
         help="放行封存/烧毁池的题（仅练习场自测；正式赛不要用）",
@@ -1299,6 +1398,11 @@ def main() -> int:
     #: 连续「一行结果都没写」的车道数——用来把环境停跑的退避拉长到 5 分钟，
     #: 而不是每 poll 秒重派一次。任何一次正常收车就清零。
     infra_streak = 0
+    #: 车道错峰：相邻两条车道起跑至少隔 ``--lane-stagger`` 秒。2026-11-19
+    #: 实测三条车道同一秒起实例时，起实例/DNS/边缘节点跟着一起抖，收场也
+    #: 挤在同一秒调 DELETE。错峰只影响"背靠背补位"，已跑了几分钟的车道不受影响。
+    stagger_s = max(0.0, float(getattr(args, "lane_stagger", 0) or 0))
+    last_spawn_at = 0.0
 
     def _sigint(_sig, _frm):
         nonlocal stop
@@ -1343,6 +1447,9 @@ def main() -> int:
     pool_note_printed = False
 
     while not stop:
+        # 强杀留下的实例（台账主人 pid 已死）在这里回收：不等撞配额再收拾，
+        # 也不让平台上挂着"没解出也没结束"的靶机。
+        _sweep_orphans(args.token)
         if deadline_reached(deadline):
             print("[compete] 到 --until，收工", flush=True)
             break
@@ -1504,6 +1611,7 @@ def main() -> int:
                         tag=f"-lane{lane}",
                         extra_env=_race_env(race_dir, cid, lane),
                     )
+                last_spawn_at = time.time()
                 print(
                     f"[compete] 竞速派单 {cid}（{args.lanes} 车道同题先解先停"
                     + (f"，换向={direction[0]}" if direction else "")
@@ -1535,6 +1643,16 @@ def main() -> int:
                         session_warned = True
                     break
                 session_warned = False
+                # 错峰在**改 state 之前**做：等待期间收到停止信号，题要原样
+                # 放回队首——先标 RUNNING 再退出的话，这题下一轮会被当孤儿跳过。
+                if stagger_s and last_spawn_at:
+                    gap = stagger_s - (time.time() - last_spawn_at)
+                    while gap > 0 and not stop:
+                        time.sleep(min(gap, 1.0))
+                        gap = stagger_s - (time.time() - last_spawn_at)
+                    if stop:
+                        queue.insert(0, chal)
+                        break
                 rec = state.setdefault(cid, {})
                 # 收车时用来判「本轮有没有写结果行」；必须在启动子进程之前取。
                 rec["rows_before"] = _row_count(state_dir, cid)
@@ -1564,12 +1682,13 @@ def main() -> int:
                     lane_models=lane_models,
                 )
                 lane_of[cid] = lane
+                last_spawn_at = time.time()
                 lane_label = (
                     f"{lane}({lane_models[lane]['name']})" if lane_models else str(lane)
                 )
                 print(
                     f"[compete] 派单 {cid}（{len(running)}/{args.lanes} 车道，"
-                    f"lane={lane_label} 中转 {_lane_env(lane)['CTF_VPN_RELAY']}"
+                    f"lane={lane_label} 中转 {_lane_env(lane, lane_models).get('CTF_VPN_RELAY', '直连')}"
                     + (f"，换向={direction[0]}" if direction else "")
                     + "）",
                     flush=True,
@@ -1578,6 +1697,7 @@ def main() -> int:
         if not running and not race_runs:
             if args.once:
                 print("[compete] --once：队列跑完，退出", flush=True)
+                _sweep_orphans(args.token)
                 return 0
             print(
                 f"[compete] 队列空（无可跑题），{args.poll}s 后重刷题表",
@@ -1660,6 +1780,9 @@ def main() -> int:
                     proc.wait(timeout=15)
                 except subprocess.TimeoutExpired:
                     proc.kill()
+            # 子进程被强杀时不会走到 batch_eval 的 finally：它的实例此刻
+            # 只会留在台账里。这里立刻按"主人已死"回收一次。
+            _sweep_orphans(args.token)
             save_state(state_dir, state)
     return 0
 

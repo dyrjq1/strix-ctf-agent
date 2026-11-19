@@ -407,7 +407,7 @@ def test_each_lane_gets_its_own_vpn_relay_ports(monkeypatch) -> None:
     别人实例上——最隐蔽的"打错地方"。这里钉住端口随车道线性错开。
     """
     monkeypatch.delenv("CTF_VPN_RELAY_BASE", raising=False)
-    envs = [compete._lane_env(i) for i in range(3)]
+    envs = [compete._lane_env(i, relay_up=True) for i in range(3)]
     relays = [e["CTF_VPN_RELAY"] for e in envs]
     controls = [e["CTF_VPN_RELAY_CONTROL"] for e in envs]
     assert len(set(relays)) == 3
@@ -469,8 +469,80 @@ def test_drop_pool_blocked_keeps_order_and_other_ids() -> None:
 
 def test_lane_relay_base_is_overridable(monkeypatch) -> None:
     monkeypatch.setenv("CTF_VPN_RELAY_BASE", "50000")
-    assert compete._lane_env(1)["CTF_VPN_RELAY"].endswith(":50002")
-    assert compete._lane_env(1)["CTF_VPN_RELAY_CONTROL"].endswith(":50003")
+    env = compete._lane_env(1, relay_up=True)
+    assert env["CTF_VPN_RELAY"].endswith(":50002")
+    assert env["CTF_VPN_RELAY_CONTROL"].endswith(":50003")
+
+
+def test_no_relay_env_when_the_host_relay_is_not_running() -> None:
+    """VPS 上没有宿主机中转：不注入这两个变量，子进程直接走直连。
+
+    11-19 实测：中转控制口每次先吃 3s 超时、再吃一次注定失败的握手，
+    每个实例白花 5–20s；而真正把隧道拉起来的是后面的直连路径。
+    """
+    env = compete._lane_env(0, relay_up=False)
+    assert "CTF_VPN_RELAY" not in env
+    assert "CTF_VPN_RELAY_CONTROL" not in env
+
+
+def test_relay_probe_is_cached_per_host(monkeypatch) -> None:
+    """探测结果按 host 缓存，派单处不会每次派单都去连一遍。"""
+    calls = []
+
+    def fake_connect(addr, timeout=0):  # noqa: ANN001, ARG001
+        calls.append(addr)
+        raise OSError("nope")
+
+    monkeypatch.setattr(compete.socket, "create_connection", fake_connect)
+    monkeypatch.setattr(compete, "_relay_state", {})
+    assert compete._relay_up("10.255.255.1") is False
+    assert compete._relay_up("10.255.255.1") is False
+    assert calls == [("10.255.255.1", 47445)]
+
+
+def test_lane_stagger_defaults_to_30s() -> None:
+    """车道默认错峰 30s：三条车道同一秒起跑会一起压平台/边缘节点。"""
+    args = compete.build_parser().parse_args(["--token", "t", "--competition", "c"])
+    assert args.lane_stagger == 30.0
+
+
+def test_sweep_orphans_reaps_only_dead_owners(monkeypatch) -> None:
+    """停止信号强杀子进程后，台账里主人已死的实例要被回收。"""
+    deleted: list[str] = []
+    forgotten: list[str] = []
+
+    monkeypatch.setattr(
+        compete.batch_eval, "_ledger_dead_ids", lambda: {"dead-1", "dead-2"}
+    )
+    monkeypatch.setattr(compete.batch_eval, "_ledger_forget", forgotten.append)
+
+    class Resp:
+        status_code = 202
+
+    def fake_delete(url, headers=None, timeout=0, **kw):  # noqa: ANN001, ARG001
+        deleted.append(url.rsplit("/", 1)[-1])
+        return Resp()
+
+    monkeypatch.setattr(compete.requests, "delete", fake_delete)
+
+    assert compete._sweep_orphans("tok") == ["dead-1", "dead-2"]
+    assert deleted == ["dead-1", "dead-2"]
+    assert forgotten == ["dead-1", "dead-2"]
+
+
+def test_sweep_orphans_keeps_the_ledger_entry_on_failure(monkeypatch) -> None:
+    """DELETE 失败时不能抹台账——否则下次没人认领这具尸体。"""
+    forgotten: list[str] = []
+
+    monkeypatch.setattr(compete.batch_eval, "_ledger_dead_ids", lambda: {"dead-1"})
+    monkeypatch.setattr(compete.batch_eval, "_ledger_forget", forgotten.append)
+
+    class Resp:
+        status_code = 503
+
+    monkeypatch.setattr(compete.requests, "delete", lambda *a, **kw: Resp())
+    assert compete._sweep_orphans("tok") == []
+    assert forgotten == []
 
 
 def test_attempt_box_is_the_single_wall_cap() -> None:
@@ -762,8 +834,8 @@ def test_lane_env_maps_each_lane_to_its_own_vendor(monkeypatch) -> None:
         {"name": "a", "LLM_API_BASE": "https://a/v1", "LLM_API_KEY": "sk-a", "model": "m-a"},
         {"name": "b", "LLM_API_BASE": "https://b/v1", "LLM_API_KEY": "sk-b", "model": "m-b"},
     ]
-    env0 = compete._lane_env(0, lane_models)
-    env1 = compete._lane_env(1, lane_models)
+    env0 = compete._lane_env(0, lane_models, relay_up=True)
+    env1 = compete._lane_env(1, lane_models, relay_up=True)
     assert env0["LLM_API_BASE"] == "https://a/v1" and env0["LLM_API_KEY"] == "sk-a"
     assert env1["LLM_API_BASE"] == "https://b/v1" and env1["LLM_API_KEY"] == "sk-b"
     assert env0["STRIX_LLM"] == "openai/m-a"
