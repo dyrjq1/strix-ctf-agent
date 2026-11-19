@@ -32,6 +32,14 @@
 标记字段只有 ``host / family / mechanism / signature``，其中 signature 是
 ``_obs_signature`` 的 12 位指纹，不含响应正文。文件通过
 ``CTFY_STALL_MARKERS`` 指定；未设置时守卫只在内存里计数。
+
+## 收场也要落一条
+
+``observe()`` 只在停滞判据响时写标记，而 wallclock / 轮次打满这类收场
+一次也不触发它。:meth:`ProgressGuard.record_stop` 因此在**每次收场**都补写
+一条（``stage="stop:<reason>"``），并附上目标给过的状态码分布（``surface``）
+与本轮点过的方法卡（``cards``/``cards_state``）——这三样就是下一轮唯一的
+起点，「上一轮停在哪、选了什么打法」不该靠猜。
 """
 
 from __future__ import annotations
@@ -41,9 +49,11 @@ from ctf_strix.tool_notes import append_note
 import json
 import logging
 import os
+import re
 import threading
 import time
 from typing import TYPE_CHECKING, Any, Final
+from urllib.parse import urlsplit
 
 from ctf_strix.enum_guard import (
     MECHANISM_NAMES,
@@ -280,6 +290,36 @@ class ProgressGuard:
 
     # -- internals ---------------------------------------------------------
 
+    def record_stop(self, reason: str) -> None:
+        """为本次收场**无条件**写一条标记（守卫是否触发都写）。
+
+        为什么必须无条件：``observe()`` 只在停滞判据响的时候落盘，而实测最
+        常见的三种收场——``wallclock`` / ``turn_capped`` / ``agent_idle``——
+        一次都触发不了。2026-11-19 三道题跑完，盒子里连
+        ``stall_markers.jsonl`` 都没有，于是重试提示里「上一轮停在哪」整段
+        缺失，只剩一行「收场：wallclock」：下一轮模型只能原样重来。
+
+        收场标记回答四件事，都是结构事实、都不含响应正文和答案：
+
+        * 最后打到哪（``host`` / ``family`` / ``mechanism`` / ``signature``）；
+        * 已经打过哪些路径（``tried``：去重后的 ``METHOD /path → 状态``）；
+        * 目标给过什么（``surface``：最后一次请求与状态码分布，来自流量台账）；
+        * 选了什么方法卡（``cards`` + ``cards_state``：picked / menu_no_pick /
+          no_menu——「没摆菜单」和「摆了没点」是两种不同的失败）。
+
+        Args:
+            reason: 收场原因，与 ``result.json`` 的 ``stop_reason`` 同源。
+        """
+        stage = f"stop:{str(reason or '').strip() or 'unknown'}"
+        with self._lock:
+            marker = self._marker(streak=self.streak, stage=stage)
+        cards, cards_state = _cards_state()
+        if cards:
+            marker["cards"] = cards[:6]
+        marker["cards_state"] = cards_state
+        marker.update(probe_surface())
+        self._write_marker(marker)
+
     def _negative_stuck(self) -> int:
         """How many negative-evidence groups have closed (K=3) so far."""
         try:
@@ -344,6 +384,115 @@ class ProgressGuard:
 
 _GUARD: ProgressGuard | None = None
 _GUARD_LOCK = threading.Lock()
+
+#: 路径里像密钥/会话号的长串（≥24 位字母数字）打码：路径要进下一轮的提示，
+#: 但 token 不许进任何落盘文件（红线）。
+_LONG_SEG = re.compile(r"[A-Za-z0-9_\-]{24,}")
+
+
+def probe_surface() -> dict[str, Any]:
+    """本次 run 的请求面快照：``tried``（去重后的方法+路径+状态）与
+    ``surface``（最后一次请求 + 状态码分布）。
+
+    一份口径两处用：收场标记（父进程读，生成重试提示）与 ``result.json``
+    （平台侧失败归因读）。分开算就会像 11-19 那样——一边有路径、另一边只有
+    「收场：wallclock」。
+    """
+    out: dict[str, Any] = {}
+    tried = _tried_paths()
+    if tried:
+        out["tried"] = tried
+    surface = _surface_fact()
+    if surface:
+        out["surface"] = surface
+    return out
+
+
+def _cards_state() -> tuple[list[str], str]:
+    """这一轮点了哪几张方法卡，以及"没点"是哪一种没点。
+
+    Returns:
+        ``(ids, state)``；``state`` 是 ``picked`` / ``menu_no_pick`` /
+        ``no_menu`` / ``unknown``。``unknown`` 表示记账模块本身不可用——那
+        是另一种需要看见的故障，不能伪装成"没选"。
+    """
+    try:
+        from ctf_strix import card_menu, card_pick
+    except Exception:  # noqa: BLE001 - 记账模块故障不能拖垮收场
+        return [], "unknown"
+    try:
+        picked = card_pick.used()
+        shown = card_menu.shown()
+    except Exception:  # noqa: BLE001
+        return [], "unknown"
+    if picked:
+        return [str(cid) for cid in picked], "picked"
+    return [], ("menu_no_pick" if shown else "no_menu")
+
+
+def _scrub(path: str) -> str:
+    """把路径里的长串打码（session id / api key 常常就长这样）。"""
+    return _LONG_SEG.sub("…", path)
+
+
+def _tried_paths(limit: int = 8) -> list[str]:
+    """这一轮已经打过哪些 ``METHOD /path → 状态``（去重，时间序）。
+
+    只给「停在哪」不够：下一轮的原罪是**重复踩同一组坑**。把去重后的
+    请求面直接交给它，是让"别再打这些"变成一条可核对的事实，而不是一句
+    希望。查询串丢弃、长串打码——路径要进提示，秘密不进。
+    """
+    try:
+        from ctf_strix.traffic import ledger
+
+        items = [e for e in ledger().items() if getattr(e, "method", "")]
+    except Exception:  # noqa: BLE001 - 台账不可用只是少一条事实
+        return []
+    out: list[str] = []
+    seen: set[str] = set()
+    for item in items:
+        try:
+            path = urlsplit(str(item.url)).path or "/"
+        except ValueError:
+            continue
+        key = f"{item.method} {_scrub(path)}"
+        if key in seen:
+            continue
+        seen.add(key)
+        status = str(item.status) if item.status else (item.phase or "无响应")
+        out.append(f"{key[:60]}→{status}")
+        if len(out) >= limit:
+            break
+    return out
+
+
+def _surface_fact() -> str:
+    """目标给过的结构事实：最后一次请求 + 状态码分布（无正文、无答案）。
+
+    取流量台账，不取 run.log：台账每一条都是一次真实交换（含被拒的），
+    而日志里的响应正文既长又有被判分风险。
+    """
+    try:
+        from ctf_strix.traffic import ledger
+
+        items = [e for e in ledger().items() if getattr(e, "method", "")]
+    except Exception:  # noqa: BLE001 - 台账不可用只是少一条事实
+        return ""
+    if not items:
+        return ""
+    codes: dict[str, int] = {}
+    for item in items:
+        key = str(item.status) if item.status else (item.phase or "无响应")
+        codes[key] = codes.get(key, 0) + 1
+    top = sorted(codes.items(), key=lambda kv: (-kv[1], kv[0]))[:4]
+    last = items[-1]
+    try:
+        path = urlsplit(str(last.url)).path or "/"
+    except ValueError:
+        path = "/"
+    status = str(last.status) if last.status else (last.phase or "无响应")
+    where = f"{last.method} {_scrub(path)[:60]} → {status}"
+    return f"{where}；码 " + " ".join(f"{k}×{v}" for k, v in top)
 
 _MARK: Final[str] = "_ctf_progress_guarded"
 

@@ -324,3 +324,110 @@ def test_groups_past_the_injection_ceiling_still_report_as_stuck():
     assert last is None  # the ceiling is spent, so the third group is silent
     assert len(guard.stuck_groups()) == groups
     assert guard.stats()["injections"] == ng.LIMITS[ng.L4]
+
+
+# -- every ending leaves a marker, not just the stalled ones ---------------
+
+
+def _last_marker(tmp_path: Path) -> dict:
+    lines = (tmp_path / "markers.jsonl").read_text(encoding="utf-8").splitlines()
+    return json.loads(lines[-1])
+
+
+def test_a_wallclock_stop_leaves_a_marker_although_nothing_tripped(guard, tmp_path):
+    """wallclock 从不触发停滞判据，但下一轮必须有东西可读。
+
+    2026-11-19：三道题全部以 wallclock 收场，盒子里一个 markers 文件都没有
+    （``observe`` 只在判据响的时候落盘），重试提示因此只剩「收场：wallclock」。
+    """
+    guard.observe("http_probe", _args(_ADMIN), NOT_FOUND)
+    assert guard.tripped is False
+
+    guard.record_stop("wallclock")
+
+    marker = _last_marker(tmp_path)
+    assert marker["stage"] == "stop:wallclock"
+    assert marker["host"] == "h.test"
+    assert marker["probes"] == 1
+    assert marker["cards_state"] in {"no_menu", "menu_no_pick", "picked", "unknown"}
+    assert "page not found" not in json.dumps(marker, ensure_ascii=False)
+
+
+def test_the_stop_marker_lists_the_paths_already_tried(guard, tmp_path, monkeypatch):
+    """下一轮的原罪是重复踩坑：标记必须带上去重后的请求面。"""
+    from ctf_strix import traffic
+
+    monkeypatch.setattr(traffic, "_LEDGER", traffic.TrafficLedger(None))
+    traffic.record(
+        request_id="r1", method="GET", url="http://h.test/admin/panel", status=404
+    )
+    traffic.record(
+        request_id="r2",
+        method="POST",
+        url="http://h.test/api/login?token=abc",
+        status=401,
+    )
+    traffic.record(
+        request_id="r3", method="GET", url="http://h.test/admin/panel", status=404
+    )
+
+    guard.record_stop("wallclock")
+
+    marker = _last_marker(tmp_path)
+    assert marker["tried"] == ["GET /admin/panel→404", "POST /api/login→401"]
+    assert "token" not in json.dumps(marker, ensure_ascii=False)
+    assert marker["surface"].startswith("GET /admin/panel → 404")
+    assert "404×2" in marker["surface"]
+
+
+def test_a_session_like_path_segment_is_masked(guard, tmp_path, monkeypatch):
+    """路径要进下一轮提示，长串（会话号/密钥）不进任何落盘文件。"""
+    from ctf_strix import traffic
+
+    monkeypatch.setattr(traffic, "_LEDGER", traffic.TrafficLedger(None))
+    traffic.record(
+        request_id="r1",
+        method="GET",
+        url="http://h.test/reset/abcdef0123456789abcdef0123456789",
+        status=200,
+    )
+
+    guard.record_stop("wallclock")
+
+    text = json.dumps(_last_marker(tmp_path), ensure_ascii=False)
+    assert "abcdef0123456789abcdef0123456789" not in text
+    assert "…" in text
+
+
+def test_the_stop_marker_records_the_picked_method_cards(guard, tmp_path, monkeypatch):
+    """「选了什么方法卡」是失败描述的另一半。"""
+    from ctf_strix import card_menu, card_pick, method_cards
+
+    monkeypatch.setattr(card_menu, "_GUARD", None)
+    monkeypatch.delenv("CTF_CARDS_STATE", raising=False)
+    pool = method_cards.pool("web", "", ["sqli"])[:2]
+    card_pick.set_pool(pool)
+    try:
+        card_pick._pick([pool[0].cid])
+
+        guard.record_stop("turn_capped")
+
+        marker = _last_marker(tmp_path)
+        assert marker["cards"] == [pool[0].cid]
+        assert marker["cards_state"] == "picked"
+    finally:
+        card_pick.set_pool([])
+
+
+def test_a_menu_that_was_never_shown_is_not_reported_as_a_refusal(
+    guard, tmp_path, monkeypatch
+):
+    """「没摆菜单」和「摆了没点」是两种失败，混成一个空列表就分不开了。"""
+    from ctf_strix import card_menu, card_pick
+
+    monkeypatch.setattr(card_menu, "_GUARD", None)
+    card_pick.set_pool([])
+
+    guard.record_stop("wallclock")
+
+    assert _last_marker(tmp_path)["cards_state"] == "no_menu"

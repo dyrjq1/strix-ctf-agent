@@ -19,8 +19,10 @@ from ctf_strix import card_pick, card_menu, method_cards
 def _clean_state(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.delenv("CTF_CARDS_STATE", raising=False)
     card_pick.set_pool([])
+    card_menu._TURNS.reset()
     yield
     card_pick.set_pool([])
+    card_menu._TURNS.reset()
 
 
 def _web_cards() -> list:
@@ -105,14 +107,50 @@ def test_the_registered_tool_is_named_and_typed_for_the_menu() -> None:
     assert "ids" in (schema.get("properties") or {}), "the tool cannot take ids"
 
 
-def test_the_menu_guard_fires_once_after_the_fifth_call() -> None:
+def test_the_menu_guard_fires_once_after_the_third_round_by_default() -> None:
+    """默认在第三轮回复之后摆菜单；工具调用多少次都不算轮次。"""
     card_pick.set_pool(_web_cards())
-    guard = card_menu.CardMenuGuard(after=5)
-    hints = [guard.observe() for _ in range(4)]
-    assert hints == [None, None, None, None]
+    guard = card_menu.CardMenuGuard()
+    card_menu._TURNS.reset()
+    # 第一、二轮里怎么调工具都不摆菜单。
+    assert [guard.observe() for _ in range(5)] == [None] * 5
+    card_menu._TURNS.bump()
+    card_menu._TURNS.bump()
+    assert guard.observe() is None, "two rounds in is still early"
+    card_menu._TURNS.bump()
     fired = guard.observe()
     assert fired and "method_cards_pick" in fired
     assert guard.observe() is None, "the menu must not repeat on every call"
+
+
+def test_the_menu_guard_honours_a_custom_after() -> None:
+    card_pick.set_pool(_web_cards())
+    guard = card_menu.CardMenuGuard(after=5)
+    card_menu._TURNS.reset()
+    for _ in range(4):
+        card_menu._TURNS.bump()
+        assert guard.observe() is None
+    card_menu._TURNS.bump()
+    assert guard.observe()
+
+
+def test_reset_puts_the_round_counter_back_to_zero() -> None:
+    card_pick.set_pool(_web_cards())
+    guard = card_menu.CardMenuGuard()
+    card_menu._TURNS.bump()
+    card_menu._TURNS.bump()
+    guard.reset()
+    assert card_menu._TURNS.current() == 0
+    assert guard.observe() is None
+
+
+def test_parallel_tool_calls_in_one_round_do_not_burn_rounds() -> None:
+    """一轮里并行调用五个工具仍是一轮：菜单必须等到第三轮。"""
+    card_pick.set_pool(_web_cards())
+    guard = card_menu.CardMenuGuard()
+    card_menu._TURNS.reset()
+    card_menu._TURNS.bump()
+    assert [guard.observe() for _ in range(5)] == [None] * 5
 
 
 def test_the_guard_stays_quiet_when_a_card_was_already_picked() -> None:
@@ -120,11 +158,13 @@ def test_the_guard_stays_quiet_when_a_card_was_already_picked() -> None:
     card_pick.set_pool(pool)
     card_pick._pick([pool[0].cid])
     guard = card_menu.CardMenuGuard(after=1)
+    card_menu._TURNS.bump()
     assert guard.observe() is None
 
 
 def test_the_guard_stays_quiet_without_a_pool() -> None:
     guard = card_menu.CardMenuGuard(after=1)
+    card_menu._TURNS.bump()
     assert guard.observe() is None
 
 
@@ -132,3 +172,74 @@ def test_install_can_be_switched_off(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("CTF_CARD_MENU", "0")
     monkeypatch.setattr(card_menu, "_GUARD", None)
     assert card_menu.install() is None
+
+
+class _FakeModel:
+    """只实现代理会转发的那几个方法，用来数模型回复。"""
+
+    def __init__(self, events: int = 2) -> None:
+        self.calls = 0
+        self.events = events
+
+    async def close(self) -> None:  # pragma: no cover - 代理透传
+        return None
+
+    async def _cleanup_on_run_end(self, owner: object) -> None:  # pragma: no cover
+        return None
+
+    def get_retry_advice(self, request: object) -> None:  # pragma: no cover
+        return None
+
+    async def get_response(self, *args, **kwargs):
+        self.calls += 1
+        return {"ok": True}
+
+    async def stream_response(self, *args, **kwargs):
+        for i in range(self.events):
+            yield {"i": i}
+
+
+def test_the_turn_proxy_counts_one_get_response_as_one_round() -> None:
+    import asyncio
+
+    inner = _FakeModel()
+    proxy = card_menu._TurnProxy(inner)
+    asyncio.run(proxy.get_response(None, [], None, [object()]))
+    assert card_menu._TURNS.current() == 1
+    asyncio.run(proxy.get_response(None, [], None, [object()]))
+    assert card_menu._TURNS.current() == 2, "each completed reply is one round"
+
+
+def test_the_turn_proxy_counts_a_fully_consumed_stream_once() -> None:
+    import asyncio
+
+    inner = _FakeModel(events=3)
+    proxy = card_menu._TurnProxy(inner)
+
+    async def consume() -> list:
+        return [event async for event in proxy.stream_response(None, [], None, [object()])]
+
+    assert len(asyncio.run(consume())) == 3
+    assert card_menu._TURNS.current() == 1
+
+
+def test_an_abandoned_stream_is_not_a_round() -> None:
+    """半路被取消的回复不算一轮：模型没答完，菜单不能因此提前。"""
+    import asyncio
+
+    inner = _FakeModel(events=5)
+    proxy = card_menu._TurnProxy(inner)
+    stream = proxy.stream_response(None, [], None, [object()])
+
+    async def one_event() -> None:
+        await stream.__anext__()
+        await stream.aclose()
+
+    asyncio.run(one_event())
+    assert card_menu._TURNS.current() == 0
+
+
+def test_internal_calls_without_tools_are_not_rounds() -> None:
+    """压缩/去重的 ``tools=[]`` 调用不是题目推理的一轮。"""
+    assert card_menu._counts_as_a_turn((None, "prompt"), {"tools": []}) is False
+    assert card_menu._counts_as_a_turn((None, [], None, [object()]), {}) is True

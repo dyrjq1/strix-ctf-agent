@@ -29,7 +29,7 @@ pytest.importorskip("strix.agents.factory", reason="vendor tree not importable h
 def registry():
     """Register for one kind and return ``(tool names, groups, prompt text)``."""
 
-    def run(kind: str, task: dict | None = None):
+    def run(kind: str, task: dict | None = None, attachments=None):
         from ctf_strix import agent, prompt
         from strix.agents import factory
 
@@ -39,7 +39,7 @@ def registry():
         saved = list(factory._EXTRA_TOOLS)
         factory._EXTRA_TOOLS.clear()
         try:
-            hint, groups = agent.install_toolset(task or {}, kind)
+            hint, groups = agent.install_toolset(task or {}, kind, attachments=attachments)
             after = {t.name for t in factory.registered_agent_tools()}
             prompt.activate(kind, tuple(groups), after)
             return after, groups, prompt.build({})
@@ -108,6 +108,23 @@ def test_web_challenge_registers_http_and_not_attachment_tools(registry):
     for file_tool in ("file_triage", "decode_blob", "unpack_archive"):
         assert file_tool not in names
         assert f"`{file_tool}`" not in text
+
+
+def test_a_web_challenge_with_attachments_gets_the_attachment_primitives(registry):
+    """web + 附件 与 bare web 是两回事。
+
+    2026-11-19 实测：一道多服务 web 题的附件是 ``challenge.zip.b64``，
+    ``kind=web`` 从未注册 ``unpack_archive``，模型用四次 ``exec_command``
+    （unzip / 7z / busybox / python zipfile）才打开一个包，然后撞墙钟。
+    """
+    task = {"challenge": {"description": "a service with a source bundle"}}
+    names, _groups, text = registry("web", task, attachments=[{"path": "challenge.zip"}])
+    assert {"file_triage", "unpack_archive", "hexpeek", "decode_blob"} <= names
+    assert "`unpack_archive`" in text, "registered but not described is the same bug"
+    assert "elfpeek" not in names, "a web attachment is a tree, not a binary"
+    assert "tcp" not in names
+    # The live-target half must not have been displaced by the file half.
+    assert {"http_probe", "route_map"} <= names
 
 
 def test_web_challenge_registers_viability_probe(registry):

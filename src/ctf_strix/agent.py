@@ -721,6 +721,58 @@ def _write_result(path: Path, payload: dict[str, Any]) -> None:
     tmp = path.with_suffix(path.suffix + ".tmp")
     tmp.write_text(json.dumps(merged, ensure_ascii=False, indent=2), encoding="utf-8")
     tmp.replace(path)
+    # 收场标记：每一条收场路径都从这里过，所以记一笔也放这里。守卫自己只在
+    # 停滞判据响时落盘，而 wallclock / 轮次打满从不触发它——2026-11-19 三道
+    # 题跑完盒子里连 stall_markers.jsonl 都没有，下一轮的重试提示因此没有
+    # 「上一轮停在哪」。写不进去不能影响 result.json（已经落盘了）。
+    try:
+        from ctf_strix import progress_guard
+
+        progress_guard.current().record_stop(str(merged.get("stop_reason") or ""))
+    except Exception:  # noqa: BLE001 - 记账失败不是收场失败
+        print("[ctfy] stop marker not recorded", flush=True)
+
+
+def _probe_diag() -> dict[str, Any] | None:
+    """本次 run 的请求面（去重后的路径+状态、状态码分布），写进 result.json。
+
+    与收场标记同一份口径（``progress_guard.probe_surface``）：路径里的长串
+    已打码、查询串已丢弃，不含正文也不含答案。
+    """
+    try:
+        from ctf_strix import progress_guard
+
+        snap = progress_guard.probe_surface()
+    except Exception:  # noqa: BLE001 - 诊断缺失不影响收场
+        return None
+    return snap or None
+
+
+def _cards_diag() -> dict[str, Any] | None:
+    """这一轮点了哪几张方法卡，作为 result.json 的顶格字段。
+
+    失败描述要回答「选了什么打法」：只读 ``card_pick.chosen()`` 会在第二次
+    attempt 开头看到空表（它在 attempt 之间复位），所以这里同时带跨 attempt
+    的累计 ``used`` 与菜单是否摆出过——「没摆菜单」和「摆了没点」是两种
+    不同的失败，混成一个空列表就再也分不开了。
+    """
+    try:
+        from ctf_strix import card_menu, card_pick
+
+        picked = card_pick.chosen()
+        used = card_pick.used()
+        shown = card_menu.shown()
+        pool = card_pick.pool_size()
+    except Exception:  # noqa: BLE001 - 诊断缺失不影响收场
+        return None
+    if not (picked or used or shown or pool):
+        return None
+    return {
+        "this_attempt": [str(cid) for cid in picked[:6]],
+        "used": [str(cid) for cid in used[:6]],
+        "menu_shown": bool(shown),
+        "pool": int(pool),
+    }
 
 
 #: ``finish_scan`` is a local strix tool with an SDK-level 60 s timeout.  Bound
@@ -2326,6 +2378,16 @@ def main() -> int:
             # 必须随 result.json 出去：外层 harness 要不要用剩余样本换策略重开，
             # 唯一的输入就是这条。四字段都不含响应正文，也不含答案。
             payload["stall_marker"] = stall_marker
+        cards_diag = _cards_diag()
+        if cards_diag:
+            # 「上一轮选了什么方法卡」是失败描述的一半：没有它，下一轮只能
+            # 猜上一轮是没挑打法、还是挑了没推进。
+            payload["method_cards"] = cards_diag
+        probed = _probe_diag()
+        if probed:
+            # 另一半是「打过哪些路径、目标回了什么」。平台侧的失败归因只看
+            # result.json；不给它，失败描述就只剩一个 stop_reason。
+            payload["probed"] = probed
         if isinstance(diag, dict) and diag.get("silent_stop"):
             # A clean return with no finish call and no answer used to look the
             # same as any other unsuccessful run.
@@ -2697,12 +2759,23 @@ def _qa_target(task: dict[str, Any]) -> tuple[str, str, str, str] | None:
     return platform, token, challenge, competition
 
 
-def install_toolset(task: dict[str, Any], kind: str) -> tuple[str, list[str]]:
+def install_toolset(
+    task: dict[str, Any],
+    kind: str,
+    *,
+    attachments: list[dict[str, str]] | None = None,
+) -> tuple[str, list[str]]:
     """Register every capability this challenge kind is entitled to.
 
     Args:
         task: parsed task.json; AI-security gating reads its metadata.
         kind: challenge kind from _challenge_kind.
+        attachments: already-read attachment entries (``_local_attachments``
+            shape).  A *web* challenge that ships files is the one case where
+            the attachment primitives pay for themselves on a live target: the
+            2026-11-19 test run had to unpack ``challenge.zip.b64`` with four
+            ``exec_command`` calls because ``kind=web`` never registered
+            ``unpack_archive``.
 
     Returns:
         (skill routing hint, installer groups that registered).  The groups
@@ -2754,7 +2827,17 @@ def install_toolset(task: dict[str, Any], kind: str) -> tuple[str, list[str]]:
         )
 
     # 附件题（rev/pwn/misc/crypto）才装文件入口原语；web 题不为它付 schema token。
-    if kind in ("file", "tcp"):
+    # 例外：web 题**带附件**时也装——那不是"web 不需要"，是"纯 web 不需要"。
+    # 2026-11-19 测试赛实测：一道多服务 web 题的附件是 challenge.zip.b64，
+    # kind=web 没注册 unpack_archive，模型用 exec_command 连撞四次
+    # （unzip / 7z / busybox unzip / python zipfile）才解开一个包。
+    has_attachments = bool(attachments) or bool(
+        task.get("attachments") or task.get("files")
+    )
+    wants_file_tools = kind in ("file", "tcp") or (
+        kind in ("web", "checker", "engagement") and has_attachments
+    )
+    if wants_file_tools:
         try:
             from ctf_strix import file_triage
 
@@ -2840,7 +2923,8 @@ def install_toolset(task: dict[str, Any], kind: str) -> tuple[str, list[str]]:
     # 子文件，对模型零信息量。
     #
     # 方法卡（2026-11-19）：起手只给 playbook + 命中的卡；这道题的候选卡池
-    # 进 card_pick，第 5 次工具调用时 card_menu 把菜单摆出来，模型自己点 3 张。
+    # 进 card_pick，第 3 轮（模型第 3 次输入→输出）之后 card_menu 把菜单摆出来，
+# 模型自己点 3 张。轮次由模型侧计数，不是工具调用数。
     # 这是"平台 tag 是题型词、卡表键是技术词、交集恒空"的直接修复：确定性命中
     # 不了的部分交给看到证据之后的模型。
     hint = ""
@@ -3491,7 +3575,7 @@ def _run_agent(
     # installer; failures are printed instead of swallowed.
     # One place assembles the tool surface, so what is registered and what
     # the prompt describes cannot drift apart (docs/27 C3/C4).
-    hint, groups = install_toolset(task, kind)
+    hint, groups = install_toolset(task, kind, attachments=attachments)
 
     # shell 发出的 HTTP 记进流量台账（只记录、不改行为）。277 个 run 里
     # exec_command 占 64% 的调用，这些交换原本全部逃出台账，导致

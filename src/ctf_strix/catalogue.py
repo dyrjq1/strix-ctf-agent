@@ -98,7 +98,8 @@ CATALOGUE: Final[tuple[ToolInfo, ...]] = (
     ToolInfo(
         "http_probe",
         "one HTTP exchange in, one structured line out; a per-host cookie jar "
-        "keeps a login alive across calls; bodies and headers need no script",
+        "keeps a login alive across calls; bodies, headers and multipart file "
+        "uploads need no script",
         WEB_KINDS,
         "web",
     ),
@@ -178,11 +179,22 @@ CATALOGUE: Final[tuple[ToolInfo, ...]] = (
         "web",
     ),
     # -- attachment --------------------------------------------------------
+    #
+    # The four "what am I holding" primitives also apply to a *web* challenge
+    # that ships a source tree: 2026-11-19 a multi-service web task arrived as
+    # ``challenge.zip.b64``, the agent had no unpack_archive (kind=web), and it
+    # burned four calls on ``unzip`` / ``7z`` / ``busybox unzip`` / python
+    # zipfile before reading one file.  The catalogued kind set is only half the
+    # gate -- ``for_kind`` is intersected with the real registry, and the agent
+    # registers these for web only when the task actually ships attachments, so
+    # a bare web challenge is still never promised what it does not pay for.
+    # ``elfpeek`` / ``elffind`` stay file/tcp: a web attachment is a tree, not
+    # a binary to exploit.
     ToolInfo(
         "file_triage",
         "identify a file or directory: family, size, entropy, flag-like "
         "strings, and the one command to run next",
-        FILE_KINDS | TCP_KINDS,
+        FILE_KINDS | TCP_KINDS | WEB_KINDS,
         "file",
     ),
     ToolInfo(
@@ -190,7 +202,7 @@ CATALOGUE: Final[tuple[ToolInfo, ...]] = (
         "decode a multi-layer blob and report the chain: "
         "base64/base32/base58/base85/ascii85/hex/binary, gzip/zlib/utf-16 "
         "between layers, rot13/rot47/url/html-entity on top",
-        FILE_KINDS | TCP_KINDS,
+        FILE_KINDS | TCP_KINDS | WEB_KINDS,
         "file",
     ),
     ToolInfo(
@@ -198,14 +210,14 @@ CATALOGUE: Final[tuple[ToolInfo, ...]] = (
         "extract an archive safely and keep going into nested archives: "
         "zip/tar/gzip/bzip2/xz/zstd, plus 7z/rar through the system 7z; "
         "refuses entries that escape the output directory",
-        FILE_KINDS | TCP_KINDS,
+        FILE_KINDS | TCP_KINDS | WEB_KINDS,
         "file",
     ),
     ToolInfo(
         "hexpeek",
         "bytes as hex and ASCII with offsets, for reading a header without "
         "guessing at `xxd` flags",
-        FILE_KINDS | TCP_KINDS,
+        FILE_KINDS | TCP_KINDS | WEB_KINDS,
         "file",
     ),
     ToolInfo(

@@ -3108,15 +3108,14 @@ def _resample_allowed(reason: str) -> bool:
     return reason in _RESAMPLE_REASONS
 
 
-def _last_marker_facts(markers: Path | None) -> list[str]:
-    """读停滞标记的最后一行，取 host/family/mechanism/stage 四元组。"""
+def _last_marker(markers: Path | None) -> dict:
+    """读标记文件最后一条可解析记录；读不到返回空字典。"""
     if markers is None:
-        return []
+        return {}
     try:
         lines = markers.read_text(encoding="utf-8").splitlines()
     except OSError:
-        return []
-    last: dict = {}
+        return {}
     for line in reversed(lines):
         if line.strip():
             try:
@@ -3124,13 +3123,62 @@ def _last_marker_facts(markers: Path | None) -> list[str]:
             except ValueError:
                 continue
             if isinstance(parsed, dict):
-                last = parsed
-                break
-    return [
+                return parsed
+    return {}
+
+
+def _last_marker_facts(markers: Path | None) -> list[str]:
+    """把最后一条标记压成「上一轮停在哪」。
+
+    2026-11-19 之前这里只认 host/family/mechanism/stage，而那个文件只在停滞
+    判据响的时候才被写——三道题全部以 wallclock 收场，盒子里一个标记文件都
+    没有，于是重试提示里的「探到」整行消失，只剩「收场：wallclock」。
+    现在收场本身也落一条（``progress_guard.record_stop``），并多带
+    ``surface``：最后一次请求 + 目标给过的状态码分布。光说"停在哪台主机"
+    不够——「上一轮的失败路径」要具体到它最后打在哪个路径、被什么挡住。
+    """
+    last = _last_marker(markers)
+    out = [
         f"{key}={last[key]}"
-        for key in ("host", "family", "mechanism", "stage")
+        for key in ("host", "family", "mechanism")
         if str(last.get(key) or "").strip()
     ]
+    surface = str(last.get("surface") or "").strip()
+    if surface:
+        out.append(surface)
+    stage = str(last.get("stage") or "").strip()
+    if stage and not stage.startswith("stop:"):
+        # ``stop:<reason>`` 与「收场：」是同一句话，不再占提示的字符预算；
+        # 只有 stall / deep_exhausted 这类守卫阶段是额外信息。
+        out.append(f"stage={stage}")
+    return out
+
+
+def _tried_fact(markers: Path | None) -> str:
+    """「已经打过哪些路径」——下一轮不重复踩同一组坑的唯一依据。"""
+    last = _last_marker(markers)
+    tried = last.get("tried")
+    if not isinstance(tried, list) or not tried:
+        return ""
+    joined = " ".join(str(item) for item in tried[:8])
+    return ("试过：" + joined)[:180]
+
+
+def _cards_fact(markers: Path | None) -> str:
+    """「上一轮选了什么方法卡」；没选也要说清是没摆菜单还是摆了没点。"""
+    last = _last_marker(markers)
+    if not last:
+        return ""
+    cards = last.get("cards")
+    ids = [str(c) for c in cards] if isinstance(cards, list) else []
+    if ids:
+        return "卡：" + ",".join(ids[:6])[:60]
+    state = str(last.get("cards_state") or "").strip()
+    if state == "menu_no_pick":
+        return "卡：未选（菜单已摆出，模型没点）"
+    if state == "no_menu":
+        return "卡：未选（还没走到摆菜单那一轮就收场）"
+    return ""
 
 
 def _activity_fact(guard: dict) -> str:
@@ -3178,10 +3226,13 @@ def _activity_fact(guard: dict) -> str:
 
 
 def _failure_facts(rec: dict, markers: Path | None) -> list[str]:
-    """把一次失败压成 1–3 行结构化事实，供调度器落盘并注入下一次重试。
+    """把一次失败压成至多 5 行结构化事实，供调度器落盘并注入下一次重试。
 
-    只带机器可读的收场值与停滞四元组，不搬日志正文：重试提示里塞正文
-    会过拟合，也会把无关内容带进下一轮上下文。
+    只带机器可读的结构事实，不搬日志正文：重试提示里塞正文会过拟合，也会
+    把无关内容带进下一轮上下文。事实的优先级按「下一轮能不能据此换方向」
+    排：收场 → 上一轮停在哪（探到）→ 已经打过哪些路径（试过）→ 选了什么
+    方法卡 → 被判否的提交 → 轨迹计数。2026-11-19 用户口径：失败描述至少
+    要说清上一轮的失败路径与所选方法卡，否则这个接口就没有存在意义。
     """
     if rec.get("correct"):
         return []
@@ -3190,25 +3241,34 @@ def _failure_facts(rec: dict, markers: Path | None) -> list[str]:
         facts.append(f"异常：{str(rec['error'])[:120]}")
     elif rec.get("stop_reason"):
         facts.append(f"收场：{rec['stop_reason']}")
-    activity = _activity_fact(rec.get("guard") or {})
-    if activity:
-        facts.append(activity)
+    stopped = _last_marker_facts(markers)
+    if stopped:
+        facts.append("探到：" + " ".join(stopped)[:180])
+    # 上面两行是「敌人在哪」，下面这行是「已经打过哪些门」：用户 2026-11-19
+    # 的原话——不给路径，下一轮就是把上一轮的坑再踩一遍。
+    paths = _tried_fact(markers)
+    if paths:
+        facts.append(paths)
+    cards = _cards_fact(markers)
+    if cards:
+        facts.append(cards)
     rejected = rec.get("answers_rejected")
     if isinstance(rejected, dict) and rejected:
         shown = "、".join(f"{k}={v}" for k, v in list(rejected.items())[:3])
         facts.append(f"提交被判否：{shown[:140]}")
-    tried = _last_marker_facts(markers)
-    if tried:
-        facts.append("探到：" + " ".join(tried)[:140])
-    return facts[:3]
+    activity = _activity_fact(rec.get("guard") or {})
+    if activity:
+        facts.append(activity)
+    return facts[:5]
 
 
 def _resume_steer(markers: Path, reason: str, sample_no: int) -> str:
-    """用上一轮落盘的停滞事实生成换向提示。
+    """用上一轮落盘的收场事实生成换向提示。
 
-    只带结构事实（host / path family / 机制类 / 停止阶段），不带响应正文：
-    正文进提示就是对着失败日志写死字符串，既过拟合，又会把别的题的残留
-    带进上下文。读不到标记文件时退回只说「换一类机制」的通用提示。
+    只带结构事实（host / path family / 机制类 / 已打过的路径 / 所选方法卡），
+    不带响应正文：正文进提示就是对着失败日志写死字符串，既过拟合，又会把
+    别的题的残留带进上下文。读不到标记文件时退回只说「换一类机制」的通用
+    提示。
 
     Args:
         markers: 上一轮样本的 ``stall_markers.jsonl``。
@@ -3218,25 +3278,19 @@ def _resume_steer(markers: Path, reason: str, sample_no: int) -> str:
     Returns:
         追加在题面后面的短提示。
     """
-    last: dict = {}
-    try:
-        for line in reversed(markers.read_text(encoding="utf-8").splitlines()):
-            if line.strip():
-                last = json.loads(line)
-                break
-    except (OSError, ValueError):
-        last = {}
-    if not isinstance(last, dict):
-        last = {}
-    facts = [
-        f"{key}={last[key]}"
-        for key in ("host", "family", "mechanism", "stage")
-        if str(last.get(key) or "").strip()
-    ]
-    tried = "、".join(facts) if facts else "（上一轮没留下可用的停滞事实）"
+    facts = _last_marker_facts(markers)
+    # 这句子已经说了「已经试到」，因此去掉单项自己的前缀，别写成
+    # 「已经试到：…、试过：…、卡：…」。
+    paths = _tried_fact(markers).removeprefix("试过：")
+    if paths:
+        facts.append(paths)
+    cards = _cards_fact(markers).removeprefix("卡：")
+    if cards:
+        facts.append(cards)
+    tried = "、".join(facts) if facts else "（上一轮没留下可用的收场事实）"
     return (
-        f"[重开 {sample_no}] 上一轮以 {reason} 收场：整轮探测没有产生新观测，"
-        "不是模型崩溃，是证据。\n"
+        f"[重开 {sample_no}] 上一轮以 {reason} 收场。这是证据，不是模型崩溃；"
+        "下面这些是它停在什么地方、已经打过什么。\n"
         f"已经试到：{tried}。\n"
         "这一轮不要重复同一组探测、不要再看同一份响应。换一个机制类别："
         "换根组件、换参数语义、换认证边界、换数据流向各算一类。"

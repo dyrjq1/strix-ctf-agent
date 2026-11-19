@@ -238,7 +238,7 @@ def test_steer_survives_missing_or_broken_markers(
     hint = _resume_steer(markers, "no_progress", 2)
 
     assert "[重开 2]" in hint
-    assert "（上一轮没留下可用的停滞事实）" in hint
+    assert "（上一轮没留下可用的收场事实）" in hint
     assert "traffic_list" in hint
 
 

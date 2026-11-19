@@ -2954,6 +2954,12 @@ FILE_TOOLS: Final = (decode_blob, unpack_archive, hexpeek, elfpeek, elffind)
 #: playbook says "``elffind`` the offset, then send it", so withholding the
 #: static tools made the first instruction unexecutable (REVIEW-20261112 PWN-1).
 TCP_TOOLS: Final = (tcp, tcp_batch)
+#: What a *web* challenge that ships a source tree needs: the three questions
+#: "what is this file / what is inside this archive / what are these bytes".
+#: No ELF pair -- a web attachment is a tree, and the two binary schemas cost
+#: ~2.2k chars per turn for a question that tree never asks.  Registered only
+#: when the task carries attachments (agent.install_toolset).
+WEB_FILE_TOOLS: Final = (decode_blob, unpack_archive, hexpeek)
 
 
 def register(register_fn=None, kind: str = "file") -> list[str]:
@@ -2962,10 +2968,11 @@ def register(register_fn=None, kind: str = "file") -> list[str]:
     Args:
         register_fn: Injection point; defaults to
             ``factory.register_agent_tools``.
-        kind: ``"file"`` (attachment primitives) or ``"tcp"`` (attachment
+        kind: ``"file"`` (attachment primitives), ``"tcp"`` (attachment
             primitives **plus** the socket primitives -- a remote-binary
-            challenge needs both).  Anything else registers nothing -- a web
-            challenge must not pay for these schemas.
+            challenge needs both), or ``"web"`` (only the three that answer
+            "what am I holding": a web challenge ships a source tree far more
+            often than a binary).  Any other kind registers nothing.
 
     Returns:
         Tool names registered by this call (empty when already present).
@@ -2974,6 +2981,8 @@ def register(register_fn=None, kind: str = "file") -> list[str]:
         tools = FILE_TOOLS
     elif kind == "tcp":
         tools = (*FILE_TOOLS, *TCP_TOOLS)
+    elif kind == "web":
+        tools = WEB_FILE_TOOLS
     else:
         return []
 

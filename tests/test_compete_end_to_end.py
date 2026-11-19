@@ -127,7 +127,8 @@ def _run(monkeypatch, base: str, state_dir: Path, spawned: list, *,
     monkeypatch.setattr(compete, "PLATFORM", base)
 
     def fake_spawn(chal, args, sdir, failure_path=None, lane=0,
-                   direction=None, attempt=1, lane_models=None):
+                   direction=None, attempt=1, lane_models=None,
+                   tag="", extra_env=None, model_slot=None):
         runs = Path(sdir) / "runs"
         runs.mkdir(parents=True, exist_ok=True)
         # 真 _spawn 会先把派单 plan 落盘再起子进程；这里照做，好让"派单项里
@@ -149,6 +150,12 @@ def _run(monkeypatch, base: str, state_dir: Path, spawned: list, *,
             "direction": direction[0] if direction else None,
             "failure_path": list(failure_path or []),
             "lane_models": lane_models is not None,
+            "model_slot": model_slot,
+            "model": (
+                lane_models[model_slot]["name"]
+                if lane_models and model_slot is not None
+                else None
+            ),
         })
         rec = {"challenge": str(chal["id"]), "correct": correct}
         if not correct:
@@ -304,6 +311,69 @@ def test_lane_config_is_loaded_and_forwarded(platform, monkeypatch, tmp_path):
     state = json.loads((tmp_path / "state.json").read_text(encoding="utf-8"))
     assert state["CHAL-1"].get("lane_model") == "a"
     assert "sk-a" not in json.dumps(state)
+
+
+def test_a_retry_lands_on_another_vendor(platform, monkeypatch, tmp_path):
+    """同一道题重派要换厂商：一条车道也能在 3 家里轮转，不吃「车道数」限制。
+
+    2026-11-19 验收跑里三题各自钉死一条车道、连跑四轮同一个模型；
+    用户口径「不要几个会话都用一个模型」。这里钉住真实派单路径上
+    ``model_slot`` 每轮都在变。
+    """
+    conf = tmp_path / "lanes.conf"
+    conf.write_text(
+        "a|https://a.llm-next.ctfy.io/v1|sk-a|m-a\n"
+        "b|https://b.llm-next.ctfy.io/v1|sk-b|m-b\n"
+        "c|https://c.llm-next.ctfy.io/v1|sk-c|m-c\n",
+        encoding="utf-8",
+    )
+    base, p = platform([_chal("CHAL-1")])
+    spawned: list = []
+    _run(
+        monkeypatch, base, tmp_path, spawned, correct=False,
+        # 错峰与本测无关（默认 30s × 4 次重派 = 白等 2 分钟）。
+        argv_extra=("--lane-config", str(conf), "--lane-stagger", "0"),
+    )
+    models = [s["model"] for s in spawned]
+    assert len(models) > 2
+    assert all(a != b for a, b in zip(models, models[1:])), models
+    # 车道只有一条：端口不变，变的是厂商槽位。
+    assert {s["lane"] for s in spawned} == {0}
+    state = json.loads((tmp_path / "state.json").read_text(encoding="utf-8"))
+    assert state["CHAL-1"]["lane_model"] == models[-1]
+
+
+def test_three_lanes_without_lane_config_refuses_to_start(platform, monkeypatch, tmp_path):
+    """三个实例三个会话共用一个 API：启动即退，一个子进程都不起。
+
+    2026-11-19 用户口径：「不要开三个实例的同时三个会话用的是同一个 api」。
+    """
+    base, p = platform([_chal("CHAL-1")])
+    spawned: list = []
+    rc = _run(monkeypatch, base, tmp_path, spawned, argv_extra=("--lanes", "3"))
+    assert rc == 2
+    assert not spawned
+
+
+def test_lane_config_with_a_duplicate_vendor_refuses_to_start(
+    platform, monkeypatch, tmp_path
+):
+    """三行配置里两行指向同一厂商同一模型 = 同上，启动即退。"""
+    conf = tmp_path / "lanes.conf"
+    conf.write_text(
+        "a|https://a.llm-next.ctfy.io/v1|sk-a|m-a\n"
+        "b|https://a.llm-next.ctfy.io/v1|sk-b|m-a\n"
+        "c|https://c.llm-next.ctfy.io/v1|sk-c|m-c\n",
+        encoding="utf-8",
+    )
+    base, p = platform([_chal("CHAL-1")])
+    spawned: list = []
+    rc = _run(
+        monkeypatch, base, tmp_path, spawned,
+        argv_extra=("--lane-config", str(conf), "--lanes", "3"),
+    )
+    assert rc == 2
+    assert not spawned
 
 
 def test_lane_config_with_too_few_rows_refuses_to_start(platform, monkeypatch, tmp_path):

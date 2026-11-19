@@ -119,7 +119,14 @@ def test_prompt_stays_small(block):
     # (authdiff / jsrecon / traffic_diff), measured 7,783.  Threshold 7,823 --
     # same ~40-char headroom, same rule: every added line must have a
     # registered tool behind it.
-    assert size < 7823, f"system prompt grew to {size} chars"
+    # 2026-11-19 attachment primitives (ledger 4.275): the four "what am I
+    # holding" rows now also apply to kind=web, measured 8,520.  They are
+    # *not* paid on a bare web challenge -- ``prompt.build`` filters by the
+    # measured registry and the agent registers them only when the task ships
+    # attachments (test_toolset_wiring pins both directions).  This render
+    # passes ``names=None``, i.e. the unfiltered worst case.  Threshold 8,560:
+    # same ~40-char headroom.
+    assert size < 8560, f"system prompt grew to {size} chars"
 
 
 _KINDS = ("web", "file", "tcp")

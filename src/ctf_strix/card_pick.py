@@ -79,6 +79,20 @@ def pool_size() -> int:
     return len(_POOL)
 
 
+def used() -> list[str]:
+    """本 attempt 与之前各 attempt 累计点过的卡 id（菜单 ``*`` 标记同源）。
+
+    收场记账要回答「上一轮选了什么方法卡」，而 ``chosen()`` 在每次 attempt
+    开头就被清空——只读它，收场时永远看到空列表。跨 attempt 的累计记录本来
+    就为菜单的 ``*`` 存在（``CTF_CARDS_STATE``），这里把它暴露成只读视图。
+    """
+    out = list(_CHOSEN)
+    for cid in _load_used():
+        if cid not in out:
+            out.append(cid)
+    return out
+
+
 def _state_path() -> Path | None:
     """跨 attempt 的已用卡记录路径；``CTF_CARDS_STATE`` 未设则不落盘。"""
     raw = os.environ.get("CTF_CARDS_STATE", "").strip()

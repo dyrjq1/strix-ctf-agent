@@ -866,6 +866,7 @@ def _lane_env(
     lane: int,
     lane_models: list[dict[str, str]] | None = None,
     relay_up: bool | None = None,
+    model_slot: int | None = None,
 ) -> dict[str, str]:
     """给第 ``lane`` 条车道的子进程分配**独立**的 VPN 中转端口。
 
@@ -888,6 +889,9 @@ def _lane_env(
         lane: 车道序号（0 起）。
         lane_models: per-lane 厂商配置；None = 不覆盖（单厂商行为不变）。
         relay_up: 中转可用性；None = 运行 :func:`_relay_up` 现探，测试里直接给值。
+        model_slot: 厂商槽位（``lane_models`` 下标）；None = 跟车道号同号。
+            2026-11-19 起两者解耦：车道固定 VPN 端口，槽位独立轮转，
+            这样「重派换模型」不必等某条特定车道空出来。
 
     Returns:
         追加给子进程的环境变量。
@@ -899,7 +903,7 @@ def _lane_env(
         env["CTF_VPN_RELAY"] = f"{_RELAY_HOST}:{port}"
         env["CTF_VPN_RELAY_CONTROL"] = f"{_RELAY_HOST}:{port + 1}"
     if lane_models:
-        cfg = lane_models[lane]
+        cfg = lane_models[lane if model_slot is None else model_slot]
         model = cfg["model"]
         env["LLM_API_BASE"] = cfg["LLM_API_BASE"]
         env["LLM_API_KEY"] = cfg["LLM_API_KEY"]
@@ -995,6 +999,7 @@ def _spawn(
     lane_models: list[dict[str, str]] | None = None,
     tag: str = "",
     extra_env: dict[str, str] | None = None,
+    model_slot: int | None = None,
 ) -> subprocess.Popen:
     """派一个 batch_eval 子进程跑单题（agent 上下文从零开始）。
 
@@ -1036,7 +1041,7 @@ def _spawn(
         notes.write_text(notes_text, encoding="utf-8")
         cmd += ["--retry-notes", str(notes)]
     log = open(runs / f"{cid}{tag}.stdout.log", "a", encoding="utf-8")
-    lane_env = _lane_env(lane, lane_models)
+    lane_env = _lane_env(lane, lane_models, model_slot=model_slot)
     env = {**os.environ, **lane_env}
     if "CTF_VPN_RELAY" not in lane_env:
         # 中转不可用时也要把父进程可能残留的这两个变量摘掉，否则子进程
@@ -1136,38 +1141,71 @@ def _sweep_orphans(token: str) -> list[str]:
 
 
 def _failure_lines(rec: dict[str, Any]) -> list[str]:
-    """把一次失败的结果记录压成 1–3 行人读的失败路径。
+    """把一次失败的结果记录压成 1–4 行人读的失败路径。
 
     只取结构化事实（stop_reason / error / 被判否的答案 / checker 预检 /
-    子进程落盘的停滞事实），不搬日志正文——重试提示里塞正文会过拟合，
+    子进程落盘的收场事实），不搬日志正文——重试提示里塞正文会过拟合，
     也会把无关内容带进下一轮上下文。
+
+    4 行而不是 3 行：2026-11-19 用户口径——失败描述至少要给出「上一轮停在
+    哪、已经打过哪些路径、选了什么方法卡」，否则下一轮就是把上一轮的坑再
+    踩一遍。这三样加上收场原因正好 4 行。
     """
     lines: list[str] = []
+    seen_keys: set[str] = set()
+
+    def _fact_key(line: str) -> str:
+        """同一事实的不同前缀折叠成一个键。
+
+        2026-11-19 实测的重试提示里出现过
+        ``异常收场：transport:httpx.ReadError；异常：transport:httpx.ReadError``
+        ——本函数和 batch_eval 的 ``_failure_facts`` 各写一遍同一件事，前缀不同
+        （``异常收场：`` / ``异常：``）所以按整行去重抓不住，3 行预算里白扔 1 行。
+        折叠后每行都必须是新事实；宁可少一行，不能重复一行。
+        """
+        for prefix in ("异常收场：", "异常：", "收场："):
+            if line.startswith(prefix):
+                return "stop:" + line[len(prefix):].strip()[:80]
+        return line[:80]
+
+    def _add(line: str) -> None:
+        # batch_eval 的 failure_path 一行里用 "；" 拼了多条事实（「异常：X；轨迹：…」）。
+        # 只折掉重复的**片段**，不整行丢弃——否则去重会把同一行里的「轨迹」一起
+        # 砍掉，3 行预算换不回第二种事实。
+        kept: list[str] = []
+        for part in line.split("；"):
+            key = _fact_key(part)
+            if key and key not in seen_keys:
+                seen_keys.add(key)
+                kept.append(part)
+        if kept:
+            lines.append("；".join(kept))
+
     err = str(rec.get("error") or "")
     reason = str(rec.get("stop_reason") or "")
     if rec.get("skipped"):
-        lines.append(f"基础设施跳过：{err or reason}")
+        _add(f"基础设施跳过：{err or reason}")
     elif err:
-        lines.append(f"异常收场：{err[:140]}")
+        _add(f"异常收场：{err[:140]}")
     elif reason:
-        lines.append(f"收场：{reason}")
+        _add(f"收场：{reason}")
     rejected = rec.get("answers_rejected")
     if isinstance(rejected, dict) and rejected:
         shown = "、".join(f"{qid}={val}" for qid, val in list(rejected.items())[:3])
-        lines.append(f"提交后被判否：{shown[:180]}")
+        _add(f"提交后被判否：{shown[:180]}")
     checked = rec.get("checker_checked")
     if isinstance(checked, list) and checked:
-        lines.append("checker 未过：" + ",".join(map(str, checked))[:80])
+        _add("checker 未过：" + ",".join(map(str, checked))[:80])
     stalled = rec.get("failure_path")
     if isinstance(stalled, list):
         # batch_eval 的 failure_path 与这里第一段同源（都含「收场：X」），
         # 直接 extend 会把同一行写两遍（SAMPLE-001 实测
         # "收场：unknown；收场：unknown"）。去重后保留信息量更大的几条。
-        for item in stalled[:2]:
-            line = str(item)[:140]
-            if line and line not in lines:
-                lines.append(line)
-    return lines[:3]
+        for item in stalled[:4]:
+            line = str(item)[:190]
+            if line:
+                _add(line)
+    return lines[:4]
 
 
 def _collect(
@@ -1210,7 +1248,7 @@ def _collect(
             fp = _failure_lines(rec)
             if fp:
                 hist = list(state_rec.get("failure_path") or [])
-                hist.append("；".join(fp)[:300])
+                hist.append("；".join(fp)[:460])
                 state_rec["failure_path"] = hist[-3:]
                 state_rec["one_line"] = state_rec["failure_path"][-1][:80]
     state_rec["status"] = status
@@ -1307,11 +1345,100 @@ def _collect_race(
     fp = _failure_lines(best)
     if fp:
         hist = list(state_rec.get("failure_path") or [])
-        hist.append("；".join(fp)[:300])
+        hist.append("；".join(fp)[:460])
         state_rec["failure_path"] = hist[-3:]
         state_rec["one_line"] = state_rec["failure_path"][-1][:80]
     state_rec["status"] = FAILED
     return FAILED
+
+
+def _pick_index(free: list[int], last: Any, hist: Any) -> int | None:
+    """在空闲槽位里挑一个：上一个用过的排最后，其次用得最少，最后号小的。
+
+    纯确定性（不掷骰），同一份 state 重放得到同一条派单序列。
+    """
+    free = [i for i in free if isinstance(i, int) and i >= 0]
+    if not free:
+        return None
+    counts: dict[int, int] = {}
+    for x in hist or []:
+        if isinstance(x, (int, float)):
+            counts[int(x)] = counts.get(int(x), 0) + 1
+    return sorted(free, key=lambda i: (i == last, counts.get(i, 0), i))[0]
+
+
+def _choose_lane(free: list[int], rec: dict[str, Any], n_lanes: int) -> int:
+    """空闲车道里给某题挑一条（车道只管 VPN 中转端口）。
+
+    2026-11-19 用户口径与实测：三题各自钉死在一条车道上连跑四五轮
+    （13C7AF74 永远 lane0=qwen4-max、37DA5EFD 永远 lane1=deepseek），
+    同一个模型的同一个盲区被重复消费，换向只换了 prompt 没换脑子。
+    车道与厂商解耦后，换模型由 ``_pick_slot`` 负责；车道这层仍然要尽量
+    错开，免得同一题每次重派都撞上同一个残留隧道。
+    """
+    picked = _pick_index(
+        [i for i in free if 0 <= i < max(1, n_lanes)],
+        rec.get("last_lane"),
+        rec.get("lane_history"),
+    )
+    return 0 if picked is None else picked
+
+
+def _pick_slot(
+    free_slots: list[int], rec: dict[str, Any], fallback: int
+) -> int:
+    """空闲厂商槽位里给某题挑一个：**同题重派要换模型**。
+
+    槽位 = ``lane_models`` 的下标（vendor + model），与车道（VPN 端口）解耦：
+    3 条车道可以配 4 家厂商，重派时即便只剩一条车道空着，也能落到另一家。
+    全部槽位在用时退回 ``fallback``（并发数 > 厂商数时的兜底）。
+    """
+    picked = _pick_index(
+        free_slots, rec.get("last_slot"), rec.get("slot_history")
+    )
+    return fallback if picked is None else picked
+
+
+def distinct_lane_error(
+    n_lanes: int, lane_models: list[dict[str, str]] | None
+) -> str | None:
+    """并发车道必须是**不同 API/模型**；合规返回 None，违反返回拒绝原因。
+
+    2026-11-19 用户口径：「不要开三个实例的同时三个会话用的是同一个 api」。
+    没有 ``--lane-config`` 时所有车道都继承同一份 ``LLM_API_BASE`` /
+    ``STRIX_LLM``，等于一个模型开三个会话并行——既把同一个盲区重复三遍，
+    也失去多厂商互为备份的意义。所以 ``--lanes > 1`` 必须有车道配置。
+
+    校验的是**整份配置**而不只是前 ``n_lanes`` 行：厂商槽位与车道解耦后，
+    第 4 行也可能被某条车道借去跑重派，重复行同样会造出「两个会话一个 API」。
+    """
+    if n_lanes <= 1:
+        return None
+    if not lane_models:
+        return (
+            f"--lanes {n_lanes} 但没有 --lane-config：{n_lanes} 条车道会共用同一个 "
+            "API/模型（实例三个、脑子一个）。给每条车道配不同厂商，或降 --lanes 1"
+        )
+    # 两条判据都要：同 base = 同一个上游账号/限流桶；同模型 = 同一个盲区。
+    seen_base: dict[str, int] = {}
+    seen_model: dict[str, int] = {}
+    for i in range(len(lane_models)):
+        cfg = lane_models[i]
+        base = str(cfg.get("LLM_API_BASE") or "").rstrip("/")
+        model = str(cfg.get("model") or "")
+        if base in seen_base:
+            return (
+                f"lane {i}({cfg.get('name')}) 与 lane {seen_base[base]} 用的是"
+                f"同一个 API（{base}）：并发车道必须各不相同"
+            )
+        if model in seen_model:
+            return (
+                f"lane {i}({cfg.get('name')}) 与 lane {seen_model[model]} 用的是"
+                f"同一个模型（{model}）：并发车道必须各不相同"
+            )
+        seen_base[base] = i
+        seen_model[model] = i
+    return None
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1403,6 +1530,11 @@ def main() -> int:
                 flush=True,
             )
 
+    problem = distinct_lane_error(args.lanes, lane_models)
+    if problem:
+        print(f"[compete] 拒绝启动：{problem}", flush=True)
+        return 2
+
     state_dir = Path(args.state_dir).expanduser()
     state = load_state(state_dir)
     # 崩溃恢复：上一进程没来得及收车的 RUNNING 是孤儿（新进程此刻还没派
@@ -1424,6 +1556,8 @@ def main() -> int:
     running: dict[str, subprocess.Popen] = {}
     #: 题 → 车道号。车道号决定 VPN 中转端口（见 _lane_env）。
     lane_of: dict[str, int] = {}
+    #: 题 → 厂商槽位（lane_models 下标）。并发内互不相同 = 三个会话三个 API。
+    slot_of: dict[str, int] = {}
     #: 竞速在飞：题 → {车道号 → 子进程}。一场竞速占满所有车道，全部退出
     #: 才收一次账（_collect_race）；与 running（分散派单）互斥——竞速只在
     #: 所有车道空闲时起跑，所以两本账不会同时有活。
@@ -1710,10 +1844,29 @@ def main() -> int:
                         list(rec.get("directions") or []) + [direction[0]]
                     )[-5:]
                 used = set(lane_of.values())
-                lane = next(i for i in range(args.lanes) if i not in used)
+                free = [i for i in range(args.lanes) if i not in used]
+                lane = _choose_lane(free, rec, args.lanes)
+                # 厂商槽位与车道解耦：并发内互不相同（三个会话三个 API），
+                # 重派优先换一家（同一道题不要被同一个模型连撞两轮）。
+                slot: int | None = None
                 if lane_models:
+                    busy = set(slot_of.values())
+                    free_slots = [
+                        i for i in range(len(lane_models)) if i not in busy
+                    ]
+                    slot = _pick_slot(free_slots, rec, lane % len(lane_models))
+                    rec["last_slot"] = slot
+                    rec["slot_history"] = (
+                        list(rec.get("slot_history") or []) + [slot]
+                    )[-6:]
+                    slot_of[cid] = slot
                     # 只进调度器账本（赛后分厂商统计用），不进任何子进程上下文。
-                    rec["lane_model"] = lane_models[lane]["name"]
+                    rec["lane_model"] = lane_models[slot]["name"]
+                # 记在账本里供下一轮挑车道用（不进子进程上下文）。
+                rec["last_lane"] = lane
+                rec["lane_history"] = (
+                    list(rec.get("lane_history") or []) + [lane]
+                )[-6:]
                 running[cid] = _spawn(
                     chal,
                     args,
@@ -1723,11 +1876,14 @@ def main() -> int:
                     direction=direction,
                     attempt=attempt,
                     lane_models=lane_models,
+                    model_slot=slot,
                 )
                 lane_of[cid] = lane
                 last_spawn_at = time.time()
                 lane_label = (
-                    f"{lane}({lane_models[lane]['name']})" if lane_models else str(lane)
+                    f"{lane}({lane_models[slot]['name']})"
+                    if lane_models and slot is not None
+                    else str(lane)
                 )
                 print(
                     f"[compete] 派单 {cid}（{len(running)}/{args.lanes} 车道，"
@@ -1761,6 +1917,7 @@ def main() -> int:
                     continue
                 del running[cid]
                 lane_of.pop(cid, None)
+                slot_of.pop(cid, None)
                 status = _collect(cid, state, state_dir, exit_code=proc.returncode)
                 if status == SOLVED:
                     my_solved.add(cid)

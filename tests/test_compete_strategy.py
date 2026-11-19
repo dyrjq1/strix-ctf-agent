@@ -323,6 +323,36 @@ def test_platform_solved_merge_is_idempotent() -> None:
     assert compete.merge_platform_solves(state, {"B"}) == []
 
 
+def test_a_retried_question_comes_back_on_a_different_lane() -> None:
+    """同题重派必须换车道——车道号就是模型号。
+
+    2026-11-19 实测：三题各自钉死一条车道连跑四轮，同一模型的同一盲区
+    被重复消费。首次派单走 0，重派依次 1、2，第四轮循环回 0。
+    """
+    rec: dict = {}
+    lanes = []
+    for _ in range(4):
+        lane = compete._choose_lane([0, 1, 2], rec, 3)
+        rec["last_lane"] = lane
+        rec["lane_history"] = (list(rec.get("lane_history") or []) + [lane])[-6:]
+        lanes.append(lane)
+    assert lanes == [0, 1, 2, 0]
+
+
+def test_lane_choice_skips_the_lane_that_is_busy() -> None:
+    """首选车道被占用时退到空闲里用得最少的那条，不撞车。"""
+    rec = {"last_lane": 0, "lane_history": [0]}
+    assert compete._choose_lane([1, 2], rec, 3) == 1
+    assert compete._choose_lane([0], rec, 3) == 0
+
+
+def test_lane_choice_is_deterministic_and_tolerates_junk() -> None:
+    """空列表兜底 0；历史里的非数字被忽略，不抛异常。"""
+    assert compete._choose_lane([], {}, 2) == 0
+    rec = {"lane_history": ["x", None, 1.0]}
+    assert compete._choose_lane([0, 1], rec, 2) == 0
+
+
 def test_fetch_my_solves_parses_both_shapes(monkeypatch) -> None:
     """平台返回 list[dict] 或 {"items": [...]} 都要吃得下。"""
 
@@ -724,6 +754,53 @@ def test_direction_alone_still_produces_notes() -> None:
     assert "上一轮失败路径" not in text
 
 
+def test_the_same_fact_is_not_written_twice_under_two_prefixes() -> None:
+    """2026-11-19 实测的重试提示：
+    ``异常收场：transport:httpx.ReadError；异常：transport:httpx.ReadError``。
+    3 行预算里一行是重复的，等于把「上一轮做了什么」砍掉三分之一。
+    """
+    lines = compete._failure_lines(
+        {
+            "error": "transport:httpx.ReadError",
+            "failure_path": ["异常：transport:httpx.ReadError；轨迹：11 次请求 / 4 组重复响应"],
+        }
+    )
+    assert len(lines) == 2, lines
+    assert sum("ReadError" in line for line in lines) == 1
+    assert any("轨迹" in line for line in lines), "去重不能顺手丢掉另一条事实"
+
+
+def test_three_distinct_facts_all_survive() -> None:
+    lines = compete._failure_lines(
+        {
+            "stop_reason": "wallclock",
+            "answers_rejected": {"flag": "nope"},
+            "checker_checked": ["precheck"],
+        }
+    )
+    assert len(lines) == 3
+
+
+def test_the_new_digest_lines_reach_the_retry_notes() -> None:
+    """失败描述四件套（收场 / 探到 / 试过 / 卡）一条都不许被 3 行上限吃掉。"""
+    rec = {
+        "stop_reason": "wallclock",
+        "failure_path": [
+            "收场：wallclock",
+            "探到：host=h.test family=http://h.test/admin；码 404×7",
+            "试过：GET /admin/panel→404 POST /api/login→401",
+            "卡：web-auth",
+        ],
+    }
+
+    lines = compete._failure_lines(rec)
+    text = "\n".join(lines)
+
+    assert len(lines) == 4
+    for needle in ("收场：wallclock", "探到：", "试过：", "卡：web-auth"):
+        assert needle in text
+
+
 def test_each_attempt_moves_to_a_different_direction() -> None:
     """连续重派必须换向：第 2、3 次尝试不能给出同一个类别。"""
     seen = [compete.entry_direction(n)[0] for n in (2, 3, 4)]
@@ -839,6 +916,99 @@ def test_lane_config_rejects_empty_file(tmp_path: Path) -> None:
     p = _lane_conf(tmp_path, ["", "# 只有注释"])
     with pytest.raises(ValueError, match="没有可用行"):
         compete.load_lane_config(p)
+
+
+def _lm(i: str, base: str, model: str) -> dict[str, str]:
+    return {
+        "name": i,
+        "LLM_API_BASE": base,
+        "LLM_API_KEY": f"sk-{i}",
+        "model": model,
+    }
+
+
+def test_single_lane_needs_no_lane_config() -> None:
+    """一条车道时不必分厂商（串行轮转的老用法保持不变）。"""
+    assert compete.distinct_lane_error(1, None) is None
+
+
+def test_three_lanes_without_config_are_refused() -> None:
+    """三实例三会话共用一个 API = 用户明令禁止：实例三个、脑子一个。"""
+    msg = compete.distinct_lane_error(3, None)
+    assert msg and "--lane-config" in msg
+
+
+def test_three_distinct_vendors_pass() -> None:
+    lanes = [
+        _lm("a", "https://a.llm-next.ctfy.io/v1", "m-a"),
+        _lm("b", "https://b.llm-next.ctfy.io/v1", "m-b"),
+        _lm("c", "https://c.llm-next.ctfy.io/v1", "m-c"),
+    ]
+    assert compete.distinct_lane_error(3, lanes) is None
+
+
+def test_duplicate_vendor_in_parallel_lanes_is_refused() -> None:
+    """同 base 同模型（哪怕尾斜杠/名字不同）也算同一个 API。"""
+    lanes = [
+        _lm("a", "https://a.llm-next.ctfy.io/v1", "m-a"),
+        _lm("b", "https://a.llm-next.ctfy.io/v1/", "m-a"),
+        _lm("c", "https://c.llm-next.ctfy.io/v1", "m-c"),
+    ]
+    msg = compete.distinct_lane_error(3, lanes)
+    assert msg and "lane 1" in msg and "lane 0" in msg
+
+
+def test_same_host_different_model_still_counts_as_one_api() -> None:
+    """同一家网关换模型名不算换厂商——同一份 key 打同一个上游。"""
+    lanes = [
+        _lm("a", "https://gw.llm-next.ctfy.io/v1", "qwen4-max"),
+        _lm("b", "https://gw.llm-next.ctfy.io/v1", "deepseek-flash"),
+    ]
+    assert compete.distinct_lane_error(2, lanes) is not None
+
+
+def test_a_duplicate_row_beyond_the_lane_count_is_still_refused() -> None:
+    """4 行配置跑 3 车道：第 4 行也可能被借去跑重派，重复行一样拒绝。"""
+    lanes = [
+        _lm("a", "https://a/v1", "m-a"),
+        _lm("b", "https://b/v1", "m-b"),
+        _lm("c", "https://c/v1", "m-c"),
+        _lm("a2", "https://a/v1", "m-a"),
+    ]
+    assert compete.distinct_lane_error(3, lanes) is not None
+
+
+def test_slot_rotation_changes_the_vendor_on_retry() -> None:
+    """3 条车道配 4 家厂商时，重派要能换到第 4 家，不被车道数卡住。"""
+    rec: dict = {}
+    slots = []
+    for busy in ([], [1, 2], [1], []):
+        free = [i for i in range(4) if i not in busy]
+        slot = compete._pick_slot(free, rec, fallback=0)
+        rec["last_slot"] = slot
+        rec["slot_history"] = (list(rec.get("slot_history") or []) + [slot])[-6:]
+        slots.append(slot)
+    # 首轮 0；其余两家被占时换到第 4 家 3；再下一轮换 2；全空时换 1。
+    # 关键性质：每一轮都不是上一轮那一家（除非只剩它）。
+    assert slots == [0, 3, 2, 1], slots
+    assert all(a != b for a, b in zip(slots, slots[1:]))
+
+
+def test_all_slots_busy_falls_back_to_the_lane_number() -> None:
+    """厂商数 < 并发数（配置不全）时退回车道号，不崩、不重号。"""
+    assert compete._pick_slot([], {"last_slot": 2}, fallback=1) == 1
+
+
+def test_lane_env_uses_the_model_slot_not_the_lane() -> None:
+    """车道定端口、槽位定厂商：同一个端口可以落到第二家厂商上。"""
+    lanes = [
+        _lm("a", "https://a/v1", "m-a"),
+        _lm("b", "https://b/v1", "m-b"),
+    ]
+    env = compete._lane_env(0, lanes, relay_up=False, model_slot=1)
+    assert env["LLM_API_BASE"] == "https://b/v1"
+    assert env["STRIX_LLM"] == "openai/m-b"
+    assert env["LLM_API_KEY"] == "sk-b"
 
 
 def test_lane_env_without_config_is_unchanged(monkeypatch) -> None:

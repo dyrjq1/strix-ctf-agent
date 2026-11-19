@@ -34,6 +34,30 @@ def _read(path):
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+def test_every_result_write_leaves_a_stop_marker(tmp_path, monkeypatch):
+    """收场标记必须在**真实收口**上落盘，而不只是在 ``record_stop`` 里能跑。
+
+    2026-11-19：三道题全部 wallclock 收场，盒子里连 stall_markers.jsonl 都
+    没有——``observe()`` 只在停滞判据响时写文件，而轮次打满/墙钟一次也不响。
+    每一轮的重试提示因此只剩「收场：wallclock」，路径与所选方法卡全缺。
+    """
+    from ctf_strix import progress_guard
+
+    markers = tmp_path / "stall_markers.jsonl"
+    monkeypatch.setenv("CTFY_STALL_MARKERS", str(markers))
+    progress_guard.reset_for_tests()
+    try:
+        agent._write_result(
+            tmp_path / "result.json", _payload({}, stop_reason="wallclock")
+        )
+    finally:
+        progress_guard.reset_for_tests()
+
+    line = json.loads(markers.read_text(encoding="utf-8").splitlines()[-1])
+    assert line["stage"] == "stop:wallclock"
+    assert line["cards_state"] in {"no_menu", "menu_no_pick", "picked", "unknown"}
+
+
 def test_old_two_flags_new_empty_keeps_both(tmp_path):
     result = tmp_path / "result.json"
     _write(result, _payload({"foothold": "FLAG{a}", "deploy": "FLAG{b}"}, stop_reason="solved"))

@@ -65,6 +65,19 @@ class _Handler(BaseHTTPRequestHandler):
         body = self.rfile.read(length)
         if self.path == "/api/plugins/preview":
             self._send(400, b'{"error":"code_b64 required"}')
+        elif self.path == "/upload":
+            # 只回报「收到了什么」：内容类型、总长度、第一段（含文件名和字段名）。
+            head = body[:600].decode("latin-1", "replace")
+            self._send(
+                200,
+                json.dumps(
+                    {
+                        "ctype": self.headers.get("Content-Type") or "",
+                        "size": len(body),
+                        "head": head,
+                    }
+                ).encode(),
+            )
         else:
             self._send(200, body or b"{}")
 
@@ -135,6 +148,73 @@ def test_empty_200_gets_actionable_hint(base_url):
     out = call(url=f"{base_url}/empty")
     assert "[HTTP 200]" in out
     assert "空 body" in out
+
+
+# --- multipart 上传：附件在磁盘上 ≠ 它被发出去了 -------------------------------
+
+
+def test_a_file_is_actually_posted_as_multipart(base_url, tmp_path):
+    """2026-11-19：模型用 requests.post 打安装端点，三次 RemoteDisconnected，
+    分不清「服务端拒绝」和「文件没带上」。这条路径必须由工具走通。"""
+    wheel = tmp_path / "provider-0.1.0-py3-none-any.whl"
+    wheel.write_bytes(b"PK\x03\x04" + b"payload" * 100)
+    out = call(
+        method="POST",
+        url=f"{base_url}/upload",
+        files_json=json.dumps({"file": str(wheel)}),
+    )
+    assert "[HTTP 200]" in out
+    assert "multipart/form-data" in out
+    # 服务端看到的文件名 = basename，大小 > 0：这两件事一起才说明文件真的到了。
+    assert "provider-0.1.0-py3-none-any.whl" in out
+    assert '"size": 0' not in out
+
+
+def test_the_filename_can_be_overridden(base_url, tmp_path):
+    """pip 的安装端点按 name-version-py3-none-any.whl 判格式，磁盘名可能不是它。"""
+    blob = tmp_path / "provider.whl"
+    blob.write_bytes(b"PK\x03\x04abc")
+    out = call(
+        method="POST",
+        url=f"{base_url}/upload",
+        files_json=json.dumps(
+            {"file": {"path": str(blob), "filename": "provider-0.1.0-py3-none-any.whl"}}
+        ),
+    )
+    assert 'filename=\\"provider-0.1.0-py3-none-any.whl\\"' in out
+    assert 'filename=\\"provider.whl\\"' not in out, "the override must replace the basename"
+
+
+def test_extra_form_fields_ride_along(base_url, tmp_path):
+    blob = tmp_path / "p.bin"
+    blob.write_bytes(b"abc")
+    out = call(
+        method="POST",
+        url=f"{base_url}/upload",
+        files_json=json.dumps({"file": str(blob)}),
+        body=json.dumps({"provider": "x"}),
+    )
+    # 响应体是被 JSON 转义过的 multipart 原文：字段名出现成 name=\"provider\"。
+    assert 'name=\\"provider\\"' in out
+    assert "\\r\\n\\r\\nx\\r\\n" in out, "the field value itself must be on the wire"
+
+
+def test_a_missing_file_is_refused_before_any_request(base_url, tmp_path):
+    out = call(
+        method="POST",
+        url=f"{base_url}/upload",
+        files_json=json.dumps({"file": str(tmp_path / "nope.whl")}),
+    )
+    assert out.startswith("[http_probe] files_json 解析失败")
+    assert "不是文件" in out
+    assert "ls -la" in out, "报错必须给出下一步，而不是只说失败"
+
+
+def test_files_json_must_be_an_object(tmp_path):
+    blob = tmp_path / "p.bin"
+    blob.write_bytes(b"abc")
+    out = call(url="http://127.0.0.1:1/", files_json=json.dumps([str(blob)]))
+    assert "必须是对象" in out
 
 
 def test_connection_refused_is_phase_connect_not_000():

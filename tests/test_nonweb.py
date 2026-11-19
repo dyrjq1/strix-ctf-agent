@@ -1411,8 +1411,18 @@ def test_register_splits_by_kind() -> None:
     }
     assert set(file_names) < set(tcp_names), "tcp must be a superset of file"
 
+    # A web challenge that ships a source tree gets the three "what am I
+    # holding" primitives and nothing else.  2026-11-19 实测：一道 web 题的
+    # 附件是 challenge.zip.b64，kind=web 没注册 unpack_archive，模型用
+    # exec_command 连撞四次才解开一个包。
     seen.clear()
-    assert nonweb.register(register_fn=collector, kind="web") == []
+    web_names = nonweb.register(register_fn=collector, kind="web")
+    assert set(web_names) == {"decode_blob", "unpack_archive", "hexpeek"}
+    assert "elfpeek" not in web_names, "a web attachment is a tree, not a binary"
+    assert seen, "the tools must actually be handed to the register function"
+
+    seen.clear()
+    assert nonweb.register(register_fn=collector, kind="misc") == []
     assert seen == []
 
 

@@ -43,6 +43,7 @@ agent 自己写的脚本有两个 bug——``$B`` 在**上一条** ``exec_comman
 from __future__ import annotations
 
 import json
+import os
 import threading
 import time
 from typing import Final
@@ -200,6 +201,50 @@ def _parse_cookies(raw: str) -> dict[str, str]:
         if not sep or not key.strip():
             raise ValueError(f"片段 {part!r} 不是 name=value")
         out[key.strip()] = value.strip()
+    return out
+
+
+def _parse_files(raw: str) -> dict[str, tuple[str, str, str]]:
+    """解析 ``files_json`` 入参：``{表单字段: 路径}`` 或带覆盖的对象。
+
+    为什么要有这一层：附件在磁盘上不等于它被发出去了。2026-11-19 的一次
+    run 用 ``requests.post`` 打安装端点，三次 ``RemoteDisconnected`` 之后
+    模型无法区分「服务端拒绝」和「脚本没把文件带上」，只能猜。工具负责的是
+    把文件真的放进 multipart，并把传输层的结果说清楚。
+
+    Returns:
+        ``{表单字段: (路径, 发送用文件名, content_type)}``；空输入返回空字典。
+        文件名默认取 ``basename``——pip 这类按 ``name-version-py3-none-any.whl``
+        判格式的端点是靠**这个字段**拒绝的，所以允许显式覆盖。
+
+    Raises:
+        ValueError: 不是 JSON 对象、字段名空、路径空或文件不存在。
+    """
+    text = (raw or "").strip()
+    if not text:
+        return {}
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"不是合法 JSON（{exc}）") from None
+    if not isinstance(data, dict):
+        raise ValueError("JSON 形式必须是对象，如 {\"file\": \"provider.whl\"}")
+    out: dict[str, tuple[str, str, str]] = {}
+    for field, spec in data.items():
+        name = str(field).strip()
+        if not name:
+            raise ValueError("表单字段名不能为空")
+        if isinstance(spec, dict):
+            path = str(spec.get("path") or "").strip()
+            filename = str(spec.get("filename") or "").strip()
+            ctype = str(spec.get("content_type") or "").strip()
+        else:
+            path, filename, ctype = str(spec).strip(), "", ""
+        if not path:
+            raise ValueError(f"字段 {name} 没有给路径")
+        if not os.path.isfile(path):
+            raise ValueError(f"字段 {name} 的路径不是文件：{path}")
+        out[name] = (path, filename or os.path.basename(path), ctype or "application/octet-stream")
     return out
 
 
@@ -378,6 +423,7 @@ async def http_probe(
     follow_redirects: bool = False,
     session: str = "auto",
     cookies: str = "",
+    files_json: str = "",
 ) -> str:
     """发一个 HTTP 请求并返回结构化结果（默认带按 host 隔离的会话）。
 
@@ -395,6 +441,8 @@ async def http_probe(
             是因为 SDK 的 strict schema 不允许自由形状的 object
             （`additionalProperties` 会被直接拒绝，注册期就炸）。
         body: 原始请求体字符串。JSON 请自己 json.dumps 后用字符串传入。
+            **带 files_json 时**，body 改读作「额外表单字段」：一个 JSON
+            对象，如 `{"provider": "x"}`；不是对象会被拒绝。
         timeout_s: 超时秒数，默认 20。
         follow_redirects: 是否跟随 3xx，默认否（3xx 本身是信息）。
         session: 会话选择。默认 `auto` = 按 scheme+host+port 自动复用
@@ -405,6 +453,14 @@ async def http_probe(
             则完全不进会话，每次都是干净请求。
         cookies: 额外 cookie，只作用于**本次**请求：JSON 对象
             `{"sid": "abc"}` 或 `sid=abc; theme=dark`。不写回会话。
+        files_json: **上传文件**（multipart/form-data），JSON 对象
+            `{"<表单字段名>": "<本地路径>"}`，值也可以是对象
+            `{"path": "...", "filename": "x.whl", "content_type": "..."}`
+            （覆盖文件名/类型，pip 这类按文件名判格式的端点会用得上）。
+            一个文件明明在磁盘上、只是没被 POST 出去，是这里唯一的职责：
+            2026-11-19 的一次 run 用 ``requests.post`` 打安装端点，被
+            ``RemoteDisconnected`` 打回来三次，而它自己分不清是「服务端
+            拒绝」还是「脚本写错」——本工具会给出 phase。
 
     Returns:
         单行摘要 + 关键响应头 + 截断后的 body；失败时给出 phase 与下一步提示。
@@ -428,6 +484,33 @@ async def http_probe(
             f"[http_probe] cookies 解析失败：{exc}。"
             '写法："sid=abc; theme=dark" 或 {"sid": "abc"}'
         )
+    try:
+        uploads = _parse_files(files_json)
+    except ValueError as exc:
+        return (
+            f"[http_probe] files_json 解析失败：{exc}。示例：{{\"file\": \"provider.whl\"}}\n"
+            "next: 先用 exec_command `ls -la` 确认附件的真实文件名（平台附件常改名），"
+            "路径按当前工作目录写。"
+        )
+
+    form: dict[str, str] | None = None
+    if uploads:
+        if body.strip():
+            try:
+                extra = json.loads(body)
+            except json.JSONDecodeError as exc:
+                return (
+                    "[http_probe] 同时给了 files_json 时，body 必须是「额外表单字段」"
+                    f"的 JSON 对象，当前不是合法 JSON：{exc}。"
+                    '示例：body=\'{"provider": "x"}\'；不带额外字段就留空。'
+                )
+            if not isinstance(extra, dict):
+                return (
+                    "[http_probe] 同时给了 files_json 时，body 必须是 JSON 对象"
+                    "（表单字段），不能是数组或字符串。"
+                )
+            form = {str(name): str(value) for name, value in extra.items()}
+
     key = _session_key(session, url)
 
     # Reserve the traffic id *before* sending: a refused connection also gets a
@@ -435,7 +518,31 @@ async def http_probe(
     request_id = traffic.ledger().next_id()
     started = time.time()
     sess = _get_session(key) if key is not None else None
-    payload = body.encode("utf-8") if isinstance(body, str) and body else None
+    payload = body.encode("utf-8") if isinstance(body, str) and body and not uploads else None
+    files_arg = None
+    handles: list[object] = []
+    if uploads:
+        files_arg = {}
+        for field, (path, filename, ctype) in uploads.items():
+            try:
+                handle = open(path, "rb")  # noqa: SIM115 — 关闭在 finally
+            except OSError as exc:
+                for opened in handles:
+                    opened.close()
+                return (
+                    f"[http_probe] 打不开上传文件 {path}：{exc}。"
+                    "先用 exec_command `ls -la` 确认真实文件名（平台附件常改名）。"
+                )
+            handles.append(handle)
+            files_arg[field] = (filename, handle, ctype)
+    # 台账里记的是「发了什么」，不是整个文件：二进制进台账会把 traffic_view 撑爆。
+    req_body = body if isinstance(body, str) and not uploads else ""
+    if uploads:
+        bits = "、".join(
+            f"{field}={filename}({os.path.getsize(path)}B)"
+            for field, (path, filename, _ctype) in uploads.items()
+        )
+        req_body = f"[multipart] {bits}" + (f" fields={body}" if form else "")
     try:
         if sess is None:
             resp = requests.request(
@@ -443,7 +550,8 @@ async def http_probe(
                 url,
                 headers=headers or {},
                 cookies=jar_in or None,
-                data=payload,
+                data=form if uploads else payload,
+                files=files_arg,
                 timeout=timeout_s,
                 allow_redirects=follow_redirects,
                 verify=False,
@@ -458,7 +566,8 @@ async def http_probe(
                     url,
                     headers=headers or {},
                     cookies=jar_in or None,
-                    data=payload,
+                    data=form if uploads else payload,
+                    files=files_arg,
                 )
             )
             resp = sess.send(
@@ -478,7 +587,7 @@ async def http_probe(
             method=method,
             url=url,
             req_headers=headers,
-            req_body=body if isinstance(body, str) else "",
+            req_body=req_body,
             phase=phase,
             elapsed=elapsed,
             note=f"{type(root).__name__}: {root}"[:300],
@@ -490,6 +599,12 @@ async def http_probe(
             "next: 这是**请求没到达服务器**，不是服务器拒绝了它。"
             "先修 URL/网络，再谈状态码。"
         )
+    finally:
+        for opened in handles:
+            try:
+                opened.close()
+            except OSError:
+                pass
 
     elapsed = time.time() - started
     raw = resp.content or b""
@@ -504,7 +619,7 @@ async def http_probe(
         method=method,
         url=url,
         req_headers=headers,
-        req_body=body if isinstance(body, str) else "",
+        req_body=req_body,
         status=resp.status_code,
         resp_headers=dict(resp.headers),
         resp_body=text,

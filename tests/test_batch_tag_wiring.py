@@ -70,7 +70,7 @@ def test_both_entrypoints_install_the_picker_and_the_menu() -> None:
     for src, label in ((agent_src, "agent.py"), (harness, "run_strix_ctf.py")):
         assert "card_pick.set_pool(" in src, f"{label} never seeds the card pool"
         assert "card_pick.install()" in src, f"{label} never registers the picker"
-        assert "card_menu.install()" in src, f"{label} never arms the round-5 menu"
+        assert "card_menu.install()" in src, f"{label} never arms the round-3 menu"
     assert "_reset_card_pick()" in agent_src, "attempts would see the menu once"
     assert "_reset_card_menu()" in agent_src
 

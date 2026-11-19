@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import sys
 from pathlib import Path
 
@@ -101,3 +102,60 @@ def test_failure_facts_stay_short_with_rejections() -> None:
     assert len(facts) == 3
     assert any(f.startswith("提交被判否") for f in facts)
     assert any(f.startswith("轨迹：") for f in facts)
+
+
+def _marker(tmp_path, **fields) -> Path:
+    path = tmp_path / "stall_markers.jsonl"
+    path.write_text(json.dumps(fields, ensure_ascii=False) + "\n", encoding="utf-8")
+    return path
+
+
+def test_the_digest_carries_the_failure_path_and_the_cards(tmp_path) -> None:
+    """用户口径（2026-11-19）：失败描述必须给出上一轮停在哪、打过哪些路径、
+    选了什么方法卡——否则下一轮就是把上一轮的坑再踩一遍。"""
+    mod = _load()
+    markers = _marker(
+        tmp_path,
+        stage="stop:wallclock",
+        host="h.test",
+        family="http://h.test/admin",
+        mechanism="access-control",
+        surface="GET /admin/panel → 404；码 404×7 200×1",
+        tried=["GET /admin/panel→404", "POST /api/login→401"],
+        cards=["web-auth"],
+        cards_state="picked",
+    )
+
+    facts = mod._failure_facts({"correct": False, "stop_reason": "wallclock"}, markers)
+    text = "；".join(facts)
+
+    assert facts[0] == "收场：wallclock"
+    assert any(f.startswith("探到：") for f in facts)
+    assert any(f.startswith("试过：") for f in facts)
+    assert any(f.startswith("卡：") for f in facts)
+    assert "GET /admin/panel→404" in text
+    assert "404×7" in text
+    assert "web-auth" in text
+    assert "stop:wallclock" not in text, "与「收场」重复的阶段不占提示预算"
+
+
+def test_a_shown_but_unused_menu_is_reported_as_such(tmp_path) -> None:
+    mod = _load()
+    markers = _marker(tmp_path, stage="stop:turn_capped", cards_state="menu_no_pick")
+
+    facts = mod._failure_facts({"correct": False, "stop_reason": "turn_capped"}, markers)
+
+    assert any("菜单已摆出" in f for f in facts)
+
+
+def test_no_marker_still_produces_a_usable_digest(tmp_path) -> None:
+    """标记文件缺失（SIGKILL 收场）时不能抛，也不能编一行假事实。"""
+    mod = _load()
+
+    facts = mod._failure_facts(
+        {"correct": False, "stop_reason": "wallclock", "guard": {"reach": 9, "enum_keys": 3}},
+        tmp_path / "absent.jsonl",
+    )
+
+    assert facts[0] == "收场：wallclock"
+    assert not any(f.startswith(("探到：", "试过：", "卡：")) for f in facts)
