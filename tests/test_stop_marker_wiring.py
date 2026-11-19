@@ -60,3 +60,40 @@ def test_an_unset_marker_path_is_a_no_op_not_a_crash(tmp_path, monkeypatch) -> N
         assert not list(tmp_path.rglob("stall_markers.jsonl"))
     finally:
         progress_guard.reset_for_tests()
+
+
+def test_a_wallclock_that_escapes_asyncio_run_still_leaves_a_marker(
+    tmp_path, monkeypatch
+) -> None:
+    """SIGALRM 逃逸出 ``asyncio.run`` 时 ``main`` 的记账不会执行。
+
+    2026-11-19 实测：跑满墙钟的那次 run，``run.log`` 里只有
+    ``[stop] reason=wallclock``，盒子里没有 ``stall_markers.jsonl``——
+    重试提示因此只剩「收场：wallclock」。这里不启 strix，只把
+    ``asyncio.run`` 换成直接抛，钉住 ``_main_entry`` 的补账。
+    """
+    from ctf_strix.agent import WallclockExceeded
+
+    markers = tmp_path / "sample-esc" / "stall_markers.jsonl"
+    monkeypatch.setenv("CTFY_STALL_MARKERS", str(markers))
+    progress_guard.reset_for_tests()
+
+    def _boom(coro):
+        coro.close()  # 不给解释器留「coroutine never awaited」的噪声
+        raise WallclockExceeded("wall budget 176s spent")
+
+    async def _never():  # pragma: no cover - asyncio.run 被换掉了
+        return 0
+
+    monkeypatch.setattr(run_strix_ctf.asyncio, "run", _boom)
+    monkeypatch.setattr(run_strix_ctf, "main", _never)
+    try:
+        assert run_strix_ctf._main_entry() == 0
+        rows = [
+            json.loads(line)
+            for line in markers.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        assert rows and rows[-1]["stage"] == "stop:wallclock", rows
+    finally:
+        progress_guard.reset_for_tests()

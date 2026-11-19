@@ -67,7 +67,10 @@ def test_wallclock_landing_is_caught_and_classified() -> None:
     """软着陆要翻成机器可读行 + exit 0，且接在 except Exception 之前。"""
     wc_pos = RUN_SRC.index("    except agent_mod.WallclockExceeded as exc:")
     guard_pos = RUN_SRC.index("    except (NoProgress, EnumExhausted, TargetAbsent)")
-    generic_pos = RUN_SRC.index("    except Exception as exc:")
+    # 从 guard_pos 往后找：文件顶部 ``_record_stop_marker`` 自己也有一个
+    # ``    except Exception as exc:``（记账失败不抛），拿全文第一个会把
+    # 位置比到文件开头去（11-19 全量跑在 4a5c436 之后就是这样假红的）。
+    generic_pos = RUN_SRC.index("    except Exception as exc:", guard_pos)
     assert wc_pos < guard_pos < generic_pos
     tail = RUN_SRC[wc_pos : RUN_SRC.index("    except (NoProgress", wc_pos)]
     assert "[stop] reason=wallclock" in tail
@@ -81,12 +84,19 @@ def test_watchdog_disarmed_before_summary_prints() -> None:
 
 
 def test_asyncio_escape_has_last_resort_net() -> None:
-    """SIGALRM 打在挂起协程上时异常从 asyncio.run 逃逸——尾部必须接住。"""
+    """SIGALRM 打在挂起协程上时异常从 asyncio.run 逃逸——尾部必须接住。
+
+    2026-11-19 起抽成 ``_main_entry()``：收场网本身要能单测，且逃逸路径
+    也必须落收场标记（此前只有 [stop] 一行，重试提示退回单行）。
+    """
+    body = RUN_SRC[RUN_SRC.index("def _main_entry() -> int:") :]
+    assert "asyncio.run(main())" in body
+    assert "except _WallclockExceeded" in body
+    assert "[stop] reason=wallclock" in body
+    assert '_record_stop_marker("wallclock")' in body
+    assert "return 0" in body
     tail = RUN_SRC[RUN_SRC.index('if __name__ == "__main__":') :]
-    assert "asyncio.run(main())" in tail
-    assert "except _WallclockExceeded" in tail
-    assert "[stop] reason=wallclock" in tail
-    assert "_exit_code = 0" in tail
+    assert "sys.exit(_main_entry())" in tail
 
 
 def test_batch_eval_rec_gains_usage_and_clean_landing() -> None:

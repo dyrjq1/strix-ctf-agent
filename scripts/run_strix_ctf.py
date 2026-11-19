@@ -1113,17 +1113,34 @@ async def main() -> int:
     return 0
 
 
-if __name__ == "__main__":
-    # 最后一道网（B-2）：SIGALRM 打在挂起的协程上时，WallclockExceeded
-    # 从 asyncio.run 逃逸，main 里的 except 接不住（Windows 无此路径，
-    # VM/Linux 是常态）。同样翻译成机器可读的 wallclock 收场 + exit 0，
-    # 与 deadline.HARD_EXIT_CODE 的 CTFY-0001 契约一致。
+def _main_entry() -> int:
+    """``__main__`` 的收场网（B-2）：逃逸出 ``asyncio.run`` 的墙钟也要记账。
+
+    SIGALRM 打在挂起的协程上时，``WallclockExceeded`` 从
+    ``asyncio.run(main())`` 直接逃逸——``main`` 里的 ``except`` 整段不执行
+    （Windows 无此路径，VM/Linux 是常态）。翻译成机器可读的 wallclock
+    收场 + exit 0，与 ``deadline.HARD_EXIT_CODE`` 的 CTFY-0001 契约一致。
+
+    这条路同样要补收场标记：2026-11-19 验收跑实测，跑满墙钟的那次 run
+    ``run.log`` 里只有 ``[stop] reason=wallclock`` 一行，盒子里没有
+    ``stall_markers.jsonl``——``main`` 的记账代码根本没轮到执行，下一轮的
+    重试提示又退回「收场：wallclock」单行。守卫状态是进程级全局，此刻
+    仍然有效，``record_stop`` 能照常写出 host / tried / surface / cards。
+    """
     from ctf_strix.agent import WallclockExceeded as _WallclockExceeded
 
     try:
-        _exit_code = asyncio.run(main())
+        return asyncio.run(main())
     except _WallclockExceeded as exc:
         print(f"\n[stopped] {type(exc).__name__}: {exc}", flush=True)
         print("[stop] reason=wallclock", flush=True)
-        _exit_code = 0
-    sys.exit(_exit_code)
+        note = _record_stop_marker("wallclock")
+        if note:
+            print(f"[guard] stop marker not recorded: {note}", flush=True)
+        else:
+            print("[guard] stop marker recorded (wallclock)", flush=True)
+        return 0
+
+
+if __name__ == "__main__":
+    sys.exit(_main_entry())
