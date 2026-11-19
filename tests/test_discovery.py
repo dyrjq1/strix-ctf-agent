@@ -72,7 +72,16 @@ class _Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _maybe_wall(self) -> bool:
+        """``/api/private*`` 是认证墙：任何方法都 401（撞墙判据的靶子）。"""
+        if self.path.startswith("/api/private"):
+            self._send(401, b'{"error":"unauthorized"}', ctype="application/json")
+            return True
+        return False
+
     def do_GET(self):
+        if self._maybe_wall():
+            return
         if self.path == "/":
             html = (
                 '<html><head>'
@@ -92,6 +101,8 @@ class _Handler(BaseHTTPRequestHandler):
             self._send(404, b'{"message":"Page not found"}', ctype="application/json")
 
     def do_POST(self):
+        if self._maybe_wall():
+            return
         if self.path == "/api/plugins/preview":
             self._send(400, b'{"error":"code_b64 required"}', ctype="application/json")
         elif self.path == "/api/plugins/stats":
@@ -100,9 +111,13 @@ class _Handler(BaseHTTPRequestHandler):
             self._send(404, b"{}", ctype="application/json")
 
     def do_PATCH(self):
+        if self._maybe_wall():
+            return
         self._send(404, b"{}", ctype="application/json")
 
     def do_PUT(self):
+        if self._maybe_wall():
+            return
         if self.path == "/api/locked":
             self._send(405, b"{}", ctype="application/json", extra={"Allow": "GET, POST"})
         else:
@@ -222,6 +237,37 @@ def test_method_sweep_keeps_405_only_with_allow(base_url):
     out = run(method_sweep("/api/locked", base_url=base_url, methods="PUT"))
     assert "405" in out
     assert "allow=GET, POST" in out
+
+
+def test_a_batch_that_is_almost_all_401_says_do_not_guess_values(base_url):
+    """撞墙判据：整批 401 时必须直接说「换机制」，不许让模型接着猜值。
+
+    历史失败题里出现过单端点 94 次 401（70×POST OTP，76 秒盲猜）。
+    """
+    out = run(method_sweep("/api/private", base_url=base_url))
+    assert "撞墙判据" in out, out
+    assert "换凭据类型" in out
+    assert "换端点族" in out
+
+
+def test_a_mixed_batch_does_not_claim_a_wall(base_url):
+    """200 与 401 混合时，问题更可能是方法/路径判断，不是认证墙。"""
+    out = run(method_sweep("/api/plugins/stats\n/api/private", base_url=base_url))
+    assert "撞墙判据" not in out, out
+
+
+def test_wall_advice_thresholds_are_counted_not_guessed():
+    """纯函数层把阈值钉死：≥3 条且 ≥80% 才触发，两条不触发。"""
+    from ctf_strix.discovery import _wall_advice
+
+    def rows(*codes):
+        return [{"status": c} for c in codes]
+
+    assert _wall_advice(rows(401, 403, 401)) != ""
+    assert _wall_advice(rows(401, 403)) == "", "两条不足以判墙"
+    assert _wall_advice(rows(401, 401, 200, 200, 403)) == "", "40% 不是墙"
+    assert _wall_advice(rows(0, 0, 401, 403, 401)) != "", "传输失败行不计入分母"
+    assert _wall_advice(rows(404, 404, 401, 401, 403)) != "", "404 不进分母"
 
 
 def test_method_sweep_requires_base_url_for_relative_path():

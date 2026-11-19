@@ -655,6 +655,33 @@ async def route_map(base_url: str, max_chunks: int = _MAX_CHUNKS) -> str:
     return "\n".join(lines)
 
 
+def _wall_advice(rows: list[dict[str, object]]) -> str:
+    """撞墙判据（批量版）：整批几乎全 401/403 时，直接说「别再换值」。
+
+    单条响应由 ``http_probe._status_hint`` 管，跨调用的重复由 ``journey_guard``
+    管；这里补的是**一批请求**的全景。历史失败题里出现过单端点被撞 94 次 401
+    （其中一批 70×POST /api/auth/otp，76 秒盲猜 OTP）——提示词约束不了
+    「一次 sweep 打几十个组合」这种形态，所以在工具输出里下判据。
+
+    阈值：**非 404 响应** ≥3 条且其中 401/403 占比 ≥80% 才算撞墙。
+    404 不进分母——那说明路径本身不存在，是发现手段的问题（另有一条提示）；
+    200 与 401 混合也不触发，那更可能是方法/路径判断，不是认证墙。
+    """
+    live = [r for r in rows if int(r.get("status") or 0) not in (0, 404)]
+    if len(live) < 3:
+        return ""
+    auth = sum(1 for r in live if int(r.get("status") or 0) in (401, 403))
+    if auth < max(3, int(len(live) * 0.8)):
+        return ""
+    return (
+        f"撞墙判据：本批 {auth}/{len(live)} 个响应是 401/403，墙在认证/授权层，"
+        "换值、加字典、换参数一律无效。下一步只做这四类之一：换凭据类型"
+        "（Cookie / JWT / Basic / API-Key / 表单会话）、换身份（注册新号 / 提权 / "
+        "换角色字段）、换端点族（/api/v1 → /api/internal → /admin）、"
+        "换传参位置（header / cookie / query / body）。"
+    )
+
+
 async def method_sweep(
     urls: str,
     base_url: str = "",
@@ -868,7 +895,10 @@ async def method_sweep(
     has_param_hint = any(
         "required" in str(r.get("body", "")).lower() or int(r["status"]) in (400, 422) for r in kept
     )
-    if has_param_hint:
+    wall = _wall_advice(results)
+    if wall:
+        lines.append("next: " + wall)
+    elif has_param_hint:
         lines.append(
             "next: 已经有接口吐出了字段名/校验错误——这是最省力的一条路。"
             "用 http_probe 按它要的字段构造 body 再发一次。"
