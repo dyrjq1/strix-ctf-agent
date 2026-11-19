@@ -47,6 +47,9 @@ TRIES=5
 RC=0
 for HOST in "${HOSTS[@]}"; do
   BEST_IP=""; BEST_OK=-1; BEST_TOTAL=999999
+  # 区分三种失败：边缘不通（000/超时）、边缘通但上游 4xx/5xx、上游正常但慢。
+  # 只有前一种是"换 IP 能解决"的；后一种是厂商/网关侧故障，换 IP 没用。
+  FALLBACK_IP=""; FALLBACK_ANS=0; SOFT=0
   # DNS 有时能给回 A（只是可能指向坏边缘）：顺手当候选，多一个选择
   CANDS=("${IPS[@]}")
   for a in $(getent ahostsv4 "$HOST" 2>/dev/null | awk '{print $1}' | sort -u); do
@@ -55,16 +58,18 @@ for HOST in "${HOSTS[@]}"; do
   done
   echo "== host=$HOST  tries=$TRIES  candidates=${CANDS[*]} =="
   for ip in "${CANDS[@]}"; do
-    ok=0; total=0
+    ok=0; total=0; answered=0
     for i in $(seq 1 $TRIES); do
       r=$(curl -sS -m 20 -o /dev/null -w '%{http_code} %{time_total}' \
         --resolve "$HOST:443:$ip" -H "Authorization: Bearer $KEY" \
         "https://$HOST/v1/models" 2>/dev/null)
       code=${r%% *}; t=${r##* }
       [ "$code" = "200" ] && { ok=$((ok+1)); total=$(awk -v a="$total" -v b="$t" 'BEGIN{print a+b}'); }
+      case "${code:-000}" in 000|"") ;; *) answered=$((answered+1)) ;; esac
       printf '  %-16s try %d  %-4s %ss\n' "$ip" "$i" "${code:-000}" "${t:-?}"
     done
-    printf '  %-16s ok=%d/%d total=%ss\n' "$ip" "$ok" "$TRIES" "$total"
+    printf '  %-16s ok=%d/%d answered=%d/%d total=%ss\n' "$ip" "$ok" "$TRIES" "$answered" "$TRIES" "$total"
+    if [ "$answered" -gt "$FALLBACK_ANS" ]; then FALLBACK_ANS=$answered; FALLBACK_IP=$ip; fi
     if [ "$ok" -gt 0 ]; then
       if [ "$ok" -gt "$BEST_OK" ] || { [ "$ok" -eq "$BEST_OK" ] && \
            awk -v a="$total" -v b="$BEST_TOTAL" 'BEGIN{exit !(a<b)}'; }; then
@@ -74,16 +79,29 @@ for HOST in "${HOSTS[@]}"; do
   done
 
   if [ -z "$BEST_IP" ]; then
-    echo "PICK_FAIL  $HOST: no edge IP answered"
-    RC=1
-    continue
+    if [ -n "$FALLBACK_IP" ]; then
+      # 边缘回了 HTTP（4xx/5xx）说明链路是通的 —— 换 IP 治不好上游。
+      # 仍然钉一个，保证内网 DNS（对 *.llm-next.ctfy.io 是 NXDOMAIN）下能解析，
+      # 否则后续错误会变成 "Could not resolve host"，掩盖真正的 502。
+      echo "PICK_FAIL  $HOST: 边缘可达但上游不健康（最多 $FALLBACK_ANS/$TRIES 次拿到 HTTP 应答）"
+      echo "           soft-pin -> $FALLBACK_IP（只为让域名可解析；这条车道仍判失败）"
+      BEST_IP=$FALLBACK_IP; BEST_OK=0; BEST_TOTAL=0; SOFT=1
+    else
+      echo "PICK_FAIL  $HOST: no edge IP answered（边缘不通，换 IP 或换个时间再试）"
+      RC=1
+      continue
+    fi
   fi
-  echo "PICK_OK  $HOST -> $BEST_IP  (ok=$BEST_OK/$TRIES total=${BEST_TOTAL}s)"
-  # 2-3/5 这类边缘样本能用但会拖重试；提示换时间再跑一遍
-  if [ "$BEST_OK" -lt 4 ]; then
-    echo "  WARN marginal edge ($BEST_OK/$TRIES) —— 能用但会多花重试；有空再跑一次可能换到更好的节点"
+  if [ "$SOFT" -eq 0 ]; then
+    echo "PICK_OK  $HOST -> $BEST_IP  (ok=$BEST_OK/$TRIES total=${BEST_TOTAL}s)"
+    # 2-3/5 这类边缘样本能用但会拖重试；提示换时间再跑一遍
+    if [ "$BEST_OK" -lt 4 ]; then
+      echo "  WARN marginal edge ($BEST_OK/$TRIES) —— 能用但会多花重试；有空再跑一次可能换到更好的节点"
+    fi
   fi
 
+  [ "$SOFT" -eq 1 ] && RC=1   # soft-pin 只解决解析，不改变"这条车道不可用"的判定
+                              # （放在 dry-run 之前：--dry-run 也必须报失败，否则赛前自检会被它骗过）
   if [ "$DRY" -eq 1 ]; then continue; fi
   if [ "$(id -u)" != "0" ]; then echo "need root to rewrite /etc/hosts"; exit 2; fi
 
@@ -96,6 +114,7 @@ for HOST in "${HOSTS[@]}"; do
   echo "# llm-gateway pin (pick_gateway_ip.sh $(date +%Y-%m-%dT%H:%M))" >> /etc/hosts
   echo "$line" >> /etc/hosts
   echo "  hosts: $line"
+  [ "$SOFT" -eq 1 ] && RC=1   # soft-pin 只解决解析，不改变"这条车道不可用"的判定
 done
 
 if [ "$DRY" -eq 1 ]; then echo "PICK_RESULT_DRYRUN"; exit $RC; fi
