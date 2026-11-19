@@ -119,6 +119,45 @@ case "$mcp_code" in
   *) fail "MCP endpoint -> HTTP '${mcp_code:-none}'" ;;
 esac
 
+# 平台 2026-11-19 起迁到新后端。本机 /etc/hosts 里钉过 ctfy.tsinghua.edu.cn
+# 的 IP（历史 DNS 劫持），后端换 IP 时钉子会让所有平台调用连到旧机器。这里
+# 把「钉的 IP」与「公共 DNS 的答案」对比一次；不一致只告警并给出改法，不
+# 自动改写（比赛中改 DNS 必须是人按下去的决定）。
+pinned=$(awk '$2 == "ctfy.tsinghua.edu.cn" {print $1; exit}' /etc/hosts 2>/dev/null)
+if [ -n "$pinned" ]; then
+  if command -v dig >/dev/null 2>&1; then
+    public=$(dig +short +time=3 +tries=1 ctfy.tsinghua.edu.cn @223.5.5.5 2>/dev/null \
+      | grep -E '^[0-9]+\.' | head -1)
+  else
+    public=""
+    skip "no dig: cannot compare the ctfy.tsinghua.edu.cn hosts pin against public DNS"
+  fi
+  if [ -n "$public" ] && [ "$public" != "$pinned" ]; then
+    fail "hosts pin $pinned != public DNS $public (backend moved? edit /etc/hosts and re-run)"
+  elif [ -n "$public" ]; then
+    pass "ctfy.tsinghua.edu.cn hosts pin matches public DNS ($pinned)"
+  fi
+fi
+
+# 解析器本身是否活着（台账 §4.284）：本机 /etc/hosts 钉了平台与存储域，所以
+# 上面的 curl 探针在「解析器全灭」时照样 PASS——必须拿一个**没钉过的**公网名字
+# 才测得出来。灭的形态是内网白名单解析器（10.0.10.238，权威型、白名单外全
+# NXDOMAIN）排在 systemd-resolved 首位，把公网名字一并否掉。
+dns_name="example.com"
+if getent hosts "$dns_name" >/dev/null 2>&1; then
+  pass "resolver answers public names ($dns_name -> $(getent hosts $dns_name | awk '{print $1; exit}'))"
+else
+  fail "resolver cannot resolve $dns_name (whitelist resolver first? fix /etc/systemd/resolved.conf.d/50-ctfy-gateway.conf: public resolvers BEFORE 10.0.10.238, then systemctl restart systemd-resolved)"
+fi
+
+# 附件下载 2026-11-19 起 302 到 Cloudflare R2（files.ctfy.run）。存不下存储域
+# 的临床表现是「题面说有文件、沙箱里没有」，所以在 preflight 里探一次边缘。
+att_code=$(curl -s -o /dev/null -m 15 -w '%{http_code}' https://files.ctfy.run/ 2>/dev/null)
+case "$att_code" in
+  2*|3*|4*) pass "attachment storage edge reachable (files.ctfy.run -> HTTP $att_code)" ;;
+  *)        fail "files.ctfy.run unreachable (curl '${att_code:-none}'): attachment downloads will fail" ;;
+esac
+
 # ---------------------------------------------------------------- 7. 车道凭据
 if [ -n "$LANES_CONF" ]; then
   hdr "lane probe ($LANES_CONF)"

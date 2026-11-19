@@ -203,10 +203,24 @@ def _http(
     method: str = "GET",
     body: bytes | None = None,
 ) -> tuple[int, dict[str, str], bytes]:
-    """Perform one request and always close the response, including errors."""
+    """Perform one request and always close the response, including errors.
+
+    ``Authorization`` is added as an *unredirected* header (2026-11-19,
+    台账 §4.283).  Attachment downloads now answer 302 to a Cloudflare R2
+    presigned URL, and S3-compatible storage refuses any request that carries
+    both the query signature and a bearer header ("only one auth mechanism"
+    → HTTP 400).  ``urllib`` copies every header onto the redirect target,
+    unlike ``requests`` which drops ``Authorization`` when the host changes,
+    so the bearer must not survive the hop.  The first request (the platform
+    API) still sends it, which is what the API authenticates on.
+    """
     request = urllib.request.Request(
         url, data=body, headers=dict(headers), method=method
     )
+    auth = request.headers.pop("Authorization", None)
+    if auth is not None:
+        # Sent on *this* request, never copied onto a redirect (§4.283).
+        request.add_unredirected_header("Authorization", auth)
     response = None
     try:
         response = urllib.request.urlopen(request, timeout=timeout)
