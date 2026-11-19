@@ -2788,6 +2788,7 @@ def install_toolset(
     from ctf_strix.capabilities import install_web_capabilities
     from ctf_strix.capabilities import live_tool_names
     from ctf_strix.capabilities import wants_aisec
+    from ctf_strix.capabilities import wants_file_tools
 
     # Only kinds with a live web surface pay for the HTTP primitives.  A file or
     # tcp challenge used to register all four unconditionally: 3,829 chars of
@@ -2834,10 +2835,10 @@ def install_toolset(
     has_attachments = bool(attachments) or bool(
         task.get("attachments") or task.get("files")
     )
-    wants_file_tools = kind in ("file", "tcp") or (
-        kind in ("web", "checker", "engagement") and has_attachments
-    )
-    if wants_file_tools:
+    # The predicate lives in capabilities so the harness entrypoint cannot
+    # drift from this one again (it did: the 2026-11-19 web-attachment fix
+    # was applied only here).
+    if wants_file_tools(kind, has_attachments):
         try:
             from ctf_strix import file_triage
 

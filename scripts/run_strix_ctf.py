@@ -710,9 +710,21 @@ async def main() -> int:
 
     # 文件类题（rev/pwn/misc/crypto 的附件题）才装入口原语。
     #
-    # 只在 target_kind == file 时注册，是因为它会往 system prompt 里多塞一段
-    # schema；web 题每一轮都要为这段付 token，收益却是零。
-    if args.target_kind in ("file", "tcp"):
+    # 只在 target_kind == file/tcp 时注册，是因为它会往 system prompt 里多塞一段
+    # schema；**纯** web 题每一轮都要为这段付 token，收益却是零。
+    #
+    # 例外（与官方入口 agent.install_toolset 同一判据）：web 题**带附件**时也装。
+    # 2026-11-19 测试赛实测：一道多服务 web 题的附件是 challenge.zip.b64，
+    # kind=web 没注册 unpack_archive，模型用 exec_command 连撞四次
+    # （unzip / 7z / busybox unzip / python zipfile）才解开一个包。
+    # 这个 bug 当年只修在官方入口上，harness 这条路（首版 batch_eval 之后的
+    # 比赛真跑入口）原样留着，所以两边必须用同一条判据。
+    from ctf_strix.capabilities import wants_file_tools
+
+    # 判据取「文件真的会被注入」而不是「传了参数」：注入块同样要求目录存在，
+    # 两条判据必须一致，否则会出现「装了工具但工作目录是空的」。
+    has_attachments = bool(args.files_dir) and Path(args.files_dir).is_dir()
+    if wants_file_tools(args.target_kind, has_attachments):
         try:
             from ctf_strix import file_triage
 
@@ -725,15 +737,21 @@ async def main() -> int:
         # Same split as the official entrypoint: attachment primitives only on
         # file challenges, socket primitives only on tcp ones.  Registering both
         # would put ~2.5k chars of unused schema in front of the model on every
-        # call of the other kind.
+        # call of the other kind.  ``nonweb.register(kind="web")`` gives the
+        # three "what am I holding" primitives and no ELF pair.
         try:
             from ctf_strix import nonweb
 
             added = nonweb.register(kind=args.target_kind)
-            groups.append("tcp" if args.target_kind == "tcp" else "file")
+            if args.target_kind == "tcp":
+                groups.append("tcp")
+            elif "file" not in groups:
+                groups.append("file")
             print(f"[nonweb] registered {len(added)} tools: {', '.join(added) or '(already present)'}")
         except Exception as e:  # noqa: BLE001
             print(f"[nonweb] registration failed: {type(e).__name__}: {e}")
+    elif args.target_kind in ("web", "checker", "engagement"):
+        print(f"[file] skipped (kind={args.target_kind}, no attachments)")
 
     # CTF 技能包：12 个方向索引，走 strix 自带的 load_skill。
     #

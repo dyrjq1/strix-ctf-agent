@@ -45,6 +45,30 @@ def _install(
 #: for a web surface that does not exist.
 WEB_KINDS: tuple[str, ...] = ("web", "checker", "engagement")
 
+
+def wants_file_tools(kind: str, has_attachments: bool) -> bool:
+    """Decide whether to register the attachment + socket primitives.
+
+    One rule, both entrypoints.  ``agent.install_toolset`` (the official
+    entrypoint) and ``scripts/run_strix_ctf.py`` (the harness the measurement
+    batches and the race-day lanes drive) must agree on this, exactly like
+    :func:`wants_aisec`: the 2026-11-19 web-attachment fix landed in the
+    official entrypoint only, so every measured run and every race-day lane
+    still sent a web challenge with ``challenge.zip.b64`` *without*
+    ``unpack_archive`` -- the model then burned four ``exec_command`` calls on
+    unzip / 7z / busybox / python zipfile.
+
+    Args:
+        kind: challenge kind.
+        has_attachments: whether the task shipped files at all.  A ``web``
+            challenge with attachments is a source tree, not a pure web target;
+            it gets the three "what am I holding" tools.
+
+    Returns:
+        True when the file/socket installers should run.
+    """
+    return kind in ("file", "tcp") or (kind in WEB_KINDS and bool(has_attachments))
+
 #: Tokens in the task's own metadata that mark a challenge as AI-facing.  This
 #: is used only to *offer* the AI-security tools; a hit is not a claim that the
 #: challenge is one.  Kept deliberately narrow: every token here has been seen

@@ -127,6 +127,40 @@ def test_a_web_challenge_with_attachments_gets_the_attachment_primitives(registr
     assert {"http_probe", "route_map"} <= names
 
 
+def test_both_entrypoints_share_one_file_tools_gate():
+    """官方入口与 harness 必须是同一条判据，不许各写一份。
+
+    上面那条测试钉的 ``agent.install_toolset``，但比赛真跑的车道走的是
+    ``scripts/run_strix_ctf.py``。2026-11-19 的 web+附件 修复只落在了官方
+    入口，harness 那条路仍然 ``kind in ("file", "tcp")`` 才装工具——13C7AF74
+    那道带 ``challenge.zip`` 的 web 题在真实 run 里 ``file_lines=0``，
+    ``unpack_archive`` 从未注册。测试全绿是因为两条路径只钉了一条。
+    """
+    from ctf_strix.capabilities import wants_file_tools
+
+    # 判据本身：web 只有在带附件时才装。
+    assert wants_file_tools("file", False)
+    assert wants_file_tools("tcp", False)
+    assert not wants_file_tools("web", False)
+    assert wants_file_tools("web", True)
+    assert wants_file_tools("checker", True)
+    assert wants_file_tools("engagement", True)
+
+    # 两个入口都必须调用它，而不是自己再写一份 kind 判断。
+    import inspect
+
+    from ctf_strix import agent as agent_mod
+
+    assert "wants_file_tools(" in inspect.getsource(agent_mod.install_toolset)
+    harness = (ROOT / "scripts" / "run_strix_ctf.py").read_text(encoding="utf-8")
+    assert "wants_file_tools(" in harness, (
+        "harness 没有走 capabilities.wants_file_tools——web 附件题会再次裸奔"
+    )
+    assert 'args.target_kind in ("file", "tcp")' not in harness, (
+        "harness 又自己写了一份 kind 判断，官方入口的附件例外不会跟过来"
+    )
+
+
 def test_web_challenge_registers_viability_probe(registry):
     """The ladder tool must be in the real web registry, not just importable.
 
