@@ -28,6 +28,23 @@ from pathlib import Path
 _T0 = time.monotonic()
 
 
+def _record_stop_marker(reason: str) -> str:
+    """把本轮收场事实写进 ``CTFY_STALL_MARKERS``；返回空串表示写成。
+
+    单独抽出来是为了可测：``main()`` 起不来（要真 strix 运行时），但
+    「收场标记到底有没有落盘」是 2026-11-19 验收跑里唯一没接上的线——
+    三道题 wallclock 收场的盒子里一个 ``stall_markers.jsonl`` 都没有。
+    测试直接调本函数、断言文件形状，不依赖 strix 运行时。
+    """
+    try:
+        from ctf_strix import progress_guard
+
+        progress_guard.current().record_stop(str(reason or "unknown"))
+        return ""
+    except Exception as exc:  # noqa: BLE001 - 记账失败不是收场失败
+        return f"{type(exc).__name__}: {exc}"
+
+
 def _stop_reason(exc: BaseException) -> str:
     """Map a guard's ``BaseException`` shutdown to the harness's stop reason.
 
@@ -933,6 +950,12 @@ async def main() -> int:
 
     print(f"[scan] id={scan_id} kind={args.target_kind} target={args.target} turns={args.turns}")
     started = time.time()
+    #: 本轮收场原因（机器可读）。收场标记必须在**本入口**补写：这条路径不
+    #: 经过 ``agent.main`` 的 ``_write_result``，而 2026-11-19 验收跑实测
+    #: 三道题 wallclock 收场后盒子里连 ``stall_markers.jsonl`` 都没有——
+    #: 下一轮的重试提示只剩「收场：wallclock；轨迹：…」，用户要的
+    #: 「上一轮失败路径 / 选了什么方法卡」整段缺失（§4.276 的接线漏洞）。
+    stop_reason = ""
     try:
         result = await run_strix_scan(
             scan_config=scan_config,
@@ -950,6 +973,7 @@ async def main() -> int:
         # （预算问题重开只是重复烧钱），也不再被记成 rc=-9 硬杀或
         # 「error=None 的正常失败」。
         result = None
+        stop_reason = "wallclock"
         print(f"\n[stopped] {type(exc).__name__}: {exc}")
         print("[stop] reason=wallclock")
     except agent_mod.RaceLost as exc:
@@ -957,6 +981,7 @@ async def main() -> int:
         # 不算失败也不重开——reason=race_lost 不在 _RESAMPLE_REASONS，
         # 重开等于把兄弟刚解掉的题再烧一遍。照常走 [usage]/守卫汇总。
         result = None
+        stop_reason = "race_lost"
         print(f"\n[stopped] {type(exc).__name__}: {exc}")
         print("[stop] reason=race_lost")
     except (NoProgress, EnumExhausted, TargetAbsent) as exc:
@@ -971,6 +996,7 @@ async def main() -> int:
         # 换哪种策略，是外层 harness（batch_eval --max-samples）的决定。
         result = None
         reason = _stop_reason(exc)
+        stop_reason = reason
         print(f"\n[stopped] {type(exc).__name__}: {exc}")
         extra = ""
         if isinstance(exc, NoProgress):
@@ -983,6 +1009,11 @@ async def main() -> int:
         print(f"[stop] reason={reason}{extra}")
     except Exception as exc:  # noqa: BLE001 — a turn cap is a normal outcome here
         result = None
+        stop_reason = _stop_reason(exc)
+        if stop_reason == "unknown":
+            # 轮次打满是最常见的正常收场（MaxTurnsExceeded），标记要能读出
+            # 是哪一种，别把「轮次用完」和「真异常」都写成 unknown。
+            stop_reason = type(exc).__name__
         print(f"\n[stopped] {type(exc).__name__}: {exc}")
         # 父进程（batch_eval）不解析 [stopped]——那行连 MaxTurnsExceeded 这种
         # 正常收场都包含，没法当错误信号。这里单独给一条带完整限定名的
@@ -1003,6 +1034,20 @@ async def main() -> int:
             f" mechanism={mechanism or '-'} signature={signature or '-'}"
         )
         result = None
+        stop_reason = "no_progress"
+    # 收场标记：把「停在哪、打过哪些路径、选了什么卡」落到
+    # ``CTFY_STALL_MARKERS``。``agent.main`` 在 ``_write_result`` 里做这件事，
+    # 本入口不走那条路——2026-11-19 实测 wallclock 收场的盒子连标记文件都
+    # 没有，重试提示因此只剩一行「收场」。写不进去不影响收场（已有 result
+    # 落盘与日志），所以整体吞异常。
+    if result is not None:
+        stop_reason = stop_reason or "completed"
+    stop_reason = stop_reason or "unknown"
+    _marker_note = _record_stop_marker(stop_reason)
+    if _marker_note:
+        print(f"[guard] stop marker not recorded: {_marker_note}", flush=True)
+    else:
+        print(f"[guard] stop marker recorded ({stop_reason})", flush=True)
     if hard_watchdog:
         # 收尾汇总阶段解除自家 watchdog（agent.main 同款顺序：先解除再
         # 清理），避免 alarm 打断 [usage]/守卫汇总的打印；父进程的墙钟
