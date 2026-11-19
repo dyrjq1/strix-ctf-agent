@@ -1253,6 +1253,40 @@ def _check_race_lost() -> None:
     race_stop.checkpoint()
 
 
+def _check_target_absent(
+    guard: Any,
+    round_boundary: bool,
+    *,
+    solved: bool = False,
+) -> None:
+    """「靶面不存在」止损：同一挂点、两条入口共用这一个判据。
+
+    官方入口（``_run_agent``）与评测车道（``scripts/run_strix_ctf.py``）
+    各自定义过一个 sink。2026-11-19 审计（台账 §4.282）发现车道侧只
+    import 了异常类而没有 raise 点：守卫把探测拦下、``stop_reason`` 却
+    永远落不到 ``target_absent``，死靶依旧烧满墙钟。判据写在这里，两边
+    都调它，就不会再各写一份。
+
+    Args:
+        guard: :class:`ctf_strix.target_absent.TargetAbsentGuard` 实例
+            （车道入口在 ``main`` 里安装后一直在作用域内）。
+        round_boundary: 当前事件是否为一轮的收尾（``_is_round_boundary``）。
+        solved: 本 run 是否已解出。已解出时不停——停的是「没答案」的靶。
+
+    Raises:
+        TargetAbsent: 守卫已触发且正处轮边界时。
+    """
+    if guard is None or solved or not round_boundary:
+        return
+    if not guard.tripped:
+        return
+    raise TargetAbsent(
+        guard.stop_detail(),
+        origin=guard.tripped_origin or "",
+        paths=guard.threshold,
+    )
+
+
 #: 「止损」终止（以下异常类）：都继承 ``BaseException``，会绕过 ``main`` 里的普通收尾。
 #: 统计必须在抛出点挂到异常上，否则 result.json 只能写 ``turns=0``、诊断全空。
 _STOP_TYPES: tuple[type[BaseException], ...] = (
@@ -3759,30 +3793,32 @@ def _run_agent(
             # stretch of probes that produced the answer may well have been
             # repeating a dead path first.
             progress_guard.note_answer()
-        if round_boundary and target_guard.tripped and not success.solved:
-            # The crossing tool call already returned the hard error.  Raise
-            # from the sink, at a round boundary; ``main`` maps TargetAbsent
-            # to its own stop reason (mirrors IdleTimeout).
-            #
-            # This is *not* the boundary of the round that tripped: the
-            # vendor queue order is ``tool_call_item -> response.completed(N)
-            # -> [tools run] -> output batch`` (every event is queued as soon
-            # as it is produced), so boundary N arrives *before* round N's
-            # outputs.  Safety comes from the FIFO queue plus boundary N+1
-            # landing after all of round N's outputs; the boundary event
-            # itself carries no item.  The stop therefore fires on the *next*
-            # round's boundary, after a sibling call's output (possibly the
-            # flag) has reached this sink.
-            #
-            # Cost: one extra generation.  Round N+1's ``tool_call_item`` has
-            # already been emitted and this raise cancels it before it runs.
-            # If that extra generation breaches the output budget,
-            # ``stop_reason`` lands on ``output_budget`` instead (rare).
-            raise TargetAbsent(
-                target_guard.stop_detail(),
-                origin=target_guard.tripped_origin or "",
-                paths=target_guard.threshold,
-            )
+        # The crossing tool call already returned the hard error.  Raise
+        # from the sink, at a round boundary; ``main`` maps TargetAbsent
+        # to its own stop reason (mirrors IdleTimeout).
+        #
+        # This is *not* the boundary of the round that tripped: the
+        # vendor queue order is ``tool_call_item -> response.completed(N)
+        # -> [tools run] -> output batch`` (every event is queued as soon
+        # as it is produced), so boundary N arrives *before* round N's
+        # outputs.  Safety comes from the FIFO queue plus boundary N+1
+        # landing after all of round N's outputs; the boundary event
+        # itself carries no item.  The stop therefore fires on the *next*
+        # round's boundary, after a sibling call's output (possibly the
+        # flag) has reached this sink.
+        #
+        # Cost: one extra generation.  Round N+1's ``tool_call_item`` has
+        # already been emitted and this raise cancels it before it runs.
+        # If that extra generation breaches the output budget,
+        # ``stop_reason`` lands on ``output_budget`` instead (rare).
+        #
+        # The predicate itself lives in ``_check_target_absent`` because
+        # the lane entrypoint has to make the same call (§4.282).
+        _check_target_absent(
+            target_guard,
+            round_boundary,
+            solved=success.solved,
+        )
         if round_boundary and enum_guard.exhausted and not success.solved:
             # Refused calls return instantly and still produce a tool call,
             # so retrying a blocked family is free for the model and burns

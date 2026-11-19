@@ -3402,6 +3402,26 @@ def _tags_arg(tags: list[str] | None) -> list[str]:
     return ["--tags", *out] if out else []
 
 
+#: goal 文本按题型选，与 ``ctf_strix.agent.GOAL_FILES`` 同表。
+#:
+#: 2026-11-19 审计（台账 §4.282）：车道入口一直只读 ``ctf_goal.txt``，于是
+#: file/tcp 题拿到的是 web 版目标——第一条指令就是 ``http_probe``/``route_map``
+#: 和"注册一个账号"，而这两个工具在 file/tcp 题上**根本没注册**。这不是
+#: 措辞问题，是让模型去打一个不存在的东西。表本身由测试钉住与官方入口一致。
+_GOAL_FILES: dict[str, str] = {
+    "web": "ctf_goal.txt",
+    "tcp": "goal_tcp.txt",
+    "file": "goal_file.txt",
+    "checker": "goal_checker.txt",
+    "engagement": "ctf_goal_engagement.txt",
+}
+
+
+def _goal_file_for(target_kind: str) -> str:
+    """按题型返回 ``config/`` 下的 goal 文件名；未知题型退回 web。"""
+    return _GOAL_FILES.get(str(target_kind or "").strip().lower(), _GOAL_FILES["web"])
+
+
 def run_agent(
     target: str,
     turns: int,
@@ -3432,7 +3452,7 @@ def run_agent(
     项目代码用绝对路径引用，不受 cwd 变化影响。
     """
     root = Path(__file__).resolve().parent.parent
-    goal = (root / "config" / "ctf_goal.txt").read_text(encoding="utf-8")
+    goal = (root / "config" / _goal_file_for(target_kind)).read_text(encoding="utf-8")
     instruction = f"{goal}\n\n{extra}" if extra else goal
 
     # 每次都是全新沙箱：见 `_fresh_box` 里关于 session resume 的记录。

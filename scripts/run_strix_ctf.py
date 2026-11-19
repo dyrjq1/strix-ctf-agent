@@ -242,6 +242,24 @@ _EMPTY_ENDPOINTS: dict[str, int] = {
 }
 
 
+def _looks_like_answer(text: str) -> bool:
+    """这段文本里带着"答案形态"吗（任意标签的 ``x{...}`` 或 ``ANSWER[...]``）。
+
+    2026-11-19 审计（台账 §4.282）：原来只认字面量 ``FLAG{``。但赛题的 flag
+    标签是题目自己的——``flag{}`` / ``CTF{}`` / ``utflag{}`` / ``HTB{}`` /
+    裸 hex 都在 ctf_goal 里写明是正常形态。答案落在长输出 600 字节之后时，
+    日志里就只剩截断品，而 batch_eval 的兜底提取（``best_flag``）读的正是
+    这份日志。判据改用 ``flag_extract.CANDIDATE_RE``，与提交链同一张正则。
+    """
+    if "FLAG{" in text or "ANSWER[" in text:
+        return True
+    try:
+        from ctf_strix.flag_extract import CANDIDATE_RE
+    except Exception:  # noqa: BLE001 - 日志显示不能因为 import 失败就崩
+        return False
+    return bool(CANDIDATE_RE.search(text))
+
+
 def _arg_display_limit(arg_text: str) -> int:
     """工具参数在 run.log 里的显示上限。
 
@@ -255,7 +273,7 @@ def _arg_display_limit(arg_text: str) -> int:
     提取不到值，于是「答对了」在账本上记成「没作答」（3/6 假失败）。
     截断一个候选 token 会误导模型；截断带答案的参数则直接吞掉正确答案。
     """
-    if "FLAG{" in arg_text or "ANSWER[" in arg_text:
+    if _looks_like_answer(arg_text):
         return 4000
     return 400
 
@@ -484,6 +502,16 @@ async def main() -> int:
         f"(warn>={SWEEP_WARN} distinct values in one call, hard>={SWEEP_HARD})"
     )
 
+    # 「靶面不存在」守卫。enum_guard 按**路径族**计数，一条 run 对 95 个不同
+    # 路径各打一次永远不动任何计数器；这个按"同一份非应答 body 跨路径"计数。
+    # 2026-11-19 审计（台账 §4.282）：官方入口装了它，车道入口只 import 了
+    # 异常类——下面的 ``except TargetAbsent`` 因此是**死分支**：死靶会烧满
+    # 900s，而且产不出 batch_eval 重抽集合里的 ``target_absent`` 收场理由。
+    from ctf_strix.target_absent import install as install_target_absent
+
+    target_guard = install_target_absent()
+    print("[guard] target-absent guard installed (identical non-answer body across paths)")
+
     # 收工时自动提交。顺序很关键：**必须在 finish guard 之后安装**，
     # 因为两者都包 finish_scan.on_invoke_tool，后装的是外层——
     # 外层先跑 = 先提交、再交给收工守卫判断该不该放行。
@@ -589,6 +617,7 @@ async def main() -> int:
             "_ctf_sweep_guarded",
             "_ctf_negative_guarded",
             "_ctf_turn_budget",
+            "_ctf_target_guarded",
         )
     )
     print(f"[guard] mount verified={wired} (exec_command reaches guards)")
@@ -864,6 +893,13 @@ async def main() -> int:
         # 未配置（race_stop.configure() 返回 None）时是纯 no-op，与
         # soft_timeout 不同——它不依赖 hard_watchdog 是否安装。
         agent_mod._check_race_lost()
+        # 「靶面不存在」止损（§4.282）：守卫在 main 里装了，但此前没有
+        # raise 点——``except TargetAbsent`` 是死分支，死靶照样烧满墙钟。
+        # 判据与官方入口共用 ``agent_mod._check_target_absent``。
+        agent_mod._check_target_absent(
+            target_guard,
+            agent_mod._is_round_boundary(event),
+        )
         item = getattr(event, "item", None)
         kind = getattr(item, "type", None)
         if kind == "tool_call_item":
@@ -882,9 +918,13 @@ async def main() -> int:
             # which made the batch evaluator see a truncated, unsubmitable token.
             # Any output that mentions a flag is kept whole; the rest is trimmed
             # only to keep the log readable.
-            limit = 4000 if "FLAG{" in output else 600
+            limit = 4000 if _looks_like_answer(output) else 600
             body = output if len(output) <= limit else output[:limit] + f"… <truncated {len(output) - limit}B>"
             print(f"  [{agent_id}] OUT  {body}")
+            if _looks_like_answer(output):
+                # 已经有候选答案就绝不停：守卫换的是「没答案的死靶」，
+                # 把可能能提交的 flag 扔掉是反的。
+                target_guard.note_answer()
 
     scan_id = args.name or f"ctf-{int(time.time())}"
 
@@ -965,6 +1005,19 @@ async def main() -> int:
                 print(f"[files] ERROR 这些路径会被 strix 静默丢弃: {bad}")
             else:
                 print(f"[files] 路径校验通过（均在 /workspace/ 下）")
+
+    # 附件清单必须进指令。``extra_files`` 是**静默**注入的：不说一声，模型
+    # 不知道工作目录里有什么，更不知道 ``.b64`` 要先 ``base64 -d``——11-19
+    # 那道带 ``challenge.zip.b64`` 的 web 题就是这样，模型连撞四次
+    # exec_command 才解开。这段文本与官方入口 ``agent._attachment_section``
+    # 同一份，不另写（台账 §4.281/§4.282）。
+    if extra_files:
+        section = agent_mod._attachment_section(extra_files)
+        if section:
+            scan_config["user_instructions"] = (
+                f"{scan_config['user_instructions']}\n\n{section}"
+            ).strip()
+            print(f"[files] 附件清单已写进指令（{len(extra_files)} 项）")
 
     print(f"[scan] id={scan_id} kind={args.target_kind} target={args.target} turns={args.turns}")
     started = time.time()
