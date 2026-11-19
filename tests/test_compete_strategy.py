@@ -500,6 +500,28 @@ def test_relay_probe_is_cached_per_host(monkeypatch) -> None:
     assert calls == [("10.255.255.1", 47445)]
 
 
+def test_sweep_vpn_ifaces_removes_only_wireguard_ones(monkeypatch) -> None:
+    """停止后清残留接口，但只碰 ``wg<pid>`` 形状的，别把 eth0 拆了。"""
+
+    class Proc:
+        def __init__(self, stdout: str = "") -> None:
+            self.stdout = stdout
+
+    calls: list[list[str]] = []
+
+    def fake_run(cmd, **kw):  # noqa: ANN001, ARG001
+        calls.append(list(cmd))
+        if cmd[:3] == ["ip", "-br", "link"]:
+            return Proc("wg65350  UNKNOWN\nlo  UNKNOWN\neth0  UP\n")
+        return Proc()
+
+    monkeypatch.setattr(compete.subprocess, "run", fake_run)
+
+    assert compete._sweep_vpn_ifaces() == ["wg65350"]
+    assert ["ip", "link", "del", "wg65350"] in calls
+    assert all("eth0" not in " ".join(c) for c in calls)
+
+
 def test_lane_stagger_defaults_to_30s() -> None:
     """车道默认错峰 30s：三条车道同一秒起跑会一起压平台/边缘节点。"""
     args = compete.build_parser().parse_args(["--token", "t", "--competition", "c"])

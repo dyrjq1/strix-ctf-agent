@@ -77,6 +77,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import signal
 import socket
 import subprocess
@@ -1050,6 +1051,48 @@ def _spawn(
     return subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT, env=env)
 
 
+def _sweep_vpn_ifaces() -> list[str]:
+    """删掉本机残留的 ``wg<pid>`` 接口，返回删掉的名字。
+
+    接口名由 batch_eval 起隧道时写成 ``wg{pid % 100000}``。子进程被 SIGKILL
+    时不会走 ``tunnel.down()``，接口和它带的路由就留在内核里（11-19 实测
+    ``wg56182`` / ``wg56183`` 一直挂到手工清理）。接口本身无害，但它背着
+    指向旧实例网段的路由——同一道题重派时，新隧道给同网段加路由会撞
+    ``File exists``，隧道起不来，整题被记成 SKIP。
+
+    **只在停止信号把本进程的车道全部杀完之后调用**：此时本机不该有活跃
+    车道，删到的是尸体。运行期不要调——会拔掉正在用的隧道。
+    """
+    deleted: list[str] = []
+    try:
+        out = subprocess.run(
+            ["ip", "-br", "link", "show", "type", "wireguard"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return deleted
+    for line in out.splitlines():
+        name = line.split()[0] if line.strip() else ""
+        if not re.fullmatch(r"wg\d+", name):
+            continue
+        try:
+            subprocess.run(
+                ["ip", "link", "del", name],
+                capture_output=True,
+                timeout=10,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError):
+            continue
+        deleted.append(name)
+    if deleted:
+        print(f"[compete] 清掉残留 WireGuard 接口 {', '.join(deleted)}", flush=True)
+    return deleted
+
+
 def _sweep_orphans(token: str) -> list[str]:
     """删掉台账里**主人进程已死**的实例，返回删掉的 id。
 
@@ -1783,6 +1826,9 @@ def main() -> int:
             # 子进程被强杀时不会走到 batch_eval 的 finally：它的实例此刻
             # 只会留在台账里。这里立刻按"主人已死"回收一次。
             _sweep_orphans(args.token)
+            # 车道已全部退出：此时本机残留的 wg 接口都是尸体，连同它们的
+            # 旧路由一起清掉，免得下次重派同一道题撞 File exists。
+            _sweep_vpn_ifaces()
             save_state(state_dir, state)
     return 0
 
