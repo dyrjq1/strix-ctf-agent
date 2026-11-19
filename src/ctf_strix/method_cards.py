@@ -44,7 +44,11 @@ PLAYBOOK_MAX_CHARS = 620
 
 #: Kinds that get the web playbook.  ``agent`` is reserved: agentic-AI tasks
 #: currently arrive as ``web`` through ``agent._challenge_kind``.
-WEB_KINDS: frozenset[str] = frozenset({"web", "agentic"})
+#:
+#: ``checker`` / ``engagement`` 也在这里：2026-11-19 Codex 复核指出这两类题
+#: 注册的是同一套 web 工具（``agent.py`` 的 ``kind in ("web","checker",
+#: "engagement")``），却拿不到 playbook 也拿不到卡池——等于开局一片空白。
+WEB_KINDS: frozenset[str] = frozenset({"web", "agentic", "checker", "engagement"})
 
 HEADER = "[Method cards] tag 命中：下面只给看哪里和先后顺序，工具名照用。"
 
@@ -164,7 +168,8 @@ CARDS: tuple[Card, ...] = (
     ),
     _card(
         "idor,broken_access_control,mass_assignment,2fa_bypass,account_merge",
-        "越权：两个账号互换同名资源 id，看是否 200 且内容不同；`traffic_list` 回看已发请求里的 id/role 字段。两个账号放两个具名会话（session 参数分别写 alice 与 bob），否则后登录的会把前一个的 cookie 覆盖掉。",
+        "越权：两个账号互换同名资源 id，看是否 200 且内容不同；`traffic_list` 只有 id/方法/状态/长度/URL，"
+        "要看请求体或响应体里的 id/role 字段用 `traffic_view`（part=request / response）。两个账号放两个具名会话（session 参数分别写 alice 与 bob），否则后登录的会把前一个的 cookie 覆盖掉。",
         cid="authz.idor",
     ),
     _card(
@@ -360,24 +365,26 @@ DOMAIN_CARDS: tuple[Card, ...] = (
     ),
     _card(
         "bof,stack,elf",
-        "PWN 栈溢出四步：`elfpeek` view=info 看 PIE/NX/canary → view=symbols/strings 找 gets/read/"
+        "PWN 栈溢出四步：`elfpeek` view=info 看 PIE/NX/canary → view=symbols 与 view=strings 找 gets/read/"
         "system/win → `exec_command` 生成 cyclic 模式串、`tcp` 发超长触发崩溃 → `elffind` 反查精确偏移。"
-        "有附件 libc 就照它的符号算 system 与 /bin/sh；payload 落盘后用 `tcp` 发，别手搓转义串。"
+        "有附件 libc 就照它的符号算 system 与 /bin/sh；payload 用 `exec_command` 生成，`tcp` 发文本，"
+        "含非打印字节就转成 hex 串并 hex_mode=true，别手搓转义串。"
         "崩溃看不懂就在 `exec_command` 里跑 gdb -batch 看 rip 与栈。",
         cid="pwn.stack",
     ),
     _card(
         "format_string,rop,seccomp",
-        "PWN 进阶：格式化串先用 `tcp_batch` 批量试 %1$p..%20$p 一次收敛、定位自己的输入位置，再谈 %n 写；"
-        "没有 win 函数走 ROP，`elfpeek` view=gadgets filter=rdi|rsi|rdx|syscall；堆题先看 malloc/free "
-        "顺序与 tcache 是否 double-free，别急着一次打通；远程先泄漏 libc 基址再算偏移。",
+        "PWN 进阶：格式化串先用 `tcp_batch`（hex_mode=false）批量试 %1$p..%20$p 一次收敛、定位自己的输入"
+        "位置，再谈 %n 写；没有 win 函数走 ROP，`elfpeek` view=gadgets filt=rdi|rsi|rdx|syscall；"
+        "堆题先看 malloc/free 顺序与 tcache 是否 double-free，别急着一次打通；远程先泄漏 libc 基址再算偏移。",
         cid="pwn.adv",
     ),
     _card(
         "heap,asan,sanitizer,use_after_free,uaf,arbitrary_read",
         "PWN 泄漏链四步（ASan/记录管理器类）：① 先用已打通的任意读写读『结构固定字段』——self/label/"
-        "blob.data 里通常就有 heap 与 PIE 指针；② 用 `elfpeek` view=info/symbols 加附件 libc 的符号偏移"
-        "把 PIE 指针→PIE base、GOT 项→libc base；③ 每次读 8 字节都打印 hex 与**实际长度**并断言长度=8"
+        "blob.data 里通常就有 heap 与 PIE 指针；② 用 `elfpeek` view=info 与 view=symbols 两张表（一次"
+        "调用只能一个 view）加附件 libc 的符号偏移把 PIE 指针→PIE base、GOT 项→libc base；"
+        "③ 每次读 8 字节都打印 hex 与**实际长度**并断言长度=8"
         "（短读先修读取长度，别假设成功）；④ 拿到 base 后再构造 openat/read/write 或 ret2libc。"
         "每步落一个可重跑脚本 + 一条断言，失败先看是哪一步。",
         cid="pwn.leak",
@@ -386,28 +393,30 @@ DOMAIN_CARDS: tuple[Card, ...] = (
         "rsa,small_e,wiener,common_modulus",
         "CRYPTO RSA 先自动试：`exec_command` 写 python（pycryptodome/gmpy2）依次试 小指数开方 / wiener / "
         "共模 / fermat（p、q 相邻）。有「明文结构」线索就走格攻击（Coppersmith 小根、LLL）；都不中就找 n 的"
-        "分解线索（题面提示、共享因子、p=q），拿到 d 后用 `hexpeek` 拼明文再 `decode_blob` 剥编码。",
+        "分解线索（题面提示、共享因子、p=q），拿到 d 后用 `exec_command` 算明文，`hexpeek` 只管看字节"
+        "布局，再 `decode_blob` 剥编码。",
         cid="crypto.rsa",
     ),
     _card(
         "aes,ecb,oracle,cbc",
         "CRYPTO 分组密码：先判模式——16 字节对齐后出现相同块 = ECB；ECB 打块剪切/字节翻转移位取目标块；"
-        "CBC 打 IV 与前一密文块的位翻转；padding oracle 用 `tcp_batch` 一次批量试末字节（≤200/轮）。"
-        "密钥已知就用 `exec_command` 本地算（ecb/cbc/ctr），别手搓分组填充。",
+        "CBC 打 IV 与前一密文块的位翻转；padding oracle 用 `tcp_batch`（hex_mode=false）一次批量试末字节"
+        "（≤200/轮）。密钥已知就用 `exec_command` 本地算（ecb/cbc/ctr），别手搓分组填充。",
         cid="crypto.block",
     ),
     _card(
         "zip,archive,forensics",
         "MISC 归档/取证：`unpack_archive` 按魔数解包（zip 加密先判 ZipCrypto 还是 AES，别硬跑）；"
         "常见套路是伪加密（改通用标志位）、注释/文件名/额外字段藏值、CRC 与明文碰撞；取证先 `hexpeek` "
-        "看头与尾部附加数据，再 `decode_blob` 剥编码链，不要整文件打印。",
+        "看头与尾部附加数据，需要剥编码链时先用 `exec_command` 把文件读成文本，再交 `decode_blob`，"
+        "不要整文件打印。",
         cid="misc.archive",
     ),
     _card(
         "udp,connectivity,pcap,stego,image_encoding",
         "MISC 通道/隐写：先判可达（不可达=环境问题，立刻收口）；UDP/自定义协议没有专用工具——用 "
         "`exec_command` 落一个 python socket 脚本再跑；隐写/图片先 `hexpeek` 看尾部与 ZIP/PNG 文本块，"
-        "再 `decode_blob` 逐层剥。",
+        "再 `exec_command` 取出可疑段，交 `decode_blob` 逐层剥。",
         cid="misc.channel",
     ),
 )
@@ -421,7 +430,8 @@ CATEGORY_FALLBACK: dict[str, Card] = {
         "`elffind` 取函数偏移；② 无后门但能泄露 → ret2libc：`elfpeek` view=symbols 定位 GOT/plt → libc base"
         " → system(/bin/sh)；③ 静态链接无 libc → ret2syscall 或 SROP；④ 64 位无 pop rdi → ret2csu；"
         "⑤ 有格式化串 → `tcp_batch` 批量试 %p 定位再 %n；⑥ 堆题 → malloc/free 顺序、tcache double-free/UAF。"
-        "纪律：`exec_command` 里跑 gdb 本地确认偏移，本地不通不打远端；payload 落盘后 `tcp` 发。",
+        "纪律：`exec_command` 里跑 gdb 本地确认偏移，本地不通不打远端；payload 用 `exec_command` 生成后"
+        "交 `tcp`（文本，或 hex 串 + hex_mode=true）。",
         cid="fallback.pwn",
     ),
     "rev": _card(
@@ -449,6 +459,22 @@ CATEGORY_FALLBACK: dict[str, Card] = {
     ),
 }
 
+#: 纯附件（``kind=file``）的 pwn 兜底：不能点 ``tcp``/``tcp_batch``——那两个工具
+#: 只在 tcp 组注册（``_usable`` 会把点名它们的整张卡剔掉，2026-11-19 Codex 复核
+#: 就是这个后果：pwn 附件题 `pool=[]`，一张卡都没有）。附件题能做的其实是
+#: "本地打通再写 exploit"，所以换成本地四步。
+FILE_CATEGORY_FALLBACK: dict[str, Card] = {
+    **CATEGORY_FALLBACK,
+    "pwn": _card(
+        "pwn",
+        "PWN（附件题）四步：① `elfpeek` view=info 看架构/保护，view=symbols 找 win 与危险调用；"
+        "② `elffind` 把符号与字节串换成偏移；③ `exec_command` 写本地 exp 打本机进程，gdb -batch 看 "
+        "rip/栈，先把「偏移→控制流」跑通；④ 通了再把输入原样落到脚本里，按题面要求交出 payload 或"
+        "记录（附件题常常只要 flag 文本，别自己造远程交互）。",
+        cid="fallback.pwn.file",
+    ),
+}
+
 #: file / tcp 的短流程（web 那份见 :data:`PLAYBOOK`）。粒度与 web 一致：
 #: 只讲先后与出口判据，不点具体技术。
 FILE_PLAYBOOK = (
@@ -463,10 +489,10 @@ FILE_PLAYBOOK = (
 TCP_PLAYBOOK = (
     "[TCP playbook] 五阶段，每阶段有出口判据。\n"
     "0 连接：`tcp` 拿 banner，记下协议与交互格式。\n"
-    "1 静态：`elfpeek` view=info/symbols 看保护、后门、输入函数。\n"
+    "1 静态：`elfpeek` view=info 看保护与入口，view=symbols 看后门与输入函数。\n"
     "2 触发：`tcp` 发超长或畸形输入看崩溃/回显，`tcp_batch` 批量试参数。\n"
     "3 定位：`elffind` 反查偏移，本地复现后再打远端。\n"
-    "4 收口：payload 落盘再发，flag 原样提交。"
+    "4 收口：payload 由 `exec_command` 生成再交 `tcp` 发，flag 原样提交。"
 )
 
 #: kind → 起手 playbook。
@@ -474,21 +500,43 @@ PLAYBOOKS: dict[str, str] = {"web": PLAYBOOK, "file": FILE_PLAYBOOK, "tcp": TCP_
 
 
 def playbook(kind: str | None) -> str:
-    """该 kind 的起手流程文本；未知 kind 返回空串。"""
-    return PLAYBOOKS.get(str(kind or ""), "")
+    """该 kind 的起手流程文本；未知 kind 返回空串。
+
+    web 面按 :data:`WEB_KINDS` 判，而不是查 :data:`PLAYBOOKS`——checker /
+    engagement 与 web 共用同一套工具面，理应拿到同一份 playbook。
+    """
+    k = str(kind or "")
+    if k in WEB_KINDS:
+        return PLAYBOOK
+    return PLAYBOOKS.get(k, "")
 
 
 #: 平台类别词 → 兜底表的键。平台写 ``reverse``，表里写 ``rev``。
 CATEGORY_ALIASES: dict[str, str] = {
     "web": "web",
     "pwn": "pwn",
+    "pwnable": "pwn",
+    "binary": "pwn",
+    "binary exploitation": "pwn",
     "crypto": "crypto",
+    "cryptography": "crypto",
     "rev": "rev",
+    "re": "rev",
     "reverse": "rev",
     "reversing": "rev",
     "misc": "misc",
     "forensics": "misc",
     "forensic": "misc",
+    # 平台/题面有中文类别时也要能落到兜底卡（2026-11-19 Codex 复核）
+    "逆向": "rev",
+    "反向": "rev",
+    "杂项": "misc",
+    "取证": "misc",
+    "密码": "crypto",
+    "密码学": "crypto",
+    "二进制": "pwn",
+    "漏洞利用": "pwn",
+    "渗透": "web",
 }
 
 #: 题面没有类别线索时按接入面兜底：远程二进制服务就是 pwn；
@@ -519,6 +567,14 @@ def category_of(
         if tag in CATEGORY_ALIASES:
             return CATEGORY_ALIASES[tag]
     return _KIND_DEFAULT_CATEGORY.get(str(kind or ""), "")
+
+
+def _fallback_card(kind: str, category: str | None) -> Card | None:
+    """category 兜底卡：纯附件题的 pwn 有专门一版（不点 ``tcp`` 工具）。"""
+    key = str(category or "").strip().lower()
+    if kind == "file":
+        return FILE_CATEGORY_FALLBACK.get(key)
+    return CATEGORY_FALLBACK.get(key)
 
 
 def _usable(cards: Iterable[Card], available: Collection[str] | None) -> list[Card]:
@@ -561,7 +617,7 @@ def pool(
     hit = _usable([card for card in DOMAIN_CARDS if card.keys & wanted], available)
     if hit:
         return hit
-    fallback = CATEGORY_FALLBACK.get(str(category or "").strip().lower())
+    fallback = _fallback_card(k, category)
     return _usable([fallback], available) if fallback is not None else []
 
 
@@ -589,7 +645,7 @@ def start_cards(
     hit = _usable([card for card in DOMAIN_CARDS if card.keys & wanted], available)
     if hit:
         return hit[:cap]
-    fallback = CATEGORY_FALLBACK.get(str(category or "").strip().lower())
+    fallback = _fallback_card(k, category)
     if fallback is None:
         return []
     usable = _usable([fallback], available)

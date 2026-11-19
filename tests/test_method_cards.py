@@ -38,9 +38,20 @@ def test_no_match_renders_empty() -> None:
     assert method_cards.render(None, "web") == ""
 
 
-@pytest.mark.parametrize("kind", ["file", "tcp", "checker", "engagement", None])
+@pytest.mark.parametrize("kind", ["file", "tcp", None])
 def test_non_web_kind_renders_nothing(kind: str | None) -> None:
     assert method_cards.render(["sqli", "agentic_ai"], kind) == ""
+
+
+@pytest.mark.parametrize("kind", ["checker", "engagement"])
+def test_checker_and_engagement_are_web_shaped(kind: str) -> None:
+    """2026-11-19 Codex 复核：这两类注册的是同一套 web 工具，却拿不到 playbook。
+
+    它们没有 flag（checker 看探针、engagement 交报告），攻击面仍是 HTTP，
+    所以卡池与 playbook 都该走 web 那一套。
+    """
+    assert method_cards.playbook(kind).startswith("[Web playbook]")
+    assert method_cards.select(["sqli"], kind), "a checker run with a sqli tag gets no card"
 
 
 def test_same_card_matched_by_many_keys_appears_once() -> None:
@@ -57,11 +68,19 @@ def test_rendered_text_never_echoes_tags() -> None:
 
 
 def _every_card() -> list:
-    return [
+    """Every card once: the file-kind table re-exports the shared fallbacks."""
+    out, seen = [], set()
+    for card in (
         *method_cards.CARDS,
         *method_cards.DOMAIN_CARDS,
         *method_cards.CATEGORY_FALLBACK.values(),
-    ]
+        *method_cards.FILE_CATEGORY_FALLBACK.values(),
+    ):
+        if id(card) in seen:
+            continue
+        seen.add(id(card))
+        out.append(card)
+    return out
 
 
 def test_every_backticked_name_is_a_registered_tool() -> None:
@@ -182,6 +201,59 @@ def test_render_start_is_playbook_plus_hits() -> None:
     assert "REV 决策表" in file_text, "the category fallback card must ride along"
 
     assert method_cards.render_start("file", "", []) == method_cards.FILE_PLAYBOOK
+
+
+# ---------------------------------------------------------------- 签名一致
+# 2026-11-19 Codex 复核按真实函数签名逐条对过卡片文案。下面三条把它固化成
+# 断言：这些写法都会让模型的第一调用直接失败，而失败只回一条工具错误，
+# 模型多半会换个名字再试，不是换个参数——一次写错就是几轮白烧。
+
+def test_no_card_crams_two_elfpeek_views_into_one_call() -> None:
+    """``view`` 是单值枚举（info/sections/symbols/strings/gadgets/disasm/wide）。"""
+    blobs = [card.text for card in _every_card()] + [
+        method_cards.PLAYBOOK,
+        method_cards.FILE_PLAYBOOK,
+        method_cards.TCP_PLAYBOOK,
+    ]
+    for blob in blobs:
+        bad = re.findall(r"view=[a-z]+/[a-z]+", blob)
+        assert not bad, f"one call cannot take two views: {bad}"
+
+
+def test_no_card_invents_the_elfpeek_filter_kwarg() -> None:
+    """真实参数名是 ``filt``；写 ``filter=`` 会被 schema 拒绝。"""
+    for card in _every_card():
+        assert "filter=" not in card.text, card.cid
+
+
+def test_tcp_cards_never_reach_a_file_only_run() -> None:
+    """``tcp``/``tcp_batch`` 只在 tcp 组注册。
+
+    点名它们的卡对纯附件题不可用，``_usable`` 会整张剔掉；兜底必须是那张
+    不含 tcp 的附件版，否则 pwn 附件题的卡池是空的（Codex 复核实测
+    ``file`` + ``pwn`` → ``pool=[]``）。
+    """
+    from ctf_strix import file_triage, nonweb
+
+    file_tools = {fn.__name__ for fn in (*file_triage.TOOLS, *nonweb.FILE_TOOLS)}
+    file_tools |= {"exec_command", "load_skill", "think"}
+    assert "tcp" not in file_tools and "tcp_batch" not in file_tools
+
+    pool = method_cards.pool("file", "pwn", ["pwn", "heap"], available=file_tools)
+    assert pool, "a pwn attachment run must still start from a card"
+    for card in pool:
+        assert method_cards.tools_named(card.text) <= file_tools
+
+    started = method_cards.start_cards("file", "pwn", [], available=file_tools)
+    assert [card.cid for card in started] == ["fallback.pwn.file"]
+
+
+def test_category_aliases_cover_the_platform_vocabulary() -> None:
+    """平台/题面用中文或 ``binary`` 时也要落进兜底表。"""
+    assert method_cards.category_of(["逆向"]) == "rev"
+    assert method_cards.category_of([], declared="二进制") == "pwn"
+    assert method_cards.category_of([], declared="Binary") == "pwn"
+    assert method_cards.category_of(["杂项"]) == "misc"
 
 
 def test_tags_of_ignores_name_and_description() -> None:
