@@ -77,15 +77,43 @@ def test_zero_solve_ranks_above_widely_solved_tail() -> None:
     assert [c["id"] for c in queue] == ["tail", "crowd"]
 
 
-def test_value_ordering_is_monotone_in_solver_count() -> None:
-    """价值代理只需单调：解出数越少排越前，跨难度标签成立。"""
+def test_value_ordering_is_monotone_within_the_proven_tier() -> None:
+    """同一档（他队已解出）内，解出数越少排越前——跨难度标签成立。"""
     chals = [
         _chal("many", solves_count=25),
         _chal("few", solves_count=1, difficulty="hard"),
-        _chal("none", solves_count=0, difficulty="hard"),
     ]
     queue, _ = compete.rank_queue(chals, {}, set())
-    assert [c["id"] for c in queue] == ["none", "few", "many"]
+    assert [c["id"] for c in queue] == ["few", "many"]
+
+
+def test_proven_solvable_ranks_above_zero_solve() -> None:
+    """「别人解出来了」优先于「没人解出来」（2026-11-19 用户定调）。
+
+    我方 agent 能力有限：0 解出的题对我们实测是 0 收益（11-19 测试赛 9 次
+    尝试全在 0 解出题上，全部 wallclock 收场），可解性证据比剩余分值更值钱。
+    分档隔离：未解出题的理论最高分（web easy qa 门控全给）也压不过地板价的
+    已解出题。
+    """
+    chals = [
+        _chal("none-web-easy", solves_count=0),
+        _chal("proven-floor", solves_count=200, category="crypto", difficulty="hard"),
+    ]
+    queue, _ = compete.rank_queue(chals, {}, set())
+    assert [c["id"] for c in queue] == ["proven-floor", "none-web-easy"]
+
+    top_unsolved = _chal(
+        "top",
+        solves_count=0,
+        is_qa_only=True,
+        questions=[{"id": "q", "requires": ["pre"]}],
+    )
+    floor_proven = _chal(
+        "floor", solves_count=200, category="crypto", difficulty="hard"
+    )
+    a = compete.challenge_score(top_unsolved, {}, {"pre"})
+    b = compete.challenge_score(floor_proven, {}, set())
+    assert a is not None and b is not None and b > a
 
 
 def test_web_ranks_above_other_categories_at_same_tier() -> None:

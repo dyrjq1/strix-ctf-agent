@@ -188,6 +188,15 @@ _TAIL_RETRY_BUDGET = 5
 _GATING_BONUS = 40
 #: QA 题库题（is_qa_only）：不占实例配额、通常几分钟出结果，给一点优先。
 _QA_BONUS = 30
+#: 「他队已解出」= 可解性已被证明。2026-11-19 用户定调：我方 agent 能力有限，
+#: 优先尝试别人能解出来的题。当日测试赛实证：9 次尝试全部落在 0 解出的题上，
+#: 全部 wallclock 收场、0 解出；而 ``_VALUE_WEIGHT`` 的价值优先把 0 解出题排第一。
+#:
+#: 量级刻意做成**分档隔离**而不是微调：460 > 未解出题的理论最高分
+#: （300 价值 + 20 easy + 60 web + 30 qa + 40 门控 = 450），所以任何「他队已解」
+#: 的题都排在任何未解出的题前面。组内仍按剩余价值排序（解出越少越前），
+#: ``_FAIL_PENALTY`` 也照旧——连败是我们自己的证据，可以把它降回未解出题之后。
+_PROVEN_BONUS = 460
 
 #: 难度对墙钟的放大倍数（与 batch_eval 的 tiers 同源）。派单前用真实
 #: 上限判会话窗口够不够，而不是拿基准 wallclock 猜。
@@ -368,6 +377,9 @@ def challenge_score(
     if rec.get("status") == SOLVED or cid in my_solved:
         return None
     score = _value_bonus(chal)
+    if int(chal.get("solves_count") or 0) >= 1:
+        # 别人解出来了 = 这道题在我们这套接入下确实可解，先打它。
+        score += _PROVEN_BONUS
     score += _EASE_TIEBREAK.get(str(chal.get("difficulty") or ""), 10)
     score += _CATEGORY_WEIGHT.get(str(chal.get("category") or ""), 0)
     if chal.get("is_qa_only"):
