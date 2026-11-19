@@ -248,6 +248,75 @@ def test_tcp_cards_never_reach_a_file_only_run() -> None:
     assert [card.cid for card in started] == ["fallback.pwn.file"]
 
 
+def _available_for(kind: str) -> set[str]:
+    """这个 kind 真会注册的工具名，取自 catalogue 的 kinds 字段（唯一真值）。"""
+    from ctf_strix import catalogue
+
+    return {
+        info.name
+        for info in catalogue.CATALOGUE
+        if "*" in info.kinds or kind in info.kinds
+    }
+
+
+def _kinds_card_is_served_to(card) -> tuple[str, ...]:
+    if card.kinds:
+        return tuple(sorted(card.kinds))
+    if card in method_cards.CARDS:
+        return ("web", "checker", "engagement")
+    if card.cid in {c.cid for c in method_cards.FILE_CATEGORY_FALLBACK.values()}:
+        return ("file",)
+    return ("file", "tcp")
+
+
+def test_every_card_survives_every_kind_it_can_be_served_to() -> None:
+    """卡点名的工具，必须在它可能被发到的每个 kind 下都真的注册。
+
+    反过来也成立：卡能被 ``_usable`` 剔掉就意味着菜单里少一张——2026-11-19
+    实测 ``pwn.adv`` / ``pwn.stack`` / ``crypto.block`` 在 file 题上就是这样
+    整张消失的。它们的远程版现在标 ``kinds="tcp"``，附件版另立 id。
+    """
+    bad: list[str] = []
+    for card in _every_card():
+        named = method_cards.tools_named(card.text)
+        for kind in _kinds_card_is_served_to(card):
+            missing = named - _available_for(kind)
+            if missing:
+                bad.append(f"{card.cid} @ {kind}: {sorted(missing)}")
+    assert bad == [], "cards name tools their kind does not register: " + "; ".join(bad)
+
+
+def test_card_kinds_are_real_kinds() -> None:
+    allowed = {"web", "checker", "engagement", "file", "tcp"}
+    for card in _every_card():
+        assert card.kinds <= allowed, f"{card.cid} declares {sorted(card.kinds)}"
+
+
+def test_remote_and_attachment_cards_do_not_cross_over() -> None:
+    """同一套打法两版：远程版只进 tcp 题，附件版只进 file 题。"""
+    file_tools = _available_for("file")
+    tcp_tools = _available_for("tcp")
+
+    as_file = method_cards.pool("file", "pwn", ["pwn", "bof", "stack"], available=file_tools)
+    ids = [card.cid for card in as_file]
+    assert "pwn.stack.file" in ids, ids
+    assert "pwn.stack" not in ids, ids
+
+    as_tcp = method_cards.pool("tcp", "pwn", ["pwn", "bof", "stack"], available=tcp_tools)
+    tcp_ids = [card.cid for card in as_tcp]
+    assert "pwn.stack" in tcp_ids, tcp_ids
+    assert "pwn.stack.file" not in tcp_ids, tcp_ids
+
+
+def test_file_crypto_and_pwn_pools_are_never_empty() -> None:
+    """附件题四类都要有卡可发——空菜单等于机制没生效。"""
+    for category in ("pwn", "crypto", "rev", "misc"):
+        pool = method_cards.pool("file", category, [category], available=_available_for("file"))
+        assert pool, f"file/{category} pool is empty"
+        started = method_cards.start_cards("file", category, [], available=_available_for("file"))
+        assert started, f"file/{category} start set is empty"
+
+
 def test_category_aliases_cover_the_platform_vocabulary() -> None:
     """平台/题面用中文或 ``binary`` 时也要落进兜底表。"""
     assert method_cards.category_of(["逆向"]) == "rev"

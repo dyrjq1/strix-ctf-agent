@@ -78,6 +78,11 @@ class Card:
     cid: str
     keys: frozenset[str]
     text: str
+    #: 这张卡只对哪些 kind 有意义（空集 = 不限）。纯附件版的 pwn/crypto 卡写的是
+    #: 本地打法，远程版写的是 ``tcp``/``tcp_batch``；不分开的话，附件题的工具面
+    #: 里没有 tcp，远程卡会被 :func:`_usable` 整张剔掉（2026-11-19 复核发现
+    #: pwn.adv / pwn.stack / crypto.block 在 file 题上正是这样消失的）。
+    kinds: frozenset[str] = frozenset()
 
     @property
     def title(self) -> str:
@@ -86,9 +91,10 @@ class Card:
         return head[:24]
 
 
-def _card(keys: str, text: str, cid: str = "") -> Card:
+def _card(keys: str, text: str, cid: str = "", kinds: str = "") -> Card:
     parts = frozenset(k.strip() for k in keys.split(",") if k.strip())
-    return Card(cid or (sorted(parts)[0] if parts else ""), parts, text)
+    scope = frozenset(k.strip() for k in kinds.split(",") if k.strip())
+    return Card(cid or (sorted(parts)[0] if parts else ""), parts, text, scope)
 
 
 #: Table order is priority: AI cards first (narrower), then technique cards,
@@ -284,6 +290,8 @@ def select(
     for card in CARDS:
         if not (card.keys & wanted) or card in out:
             continue
+        if card.kinds and kind not in card.kinds:
+            continue
         if known is not None and not tools_named(card.text) <= known:
             continue
         out.append(card)
@@ -371,6 +379,17 @@ DOMAIN_CARDS: tuple[Card, ...] = (
         "含非打印字节就转成 hex 串并 hex_mode=true，别手搓转义串。"
         "崩溃看不懂就在 `exec_command` 里跑 gdb -batch 看 rip 与栈。",
         cid="pwn.stack",
+        kinds="tcp",
+    ),
+    _card(
+        "bof,elf,stack",
+        "PWN 栈溢出四步（纯附件，本地跑）：`elfpeek` view=info 看 PIE/NX/canary → view=symbols 与 "
+        "view=strings 找 gets/read/system/win → `exec_command` 用 python 生成 cyclic 模式串、以管道喂给"
+        "本地二进制（timeout 兜底），gdb -batch 看 rip → `elffind` 反查精确偏移。有附件 libc 就照它的"
+        "符号算 system 与 /bin/sh；payload 用 `exec_command` 生成并写文件由本地二进制读入（含非打印"
+        "字节时别走 shell 命令行）。崩溃看不懂就 gdb -batch 看 rip 与栈。",
+        cid="pwn.stack.file",
+        kinds="file",
     ),
     _card(
         "format_string,rop,seccomp",
@@ -378,6 +397,17 @@ DOMAIN_CARDS: tuple[Card, ...] = (
         "位置，再谈 %n 写；没有 win 函数走 ROP，`elfpeek` view=gadgets filt=rdi|rsi|rdx|syscall；"
         "堆题先看 malloc/free 顺序与 tcache 是否 double-free，别急着一次打通；远程先泄漏 libc 基址再算偏移。",
         cid="pwn.adv",
+        kinds="tcp",
+    ),
+    _card(
+        "format_string,rop,seccomp",
+        "PWN 进阶（纯附件，本地跑）：格式化串先用 `exec_command` 跑 python 循环批量打 %1$p..%20$p "
+        "一次收敛、定位自己的输入位置，再谈 %n 写；没有 win 函数走 ROP，`elfpeek` "
+        "view=gadgets filt=rdi|rsi|rdx|syscall；堆题先看 malloc/free 顺序与 tcache 是否 double-free，"
+        "别急着一次打通；泄漏出的地址用 `elfpeek` view=symbols 对照附件符号算基址，再拼 payload 落成"
+        "可重跑脚本。",
+        cid="pwn.adv.file",
+        kinds="file",
     ),
     _card(
         "heap,asan,sanitizer,use_after_free,uaf,arbitrary_read",
@@ -403,6 +433,16 @@ DOMAIN_CARDS: tuple[Card, ...] = (
         "CBC 打 IV 与前一密文块的位翻转；padding oracle 用 `tcp_batch`（hex_mode=false）一次批量试末字节"
         "（≤200/轮）。密钥已知就用 `exec_command` 本地算（ecb/cbc/ctr），别手搓分组填充。",
         cid="crypto.block",
+        kinds="tcp",
+    ),
+    _card(
+        "aes,cbc,ecb,oracle",
+        "CRYPTO 分组密码（纯附件，本地算）：先判模式——16 字节对齐后出现相同块 = ECB；ECB 打块剪切/"
+        "字节翻转移位取目标块；CBC 打 IV 与前一密文块的位翻转；有 oracle 就用 `exec_command` 跑本地 "
+        "python 循环批量试末字节（≤200/轮，别只试 1 次）；密钥已知就直接 `exec_command` 本地算 "
+        "ecb/cbc/ctr，`hexpeek` 只看字节布局，别手搓分组填充。",
+        cid="crypto.block.file",
+        kinds="file",
     ),
     _card(
         "zip,archive,forensics",
@@ -433,6 +473,7 @@ CATEGORY_FALLBACK: dict[str, Card] = {
         "纪律：`exec_command` 里跑 gdb 本地确认偏移，本地不通不打远端；payload 用 `exec_command` 生成后"
         "交 `tcp`（文本，或 hex 串 + hex_mode=true）。",
         cid="fallback.pwn",
+        kinds="tcp",
     ),
     "rev": _card(
         "rev",
@@ -577,14 +618,24 @@ def _fallback_card(kind: str, category: str | None) -> Card | None:
     return CATEGORY_FALLBACK.get(key)
 
 
-def _usable(cards: Iterable[Card], available: Collection[str] | None) -> list[Card]:
-    """按本 run 的真实工具面与 ``CTF_CARDS_OFF`` 过滤（同一套规则，一处实现）。"""
+def _usable(
+    cards: Iterable[Card],
+    available: Collection[str] | None,
+    kind: str | None = None,
+) -> list[Card]:
+    """按本 run 的真实工具面、卡自己的 kind 范围与 ``CTF_CARDS_OFF`` 过滤。
+
+    三处规则收在一处：``kind`` 过滤（``card.kinds`` 非空且不含本题 kind 就剔）、
+    工具面过滤（卡点名的工具必须全部在本进程里注册）、消融开关。
+    """
     known = None if available is None else frozenset(available)
     disabled = _disabled_keys()
+    k = str(kind or "")
     return [
         card
         for card in cards
         if not (card.keys & disabled)
+        and (not card.kinds or not k or k in card.kinds)
         and (known is None or tools_named(card.text) <= known)
     ]
 
@@ -609,16 +660,16 @@ def pool(
     """
     k = str(kind or "")
     if k in WEB_KINDS:
-        hits = _usable(select(tags, k), available)
-        return hits or _usable(CARDS, available)
+        hits = _usable(select(tags, k), available, k)
+        return hits or _usable(CARDS, available, k)
     if k not in {"file", "tcp"}:
         return []
     wanted = _keys(tags)
-    hit = _usable([card for card in DOMAIN_CARDS if card.keys & wanted], available)
+    hit = _usable([card for card in DOMAIN_CARDS if card.keys & wanted], available, k)
     if hit:
         return hit
     fallback = _fallback_card(k, category)
-    return _usable([fallback], available) if fallback is not None else []
+    return _usable([fallback], available, k) if fallback is not None else []
 
 
 def start_cards(
@@ -638,17 +689,17 @@ def start_cards(
     cap = max(int(limit), 0)
     k = str(kind or "")
     if k in WEB_KINDS:
-        return _usable(select(tags, k), available)[:cap]
+        return _usable(select(tags, k), available, k)[:cap]
     if k not in {"file", "tcp"}:
         return []
     wanted = _keys(tags)
-    hit = _usable([card for card in DOMAIN_CARDS if card.keys & wanted], available)
+    hit = _usable([card for card in DOMAIN_CARDS if card.keys & wanted], available, k)
     if hit:
         return hit[:cap]
     fallback = _fallback_card(k, category)
     if fallback is None:
         return []
-    usable = _usable([fallback], available)
+    usable = _usable([fallback], available, k)
     return usable[:cap]
 
 
