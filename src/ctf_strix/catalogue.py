@@ -112,9 +112,8 @@ CATALOGUE: Final[tuple[ToolInfo, ...]] = (
     ),
     ToolInfo(
         "method_sweep",
-        "several methods times many paths in ONE call: the status matrix of "
-        "the first pass, before any hand-written curl loop; full bodies stay "
-        "in the ledger, read them with traffic_view",
+        "send one method across many paths in a single call, to find which "
+        "route answers at all",
         WEB_KINDS,
         "web",
     ),
