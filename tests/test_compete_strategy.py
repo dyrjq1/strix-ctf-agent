@@ -116,11 +116,20 @@ def test_proven_solvable_ranks_above_zero_solve() -> None:
     assert a is not None and b is not None and b > a
 
 
-def test_web_ranks_above_other_categories_at_same_tier() -> None:
-    """web 是实测强项（解出率 83%），同档位优先。"""
+def test_category_weight_is_neutral_without_competition_evidence() -> None:
+    """类别平权：'web 是强项'的先验（练习套 40/48）在比赛条件下不成立。
+
+    练习套的 83.3% 是题目级、有重试、预算 600–1800s 的数字；单次尝试口径
+    只有 62.9%。比赛条件下的 web 样本只有入围赛一道（4 个 checkpoint 全解，
+    样本量 1）。没数据就不给权重——要加回来，先有比赛条件下的解出率。
+    """
     chals = [_chal("crypto-1", category="crypto"), _chal("web-1")]
     queue, _ = compete.rank_queue(chals, {}, set())
-    assert [c["id"] for c in queue] == ["web-1", "crypto-1"]
+    # 同价值、同难度 → 同分，按 id 兜底排序；web 不因类别占先。
+    assert [c["id"] for c in queue] == ["crypto-1", "web-1"]
+    a = compete.challenge_score(_chal("c1", category="crypto"), {}, set())
+    b = compete.challenge_score(_chal("w1", category="web"), {}, set())
+    assert a == b
 
 
 def test_consecutive_failures_defer_the_question() -> None:
