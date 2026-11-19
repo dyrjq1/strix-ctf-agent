@@ -61,7 +61,12 @@ URL you were given, not hunting for a new one.
    per-user value (bonus, coupon, invite code) are the fastest schema lesson
    you will get. Two accounts beat any wordlist — the difference between them
    is the recipe.
-4. Only then attack: `method_sweep` the candidates, then send the hypothesis.
+4. Only then attack, and make the first pass one batched call: hand the
+   candidates to `method_sweep` (several methods x many paths at once) and
+   read the status matrix. Do not spend that pass on a hand-written
+   `curl`/`requests` loop: it costs a turn per round-trip and hides which
+   route answered differently. Write loop code later, for a payload the tool
+   cannot express.
 5. Then go deep, not wide. Pick the one route the sweep answered differently
    and push it to exploitation: a route you scanned is not a route you
    exploited, and a second sweep is not progress.
