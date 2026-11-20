@@ -14,6 +14,11 @@ import time
 import pytest
 
 from ctf_strix import agent
+from ctf_strix.limits import MAX_WALLCLOCK_S
+
+#: 单题墙钟上限的单一真值。2026-11-20 用户把 900 改成 5400（1.5h），断言
+#: 跟着常量走，不再在测试里抄字面量。
+_CAP = MAX_WALLCLOCK_S
 
 
 def test_wall_budget_env_overrides_tiers(monkeypatch):
@@ -39,23 +44,23 @@ def test_wall_budget_tiers_match_harness(monkeypatch):
     真正卡住的是"方向没选对"，不是"给的时间不够长"；分档只制造了配置漂移。
     """
     monkeypatch.delenv("CTFY_WALL_DEADLINE", raising=False)
-    assert agent._wall_budget({"challenge": {"difficulty": "easy"}}) == 900
-    assert agent._wall_budget({"challenge": {"difficulty": "medium"}}) == 900
-    assert agent._wall_budget({"challenge": {"difficulty": "hard"}}) == 900
+    assert agent._wall_budget({"challenge": {"difficulty": "easy"}}) == _CAP
+    assert agent._wall_budget({"challenge": {"difficulty": "medium"}}) == _CAP
+    assert agent._wall_budget({"challenge": {"difficulty": "hard"}}) == _CAP
 
 
 def test_wall_budget_unknown_difficulty_uses_hard_tier(monkeypatch):
     """task.json 不带难度（协议示例就没有）时取 hard 档，而不是 0。"""
     monkeypatch.delenv("CTFY_WALL_DEADLINE", raising=False)
-    assert agent._wall_budget({}) == 900
-    assert agent._wall_budget({"challenge": {}}) == 900
-    assert agent._wall_budget({"challenge": {"difficulty": "impossible"}}) == 900
+    assert agent._wall_budget({}) == _CAP
+    assert agent._wall_budget({"challenge": {}}) == _CAP
+    assert agent._wall_budget({"challenge": {"difficulty": "impossible"}}) == _CAP
 
 
 def test_wall_budget_env_is_clamped_to_the_single_cap(monkeypatch):
     """环境变量不能越过 900s：上限只有一个真值，不在各处各写一遍。"""
     monkeypatch.setenv("CTFY_WALL_DEADLINE", "3600")
-    assert agent._wall_budget({"challenge": {"difficulty": "hard"}}) == 900
+    assert agent._wall_budget({"challenge": {"difficulty": "hard"}}) == _CAP
 
 
 def test_wall_budget_env_unset_in_fresh_container(monkeypatch):

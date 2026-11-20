@@ -1,4 +1,4 @@
-"""单题预算的硬上限（2026-11-19 用户拍板：60 轮 / 900 秒）。
+"""单题预算的硬上限（2026-11-20 初选赛中改为：轮次不设限 / 墙钟 5400 秒）。
 
 这是**上限**，不是基准：每一档难度仍按自己的基准给预算（batch_eval 的
 tiers、agent 的 ``_WALL_TIERS``、compete 的单次时间盒），任何路径算出来
@@ -20,10 +20,20 @@ tiers、agent 的 ``_WALL_TIERS``、compete 的单次时间盒），任何路径
 from __future__ import annotations
 
 #: 一题（跨所有 attempt 合计）的轮次上限。
-MAX_TURNS: int = 60
+#:
+#: 2026-11-20 初选赛中用户定：**取消轮次上限**，只留墙钟。轮次不是当时的
+#: 真实约束（11-19 测试赛 14 次尝试全部死于墙钟、``turn_capped`` 零次），
+#: 卡住的是方向选择。这里留一个远大于任何实际用量的数当哨兵——``clamp_turns``
+#: 的语义是``[1, MAX_TURNS]``，没有“无上限”表示法，所以用一个发不出去的
+#: 大数代替，真正的界由 ``MAX_WALLCLOCK_S`` 负责。
+MAX_TURNS: int = 1_000_000
 
 #: 一题（跨所有 attempt 合计）的墙钟上限，秒。
-MAX_WALLCLOCK_S: int = 900
+#:
+#: 2026-11-20 初选赛中用户定为 5400s（1.5h，原 900s）。注意 ``compete.py``
+#: 的难度放大（hard ×2.3）会先乘再被这里夹住，所以所有难度实际拿到的都是
+#: 5400s，而不是 900×2.3。
+MAX_WALLCLOCK_S: int = 5400
 
 
 def clamp_turns(value: object) -> int:
